@@ -23,8 +23,8 @@ targets:
         CFBundleExecutable: HelloLC
         CFBundleIdentifier: com.qoder.hellolc
         CFBundlePackageType: APPL
-        CFBundleShortVersionString: "0.6.1"
-        CFBundleVersion: "7"
+        CFBundleShortVersionString: "0.6.2"
+        CFBundleVersion: "8"
         CFBundleInfoDictionaryVersion: "6.0"
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true

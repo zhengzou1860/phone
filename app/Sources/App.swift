@@ -38,6 +38,14 @@ struct ContentView: View {
                     Button("合成图自检") { bench.startSelfTest() }
                     Button("照片正对照") { bench.showPhotoPicker = true }
                 }
+                Picker("单趟取帧上限", selection: $bench.frameLimit) {
+                    Text("90 帧").tag(90)
+                    Text("600 帧").tag(600)
+                    Text("2000 帧").tag(2000)
+                }
+                .pickerStyle(.segmented)
+                .font(.footnote)
+
                 HStack(spacing: 10) {
                     Button("选视频跑基准") { bench.showVideoPicker = true }
                     Button("尺子自检") { bench.startModel() }
@@ -84,6 +92,7 @@ final class Bench: ObservableObject {
     @Published var status = ""
     @Published var showVideoPicker = false
     @Published var showPhotoPicker = false
+    @Published var frameLimit = 90
 
     init() {
         let info = Bundle.main.infoDictionary ?? [:]
@@ -109,9 +118,10 @@ final class Bench: ObservableObject {
     func startVideo(_ url: URL) {
         showVideoPicker = false
         busy = true
-        status = "视频基准运行中…"
+        let limit = frameLimit
+        status = "视频基准运行中…（单趟上限 \(limit) 帧，2000 帧那档要跑一分多钟）"
         Task.detached { [weak self] in
-            let report = Runner.videoBenchmark(url: url, frameLimit: 90)
+            let report = Runner.videoBenchmark(url: url, frameLimit: limit)
             await MainActor.run { self?.finish(report) }
         }
     }
@@ -584,8 +594,10 @@ enum Runner {
             return attrs?[.size] as? Int
         }()
         let sizeText = sizeBytes.map { "\($0 / 1048576) MB" } ?? "-"
+        let memBegin = Facts.residentMB()
         Journal.line("视频基准 开始 \(url.lastPathComponent) 源 \(String(format: "%.0fx%.0f", natW, natH)) "
-                     + "\(String(format: "%.1f", duration))s@\(String(format: "%.0f", videoFps))fps \(sizeText)")
+                     + "\(String(format: "%.1f", duration))s@\(String(format: "%.0f", videoFps))fps \(sizeText)"
+                     + " 上限\(frameLimit)帧 驻留\(memBegin)MB")
 
         let onlyDecode = videoPass(asset: asset, track: track, limit: frameLimit,
                                    target: nil, detect: false, videoFps: videoFps,
@@ -612,12 +624,15 @@ enum Runner {
                               duration: duration, tag: "解码+检测, 让解码器直出 \(s.w)x\(s.h)")
         }
 
+        let memEnd = Facts.residentMB()
+        Journal.line("视频基准 结束 \(url.lastPathComponent) 上限\(frameLimit) 驻留 \(memEnd) MB（进这条时 \(memBegin)）")
         return """
         视频基准 \(url.lastPathComponent)
         源尺寸 \(String(format: "%.0fx%.0f", natW, natH))，全长 \(String(format: "%.1f", duration)) s，\(String(format: "%.1f", videoFps)) fps，大小 \(sizeText)
         \(onlyDecode.text)
         \(native.text)
         \(small.text)
+        这条跑完 驻留 \(memBegin)→\(memEnd) MB（+\(memEnd - memBegin)）
         """
     }
 
@@ -691,6 +706,8 @@ enum Runner {
                 do {
                     try handler.perform([request])
                 } catch {
+                    reader.cancelReading()
+                    Journal.line("趟 Vision 抛错 \(tag) 第\(frames + 1)帧 \(String(describing: error).prefix(140))")
                     return ("[\(tag)] 第 \(frames + 1) 帧 Vision 抛错: \(error)", widest, tallest)
                 }
                 visionMs = Double(DispatchTime.now().uptimeNanoseconds - v0) / 1_000_000
@@ -721,6 +738,7 @@ enum Runner {
                 }
             }
         }
+        reader.cancelReading()
         Journal.line("趟 结束 \(tag) 帧=\(frames) 峰值=\(memMax)MB"
                      + (stoppedForMemory ? "（为躲 jetsam 自己收的）" : ""))
 
