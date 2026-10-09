@@ -66,6 +66,21 @@ jobs:
           grep -rhoE "VN[A-Za-z]*FeaturePrint[A-Za-z]*" "$FW" 2>/dev/null | sort -u | ann "VIS-SYM " || true
           grep -rhB2 -A6 "IdentityFeaturePrint" "$FW" 2>/dev/null | head -14 | ann "VIS-DECL " || true
 
+      # 纯诊断：人脸特征点属性名从 SDK 头文件里抠，不靠猜（对齐要靠这 5 个点）
+      - name: probe face landmark names
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=8{print "::error::" p substr($0,1,200)}'; }
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          HDR="$SDK/System/Library/Frameworks/Vision.framework/Headers"
+          echo "hdr=$([ -d "$HDR" ] && echo 在 || echo 不在)" | ann "LM-HDR "
+          grep -rhoE "@interface VNFace(Landmark|Observation)[A-Za-z0-9_]*" "$HDR" 2>/dev/null | sort -u | ann "LM-CLASS "
+          grep -rhE "^@property.*(andEye|Ear|Nose|Lip|Mouth|Chin|Contour|faceLandmarks)" "$HDR" 2>/dev/null \
+            | sed -E 's/^@property[^)]*\)[[:space:]]*//' | tr -d ';' | sort -u | ann "LM-PROP "
+          grep -rhoE "VNFaceLandmarkRegion[A-Za-z0-9_]*" "$HDR" 2>/dev/null | sort -u | ann "LM-REGION "
+          exit 0
+
       - name: install xcodegen
         run: |
           set -euo pipefail

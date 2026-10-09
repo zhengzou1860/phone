@@ -20,8 +20,8 @@ struct HelloApp: App {
 
 enum PickTarget { case video, photo }
 
-struct ContentView: View {
-    @StateObject private var bench = Bench()
+struct BenchView: View {
+    @ObservedObject var bench: Bench
 
     var body: some View {
         ScrollView {
@@ -101,10 +101,10 @@ struct ContentView: View {
             .padding()
         }
         .fullScreenCover(isPresented: $bench.showVideoPicker) {
-            PickerHost(bench: bench, target: .video)
+            PickerHost(target: .video) { url, msg in bench.finishPick(url: url, failMessage: msg, target: .video) }
         }
         .fullScreenCover(isPresented: $bench.showPhotoPicker) {
-            PickerHost(bench: bench, target: .photo)
+            PickerHost(target: .photo) { url, msg in bench.finishPick(url: url, failMessage: msg, target: .photo) }
         }
     }
 }
@@ -208,8 +208,8 @@ final class Bench: ObservableObject {
 }
 
 struct PickerHost: UIViewControllerRepresentable {
-    let bench: Bench
     let target: PickTarget
+    let onDone: (URL?, String?) -> Void
 
     func makeUIViewController(context: Context) -> PHPickerViewController {
         var config = PHPickerConfiguration()
@@ -222,15 +222,15 @@ struct PickerHost: UIViewControllerRepresentable {
 
     func updateUIViewController(_ uiViewController: PHPickerViewController, context: Context) {}
 
-    func makeCoordinator() -> Coordinator { Coordinator(bench, target) }
+    func makeCoordinator() -> Coordinator { Coordinator(target, onDone) }
 
     final class Coordinator: NSObject, PHPickerViewControllerDelegate {
-        let bench: Bench
         let target: PickTarget
+        let onDone: (URL?, String?) -> Void
 
-        init(_ bench: Bench, _ target: PickTarget) {
-            self.bench = bench
+        init(_ target: PickTarget, _ onDone: @escaping (URL?, String?) -> Void) {
             self.target = target
+            self.onDone = onDone
         }
 
         func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
@@ -260,9 +260,9 @@ struct PickerHost: UIViewControllerRepresentable {
         }
 
         private func report(_ url: URL?, _ failMessage: String?) {
-            let target = self.target
+            let onDone = self.onDone
             Task { @MainActor in
-                self.bench.finishPick(url: url, failMessage: failMessage, target: target)
+                onDone(url, failMessage)
             }
         }
     }
