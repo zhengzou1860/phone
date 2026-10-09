@@ -441,6 +441,18 @@ enum Uploader {
 
 enum Runner {
 
+    /// 帧循环里 autoreleasepool 闭包只能"记个原因再 return"，用它把原因带到循环外面判定。
+    private enum FrameStop {
+        case none
+        case sourceEnd
+        case broken(String)
+        case memoryStop(String)
+    }
+
+    /// 0.6.4 实测：满尺寸解码+检测那一趟足迹涨到 1682 MB 时系统才喊压力。
+    /// 收兵线取它的一半多一点——真到 1682 才停就要赌系统先喊还是先杀。
+    static let footprintStopMB = 900
+
     static func detectRuns(_ image: CGImage, runs: Int)
         -> (first: Double, rest: [Double], count: Int, detail: String) {
         let handler = VNImageRequestHandler(cgImage: image, orientation: .up, options: [:])
@@ -748,8 +760,11 @@ enum Runner {
         var failNote = ""
         let mem0 = Facts.footprintMB()
         var memMax = mem0
-        var stoppedForPressure = false
+        var stopReason = ""
         let chunk = chunkFrames > 0 ? chunkFrames : limit
+        // 一趟只造一个 request。0.6.4 每帧新建 request/handler，这些 ObjC 中间对象全落在
+        // 自动释放池里，要等整趟结束才回收——足迹就是这么涨到 1682 MB 的。
+        let request = VNDetectFaceRectanglesRequest()
 
         while frames < limit {
             let readerResult: AVAssetReader?
@@ -785,67 +800,89 @@ enum Runner {
                 failNote = "第 \(chunks) 块 startReading 失败: \(reader.error?.localizedDescription ?? "-")"
                 break
             }
-            Journal.line("块 \(chunks) 起于 \(String(format: "%.2f", from))s 足迹\(mem0)MB")
+            Journal.line("块 \(chunks) 起于 \(String(format: "%.2f", from))s 足迹\(Facts.footprintMB())MB")
 
             var inChunk = 0
+            var exhausted = false
             while frames < limit {
-                let d0 = DispatchTime.now().uptimeNanoseconds
-                guard let sample = output.copyNextSampleBuffer() else { break }
-                let decodeMs = Double(DispatchTime.now().uptimeNanoseconds - d0) / 1_000_000
-                guard let buffer = CMSampleBufferGetImageBuffer(sample) else { break }
-                if frames == 0 {
-                    widest = CVPixelBufferGetWidth(buffer)
-                    tallest = CVPixelBufferGetHeight(buffer)
-                }
-
-                var visionMs = 0.0
-                if detect {
-                    let request = VNDetectFaceRectanglesRequest()
-                    let handler = VNImageRequestHandler(cvPixelBuffer: buffer, orientation: .up, options: [:])
-                    let v0 = DispatchTime.now().uptimeNanoseconds
-                    do {
-                        try handler.perform([request])
-                    } catch {
-                        reader.cancelReading()
-                        failNote = "第 \(frames + 1) 帧 Vision 抛错: \(error)"
-                        Journal.line("趟 Vision 抛错 \(tag) \(failNote)")
-                        break
+                // autoreleasepool 按帧回收：池子在这一行结束时就清空，Vision 那一帧的中间对象不会活到趟末
+                var stop: FrameStop = .none
+                autoreleasepool {
+                    let d0 = DispatchTime.now().uptimeNanoseconds
+                    guard let sample = output.copyNextSampleBuffer() else {
+                        stop = .sourceEnd
+                        return
                     }
-                    visionMs = Double(DispatchTime.now().uptimeNanoseconds - v0) / 1_000_000
-                    let faces = request.results ?? []
-                    faceTotals += faces.count
-                    var bestW = 0.0
-                    var bestH = 0.0
-                    for f in faces {
-                        let pw = Double(f.boundingBox.width) * Double(widest)
-                        let ph = Double(f.boundingBox.height) * Double(tallest)
-                        if pw * ph > bestW * bestH { bestW = pw; bestH = ph }
+                    let decodeMs = Double(DispatchTime.now().uptimeNanoseconds - d0) / 1_000_000
+                    guard let buffer = CMSampleBufferGetImageBuffer(sample) else {
+                        stop = .broken("第 \(frames + 1) 帧 sample 里没有像素缓冲")
+                        return
                     }
-                    if bestW > 0 { facePx.append(min(bestW, bestH)) }
-                }
+                    if frames == 0 {
+                        widest = CVPixelBufferGetWidth(buffer)
+                        tallest = CVPixelBufferGetHeight(buffer)
+                    }
 
-                if frames >= 3 {
-                    decodeTimes.append(decodeMs)
-                    if detect { visionTimes.append(visionMs) }
+                    var visionMs = 0.0
+                    if detect {
+                        let handler = VNImageRequestHandler(cvPixelBuffer: buffer, orientation: .up, options: [:])
+                        let v0 = DispatchTime.now().uptimeNanoseconds
+                        do {
+                            try handler.perform([request])
+                        } catch {
+                            stop = .broken("第 \(frames + 1) 帧 Vision 抛错: \(error)")
+                            return
+                        }
+                        visionMs = Double(DispatchTime.now().uptimeNanoseconds - v0) / 1_000_000
+                        let faces = request.results ?? []
+                        faceTotals += faces.count
+                        var bestW = 0.0
+                        var bestH = 0.0
+                        for f in faces {
+                            let pw = Double(f.boundingBox.width) * Double(widest)
+                            let ph = Double(f.boundingBox.height) * Double(tallest)
+                            if pw * ph > bestW * bestH { bestW = pw; bestH = ph }
+                        }
+                        if bestW > 0 { facePx.append(min(bestW, bestH)) }
+                    }
+
+                    if frames >= 3 {
+                        decodeTimes.append(decodeMs)
+                        if detect { visionTimes.append(visionMs) }
+                    }
+                    frames += 1
+                    inChunk += 1
+                    let now = Facts.footprintMB()
+                    if now > memMax { memMax = now }
+                    if PressureWatch.sawPressure {
+                        stop = .memoryStop("系统已喊内存压力，足迹 \(now) MB")
+                        return
+                    }
+                    if now > Runner.footprintStopMB {
+                        stop = .memoryStop("足迹 \(now) MB 超过收兵线 \(Runner.footprintStopMB) MB")
+                        return
+                    }
+                    if frames % 30 == 0 {
+                        Journal.line("心跳 \(tag) 第\(frames)帧 足迹\(now)MB")
+                    }
                 }
-                frames += 1
-                inChunk += 1
-                let now = Facts.footprintMB()
-                if now > memMax { memMax = now }
-                if PressureWatch.sawPressure {
-                    stoppedForPressure = true
-                    Journal.line("趟 收兵 \(tag) 第\(frames)帧 足迹\(now)MB（系统已喊内存压力）")
-                    break
+                switch stop {
+                case .none: continue
+                case .sourceEnd: exhausted = true
+                case .broken(let msg):
+                    failNote = msg
+                    Journal.line("趟 中止 \(tag) \(failNote)")
+                case .memoryStop(let msg):
+                    stopReason = msg + "（第 \(frames) 帧收兵）"
+                    Journal.line("趟 收兵 \(tag) \(stopReason)")
                 }
-                if frames % 30 == 0 {
-                    Journal.line("心跳 \(tag) 第\(frames)帧 足迹\(now)MB")
-                }
+                break
             }
             reader.cancelReading()
-            if stoppedForPressure || !failNote.isEmpty || inChunk == 0 { break }
+            if exhausted || !stopReason.isEmpty || !failNote.isEmpty || inChunk == 0 { break }
         }
         Journal.line("趟 结束 \(tag) 帧=\(frames) 块=\(chunks) 峰值足迹=\(memMax)MB"
-                     + (stoppedForPressure ? "（收到压力自己收的）" : "")
+                     + (stopReason.isEmpty ? "" : "（\(stopReason)）")
                      + (failNote.isEmpty ? "" : " \(failNote)"))
 
         guard frames > 3 else {
@@ -859,8 +896,12 @@ enum Runner {
         let wholeClip = duration * videoFps / serialFps
 
         var line = "[\(tag)] \(frames) 帧 @ \(widest)x\(tallest)（\(chunks) 块） 取帧 \(stat(decodeTimes))"
+        let slope = frames > 5 ? Double(memMax - mem0) / Double(frames) : 0
         line += "\n  足迹 \(mem0)→\(Facts.footprintMB()) MB，本趟峰值 \(memMax) MB"
-            + (stoppedForPressure ? "｜收到内存压力自己收兵，只跑到第 \(frames) 帧" : "")
+            + "（每帧约 \(String(format: slope < 0.1 ? "%.2f" : "%.1f", slope)) MB）"
+        if !stopReason.isEmpty {
+            line += "\n  半趟收兵：\(stopReason)"
+        }
         if !failNote.isEmpty { line += "｜\(failNote)" }
         if detect {
             line += "\n  Vision \(stat(visionTimes))  检到脸 \(faceTotals)/\(frames) 帧"
