@@ -145,22 +145,55 @@ jobs:
           ls -la /tmp/sc | ann "UNZ " || true
           test -s /tmp/sc/w600k_mbf.onnx
 
+      - name: 试 onnx2coreml（MIL 路线 + 数值对齐）
+        run: |
+          set +e          # 一个 step 只留约 10 条 annotation ⇒ 判定行必须排在明细之前
+          ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=3{print "::error::" p substr($0,1,230)}'; }
+          rm -rf /tmp/o2c /tmp/mbf_o2c.mlpackage && mkdir -p /tmp/o2c
+          python -m venv /tmp/o2c >/dev/null 2>&1
+          /tmp/o2c/bin/pip install --quiet --no-cache-dir onnx2coreml coremltools onnx onnxruntime numpy >>/tmp/o2cpip.log 2>&1
+          /tmp/o2c/bin/onnx2coreml inspect /tmp/sc/w600k_mbf.onnx > /tmp/inspect.log 2>&1
+          /tmp/o2c/bin/onnx2coreml convert /tmp/sc/w600k_mbf.onnx -o /tmp/mbf_o2c.mlpackage \
+            --format mlpackage --verify > /tmp/o2c.log 2>&1
+          rc=$?
+          if [ $rc -eq 0 ]; then echo "onnx2coreml 转成功且 --verify 数值对齐通过" | ann "O2C-VERDICT "; else echo "onnx2coreml 失败 退出码 $rc" | ann "O2C-VERDICT "; fi
+          echo "转换器 $(/tmp/o2c/bin/pip show onnx2coreml 2>/dev/null | awk '/^Version/{print $2}') / coremltools $(/tmp/o2c/bin/python -c 'import coremltools as ct;print(ct.__version__)' 2>&1 | tail -1)；产物 $(du -sk /tmp/mbf_o2c.mlpackage 2>/dev/null | awk '{print $1"KB"}')" | ann "O2C-ENV "
+          grep -iE "conv|relu|gemm|add|reshape|total|support|op" /tmp/inspect.log | head -3 | ann "O2C-OPS "
+          tail -3 /tmp/o2c.log | ann "O2C "
+          [ $rc -eq 0 ] || exit 1
+
       - name: 逐版本试转 onnx → CoreML
         run: |
-          set +e          # 本步末位是管道且恒回 0；红绿由下面 VERDICT 行显式下
-          ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=10{print "::error::" p substr($0,1,230)}'; }
-          rm -rf /tmp/venvs /tmp/mbf_* /tmp/ver.log /tmp/pip.log && mkdir -p /tmp/venvs
-          echo "开始逐版本试转" | ann "TRY0 "
+          set +e          # 一个 step 只留约 10 条 annotation ⇒ 判定行排在明细之前
+          ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=5{print "::error::" p substr($0,1,230)}'; }
+          rm -rf /tmp/venvs /tmp/ver.log /tmp/pip.log && mkdir -p /tmp/venvs
           for V in 9.0 8.0 7.2 6.0 5.2; do
             python -m venv "/tmp/venvs/$V" >/dev/null 2>&1
             "/tmp/venvs/$V/bin/pip" install --quiet --no-cache-dir "coremltools==$V" onnx >>/tmp/pip.log 2>&1
             "/tmp/venvs/$V/bin/python" /tmp/try.py "$V" >>/tmp/ver.log 2>&1
-            echo "$V 跑完" | ann "TRY "
           done
-          tail -5 /tmp/pip.log | ann "PIPLOG "
+          if grep -q "OK(" /tmp/ver.log; then
+            echo "有 coremltools 版本能直接吃 onnx，看 SUM 行哪个版本" | ann "VERDICT "
+          else
+            echo "这 5 个 coremltools 版本没有一个把 onnx 转成 CoreML" | ann "VERDICT "
+          fi
           grep "^SUM " /tmp/ver.log | ann "SUM "
-          grep -q "OK(" /tmp/ver.log || { echo "这 5 个版本没有一个能吃下 w600k_mbf.onnx，逐版本原因见 SUM 行" | ann "VERDICT "; exit 1; }
-          echo "至少一个版本转成了，产物在 /tmp/mbf_*" | ann "VERDICT "
+          [ -s /tmp/ver.log ] || tail -3 /tmp/pip.log | ann "PIPLOG "
+          grep -q "OK(" /tmp/ver.log || exit 1
+
+      - name: 把探测日志发到固定 release（无 token 也能读）
+        if: always()
+        run: |
+          set +e
+          gh release delete channel-coreml --cleanup-tag -y >/dev/null 2>&1 || true
+          rm -f ./*.log
+          for f in /tmp/ver.log /tmp/o2c.log /tmp/inspect.log /tmp/pip.log /tmp/o2cpip.log; do
+            [ -s "$f" ] && cp "$f" "./$(basename "$f")"
+          done
+          ls -l ./*.log 2>/dev/null
+          gh release create channel-coreml ./*.log \
+            --title "coreml 探测日志" --prerelease \
+            --notes "逐版本 onnx→CoreML 与 onnx2coreml 数值对齐的完整日志" 2>&1 | tail -2
 
       - name: keep artifact
         if: always()
