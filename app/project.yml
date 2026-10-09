@@ -23,9 +23,11 @@ targets:
         CFBundleExecutable: HelloLC
         CFBundleIdentifier: com.qoder.hellolc
         CFBundlePackageType: APPL
-        CFBundleShortVersionString: "0.1"
-        CFBundleVersion: "1"
+        CFBundleShortVersionString: "0.2"
+        CFBundleVersion: "2"
         CFBundleInfoDictionaryVersion: "6.0"
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
         LSRequiresIPhoneOS: true
         UILaunchScreen: {}
         UISupportedInterfaceOrientations:
