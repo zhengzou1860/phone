@@ -42,6 +42,98 @@ enum Align {
         ]
     }
 
+    // MARK: 朝向
+    // 竖屏片走 AVAssetReader 直出来是**躺着**的（这条路上没有 preferredTransform 可套），
+    // 而锚点那条路（AVAssetImageGenerator appliesPreferredTrackTransform=true）是正着的。
+    // PC 实测：拿框猜点位时，只要朝向不对，同一张脸的余弦一律塌到 0.11~0.17（闸门 0.30）
+    // ⇒ 整片 0 命中就是这么来的。这里不"把整张图转正"（太贵），而是把点换算到转正坐标系，
+    // 再映回 raw 像素——相似变换会把旋转一起吸收掉，裁出的 112×112 自然是正着的。
+
+    /// raw 像素点 → 转正后的像素点。k = 直出的图是正片逆时针转了 k×90°。
+    static func toUpright(_ p: CGPoint, k: Int, w: Int, h: Int) -> CGPoint {
+        switch k {
+        case 1: return CGPoint(x: p.y, y: CGFloat(w - 1) - p.x)
+        case 2: return CGPoint(x: CGFloat(w - 1) - p.x, y: CGFloat(h - 1) - p.y)
+        case 3: return CGPoint(x: CGFloat(h - 1) - p.y, y: p.x)
+        default: return p
+        }
+    }
+
+    /// toUpright 的逆：转正后的像素点 → raw 像素点
+    static func toRaw(_ p: CGPoint, k: Int, w: Int, h: Int) -> CGPoint {
+        switch k {
+        case 1: return CGPoint(x: CGFloat(w - 1) - p.y, y: p.x)
+        case 2: return CGPoint(x: CGFloat(w - 1) - p.x, y: CGFloat(h - 1) - p.y)
+        case 3: return CGPoint(x: p.y, y: CGFloat(h - 1) - p.x)
+        default: return p
+        }
+    }
+
+    /// Vision 归一化点（原点左下）→ 这块 raw 缓冲的像素点（原点左上）
+    static func pixelPoint(_ p: CGPoint, _ w: Int, _ h: Int) -> CGPoint {
+        CGPoint(x: p.x * CGFloat(w), y: (1 - p.y) * CGFloat(h))
+    }
+
+    /// raw 像素框 → 转正后的外接框（k=0 时就是它自己）
+    static func uprightBox(_ b: CGRect, k: Int, w: Int, h: Int) -> CGRect {
+        let c = [CGPoint(x: b.minX, y: b.minY), CGPoint(x: b.maxX, y: b.minY),
+                 CGPoint(x: b.minX, y: b.maxY), CGPoint(x: b.maxX, y: b.maxY)]
+            .map { Align.toUpright($0, k: k, w: w, h: h) }
+        let x0 = c.map { $0.x }.min() ?? 0, x1 = c.map { $0.x }.max() ?? 0
+        let y0 = c.map { $0.y }.min() ?? 0, y1 = c.map { $0.y }.max() ?? 0
+        return CGRect(x: x0, y: y0, width: x1 - x0, height: y1 - y0)
+    }
+
+    private static func regionPoints(_ r: VNFaceLandmarkRegion2D?) -> [CGPoint]? {
+        guard let r = r, r.pointCount > 0 else { return nil }
+        // Swift 侧 normalizedPoints 是非可选的 [CGPoint]（Apple 文档声明 var normalizedPoints: [CGPoint]）
+        let p = r.normalizedPoints
+        return p.isEmpty ? nil : p
+    }
+
+    private static func centroid(_ r: VNFaceLandmarkRegion2D?) -> CGPoint? {
+        guard let p = regionPoints(r) else { return nil }
+        var x = 0.0, y = 0.0
+        for v in p { x += Double(v.x); y += Double(v.y) }
+        return CGPoint(x: x / Double(p.count), y: y / Double(p.count))
+    }
+
+    /// 一张脸送进尺子要的那 5 个点（模板口径：左眼、右眼、鼻尖、左嘴角、右嘴角，
+    /// "左"指**转正后的画面左侧**）。有真五官点就用真的；缺任一 region 就整张退回按框猜，
+    /// 并把用的哪一种报回来——退回"框猜"时分数会掉，屏幕上必须看得见。
+    /// 左右槽位是按转正后的 x 排出来的，所以 Vision 的 left/right 到底指被拍者哪一侧
+    /// 这个我从没验过的口径问题，根本不参与结果。
+    static func sendPoints(face f: VNFaceObservation, k: Int, w: Int, h: Int) -> (pts: [CGPoint], src: String) {
+        var up: [CGPoint]? = nil
+        var src = "框猜"
+        if let lm = f.landmarks,
+           let e1 = centroid(lm.leftEye), let e2 = centroid(lm.rightEye),
+           let crest = regionPoints(lm.noseCrest)?.last,
+           let lips = regionPoints(lm.outerLips), lips.count >= 3 {
+            let U = { (p: CGPoint) -> CGPoint in Align.toUpright(Align.pixelPoint(p, w, h), k: k, w: w, h: h) }
+            let a = U(e1), b = U(e2), n = U(crest)
+            let lp = lips.map { U($0) }
+            let eyes = a.x <= b.x ? [a, b] : [b, a]
+            let corners = [lp.min(by: { $0.x < $1.x })!, lp.max(by: { $0.x < $1.x })!]
+            up = [eyes[0], eyes[1], n, corners[0], corners[1]]
+            src = "真点位"
+        }
+        let pts = up ?? keypoints(from: uprightBox(pixelBox(f.boundingBox, w, h), k: k, w: w, h: h))
+        return (pts.map { Align.toRaw($0, k: k, w: w, h: h) }, src)
+    }
+
+    /// 屏幕上画黄点用的 5 个真五官点（Vision 归一化坐标，原点左下）。只服务肉眼验收：
+    /// 点落在两眼/鼻尖/两嘴角 = 对齐真取到位了；没有黄点 = 这张脸退回按框猜，分数天花板就低了。
+    static func markerPoints(face f: VNFaceObservation) -> [CGPoint]? {
+        guard let lm = f.landmarks,
+              let e1 = centroid(lm.leftEye), let e2 = centroid(lm.rightEye),
+              let crest = regionPoints(lm.noseCrest)?.last,
+              let lips = regionPoints(lm.outerLips), lips.count >= 3 else { return nil }
+        let eyes = e1.x <= e2.x ? [e1, e2] : [e2, e1]
+        let l = lips.min(by: { $0.x < $1.x })!, r = lips.max(by: { $0.x < $1.x })!
+        return [eyes[0], eyes[1], crest, l, r]
+    }
+
     /// 相似变换（旋转+等比缩放+平移）最小二乘：dst = [[a,-b],[b,a]]·src + t
     static func fit(src: [CGPoint], dst: [CGPoint]) -> (a: Double, b: Double, tx: Double, ty: Double)? {
         guard src.count == dst.count, src.count >= 3 else { return nil }
@@ -350,8 +442,10 @@ enum CutEngine {
         }
     }
 
+    /// 静帧检脸。用 landmarks 版而不是只检框：锚点也要拿真五官点，
+    /// 和扫描那侧同口径（否则一边"框猜"一边"真点位"，PC 实测同一张脸就掉到 0.19~0.89）。
     static func faces(in image: CGImage) -> [VNFaceObservation] {
-        let req = VNDetectFaceRectanglesRequest()
+        let req = VNDetectFaceLandmarksRequest()
         let handler = VNImageRequestHandler(cgImage: image, orientation: .up, options: [:])
         do {
             try handler.perform([req])
@@ -362,13 +456,14 @@ enum CutEngine {
         }
     }
 
-    /// 静帧里第 index 张脸 → 锚点向量。返回向量＋这张脸在源片坐标下的短边 px＋失败原因。
+    /// 静帧里第 index 张脸 → 锚点向量。返回向量＋这张脸在源片坐标下的短边 px＋失败原因＋点位来源。
+    /// k=0：frameImage 走的是 appliesPreferredTrackTransform=true，拿回来就是正着的。
     static func anchorFrom(image: CGImage, face: VNFaceObservation,
-                           sideScale: Double) -> ([Float]?, Double, String) {
+                           sideScale: Double) -> ([Float]?, Double, String, String) {
         let shortSide = min(face.boundingBox.width * CGFloat(image.width),
                             face.boundingBox.height * CGFloat(image.height)) * sideScale
+        let (kp, src) = Align.sendPoints(face: face, k: 0, w: image.width, h: image.height)
         let box = Align.pixelBox(face.boundingBox, image.width, image.height)
-        let kp = Align.keypoints(from: box)
         var vec: [Float]? = nil
         var why = "这张静帧的像素锁不上"
         _ = withPixels(image) { base, bpr in
@@ -382,7 +477,7 @@ enum CutEngine {
             return true
         }
         if vec == nil && why.isEmpty { why = Ruler.shared.lastError }
-        return (vec, shortSide, why)
+        return (vec, shortSide, why, src)
     }
 
     /// 整片扫描：每帧检测一次，只有脸短边（折算回源像素）达标的才裁脸跑尺子。
@@ -429,12 +524,33 @@ enum CutEngine {
             return o
         }
 
-        let request = VNDetectFaceRectanglesRequest()
+        let request = VNDetectFaceLandmarksRequest()
         let nSamples = (totalFrames + step - 1) / step
         o.keep = Array(repeating: false, count: nSamples)
         var frameIndex = 0
         var sample = 0
         var detectSum = 0.0, embedSum = 0.0, embedRuns = 0, cropFails = 0
+        var pointSrc = "—"
+        // 朝向自动定：rot<0 表示还在试。直出来的像素可能是正的、躺着的、倒着的，
+        // 我不在这信 preferredTransform（容器里读到过不靠谱的），而是拿这片子自己的前
+        // probeN 张过脸量出来——4 个朝向的中位数全部印进报告，所以就算朝向不是病因，
+        // 这张表自己会把我的理论否掉。
+        let probeN = 8
+        var rot = -1
+        var probeCols: [[Double]] = Array(repeating: [], count: 4)
+        var probeRows: [(sample: Int, sims: [Double])] = []
+        func lockRotation() {
+            var bestK = 0, bestMed = -99.0
+            for k in 0..<4 {
+                guard !probeCols[k].isEmpty, let m = CutEngine.median(probeCols[k]), m > bestMed else { continue }
+                bestMed = m; bestK = k
+            }
+            rot = bestK
+            for row in probeRows where row.sims[bestK] >= cosTh && row.sample < o.keep.count {
+                o.keep[row.sample] = true
+            }
+            Journal.line("扫描 朝向定 k=\(bestK) 中位=\(String(format: "%.3f", bestMed)) 试探 \(probeRows.count) 张")
+        }
         let mem0 = Facts.footprintMB()
         o.memMax = mem0
         var stopNote = ""
@@ -469,16 +585,29 @@ enum CutEngine {
                             let ph = Double(f.boundingBox.height) * Double(h) * sideScale
                             if min(pw, ph) < sideTh { continue }
                             o.gated += 1
-                            let box = Align.pixelBox(f.boundingBox, w, h)
-                            guard let crop = Align.cropBGRA(base, bytesPerRow: bpr, w: w, h: h,
-                                                            keypoints: Align.keypoints(from: box)) else { cropFails += 1; continue }
-                            let e0 = DispatchTime.now().uptimeNanoseconds
-                            guard let v = Ruler.shared.embed(crop) else { continue }
-                            embedSum += Double(DispatchTime.now().uptimeNanoseconds - e0) / 1_000_000
-                            embedRuns += 1
-                            let c = cosine(anchor, v)
-                            if c > best { best = c }
-                            if c >= cosTh && sample < o.keep.count { o.keep[sample] = true }
+                            let ks = rot < 0 ? [0, 1, 2, 3] : [rot]
+                            var sims = [-9.0, -9.0, -9.0, -9.0]
+                            for k in ks {
+                                let (kp, src) = Align.sendPoints(face: f, k: k, w: w, h: h)
+                                pointSrc = src
+                                guard let crop = Align.cropBGRA(base, bytesPerRow: bpr, w: w, h: h,
+                                                                keypoints: kp) else { cropFails += 1; continue }
+                                let e0 = DispatchTime.now().uptimeNanoseconds
+                                guard let v = Ruler.shared.embed(crop) else { continue }
+                                embedSum += Double(DispatchTime.now().uptimeNanoseconds - e0) / 1_000_000
+                                embedRuns += 1
+                                sims[k] = cosine(anchor, v)
+                            }
+                            if rot < 0 {
+                                probeRows.append((sample: sample, sims: sims))
+                                for k in 0..<4 where sims[k] > -8 { probeCols[k].append(sims[k]) }
+                                if let m = sims.max(), m > best { best = m }
+                                if probeRows.count >= probeN { lockRotation() }
+                            } else {
+                                let c = sims[rot]
+                                if c > best { best = c }
+                                if c >= cosTh && sample < o.keep.count { o.keep[sample] = true }
+                            }
                         }
                         if best > -8 { o.bigSims.append(best) }
                         return true
@@ -499,6 +628,7 @@ enum CutEngine {
             if !ended.isEmpty { break outer }
         }
         reader.cancelReading()
+        if rot < 0 && !probeRows.isEmpty { lockRotation() }
         if sample < nSamples && stopNote.isEmpty { stopNote = endedNote(reader) }
 
         o.detectMs = o.samples > 0 ? detectSum / Double(o.samples) : 0
@@ -512,6 +642,14 @@ enum CutEngine {
         let pct = o.samples > 0 ? Double(o.hits) / Double(o.samples) * 100 : 0
         var line = "扫 \(o.samples) 取样帧（step=\(step)，源 \(totalFrames) 帧 / \(String(format: "%.1f", duration)) s，直出长边 \(decodedLong)→源折算 ×\(String(format: "%.2f", sideScale))）"
         line += "\n有脸的帧 \(o.framesWithFace)/\(o.samples)；≥\(String(format: "%.0f", sideTh)) px 的脸 \(o.gated) 张；裁脸失败 \(cropFails) 张"
+        if rot >= 0 {
+            let meds = (0..<4).map { k -> String in
+                guard let m = CutEngine.median(probeCols[k]) else { return "转\(k * 90)° —" }
+                return "转\(k * 90)° \(String(format: "%.3f", m))"
+            }
+            line += "\n朝向试探（\(probeRows.count) 张脸各裁 4 个朝向跑尺子）：" + meds.joined(separator: "｜")
+            line += "\n  → 用 **转\(rot * 90)°**；点位 \(pointSrc)"
+        }
         line += "\n**命中 \(o.hits)/\(o.samples) 帧（\(String(format: "%.0f", pct))%）→ \(o.segments.count) 段，合计 \(String(format: "%.1f", total)) s**"
         if let med = median(o.bigSims), let mx = o.bigSims.max() {
             line += "\n  过闸脸对锚点的余弦 中位 \(String(format: "%.3f", med)) 最高 \(String(format: "%.3f", mx))（闸门 \(String(format: "%.2f", cosTh))）"
@@ -672,6 +810,8 @@ final class Cutter: ObservableObject {
     @Published var showPicker = false
     @Published var step = 1
     @Published var sideTh = 96.0
+    /// 已选为锚点的是这一帧里的第几张脸（-1＝还没选）；绿框会把它描成橙色，让"选上了"这件事看得见
+    @Published var chosen = -1
 
     var asset: AVURLAsset?
     let stop = StopFlag()
@@ -748,6 +888,7 @@ final class Cutter: ObservableObject {
         busy = true
         status = "取这一帧…"
         faces = []
+        chosen = -1
         anchor = nil
         anchorNote = ""
         let at = seconds
@@ -765,6 +906,14 @@ final class Cutter: ObservableObject {
         }
     }
 
+    /// 第 i 张检出的脸在源片里的短边 px（Vision 的框是归一化的，要乘回显示尺寸）
+    func faceLabel(_ i: Int) -> String {
+        guard i < faces.count else { return "第 \(i + 1) 张" }
+        let r = faces[i].boundingBox
+        let px = min(r.width * natural.width, r.height * natural.height)
+        return "第 \(i + 1) 张 \(Int(px)) px"
+    }
+
     func choose(_ index: Int) {
         guard index < faces.count, let a = asset else { return }
         busy = true
@@ -778,10 +927,13 @@ final class Cutter: ObservableObject {
             var vec: [Float]? = nil
             if let img = img {
                 // frameImage 是直出全分辨率（不像扫描那趟会被压到 1920），所以换算系数是 1
-                let (v, side, why) = CutEngine.anchorFrom(image: img, face: face, sideScale: 1)
+                let (v, side, why, src) = CutEngine.anchorFrom(image: img, face: face, sideScale: 1)
                 vec = v
                 text = v == nil ? "这张脸算不出向量：\(why)"
-                    : "锚点存下（这张脸源片短边 \(String(format: "%.0f", side)) px）｜\(vecFingerprint(v!))"
+                    : "锚点存下（这张脸源片短边 \(String(format: "%.0f", side)) px，点位 \(src)）｜\(vecFingerprint(v!))"
+                if v != nil && src == "框猜" {
+                    text += "\n⚠️ 这张脸没给到五官点，退回按框猜——同一个人也会掉分，扫出来的命中率会偏低。"
+                }
                 if v != nil && side < th {
                     text += "\n⚠️ 这张脸比下限 \(String(format: "%.0f", th)) px 还小：拿它当锚点，整片很可能一帧都判不过（＝输出 0 段）。停到脸大一点的帧再点。"
                 }
@@ -790,6 +942,7 @@ final class Cutter: ObservableObject {
                 guard let self = self else { return }
                 self.busy = false
                 self.anchor = vec
+                self.chosen = vec == nil ? -1 : index
                 self.anchorNote = text
                 self.status = text + (vec == nil ? "" : "｜可以「整片扫描」了")
                 Journal.line("剪辑 锚点 \(text)")
@@ -923,6 +1076,17 @@ struct CutView: View {
                             .font(.footnote)
                     }
                     .font(.footnote)
+                    if !cut.faces.isEmpty {
+                        Text("点绿框或点下面按钮都行——选中的就是「要保留的人」")
+                            .font(.footnote)
+                        HStack(spacing: 6) {
+                            ForEach(Array(cut.faces.enumerated()), id: \.offset) { i, _ in
+                                Button(cut.chosen == i ? "✓ " + cut.faceLabel(i) : cut.faceLabel(i)) { cut.choose(i) }
+                            }
+                        }
+                        .buttonStyle(.bordered)
+                        .font(.footnote)
+                    }
                     if !cut.anchorNote.isEmpty {
                         Text(cut.anchorNote)
                             .font(.system(size: 11, design: .monospaced))
@@ -986,11 +1150,22 @@ struct CutView: View {
         let box = contentRect(in: size)
         return AnyView(ForEach(Array(cut.faces.enumerated()), id: \.offset) { _, f in
             let r = f.boundingBox
-            Rectangle()
-                .stroke(Color.green, lineWidth: 2)
-                .frame(width: r.width * box.width, height: r.height * box.height)
-                .position(x: box.minX + (r.minX + r.width / 2) * box.width,
-                          y: box.minY + (1 - (r.minY + r.height / 2)) * box.height)
+            // 用 Group 不用 ZStack：ZStack 自己有尺寸，成员全靠 .position 摆时会塌成一点
+            Group {
+                Rectangle()
+                    .stroke(Color.green, lineWidth: 2)
+                    .frame(width: r.width * box.width, height: r.height * box.height)
+                    .position(x: box.minX + (r.minX + r.width / 2) * box.width,
+                              y: box.minY + (1 - (r.minY + r.height / 2)) * box.height)
+                // 5 个黄点 = 真五官点落位了；一个都没有 = 这张脸退回了按框猜
+                ForEach(Array((Align.markerPoints(face: f) ?? []).enumerated()), id: \.offset) { _, p in
+                    Circle()
+                        .fill(Color.yellow)
+                        .frame(width: 4, height: 4)
+                        .position(x: box.minX + p.x * box.width,
+                                  y: box.minY + (1 - p.y) * box.height)
+                }
+            }
         })
     }
 
