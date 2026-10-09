@@ -211,8 +211,18 @@ enum Facts {
             "endpoint   \(Uploader.endpoint)",
             "Vision     \(NSClassFromString("VNDetectFaceRectanglesRequest") != nil ? "可用" : "缺失")",
             "AVFoundation \(NSClassFromString("AVAssetReader") != nil ? "可用" : "缺失")",
-            "PhotosUI   \(NSClassFromString("PHPickerViewController") != nil ? "可用" : "缺失")"
+            "PhotosUI   \(NSClassFromString("PHPickerViewController") != nil ? "可用" : "缺失")",
+            "身份 API   VNGenerateIdentity=\(cls("VNGenerateIdentityRequest")) "
+                + "VNIdentityObs=\(cls("VNIdentityObservation"))",
+            "替身 API   ImageFeaturePrint=\(cls("VNGenerateImageFeaturePrintRequest")) "
+                + "FaceCaptureQuality=\(cls("VNDetectFaceCaptureQualityRequest"))",
+            "分割 API   PersonSegmentation=\(cls("VNGeneratePersonSegmentationRequest")) "
+                + "FaceLandmarks=\(cls("VNDetectFaceLandmarksRequest"))"
         ]
+    }
+
+    static func cls(_ name: String) -> String {
+        return NSClassFromString(name) != nil ? "有" : "无"
     }
 
     static func machineName() -> String {
@@ -270,9 +280,10 @@ enum Uploader {
 enum Runner {
 
     static func detectRuns(_ image: CGImage, runs: Int)
-        -> (times: [Double], count: Int, detail: String) {
+        -> (first: Double, rest: [Double], count: Int, detail: String) {
         let handler = VNImageRequestHandler(cgImage: image, orientation: .up, options: [:])
-        var times: [Double] = []
+        var first = -1.0
+        var rest: [Double] = []
         var count = -1
         var detail = "-"
         for i in 0..<runs {
@@ -281,17 +292,17 @@ enum Runner {
             do {
                 try handler.perform([request])
             } catch {
-                return (times, -999, "perform 抛错: \(error)")
+                return (first, rest, -999, "perform 抛错: \(error)")
             }
             let ms = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000
-            if i > 0 { times.append(ms) }
+            if i == 0 { first = ms } else { rest.append(ms) }
             let found = request.results ?? []
             count = found.count
-            if let first = found.first {
-                detail = "置信 \(first.confidence) 框 \(first.boundingBox)"
+            if let found_first = found.first {
+                detail = "置信 \(found_first.confidence) 框 \(found_first.boundingBox)"
             }
         }
-        return (times, count, detail)
+        return (first, rest, count, detail)
     }
 
     static func visionSelfTest() -> String {
@@ -301,9 +312,9 @@ enum Runner {
         let r = detectRuns(image, runs: 6)
         return """
         合成图自检（\(image.width)x\(image.height)，里面没有真人脸）
-        单次 detect: \(stat(r.times))
+        冷启动一次: \(ms(r.first))；同图再跑 5 次: \(stat(r.rest))
         检到人脸数: \(r.count)（预期 0）
-        这条只是地板值：证明"没有脸时代码路径跑得完"。判 Vision 是否真在工作要靠「照片正对照」。
+        注意: 同一张图重复请求会命中 Vision 的结果缓存，后面那几个 ms 不是单价，冷启动那个才是量级参考。
         """
     }
 
@@ -312,23 +323,28 @@ enum Runner {
             return "照片正对照\n读不出这张图片（\(url.lastPathComponent)）"
         }
         var summary: [String] = []
-        var best: (times: [Double], count: Int, detail: String, deg: Int, w: Int, h: Int)?
+        var best: (first: Double, rest: [Double], count: Int, detail: String, deg: Int, w: Int, h: Int)?
         var found = false
         for deg in [0, 90, 180, 270] {
             let candidate = deg == 0 ? base : (rotated(base, degrees: deg) ?? base)
             let r = detectRuns(candidate, runs: 4)
             summary.append("\(deg)°→\(r.count)")
             if r.count > 0 && !found {
-                best = (r.times, r.count, r.detail, deg, candidate.width, candidate.height)
+                best = (r.first, r.rest, r.count, r.detail, deg, candidate.width, candidate.height)
                 found = true
             }
         }
+        var curve: [String] = []
+        for longEdge in [max(base.width, base.height), 960, 640, 480, 320] {
+            let small = scaled(base, longEdge: longEdge)
+            let r = detectRuns(small, runs: 3)
+            curve.append("\(small.width)x\(small.height):\(ms(r.first))/检\(r.count)")
+        }
         guard let hit = best else {
-            let zero = detectRuns(base, runs: 5)
             return """
             照片正对照 \(url.lastPathComponent)  \(base.width)x\(base.height) exif方向=\(loaded.imageOrientation.rawValue)
             四个方向检出: \(summary.joined(separator: " "))
-            单次 detect: \(stat(zero.times))
+            尺寸曲线(送检尺寸:冷启动ms/检到数): \(curve.joined(separator: " | "))
             结论: 一张照片四个方向都检不到脸。若这张照片里确实有正脸 ⇒ 容器里的 Vision 并没有真的推理，只是没报错。
             """
         }
@@ -336,9 +352,29 @@ enum Runner {
         照片正对照 \(url.lastPathComponent)  原始 \(base.width)x\(base.height) exif方向=\(loaded.imageOrientation.rawValue)
         检出方向 \(hit.deg)°，送检尺寸 \(hit.w)x\(hit.h)，四个方向检出: \(summary.joined(separator: " "))
         检到 \(hit.count) 张脸  \(hit.detail)
-        单次 detect: \(stat(hit.times))
-        结论: Vision 在容器里确实在推理，上面的 ms 数才是真实单价。
+        冷启动: \(ms(hit.first))；同图再跑 3 次: \(stat(hit.rest))
+        尺寸曲线(送检尺寸:冷启动ms/检到数): \(curve.joined(separator: " | "))
         """
+    }
+
+    static func scaled(_ image: CGImage, longEdge: Int) -> CGImage {
+        let srcLong = max(image.width, image.height)
+        guard longEdge > 0, longEdge < srcLong else { return image }
+        let ratio = CGFloat(longEdge) / CGFloat(srcLong)
+        let w = max(1, Int(round(CGFloat(image.width) * ratio)))
+        let h = max(1, Int(round(CGFloat(image.height) * ratio)))
+        guard let ctx = CGContext(data: nil,
+                                  width: w,
+                                  height: h,
+                                  bitsPerComponent: 8,
+                                  bytesPerRow: 0,
+                                  space: CGColorSpaceCreateDeviceRGB(),
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else {
+            return image
+        }
+        ctx.interpolationQuality = .medium
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: CGFloat(w), height: CGFloat(h)))
+        return ctx.makeImage() ?? image
     }
 
     static func rotated(_ image: CGImage, degrees: Int) -> CGImage? {
@@ -370,34 +406,77 @@ enum Runner {
         if ready.wait(timeout: .now() + 20) == .timedOut {
             return "视频基准\n加载 tracks/duration 超时 20 s"
         }
-
         guard let track = asset.tracks(withMediaType: .video).first else {
-            return "视频基准\n找不到视频轨（\(url.lastPathComponent)）\n路径 \(url.path)"
+            return "视频基准\n找不到视频轨（\(url.lastPathComponent)）"
+        }
+
+        let duration = CMTimeGetSeconds(asset.duration)
+        let nominal = track.nominalFrameRate
+        let videoFps = nominal > 0 ? Double(nominal) : 30.0
+        let sizeBytes: Int? = {
+            let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
+            return attrs?[.size] as? Int
+        }()
+        let sizeText = sizeBytes.map { "\($0 / 1048576) MB" } ?? "-"
+
+        let onlyDecode = videoPass(asset: asset, track: track, limit: frameLimit,
+                                   target: nil, detect: false, videoFps: videoFps,
+                                   duration: duration, tag: "只解码不检测")
+        let native = videoPass(asset: asset, track: track, limit: frameLimit,
+                               target: nil, detect: true, videoFps: videoFps,
+                               duration: duration, tag: "解码+检测")
+        var small = videoPass(asset: asset, track: track, limit: frameLimit,
+                              target: nil, detect: true, videoFps: videoFps,
+                              duration: duration, tag: "小尺寸(未启用)")
+        let longSide = max(native.w, native.h)
+        if longSide > 640 {
+            let ratio = 640.0 / Double(longSide)
+            let tw = max(16, Int(Double(native.w) * ratio)) & ~1
+            let th = max(16, Int(Double(native.h) * ratio)) & ~1
+            small = videoPass(asset: asset, track: track, limit: frameLimit,
+                              target: (w: tw, h: th), detect: true, videoFps: videoFps,
+                              duration: duration, tag: "解码+检测, 让解码器直出 \(tw)x\(th)")
+        }
+
+        return """
+        视频基准 \(url.lastPathComponent)
+        全长 \(String(format: "%.1f", duration)) s，\(String(format: "%.1f", videoFps)) fps，大小 \(sizeText)
+        \(onlyDecode.text)
+        \(native.text)
+        \(small.text)
+        """
+    }
+
+    static func videoPass(asset: AVURLAsset, track: AVAssetTrack, limit: Int,
+                          target: (w: Int, h: Int)?, detect: Bool, videoFps: Double,
+                          duration: Double, tag: String) -> (text: String, w: Int, h: Int) {
+        var settings: [String: Any] = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
+        if let target = target {
+            settings[kCVPixelBufferWidthKey as String] = target.w
+            settings[kCVPixelBufferHeightKey as String] = target.h
         }
 
         let readerResult: AVAssetReader?
         do {
             readerResult = try AVAssetReader(asset: asset)
         } catch {
-            return "视频基准\nAVAssetReader 创建失败: \(error)"
+            return ("[\(tag)] AVAssetReader 创建失败: \(error)", 0, 0)
         }
         guard let reader = readerResult else {
-            return "视频基准\nAVAssetReader 创建返回 nil"
+            return ("[\(tag)] AVAssetReader 返回 nil", 0, 0)
         }
-
-        let settings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
         let outputResult: AVAssetReaderTrackOutput?
         do {
             outputResult = try AVAssetReaderTrackOutput(track: track, outputSettings: settings)
         } catch {
-            return "视频基准\nTrackOutput 创建失败: \(error)"
+            return ("[\(tag)] TrackOutput 创建失败: \(error)", 0, 0)
         }
         guard let output = outputResult else {
-            return "视频基准\nTrackOutput 创建返回 nil（BGRA 不被支持？）"
+            return ("[\(tag)] TrackOutput 返回 nil（这套 outputSettings 不被支持）", 0, 0)
         }
         reader.add(output)
         guard reader.startReading() else {
-            return "视频基准\nstartReading 失败: \(reader.error?.localizedDescription ?? "-")"
+            return ("[\(tag)] startReading 失败: \(reader.error?.localizedDescription ?? "-")", 0, 0)
         }
 
         var decodeTimes: [Double] = []
@@ -407,7 +486,7 @@ enum Runner {
         var tallest = 0
         var frames = 0
 
-        while frames < frameLimit {
+        while frames < limit {
             let d0 = DispatchTime.now().uptimeNanoseconds
             guard let sample = output.copyNextSampleBuffer() else { break }
             let decodeMs = Double(DispatchTime.now().uptimeNanoseconds - d0) / 1_000_000
@@ -417,53 +496,47 @@ enum Runner {
                 tallest = CVPixelBufferGetHeight(buffer)
             }
 
-            let request = VNDetectFaceRectanglesRequest()
-            let handler = VNImageRequestHandler(cvPixelBuffer: buffer, orientation: .up, options: [:])
-            let v0 = DispatchTime.now().uptimeNanoseconds
-            do {
-                try handler.perform([request])
-            } catch {
-                return "视频基准\n第 \(frames + 1) 帧 Vision 抛错: \(error)"
+            var visionMs = 0.0
+            if detect {
+                let request = VNDetectFaceRectanglesRequest()
+                let handler = VNImageRequestHandler(cvPixelBuffer: buffer, orientation: .up, options: [:])
+                let v0 = DispatchTime.now().uptimeNanoseconds
+                do {
+                    try handler.perform([request])
+                } catch {
+                    return ("[\(tag)] 第 \(frames + 1) 帧 Vision 抛错: \(error)", widest, tallest)
+                }
+                visionMs = Double(DispatchTime.now().uptimeNanoseconds - v0) / 1_000_000
+                faceTotals += request.results?.count ?? 0
             }
-            let visionMs = Double(DispatchTime.now().uptimeNanoseconds - v0) / 1_000_000
 
             if frames >= 3 {
                 decodeTimes.append(decodeMs)
-                visionTimes.append(visionMs)
+                if detect { visionTimes.append(visionMs) }
             }
-            faceTotals += request.results?.count ?? 0
             frames += 1
         }
 
-        guard frames > 3, !visionTimes.isEmpty else {
-            return "视频基准\n只解出 \(frames) 帧，不够计时（reader.status=\(reader.status.rawValue)）"
+        guard frames > 3 else {
+            return ("[\(tag)] 只解出 \(frames) 帧，不够计时（status=\(reader.status.rawValue)）", widest, tallest)
         }
-
         let decodeAvg = decodeTimes.reduce(0, +) / Double(decodeTimes.count)
-        let visionAvg = visionTimes.reduce(0, +) / Double(visionTimes.count)
+        let visionAvg = visionTimes.isEmpty ? 0 : visionTimes.reduce(0, +) / Double(visionTimes.count)
         let perFrame = decodeAvg + visionAvg
         let serialFps = 1000.0 / max(perFrame, 0.001)
-        let duration = CMTimeGetSeconds(asset.duration)
-        let nominal = track.nominalFrameRate
-        let videoFps = nominal > 0 ? Double(nominal) : 30.0
         let realtimeFactor = serialFps / videoFps
         let wholeClip = duration * videoFps / serialFps
-        let sizeBytes: Int? = {
-            let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
-            return attrs?[.size] as? Int
-        }()
-        let sizeText = sizeBytes.map { "\($0 / 1048576) MB" } ?? "-"
 
-        return """
-        视频基准 \(url.lastPathComponent)
-        解出 \(frames) 帧 @ \(widest)x\(tallest)，全长 \(String(format: "%.1f", duration)) s，\(String(format: "%.1f", videoFps)) fps，大小 \(sizeText)
-        解码: \(stat(decodeTimes))
-        Vision: \(stat(visionTimes))
-        串行 \(String(format: "%.1f", perFrame)) ms/帧 = \(String(format: "%.1f", serialFps)) 帧/秒
-        实时倍率 \(String(format: "%.2f", realtimeFactor)) x（>1 才比 realtime 快）
-        逐帧扫完整段 \(String(format: "%.1f", duration)) s 视频需 \(String(format: "%.1f", wholeClip)) s
-        检到人脸总数: \(faceTotals)
-        """
+        var line = "[\(tag)] \(frames) 帧 @ \(widest)x\(tallest)  取帧 \(stat(decodeTimes))"
+        if detect {
+            line += "\n  Vision \(stat(visionTimes))  检到脸 \(faceTotals)/\(frames) 帧"
+        }
+        line += "\n  合计 \(String(format: "%.1f", perFrame)) ms/帧 = \(String(format: "%.1f", serialFps)) 帧/秒 = \(String(format: "%.2f", realtimeFactor))x 实时；扫完整段 \(String(format: "%.1f", duration)) s 需 \(String(format: "%.1f", wholeClip)) s"
+        return (line, widest, tallest)
+    }
+
+    static func ms(_ value: Double) -> String {
+        return String(format: "%.2f ms", value)
     }
 
     static func stat(_ values: [Double]) -> String {
