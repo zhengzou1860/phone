@@ -574,11 +574,11 @@ enum CutExport {
         var failed = ""
         for s in segments {
             let sec = s.seconds(fps: fps, step: step)
-            let range = CMTimeRange(start: t(sec.start), end: t(sec.end))
+            let rng = CMTimeRange(start: t(sec.start), duration: t(sec.length))
             do {
-                try dstVideo.insertTimeRange(range, of: srcVideo, at: cursor)
+                try dstVideo.insertTimeRange(rng, of: srcVideo, at: cursor)
                 if let dstAudio = dstAudio, let srcAudio = srcAudio {
-                    try? dstAudio.insertTimeRange(range, of: srcAudio, at: cursor)
+                    try? dstAudio.insertTimeRange(rng, of: srcAudio, at: cursor)
                 }
                 cursor = CMTimeAdd(cursor, t(sec.length))
                 appended += 1
@@ -589,6 +589,7 @@ enum CutExport {
         }
         if !failed.isEmpty { return (nil, failed) }
         guard appended > 0 else { return (nil, "一段都没插进去（没命中就别导）") }
+        Journal.line("导出 拼 \(appended) 段 合成时长 \(String(format: "%.1f", CMTimeGetSeconds(comp.duration))) s")
 
         let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
             ?? URL(fileURLWithPath: NSTemporaryDirectory())
