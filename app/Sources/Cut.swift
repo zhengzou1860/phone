@@ -439,6 +439,8 @@ struct ScanOutcome {
     var detectMs = 0.0
     var embedMs = 0.0
     var memMax = 0
+    /// 扫描自己量出来的朝向（k×90°，-1 = 没量到）。导出拿它和容器写的变换对账。
+    var rot = -1
 }
 
 enum CutEngine {
@@ -674,6 +676,7 @@ enum CutEngine {
         o.embedMs = embedRuns > 0 ? embedSum / Double(embedRuns) : 0
         o.segments = segmentsFromKeep(o.keep)
         o.hits = o.keep.filter { $0 }.count
+        o.rot = rot
 
         var total = 0.0
         for s in o.segments { total += s.seconds(fps: fps, step: step).length }
@@ -721,7 +724,8 @@ enum CutEngine {
 
 enum CutExport {
 
-    static func compose(url: URL, segments: [Segment], step: Int, preset: String) -> (URL?, String) {
+    static func compose(url: URL, segments: [Segment], step: Int, preset: String,
+                        measuredRot: Int) -> (URL?, String) {
         let source = AVURLAsset(url: url)
         let sem = DispatchSemaphore(value: 0)
         source.loadValuesAsynchronously(forKeys: ["tracks", "duration"]) { sem.signal() }
@@ -780,6 +784,25 @@ enum CutExport {
         session.outputURL = out
         session.outputFileType = .mov
         session.shouldOptimizeForNetworkUse = true
+        // AVMutableComposition 不把源轨的 preferredTransform 带进成片：竖屏片存的是躺着的像素
+        // 加一个 90° 变换，播放器自己套那个变换，合成导出不套 ⇒ 成片比原片躺 90°（上机实测到的就是这个）。
+        // 在合成上按源轨自己的变换重摆一次，尺寸按摆完的四个角算。
+        let tf = srcVideo.preferredTransform
+        let nat = srcVideo.naturalSize
+        let cs = [CGPoint(x: 0, y: 0), CGPoint(x: nat.width, y: 0),
+                  CGPoint(x: 0, y: nat.height), CGPoint(x: nat.width, y: nat.height)]
+            .map { $0.applying(tf) }
+        let vc = AVMutableVideoComposition()
+        let li = AVMutableVideoCompositionLayerInstruction(assetTrack: dstVideo)
+        li.setTransform(tf, at: .zero)
+        let ti = AVMutableVideoCompositionInstruction()
+        ti.timeRange = CMTimeRange(start: .zero, duration: comp.duration)
+        ti.layerInstructions = [li]
+        vc.instructions = [ti]
+        vc.frameDuration = CMTime(value: 1, timescale: Int32(max(1, fps.rounded())))
+        vc.renderSize = CGSize(width: (cs.map { $0.x }.max()! - cs.map { $0.x }.min()!).rounded(),
+                               height: (cs.map { $0.y }.max()! - cs.map { $0.y }.min()!).rounded())
+        session.videoComposition = vc
         let t0 = DispatchTime.now().uptimeNanoseconds
         let esem = DispatchSemaphore(value: 0)
         session.exportAsynchronously { esem.signal() }
@@ -789,7 +812,12 @@ enum CutExport {
             return (nil, "导出失败 status=\(session.status.rawValue): \(session.error?.localizedDescription ?? "-")")
         }
         let size = ((try? FileManager.default.attributesOfItem(atPath: out.path)[.size]) as? Int) ?? 0
-        return (out, "拼 \(appended) 段 → \(out.lastPathComponent)｜成片 \(String(format: "%.1f", CMTimeGetSeconds(comp.duration))) s，\(String(format: "%.1f", Double(size) / 1048576)) MB，导出耗时 \(String(format: "%.1f", cost)) s")
+        // 容器写的变换角度，和扫描那张脸自己量出来的朝向，两个都印出来对账
+        var deg = Int((atan2(tf.b, tf.a) * 180 / .pi).rounded())
+        if deg < 0 { deg += 360 }
+        let meas = measuredRot < 0 ? "未量到" : "转\(measuredRot * 90)°"
+        let orient = "朝向 容器 \(deg)°→成片 \(Int(vc.renderSize.width))x\(Int(vc.renderSize.height))｜扫描实测 \(meas)"
+        return (out, "拼 \(appended) 段 → \(out.lastPathComponent)｜成片 \(String(format: "%.1f", CMTimeGetSeconds(comp.duration))) s，\(String(format: "%.1f", Double(size) / 1048576)) MB，导出耗时 \(String(format: "%.1f", cost)) s\n\(orient)")
     }
 
     static func toPhotos(_ file: URL) -> String {
@@ -856,6 +884,8 @@ final class Cutter: ObservableObject {
     let stop = StopFlag()
     /// 上一次扫描用的取样步进：导出必须照它切，不能用现在 Picker 上的值（扫完人可能顺手改了步进）
     var scannedStep = 1
+    /// 上一次扫描量出来的朝向（k×90°，-1 = 没量到），导出拿它对账
+    var scannedRot = -1
 
     /// 选完那一刻就收 cover：拷文件还在后台跑，主界面显示进度比停在相册里强
     func pickStarted() {
@@ -1000,6 +1030,7 @@ final class Cutter: ObservableObject {
         stop.on = false
         report = ""
         segments = []
+        scannedRot = -1
         exportNote = ""
         PressureWatch.reset()
         let st = step, scth = sideTh
@@ -1018,6 +1049,7 @@ final class Cutter: ObservableObject {
                 self.busy = false
                 self.report = o.text
                 self.segments = o.segments
+                self.scannedRot = o.rot
                 self.status = "扫完：\(o.hits)/\(o.samples) 帧命中，\(o.segments.count) 段"
             }
         }
@@ -1037,9 +1069,11 @@ final class Cutter: ObservableObject {
         exportNote = "拼接导出中…"
         let segs = segments
         let st = scannedStep
+        let mr = scannedRot
         Task.detached { [weak self] in
             let (file, text) = CutExport.compose(url: url, segments: segs, step: st,
-                                                 preset: AVAssetExportPresetHighestQuality)
+                                                 preset: AVAssetExportPresetHighestQuality,
+                                                 measuredRot: mr)
             let photo = file == nil ? "" : CutExport.toPhotos(file!)
             Task { @MainActor in
                 guard let self = self else { return }
