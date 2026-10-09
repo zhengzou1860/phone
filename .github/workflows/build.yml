@@ -144,41 +144,74 @@ jobs:
 
       - name: convert
         run: |
-          set -uo pipefail
+          set +e          # GitHub 的 run 步默认是 bash -eo pipefail，不显式关掉就一步错、后面全不执行
           ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=8{print "::error::" p substr($0,1,230)}'; }
+          echo "步骤已开始，errexit 已关" | ann "CV0 "
           python - > /tmp/conv.log 2>&1 <<'PY'
           import traceback
-          import coremltools as ct
-          import coremltools.converters.onnx as _onnx  # 9.0 懒加载，必须显式 import
+
+          def brief(e):
+              return "%s: %s" % (type(e).__name__, " ".join(str(e).split())[:260])
+
+          try:
+              import coremltools as ct
+              print("CT-VER", ct.__version__)
+          except Exception as e:
+              print("CT-IMPORT-FAIL", brief(e))
+              raise SystemExit(0)
 
           src = "/tmp/sc/w600k_mbf.onnx"
-          for label, target in (("iOS15/mlprogram", ct.target.iOS15),
-                                ("legacy/nn", None)):
+          try:
+              import onnx
+              g = onnx.load(src)
+              print("ONNX-OK nodes=%d ir=%d opset=%s" % (
+                  len(g.graph.node), g.ir_version,
+                  ",".join("%s:%s" % (o.domain or "ai.onnx", o.version) for o in g.opset_import)))
+          except Exception as e:
+              print("ONNX-LOAD-FAIL", brief(e))
+
+          cands = []
+          for name in ("iOS18", "iOS15", "iOS13", "iOS12"):
+              t = getattr(ct.target, name, None)
+              if t is not None:
+                  cands.append((name, t))
+          cands.append(("legacy-nn", None))
+          print("TRY-ORDER", ",".join(n for n, _ in cands))
+
+          for label, target in cands:
               try:
                   kw = {} if target is None else {"minimum_deployment_target": target}
-                  m = ct.convert(src, **kw)
-                  out = "/tmp/mbf_%s.mlpackage" % label.split("/")[0]
+                  m = ct.convert(src, source="onnx", **kw)
+                  out = "/tmp/mbf_%s" % label
                   m.save(out)
                   spec = m.get_spec().description
                   print("CONVERT-OK %s -> %s" % (label, out))
                   for i in spec.input:
-                      print("  input", i.name, i.type,
-                            list(i.shape if hasattr(i, "shape") else []))
+                      print("  in", i.name, i.type, list(i.shape) if hasattr(i, "shape") else "")
                   for o in spec.output:
-                      print("  output", o.name, o.type)
+                      print("  out", o.name, o.type)
                   break
-              except Exception:
-                  print("CONVERT-FAIL %s" % label)
+              except Exception as e:
+                  print("CONVERT-FAIL %s %s" % (label, brief(e)))
                   traceback.print_exc()
           PY
-          echo "--- convert log ---" | ann "CV "
-          cat /tmp/conv.log | ann "CV "
-          du -sh /tmp/mbf_* 2>/dev/null | ann "CV-SIZE " || echo "无产物" | ann "CV-SIZE "
+          echo "conv.log 字节 $(wc -c < /tmp/conv.log)" | ann "CV1 "
+          grep -E "^(CT-|ONNX-|TRY-|CONVERT-)" /tmp/conv.log | ann "CV2 "
+          tail -6 /tmp/conv.log | ann "CV3 "
+          ls -d /tmp/mbf_* 2>/dev/null | ann "CV4 "
 
       - name: keep artifact
+        if: always()
+        run: |
+          set +e
+          ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=6{print "::error::" p substr($0,1,230)}'; }
+          cd /tmp && zip -r -q mbf_coreml.zip mbf_* 2>/dev/null
+          ls -l /tmp/mbf_coreml.zip | ann "ART "
+
+      - name: upload artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: mbf-coreml
-          path: /tmp/mbf_iOS15.mlpackage
+          path: /tmp/mbf_coreml.zip
           if-no-files-found: ignore
