@@ -24,15 +24,16 @@ jobs:
 
       # 纯诊断：身份 API 到底在不在 SDK，不依赖手机端就能判
       - name: probe Vision SDK symbols
+        continue-on-error: true
         run: |
           set -uo pipefail
           ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=8{print "::error::" p substr($0,1,230)}'; }
           SDK=$(xcrun --sdk iphoneos --show-sdk-path)
           FW="$SDK/System/Library/Frameworks/Vision.framework"
-          echo "sdk=$SDK" | ann "VIS-PATH "
-          strings -a "$FW/Vision" 2>/dev/null | grep -oE "VN[A-Za-z]*FeaturePrint[A-Za-z]*" | sort -u | ann "VIS-CLASS "
-          grep -rhoE "VN[A-Za-z]*FeaturePrint[A-Za-z]*" "$FW/Headers" 2>/dev/null | sort -u | ann "VIS-HDRSYM "
-          grep -rhE "IdentityFeaturePrint" "$FW/Headers" 2>/dev/null | head -6 | ann "VIS-DECL "
+          { echo "sdk=$SDK"; echo "fw_dir=$([ -d "$FW" ] && echo 在 || echo 不在)"; ls "$FW" 2>&1 | head -10; } | ann "VIS-LS "
+          find "$SDK" -name "Vision.tbd" -o -name "Vision.h" 2>/dev/null | head -4 | ann "VIS-FIND " || true
+          grep -rhoE "VN[A-Za-z]*FeaturePrint[A-Za-z]*" "$FW" 2>/dev/null | sort -u | ann "VIS-SYM " || true
+          grep -rhB2 -A6 "IdentityFeaturePrint" "$FW" 2>/dev/null | head -14 | ann "VIS-DECL " || true
 
       - name: install xcodegen
         run: |
@@ -144,13 +145,14 @@ jobs:
           python - > /tmp/conv.log 2>&1 <<'PY'
           import traceback
           import coremltools as ct
+          import coremltools.converters.onnx as _onnx  # 9.0 懒加载，必须显式 import
 
           src = "/tmp/sc/w600k_mbf.onnx"
           for label, target in (("iOS15/mlprogram", ct.target.iOS15),
                                 ("legacy/nn", None)):
               try:
                   kw = {} if target is None else {"minimum_deployment_target": target}
-                  m = ct.converters.onnx.convert(model=src, **kw)
+                  m = ct.convert(src, **kw)
                   out = "/tmp/mbf_%s.mlpackage" % label.split("/")[0]
                   m.save(out)
                   spec = m.get_spec().description
@@ -167,7 +169,7 @@ jobs:
           PY
           echo "--- convert log ---" | ann "CV "
           cat /tmp/conv.log | ann "CV "
-          du -sh /tmp/mbf_* 2>/dev/null | ann "CV-SIZE "
+          du -sh /tmp/mbf_* 2>/dev/null | ann "CV-SIZE " || echo "无产物" | ann "CV-SIZE "
 
       - name: keep artifact
         if: always()
