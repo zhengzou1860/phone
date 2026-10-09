@@ -54,6 +54,22 @@ struct ContentView: View {
                 .pickerStyle(.segmented)
                 .font(.footnote)
 
+                Picker("扫描出图尺寸", selection: $bench.scanLongEdge) {
+                    Text("满尺寸").tag(0)
+                    Text("长边 960").tag(960)
+                    Text("长边 640").tag(640)
+                }
+                .pickerStyle(.segmented)
+                .font(.footnote)
+
+                Picker("reader 分块", selection: $bench.chunkFrames) {
+                    Text("整片一个").tag(0)
+                    Text("每 300 帧").tag(300)
+                    Text("每 100 帧").tag(100)
+                }
+                .pickerStyle(.segmented)
+                .font(.footnote)
+
                 HStack(spacing: 10) {
                     Button("选视频跑基准") { bench.showVideoPicker = true }
                     Button("尺子自检") { bench.startModel() }
@@ -102,6 +118,8 @@ final class Bench: ObservableObject {
     @Published var showPhotoPicker = false
     @Published var frameLimit = 90
     @Published var repeatCount = 1
+    @Published var scanLongEdge = 0
+    @Published var chunkFrames = 0
 
     init() {
         let info = Bundle.main.infoDictionary ?? [:]
@@ -130,9 +148,14 @@ final class Bench: ObservableObject {
         busy = true
         let limit = frameLimit
         let times = repeatCount
-        status = "视频基准运行中…（单趟上限 \(limit) 帧 ×连跑 \(times) 遍，2000 帧那档要跑一分多钟）"
+        let edge = scanLongEdge
+        let chunk = chunkFrames
+        PressureWatch.reset()
+        status = "视频基准运行中…（上限 \(limit) 帧 ×\(times) 遍，"
+            + "\(edge == 0 ? "满尺寸" : "长边\(edge)")，\(chunk == 0 ? "不分块" : "每\(chunk)帧换 reader")）"
         Task.detached { [weak self] in
-            let report = Runner.videoBenchmark(url: url, frameLimit: limit, repeatCount: times)
+            let report = Runner.videoBenchmark(url: url, frameLimit: limit, repeatCount: times,
+                                               longEdge: edge, chunkFrames: chunk)
             await MainActor.run { self?.finish(report) }
         }
     }
@@ -163,7 +186,7 @@ final class Bench: ObservableObject {
         status = "正在发往电脑…"
         let text = Facts.lines().joined(separator: "\n") + "\n\n"
             + log.joined(separator: "\n\n")
-            + "\n\n—— 磁盘日志最近 60 行 ——\n" + Journal.tail(60)
+            + "\n\n—— 磁盘日志最近 150 行 ——\n" + Journal.tail(150)
         Task.detached { [weak self] in
             let report = Uploader.send(text)
             await MainActor.run { self?.finish(report) }
@@ -254,7 +277,7 @@ enum Facts {
             "version    \(info["CFBundleShortVersionString"] ?? "-") (\(info["CFBundleVersion"] ?? "-"))",
             "iOS        \(pi.operatingSystemVersionString)",
             "machine    \(machineName())  cores=\(pi.processorCount)",
-            "memory     驻留 \(residentMB()) MB / 物理 \(pi.physicalMemory / 1048576) MB",
+            "memory     足迹 \(footprintMB()) / 驻留 \(residentMB()) MB / 物理 \(pi.physicalMemory / 1048576) MB",
             "endpoint   \(Uploader.endpoint)",
             "Vision     \(NSClassFromString("VNDetectFaceRectanglesRequest") != nil ? "可用" : "缺失")",
             "AVFoundation \(NSClassFromString("AVAssetReader") != nil ? "可用" : "缺失")",
@@ -304,6 +327,21 @@ enum Facts {
         guard kr == KERN_SUCCESS else { return -1 }
         return Int(info.resident_size) / 1_048_576
     }
+
+    /// jetsam 判杀用的是 phys_footprint，不是 resident_size。上一版我只读了后者，
+    /// 于是"峰值 348 MB 离 1500 MB 还远"这句根本不成立——两把尺子不是一回事。
+    static func footprintMB() -> Int {
+        var info = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size)
+            / mach_msg_type_number_t(MemoryLayout<integer_t>.size)
+        let kr = withUnsafeMutablePointer(to: &info) { ptr in
+            ptr.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { rebound in
+                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), rebound, &count)
+            }
+        }
+        guard kr == KERN_SUCCESS else { return -1 }
+        return Int(info.phys_footprint) / 1_048_576
+    }
 }
 
 /// 每一步都往 Documents/hello_log.txt 追加一行（带内存水位）。
@@ -325,8 +363,12 @@ enum Journal {
     static func line(_ text: String) {
         let f = DateFormatter()
         f.dateFormat = "MM-dd HH:mm:ss"
-        let entry = "\(f.string(from: Date())) 内存\(Facts.residentMB())MB \(text)\n"
-        guard let url = url, let data = (load() + entry).data(using: .utf8) else { return }
+        let entry = "\(f.string(from: Date())) 足迹\(Facts.footprintMB())/驻留\(Facts.residentMB())MB \(text)"
+        guard let url = url else { return }
+        var lines = load().split(separator: "\n").map(String.init)
+        lines.append(entry)
+        if lines.count > 400 { lines.removeFirst(lines.count - 400) }
+        guard let data = lines.joined(separator: "\n").appending("\n").data(using: .utf8) else { return }
         try? data.write(to: url)
     }
 
@@ -341,6 +383,9 @@ enum Journal {
 /// 一声没喊就死 → 不是内存，得换方向查（原生崩溃 / 容器层）。
 enum PressureWatch {
     static var sources: [DispatchSourceMemoryPressure] = []
+    static var sawPressure = false
+
+    static func reset() { sawPressure = false }
 
     static func start() {
         guard sources.isEmpty else { return }
@@ -349,14 +394,16 @@ enum PressureWatch {
         NotificationCenter.default.addObserver(
             forName: UIApplication.didReceiveMemoryWarningNotification, object: nil, queue: .main
         ) { _ in
-            Journal.line("didReceiveMemoryWarning 驻留\(Facts.residentMB())MB")
+            sawPressure = true
+            Journal.line("didReceiveMemoryWarning 足迹\(Facts.footprintMB())MB")
         }
     }
 
     private static func watch(_ level: DispatchSource.MemoryPressureEvent, _ label: String) {
         let src = DispatchSource.makeMemoryPressureSource(eventMask: level, queue: .main)
         src.setEventHandler {
-            Journal.line("内存压力\(label) 驻留\(Facts.residentMB())MB")
+            if level.contains(.critical) { sawPressure = true }
+            Journal.line("内存压力\(label) 足迹\(Facts.footprintMB())MB")
         }
         src.resume()
         sources.append(src)
@@ -393,10 +440,6 @@ enum Uploader {
 }
 
 enum Runner {
-
-    /// 驻留内存超过这个数就自己收手，不等系统来杀（iPhone 11 物理 3852 MB，
-    /// 单进程上限拿不到，只能拿实测水位当参照）。
-    static let memCapMB = 1500
 
     static func detectRuns(_ image: CGImage, runs: Int)
         -> (first: Double, rest: [Double], count: Int, detail: String) {
@@ -608,7 +651,8 @@ enum Runner {
         return ctx.makeImage()
     }
 
-    static func videoBenchmark(url: URL, frameLimit: Int, repeatCount: Int = 1) -> String {
+    static func videoBenchmark(url: URL, frameLimit: Int, repeatCount: Int = 1,
+                               longEdge: Int = 0, chunkFrames: Int = 0) -> String {
         let asset = AVURLAsset(url: url)
 
         let ready = DispatchSemaphore(value: 0)
@@ -630,57 +674,48 @@ enum Runner {
             return attrs?[.size] as? Int
         }()
         let sizeText = sizeBytes.map { "\($0 / 1048576) MB" } ?? "-"
-        let memBegin = Facts.residentMB()
+        let memBegin = Facts.footprintMB()
         Journal.line("视频基准 开始 \(url.lastPathComponent) 源 \(String(format: "%.0fx%.0f", natW, natH)) "
                      + "\(String(format: "%.1f", duration))s@\(String(format: "%.0f", videoFps))fps \(sizeText)"
-                     + " 上限\(frameLimit)帧 驻留\(memBegin)MB")
+                     + " 上限\(frameLimit)帧×\(repeatCount)遍 尺寸\(longEdge == 0 ? "满" : "长边\(longEdge)")"
+                     + " 块\(chunkFrames == 0 ? "不分" : "\(chunkFrames)帧") 足迹\(memBegin)MB")
 
+        // 地板：满尺寸只解码不检测，一个 reader 到底。0.6.3 实测这一趟 2000 帧很稳，
+        // 死的全部是"解码+检测"那一趟，所以它留作对照，不参与尺寸/分块开关。
         let onlyDecode = videoPass(asset: asset, track: track, limit: frameLimit,
                                    target: nil, detect: false, videoFps: videoFps,
-                                   duration: duration, tag: "只解码不检测")
-        // 长边封顶 1920：4K 源满尺寸解码 + Vision 是闪退头号嫌疑，先别让基准把自己挤死
-        let capTarget: (w: Int, h: Int)?
-        if max(natW, natH) > 1920 {
-            capTarget = fitSize(Int(natW), Int(natH), longEdge: 1920)
-        } else {
-            capTarget = nil
-        }
-        let native = videoPass(asset: asset, track: track, limit: frameLimit,
-                               target: capTarget, detect: true, videoFps: videoFps,
-                               duration: duration,
-                               tag: capTarget == nil ? "解码+检测" : "解码+检测（长边封顶 1920）")
-        // 0.6.2 这里无条件先跑了一趟满尺寸带检测再把结果扔掉——那一趟正是闪退发生的地方，
-        // 而且它对本条视频的数字没有任何贡献（下面立刻被 640 趟覆盖）。
-        let longSide = max(native.w, native.h)
-        let small: (text: String, w: Int, h: Int)
-        if longSide > 640 {
-            let s = fitSize(native.w, native.h, longEdge: 640)
-            small = videoPass(asset: asset, track: track, limit: frameLimit,
-                              target: (w: s.w, h: s.h), detect: true, videoFps: videoFps,
-                              duration: duration, tag: "解码+检测, 让解码器直出 \(s.w)x\(s.h)")
-        } else {
-            small = (text: "[小尺寸趟] 源长边只有 \(longSide)，不重复跑", w: native.w, h: native.h)
-        }
+                                   duration: duration, tag: "只解码不检测（地板）")
 
-        var repeats = ""
-        if repeatCount > 1 {
-            for it in 2...repeatCount {
-                let r = videoPass(asset: asset, track: track, limit: frameLimit,
-                                  target: capTarget, detect: true, videoFps: videoFps,
-                                  duration: duration, tag: "连跑第\(it)/\(repeatCount)遍")
-                repeats += "\n" + r.text
+        let target: (w: Int, h: Int)?
+        if longEdge == 0 {
+            target = max(natW, natH) > 1920 ? fitSize(Int(natW), Int(natH), longEdge: 1920) : nil
+        } else {
+            target = fitSize(Int(natW), Int(natH), longEdge: longEdge)
+        }
+        let baseTag = target.map { "解码+检测 直出\($0.w)x\($0.h)" } ?? "解码+检测 满尺寸"
+
+        var passTexts: [String] = []
+        for it in 1...max(1, repeatCount) {
+            if PressureWatch.sawPressure {
+                passTexts.append("[第 \(it) 遍没跑] 前面已经把系统逼到内存压力，再跑就是找死")
+                break
             }
+            let r = videoPass(asset: asset, track: track, limit: frameLimit,
+                              target: target, detect: true, videoFps: videoFps, duration: duration,
+                              tag: repeatCount > 1 ? "\(baseTag) 第\(it)/\(repeatCount)遍" : baseTag,
+                              chunkFrames: chunkFrames)
+            passTexts.append(r.text)
+            if r.frames == 0 { break }
         }
 
-        let memEnd = Facts.residentMB()
-        Journal.line("视频基准 结束 \(url.lastPathComponent) 上限\(frameLimit) 驻留 \(memEnd) MB（进这条时 \(memBegin)）")
+        let memEnd = Facts.footprintMB()
+        Journal.line("视频基准 结束 \(url.lastPathComponent) 足迹 \(memEnd) MB（进这条时 \(memBegin)）")
         return """
         视频基准 \(url.lastPathComponent)
         源尺寸 \(String(format: "%.0fx%.0f", natW, natH))，全长 \(String(format: "%.1f", duration)) s，\(String(format: "%.1f", videoFps)) fps，大小 \(sizeText)
         \(onlyDecode.text)
-        \(native.text)
-        \(small.text)\(repeats)
-        这条跑完 驻留 \(memBegin)→\(memEnd) MB（+\(memEnd - memBegin)）
+        \(passTexts.joined(separator: "\n"))
+        这条跑完 足迹 \(memBegin)→\(memEnd) MB（+\(memEnd - memBegin)）
         """
     }
 
@@ -694,34 +729,12 @@ enum Runner {
 
     static func videoPass(asset: AVURLAsset, track: AVAssetTrack, limit: Int,
                           target: (w: Int, h: Int)?, detect: Bool, videoFps: Double,
-                          duration: Double, tag: String) -> (text: String, w: Int, h: Int) {
+                          duration: Double, tag: String,
+                          chunkFrames: Int = 0) -> (text: String, w: Int, h: Int, frames: Int) {
         var settings: [String: Any] = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
         if let target = target {
             settings[kCVPixelBufferWidthKey as String] = target.w
             settings[kCVPixelBufferHeightKey as String] = target.h
-        }
-
-        let readerResult: AVAssetReader?
-        do {
-            readerResult = try AVAssetReader(asset: asset)
-        } catch {
-            return ("[\(tag)] AVAssetReader 创建失败: \(error)", 0, 0)
-        }
-        guard let reader = readerResult else {
-            return ("[\(tag)] AVAssetReader 返回 nil", 0, 0)
-        }
-        let outputResult: AVAssetReaderTrackOutput?
-        do {
-            outputResult = try AVAssetReaderTrackOutput(track: track, outputSettings: settings)
-        } catch {
-            return ("[\(tag)] TrackOutput 创建失败: \(error)", 0, 0)
-        }
-        guard let output = outputResult else {
-            return ("[\(tag)] TrackOutput 返回 nil（这套 outputSettings 不被支持）", 0, 0)
-        }
-        reader.add(output)
-        guard reader.startReading() else {
-            return ("[\(tag)] startReading 失败: \(reader.error?.localizedDescription ?? "-")", 0, 0)
         }
 
         var decodeTimes: [Double] = []
@@ -731,68 +744,112 @@ enum Runner {
         var widest = 0
         var tallest = 0
         var frames = 0
-        let mem0 = Facts.residentMB()
+        var chunks = 0
+        var failNote = ""
+        let mem0 = Facts.footprintMB()
         var memMax = mem0
-        var stoppedForMemory = false
-        Journal.line("趟 开始 \(tag) limit=\(limit)")
+        var stoppedForPressure = false
+        let chunk = chunkFrames > 0 ? chunkFrames : limit
 
         while frames < limit {
-            let d0 = DispatchTime.now().uptimeNanoseconds
-            guard let sample = output.copyNextSampleBuffer() else { break }
-            let decodeMs = Double(DispatchTime.now().uptimeNanoseconds - d0) / 1_000_000
-            guard let buffer = CMSampleBufferGetImageBuffer(sample) else { break }
-            if frames == 0 {
-                widest = CVPixelBufferGetWidth(buffer)
-                tallest = CVPixelBufferGetHeight(buffer)
-            }
-
-            var visionMs = 0.0
-            if detect {
-                let request = VNDetectFaceRectanglesRequest()
-                let handler = VNImageRequestHandler(cvPixelBuffer: buffer, orientation: .up, options: [:])
-                let v0 = DispatchTime.now().uptimeNanoseconds
-                do {
-                    try handler.perform([request])
-                } catch {
-                    reader.cancelReading()
-                    Journal.line("趟 Vision 抛错 \(tag) 第\(frames + 1)帧 \(String(describing: error).prefix(140))")
-                    return ("[\(tag)] 第 \(frames + 1) 帧 Vision 抛错: \(error)", widest, tallest)
-                }
-                visionMs = Double(DispatchTime.now().uptimeNanoseconds - v0) / 1_000_000
-                let faces = request.results ?? []
-                faceTotals += faces.count
-                var bestW = 0.0
-                var bestH = 0.0
-                for f in faces {
-                    let pw = Double(f.boundingBox.width) * Double(widest)
-                    let ph = Double(f.boundingBox.height) * Double(tallest)
-                    if pw * ph > bestW * bestH { bestW = pw; bestH = ph }
-                }
-                if bestW > 0 { facePx.append(min(bestW, bestH)) }
-            }
-
-            if frames >= 3 {
-                decodeTimes.append(decodeMs)
-                if detect { visionTimes.append(visionMs) }
-            }
-            frames += 1
-            let now = Facts.residentMB()
-            if now > memMax { memMax = now }
-            if now > Runner.memCapMB {
-                stoppedForMemory = true
-                Journal.line("趟 主动停 \(tag) 第\(frames)帧 驻留\(now)MB 超 \(Runner.memCapMB)MB")
+            let readerResult: AVAssetReader?
+            do {
+                readerResult = try AVAssetReader(asset: asset)
+            } catch {
+                failNote = "AVAssetReader 建不起来: \(error)"
                 break
             }
-            if frames % 30 == 0 {
-                Journal.line("心跳 \(tag) 第\(frames)帧 驻留\(now)MB")
+            guard let reader = readerResult else {
+                failNote = "AVAssetReader 返回 nil"
+                break
             }
+            let outputResult: AVAssetReaderTrackOutput?
+            do {
+                outputResult = try AVAssetReaderTrackOutput(track: track, outputSettings: settings)
+            } catch {
+                failNote = "TrackOutput 创建失败: \(error)"
+                break
+            }
+            guard let output = outputResult else {
+                failNote = "TrackOutput 返回 nil（这套 outputSettings 不被支持）"
+                break
+            }
+            chunks += 1
+            let from = Double(frames) / max(videoFps, 1)
+            reader.timeRange = CMTimeRange(
+                start: CMTime(seconds: from, preferredTimescale: 600),
+                duration: CMTime(seconds: Double(min(chunk, limit - frames)) / max(videoFps, 1) + 0.2,
+                                 preferredTimescale: 600))
+            reader.add(output)
+            guard reader.startReading() else {
+                failNote = "第 \(chunks) 块 startReading 失败: \(reader.error?.localizedDescription ?? "-")"
+                break
+            }
+            Journal.line("块 \(chunks) 起于 \(String(format: "%.2f", from))s 足迹\(mem0)MB")
+
+            var inChunk = 0
+            while frames < limit {
+                let d0 = DispatchTime.now().uptimeNanoseconds
+                guard let sample = output.copyNextSampleBuffer() else { break }
+                let decodeMs = Double(DispatchTime.now().uptimeNanoseconds - d0) / 1_000_000
+                guard let buffer = CMSampleBufferGetImageBuffer(sample) else { break }
+                if frames == 0 {
+                    widest = CVPixelBufferGetWidth(buffer)
+                    tallest = CVPixelBufferGetHeight(buffer)
+                }
+
+                var visionMs = 0.0
+                if detect {
+                    let request = VNDetectFaceRectanglesRequest()
+                    let handler = VNImageRequestHandler(cvPixelBuffer: buffer, orientation: .up, options: [:])
+                    let v0 = DispatchTime.now().uptimeNanoseconds
+                    do {
+                        try handler.perform([request])
+                    } catch {
+                        reader.cancelReading()
+                        failNote = "第 \(frames + 1) 帧 Vision 抛错: \(error)"
+                        Journal.line("趟 Vision 抛错 \(tag) \(failNote)")
+                        break
+                    }
+                    visionMs = Double(DispatchTime.now().uptimeNanoseconds - v0) / 1_000_000
+                    let faces = request.results ?? []
+                    faceTotals += faces.count
+                    var bestW = 0.0
+                    var bestH = 0.0
+                    for f in faces {
+                        let pw = Double(f.boundingBox.width) * Double(widest)
+                        let ph = Double(f.boundingBox.height) * Double(tallest)
+                        if pw * ph > bestW * bestH { bestW = pw; bestH = ph }
+                    }
+                    if bestW > 0 { facePx.append(min(bestW, bestH)) }
+                }
+
+                if frames >= 3 {
+                    decodeTimes.append(decodeMs)
+                    if detect { visionTimes.append(visionMs) }
+                }
+                frames += 1
+                inChunk += 1
+                let now = Facts.footprintMB()
+                if now > memMax { memMax = now }
+                if PressureWatch.sawPressure {
+                    stoppedForPressure = true
+                    Journal.line("趟 收兵 \(tag) 第\(frames)帧 足迹\(now)MB（系统已喊内存压力）")
+                    break
+                }
+                if frames % 30 == 0 {
+                    Journal.line("心跳 \(tag) 第\(frames)帧 足迹\(now)MB")
+                }
+            }
+            reader.cancelReading()
+            if stoppedForPressure || !failNote.isEmpty || inChunk == 0 { break }
         }
-        reader.cancelReading()
-        Journal.line("趟 结束 \(tag) 帧=\(frames) 峰值=\(memMax)MB"
-                     + (stoppedForMemory ? "（为躲 jetsam 自己收的）" : ""))
+        Journal.line("趟 结束 \(tag) 帧=\(frames) 块=\(chunks) 峰值足迹=\(memMax)MB"
+                     + (stoppedForPressure ? "（收到压力自己收的）" : "")
+                     + (failNote.isEmpty ? "" : " \(failNote)"))
 
         guard frames > 3 else {
-            return ("[\(tag)] 只解出 \(frames) 帧，不够计时（status=\(reader.status.rawValue)）", widest, tallest)
+            return ("[\(tag)] 只解出 \(frames) 帧\(failNote.isEmpty ? "" : "，\(failNote)")", widest, tallest, frames)
         }
         let decodeAvg = decodeTimes.reduce(0, +) / Double(decodeTimes.count)
         let visionAvg = visionTimes.isEmpty ? 0 : visionTimes.reduce(0, +) / Double(visionTimes.count)
@@ -801,11 +858,10 @@ enum Runner {
         let realtimeFactor = serialFps / videoFps
         let wholeClip = duration * videoFps / serialFps
 
-        var line = "[\(tag)] \(frames) 帧 @ \(widest)x\(tallest)  取帧 \(stat(decodeTimes))"
-        line += "\n  内存 \(mem0)→\(Facts.residentMB()) MB，本趟峰值 \(memMax) MB"
-            + (stoppedForMemory
-               ? "｜被 \(Runner.memCapMB) MB 闸提前停，速度只代表前 \(frames) 帧"
-               : "")
+        var line = "[\(tag)] \(frames) 帧 @ \(widest)x\(tallest)（\(chunks) 块） 取帧 \(stat(decodeTimes))"
+        line += "\n  足迹 \(mem0)→\(Facts.footprintMB()) MB，本趟峰值 \(memMax) MB"
+            + (stoppedForPressure ? "｜收到内存压力自己收兵，只跑到第 \(frames) 帧" : "")
+        if !failNote.isEmpty { line += "｜\(failNote)" }
         if detect {
             line += "\n  Vision \(stat(visionTimes))  检到脸 \(faceTotals)/\(frames) 帧"
             if facePx.isEmpty {
@@ -821,7 +877,7 @@ enum Runner {
             }
         }
         line += "\n  合计 \(String(format: "%.1f", perFrame)) ms/帧 = \(String(format: "%.1f", serialFps)) 帧/秒 = \(String(format: "%.2f", realtimeFactor))x 实时；扫完整段 \(String(format: "%.1f", duration)) s 需 \(String(format: "%.1f", wholeClip)) s"
-        return (line, widest, tallest)
+        return (line, widest, tallest, frames)
     }
 
     static func ms(_ value: Double) -> String {
