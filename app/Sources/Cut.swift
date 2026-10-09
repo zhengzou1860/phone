@@ -866,11 +866,13 @@ final class Cutter: ObservableObject {
         text += "\n\n—— 磁盘日志尾 ——\n" + Journal.tail(150)
         busy = true
         status = "发到电脑中…"
+        let to = Uploader.endpoint
         Task.detached { [weak self] in
             let r = Uploader.send(text)
             Task { @MainActor in
                 self?.busy = false
-                self?.status = r
+                let needAddr = r.hasPrefix("发到电脑：") && !r.contains("HTTP")
+                self?.status = needAddr ? "\(r)｜地址 \(to)" : r
             }
         }
     }
