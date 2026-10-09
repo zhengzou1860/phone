@@ -709,7 +709,7 @@ enum ModelBench {
             found = (u, "包里带的是已编译 mlmodelc")
         } else if let u = Bundle.main.url(forResource: "mbf", withExtension: "mlpackage") {
             do {
-                found = (try MLModel.compile(at: u), "包里是 mlpackage，现场编译成功")
+                found = (try MLModel.compileModel(at: u), "包里是 mlpackage，现场编译成功")
             } catch {
                 found = (nil, "mlpackage 现场编译失败: \(error)")
             }
@@ -730,21 +730,35 @@ enum ModelBench {
         }
         var list: [MLFeatureProvider] = []
         if desc.type == .multiArray, let c = desc.multiArrayConstraint {
-            let dims = (c.dimensions ?? [NSNumber(value: 1)]).map { max(1, $0.intValue) }
+            let dims = c.shape.map { max(1, $0.intValue) }
             let total = dims.reduce(1, *)
             for _ in 0..<count {
-                let arr = MLMultiArray(dataType: c.dataType, dimensions: dims.map { NSNumber(value: $0) })
-                let p = arr.dataPointer.assumingMemoryBound(to: Float32.self)
-                for i in 0..<total { p[i] = Float32(rand01() * 2 - 1) }
-                if let f = MLDictionaryFeatureProvider(dictionary: [name: MLFeatureValue(multiArray: arr)]) {
-                    list.append(f)
+                let arr: MLMultiArray
+                do {
+                    arr = try MLMultiArray(shape: dims.map { NSNumber(value: $0) }, dataType: c.dataType)
+                } catch {
+                    return ([], "造 MLMultiArray 失败 dims=\(dims): \(error)")
                 }
+                switch arr.dataType {
+                case .float32:
+                    let p = arr.dataPointer.assumingMemoryBound(to: Float32.self)
+                    for i in 0..<total { p[i] = Float32(rand01() * 2 - 1) }
+                case .float16:
+                    let p = arr.dataPointer.assumingMemoryBound(to: Float16.self)
+                    for i in 0..<total { p[i] = Float16(rand01() * 2 - 1) }
+                case .float64:
+                    let p = arr.dataPointer.assumingMemoryBound(to: Double.self)
+                    for i in 0..<total { p[i] = rand01() * 2 - 1 }
+                default:
+                    return ([], "多数组元素类型 \(arr.dataType.rawValue) 我还不会填")
+                }
+                list.append(MLDictionaryFeatureProvider(dictionary: [name: MLFeatureValue(multiArray: arr)]))
             }
             return (list, "输入 \(name) multiArray dims=\(dims) 类型 \(c.dataType.rawValue)")
         }
         if desc.type == .image, let ic = desc.imageConstraint {
-            let w = max(16, ic.pixelsWide?.intValue ?? 112)
-            let h = max(16, ic.pixelsHigh?.intValue ?? 112)
+            let w = ic.pixelsWide > 0 ? ic.pixelsWide : 112
+            let h = ic.pixelsHigh > 0 ? ic.pixelsHigh : 112
             let attrs: [String: Any] = [kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any]]
             for _ in 0..<count {
                 var pb: CVPixelBuffer?
@@ -760,9 +774,7 @@ enum ModelBench {
                     for i in 0..<bytes { p[i] = UInt8(rand01() * 255) }
                 }
                 CVPixelBufferUnlockBaseAddress(buf, [])
-                if let f = MLDictionaryFeatureProvider(dictionary: [name: MLFeatureValue(pixelBuffer: buf)]) {
-                    list.append(f)
-                }
+                list.append(MLDictionaryFeatureProvider(dictionary: [name: MLFeatureValue(pixelBuffer: buf)]))
             }
             return (list, "输入 \(name) image \(w)x\(h)")
         }
