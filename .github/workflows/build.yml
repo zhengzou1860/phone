@@ -1,0 +1,94 @@
+name: build-unsigned-ipa
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ipa
+  cancel-in-progress: true
+
+jobs:
+  ipa:
+    runs-on: macos-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: show toolchain
+        run: sw_vers && xcodebuild -version && xcodebuild -showsdks | grep -i ios
+
+      - name: install xcodegen
+        run: |
+          set -euo pipefail
+          curl -sL -o /tmp/xg.zip https://github.com/yonaskolb/XcodeGen/releases/download/2.46.0/xcodegen.zip
+          rm -rf /tmp/xg && unzip -q /tmp/xg.zip -d /tmp/xg
+          sudo /tmp/xg/xcodegen/install.sh
+          xcodegen --version
+
+      - name: generate project
+        working-directory: app
+        run: xcodegen --spec project.yml
+
+      - name: build
+        working-directory: app
+        run: |
+          set -euo pipefail
+          rm -rf build
+          xcodebuild -project HelloLC.xcodeproj -scheme HelloLC \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY= EXPANDED_CODE_SIGN_IDENTITY= \
+            build 2>&1 | tee /tmp/build.log
+
+      - name: package ipa
+        working-directory: app
+        run: |
+          set -euo pipefail
+          APP=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' | head -1)
+          test -n "$APP"
+          echo "built app: $APP" >> /tmp/build.log
+          file "$APP/HelloLC" | tee -a /tmp/build.log
+          rm -rf Payload hello.ipa
+          mkdir Payload
+          cp -R "$APP" Payload/
+          ditto -c -k --keepParent Payload hello.ipa
+          ls -la hello.ipa
+
+      - name: publish
+        working-directory: app
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          cp /tmp/build.log ./build.log
+          gh release delete channel-test --cleanup-tag -y 2>/dev/null || true
+          gh release create channel-test hello.ipa build.log \
+            --title "HelloLC 自测构建" \
+            --prerelease \
+            --notes "CI 自动产物 commit ${GITHUB_SHA}；未签名，装进 LiveContainer 时由它自己签名"
+          echo "安装地址："
+          echo "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/channel-test/hello.ipa"
+
+      - name: publish failure log
+        if: failure()
+        working-directory: app
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          cp /tmp/build.log ./build.log 2>/dev/null || echo "构建在生成日志之前就失败" > ./build.log
+          touch ./hello-missing.ipa
+          gh release delete channel-test --cleanup-tag -y 2>/dev/null || true
+          gh release create channel-test build.log hello-missing.ipa \
+            --title "CI 构建失败日志" \
+            --prerelease \
+            --notes "这一轮没出成 IPA，看 build.log；hello-missing.ipa 只是占位文件，用来保证资产名固定"
+          echo "日志地址："
+          echo "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/channel-test/build.log"

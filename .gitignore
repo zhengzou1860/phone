@@ -1,0 +1,12 @@
+tools/
+*.ipa
+*.msi
+*.zip
+*.png
+*.json
+.DS_Store
+xcuserdata/
+app/HelloLC.xcodeproj/
+app/build/
+app/Payload/
+app/hello.ipa
