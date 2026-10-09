@@ -596,6 +596,7 @@ enum Runner {
         var decodeTimes: [Double] = []
         var visionTimes: [Double] = []
         var faceTotals = 0
+        var facePx: [Double] = []
         var widest = 0
         var tallest = 0
         var frames = 0
@@ -621,7 +622,16 @@ enum Runner {
                     return ("[\(tag)] 第 \(frames + 1) 帧 Vision 抛错: \(error)", widest, tallest)
                 }
                 visionMs = Double(DispatchTime.now().uptimeNanoseconds - v0) / 1_000_000
-                faceTotals += request.results?.count ?? 0
+                let faces = request.results ?? []
+                faceTotals += faces.count
+                var bestW = 0.0
+                var bestH = 0.0
+                for f in faces {
+                    let pw = Double(f.boundingBox.width) * Double(widest)
+                    let ph = Double(f.boundingBox.height) * Double(tallest)
+                    if pw * ph > bestW * bestH { bestW = pw; bestH = ph }
+                }
+                if bestW > 0 { facePx.append(min(bestW, bestH)) }
             }
 
             if frames >= 3 {
@@ -644,6 +654,17 @@ enum Runner {
         var line = "[\(tag)] \(frames) 帧 @ \(widest)x\(tallest)  取帧 \(stat(decodeTimes))"
         if detect {
             line += "\n  Vision \(stat(visionTimes))  检到脸 \(faceTotals)/\(frames) 帧"
+            if facePx.isEmpty {
+                line += "\n  脸短边 px：这 \(frames) 帧一张脸都没检到"
+            } else {
+                let sp = facePx.sorted()
+                var below = 0
+                for v in facePx where v < 96 { below += 1 }
+                line += "\n  脸短边 px（直出尺寸下量）最小 \(String(format: "%.0f", sp[0]))"
+                    + " 中位 \(String(format: "%.0f", sp[sp.count / 2]))"
+                    + " 最大 \(String(format: "%.0f", sp[sp.count - 1]))"
+                    + "｜低于 96 px 的 \(below)/\(sp.count) 帧"
+            }
         }
         line += "\n  合计 \(String(format: "%.1f", perFrame)) ms/帧 = \(String(format: "%.1f", serialFps)) 帧/秒 = \(String(format: "%.2f", realtimeFactor))x 实时；扫完整段 \(String(format: "%.1f", duration)) s 需 \(String(format: "%.1f", wholeClip)) s"
         return (line, widest, tallest)
