@@ -288,10 +288,7 @@ enum Runner {
             let found = request.results ?? []
             count = found.count
             if let first = found.first {
-                let b = first.bounds
-                detail = String(format: "置信 %@，框 x%.2f y%.2f %.2fx%.2f",
-                                "\(first.confidence)",
-                                b.origin.x, b.origin.y, b.size.width, b.size.height)
+                detail = "置信 \(first.confidence) 框 \(first.boundingBox)"
             }
         }
         return (times, count, detail)
