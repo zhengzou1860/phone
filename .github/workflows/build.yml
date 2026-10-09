@@ -66,15 +66,15 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -euo pipefail
-          cp /tmp/build.log ./build.log
-          grep -nE "error:|fatal error:" ./build.log | head -80 > ./errors.txt || echo "no error: lines" > ./errors.txt
+          set -uo pipefail
+          ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" '{print "::error::" p substr($0,1,230)}'; }
+          cp /tmp/build.log ./build.log 2>/dev/null || echo "no build log" > ./build.log
+          grep -nE "error:|fatal error:" ./build.log | head -6 | ann "ERR "
           gh release delete channel-test --cleanup-tag -y 2>/dev/null || true
-          gh release create channel-test hello.ipa build.log errors.txt \
+          gh release create channel-test hello.ipa build.log \
             --title "HelloLC 自测构建 OK" \
             --prerelease \
-            --notes "CI 自动产物 commit ${GITHUB_SHA}；未签名，装进 LiveContainer 时由它自己签名"
-          echo "安装地址："
+            --notes "CI 自动产物 commit $GITHUB_SHA" 2>&1 | tail -6 | ann "GH-OK "
           echo "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/channel-test/hello.ipa"
 
       - name: publish failure log
@@ -84,13 +84,14 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -uo pipefail
-          cp /tmp/build.log ./build.log 2>/dev/null || echo "构建在生成日志之前就失败" > ./build.log
-          grep -nE "error:|fatal error:" ./build.log | head -80 > ./errors.txt || echo "no error: lines" > ./errors.txt
-          touch ./hello-missing.ipa
-          gh release delete channel-test --cleanup-tag -y 2>/dev/null || true
-          gh release create channel-test build.log errors.txt hello-missing.ipa \
+          ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" '{print "::error::" p substr($0,1,230)}'; }
+          cp /tmp/build.log ./build.log 2>/dev/null || echo "no build log at all" > ./build.log
+          grep -nE "error:|fatal error:" ./build.log | head -14 | ann "ERR "
+          echo "--- gh version ---" | ann "ENV "
+          echo "GH_TOKEN length: ${#GH_TOKEN}" | ann "ENV "
+          gh --version 2>&1 | head -2 | ann "ENV "
+          gh release delete channel-test --cleanup-tag -y 2>&1 | tail -3 | ann "DEL "
+          gh release create channel-test build.log \
             --title "CI 构建失败日志" \
             --prerelease \
-            --notes "这一轮没出成 IPA，看 errors.txt / build.log；hello-missing.ipa 只是占位文件，用来保证资产名固定"
-          echo "日志地址："
-          echo "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/channel-test/errors.txt"
+            --notes "这一轮没出成 IPA" 2>&1 | tail -6 | ann "GH-FAIL "
