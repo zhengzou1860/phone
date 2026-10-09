@@ -105,6 +105,22 @@ jobs:
           ditto -c -k --keepParent Payload hello.ipa
           ls -la hello.ipa | tee -a /tmp/build.log
 
+      # 上手机前先答清楚：xcodegen 有没有把 mlpackage 当一个文件交给 coremlc，产物里到底有没有编译好的模型
+      - name: model in bundle check
+        if: always()
+        working-directory: app
+        run: |
+          set +e
+          ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=4{print "::error::" p substr($0,1,230)}'; }
+          { echo "pbxproj 引用 mbf.mlpackage 次数=$(grep -c 'mbf.mlpackage' HelloLC.xcodeproj/project.pbxproj 2>/dev/null)";
+            echo "mlpackage 文件类型=$(grep -oE 'mbf\.mlpackage[^)]*|lastKnownFileType = [a-z.]*mlpackage[a-z.]*' HelloLC.xcodeproj/project.pbxproj 2>/dev/null | head -1)";
+            echo "mlpackage 里被逐个引用的散文件数=$(grep -c 'Data/com.apple.CoreML' HelloLC.xcodeproj/project.pbxproj 2>/dev/null)"; } | ann "P-REF "
+          APP=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' 2>/dev/null | head -1)
+          { echo "app=$APP";
+            echo "mlmodelc=$(find "$APP" -maxdepth 1 -name '*.mlmodelc' 2>/dev/null | head -2 | tr '\n' ' ')";
+            echo "大小=$(du -sk "$APP"/*.mlmodelc 2>/dev/null | awk '{print $1"KB"}' | head -1)"; } | ann "B-MODEL "
+          exit 0
+
       # 每个 step 的 annotation 有独立额度，诊断按 step 拆开，别堆在一个 step 里被截断
       - name: publish release
         working-directory: app

@@ -752,7 +752,11 @@ enum ModelBench {
                 default:
                     return ([], "多数组元素类型 \(arr.dataType.rawValue) 我还不会填")
                 }
-                list.append(MLDictionaryFeatureProvider(dictionary: [name: MLFeatureValue(multiArray: arr)]))
+                do {
+                    list.append(try MLDictionaryFeatureProvider(dictionary: [name: MLFeatureValue(multiArray: arr)]))
+                } catch {
+                    return ([], "造 multiArray feature provider 失败: \(error)")
+                }
             }
             return (list, "输入 \(name) multiArray dims=\(dims) 类型 \(c.dataType.rawValue)")
         }
@@ -774,7 +778,11 @@ enum ModelBench {
                     for i in 0..<bytes { p[i] = UInt8(rand01() * 255) }
                 }
                 CVPixelBufferUnlockBaseAddress(buf, [])
-                list.append(MLDictionaryFeatureProvider(dictionary: [name: MLFeatureValue(pixelBuffer: buf)]))
+                do {
+                    list.append(try MLDictionaryFeatureProvider(dictionary: [name: MLFeatureValue(pixelBuffer: buf)]))
+                } catch {
+                    return ([], "造 image feature provider 失败: \(error)")
+                }
             }
             return (list, "输入 \(name) image \(w)x\(h)")
         }
