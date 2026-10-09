@@ -68,9 +68,10 @@ jobs:
         run: |
           set -euo pipefail
           cp /tmp/build.log ./build.log
+          grep -nE "error:|fatal error:" ./build.log | head -80 > ./errors.txt || echo "no error: lines" > ./errors.txt
           gh release delete channel-test --cleanup-tag -y 2>/dev/null || true
-          gh release create channel-test hello.ipa build.log \
-            --title "HelloLC 自测构建" \
+          gh release create channel-test hello.ipa build.log errors.txt \
+            --title "HelloLC 自测构建 OK" \
             --prerelease \
             --notes "CI 自动产物 commit ${GITHUB_SHA}；未签名，装进 LiveContainer 时由它自己签名"
           echo "安装地址："
@@ -84,11 +85,12 @@ jobs:
         run: |
           set -uo pipefail
           cp /tmp/build.log ./build.log 2>/dev/null || echo "构建在生成日志之前就失败" > ./build.log
+          grep -nE "error:|fatal error:" ./build.log | head -80 > ./errors.txt || echo "no error: lines" > ./errors.txt
           touch ./hello-missing.ipa
           gh release delete channel-test --cleanup-tag -y 2>/dev/null || true
-          gh release create channel-test build.log hello-missing.ipa \
+          gh release create channel-test build.log errors.txt hello-missing.ipa \
             --title "CI 构建失败日志" \
             --prerelease \
-            --notes "这一轮没出成 IPA，看 build.log；hello-missing.ipa 只是占位文件，用来保证资产名固定"
+            --notes "这一轮没出成 IPA，看 errors.txt / build.log；hello-missing.ipa 只是占位文件，用来保证资产名固定"
           echo "日志地址："
-          echo "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/channel-test/build.log"
+          echo "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/channel-test/errors.txt"
