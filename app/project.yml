@@ -23,8 +23,8 @@ targets:
         CFBundleExecutable: HelloLC
         CFBundleIdentifier: com.qoder.hellolc
         CFBundlePackageType: APPL
-        CFBundleShortVersionString: "0.8"
-        CFBundleVersion: "15"
+        CFBundleShortVersionString: "0.9"
+        CFBundleVersion: "16"
         CFBundleInfoDictionaryVersion: "6.0"
         NSPhotoLibraryAddUsageDescription: "要把剪好的片段存回相册"
         NSAppTransportSecurity:

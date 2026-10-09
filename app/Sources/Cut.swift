@@ -69,11 +69,6 @@ enum Align {
         }
     }
 
-    /// Vision 归一化点（原点左下）→ 这块 raw 缓冲的像素点（原点左上）
-    static func pixelPoint(_ p: CGPoint, _ w: Int, _ h: Int) -> CGPoint {
-        CGPoint(x: p.x * CGFloat(w), y: (1 - p.y) * CGFloat(h))
-    }
-
     /// raw 像素框 → 转正后的外接框（k=0 时就是它自己）
     static func uprightBox(_ b: CGRect, k: Int, w: Int, h: Int) -> CGRect {
         let c = [CGPoint(x: b.minX, y: b.minY), CGPoint(x: b.maxX, y: b.minY),
@@ -98,22 +93,67 @@ enum Align {
         return CGPoint(x: x / Double(p.count), y: y / Double(p.count))
     }
 
+    /// 一张脸的零件（**原始归一化坐标**，没换像素、没排左右）：两眼中心、鼻尖、整圈外唇。
+    /// 左右必须等"转正后的空间"里再排：k=1/3 那块缓冲里脸是躺着的，x 极值的两个唇点是
+    /// 上唇缘和下唇缘，不是嘴角——在原始空间里挑嘴角等于喂错点给尺子。
+    static func parts(_ f: VNFaceObservation) -> (eyes: [CGPoint], nose: CGPoint, lips: [CGPoint])? {
+        guard let lm = f.landmarks,
+              let e1 = centroid(lm.leftEye), let e2 = centroid(lm.rightEye),
+              let nose = regionPoints(lm.noseCrest)?.last,
+              let lips = regionPoints(lm.outerLips), lips.count >= 3
+        else { return nil }
+        return (eyes: [e1, e2], nose: nose, lips: lips)
+    }
+
+    /// 五官点的 y 原点。上机实测黄点上下反了（鼻尖差不多、眼和嘴互换）⇒ 点的口径和
+    /// boundingBox（左下原点，那个是我逐帧核过的）不是同一套。到底哪个对不猜，见 settleOrigin。
+    /// nil = 还没在摆正的帧上判过；判过之前先按 Apple 文档口径（左上原点、不翻）。
+    static var yTopLeftOrigin: Bool? = nil
+    static var topLeft: Bool { yTopLeftOrigin ?? true }
+
+    /// 归一化五官点 → 像素点（原点左上、y 向下）。用 settleOrigin 判出来的那套 y 口径。
+    static func toPixels(_ p: CGPoint, _ w: Int, _ h: Int) -> CGPoint {
+        CGPoint(x: p.x * CGFloat(w), y: (topLeft ? p.y : 1 - p.y) * CGFloat(h))
+    }
+
+    /// 把 y 原点自己判出来并缓存（全片共用一个答案）。判据不需要任何 API 假设：
+    /// 喂进来的这一帧是摆正的（frameImage 套了 preferredTransform，检测用 .up），
+    /// 所以**眼睛必须在鼻尖上面、鼻尖必须在嘴角上面**（y 向下＝数值更小）。
+    /// 两种口径各摆一遍，谁满足这条谁赢；只有两边同判时才退回文档口径（左上原点）。
+    /// 只读 y，且嘴角按 x 挑（x 不参与翻转），所以这一层不需要转正也成立。
+    static func settleOrigin(face f: VNFaceObservation) -> String {
+        guard let p = parts(f),
+              let ml = p.lips.min(by: { $0.x < $1.x }), let mr = p.lips.max(by: { $0.x < $1.x })
+        else { return "y 原点没判（五官点缺失）" }
+        let set = p.eyes + [p.nose, ml, mr]
+        var ok: [Bool] = []
+        var desc: [String] = []
+        for tl in [true, false] {
+            let y = set.map { tl ? $0.y : 1 - $0.y }
+            let good = max(y[0], y[1]) < y[2] && y[2] < min(y[3], y[4])
+            ok.append(good)
+            desc.append("y\(tl ? "不翻" : "翻")\(good ? "√" : "×")")
+        }
+        let how: String
+        if ok[0] != ok[1] { yTopLeftOrigin = ok[0]; how = "判出" }
+        else if yTopLeftOrigin == nil { yTopLeftOrigin = true; how = "两边同判→按文档(左上)" }
+        else { how = "两边同判→沿用" }
+        let raw = set.map { String(format: "%.2f/%.2f", $0.x, $0.y) }.joined(separator: " ")
+        return "y 原点 \(desc.joined(separator: "｜"))→「\(topLeft ? "不翻" : "翻")」(\(how))｜5点 \(raw)"
+    }
+
     /// 一张脸送进尺子要的那 5 个点（模板口径：左眼、右眼、鼻尖、左嘴角、右嘴角，
     /// "左"指**转正后的画面左侧**）。有真五官点就用真的；缺任一 region 就整张退回按框猜，
     /// 并把用的哪一种报回来——退回"框猜"时分数会掉，屏幕上必须看得见。
-    /// 左右槽位是按转正后的 x 排出来的，所以 Vision 的 left/right 到底指被拍者哪一侧
+    /// 左右槽位全部在转正后的空间里按 x 排，所以 Vision 的 left/right 到底指被拍者哪一侧
     /// 这个我从没验过的口径问题，根本不参与结果。
     static func sendPoints(face f: VNFaceObservation, k: Int, w: Int, h: Int) -> (pts: [CGPoint], src: String) {
         var up: [CGPoint]? = nil
         var src = "框猜"
-        if let lm = f.landmarks,
-           let e1 = centroid(lm.leftEye), let e2 = centroid(lm.rightEye),
-           let crest = regionPoints(lm.noseCrest)?.last,
-           let lips = regionPoints(lm.outerLips), lips.count >= 3 {
-            let U = { (p: CGPoint) -> CGPoint in Align.toUpright(Align.pixelPoint(p, w, h), k: k, w: w, h: h) }
-            let a = U(e1), b = U(e2), n = U(crest)
-            let lp = lips.map { U($0) }
-            let eyes = a.x <= b.x ? [a, b] : [b, a]
+        if let p = parts(f) {
+            let U = { (q: CGPoint) -> CGPoint in Align.toUpright(Align.toPixels(q, w, h), k: k, w: w, h: h) }
+            let e = p.eyes.map(U), lp = p.lips.map(U), n = U(p.nose)
+            let eyes = e[0].x <= e[1].x ? [e[0], e[1]] : [e[1], e[0]]
             let corners = [lp.min(by: { $0.x < $1.x })!, lp.max(by: { $0.x < $1.x })!]
             up = [eyes[0], eyes[1], n, corners[0], corners[1]]
             src = "真点位"
@@ -122,16 +162,13 @@ enum Align {
         return (pts.map { Align.toRaw($0, k: k, w: w, h: h) }, src)
     }
 
-    /// 屏幕上画黄点用的 5 个真五官点（Vision 归一化坐标，原点左下）。只服务肉眼验收：
-    /// 点落在两眼/鼻尖/两嘴角 = 对齐真取到位了；没有黄点 = 这张脸退回按框猜，分数天花板就低了。
-    static func markerPoints(face f: VNFaceObservation) -> [CGPoint]? {
-        guard let lm = f.landmarks,
-              let e1 = centroid(lm.leftEye), let e2 = centroid(lm.rightEye),
-              let crest = regionPoints(lm.noseCrest)?.last,
-              let lips = regionPoints(lm.outerLips), lips.count >= 3 else { return nil }
-        let eyes = e1.x <= e2.x ? [e1, e2] : [e2, e1]
-        let l = lips.min(by: { $0.x < $1.x })!, r = lips.max(by: { $0.x < $1.x })!
-        return [eyes[0], eyes[1], crest, l, r]
+    /// 屏幕上画黄点用的 5 个点，给成**显示口径的归一化点**（原点左上、y 向下，和绿框那套换算同向）。
+    /// 画点不再自己决定翻不翻：它跟着 settleOrigin 判出来的口径，所以点准不准＝那个口径对不对。
+    static func markerPoints(_ f: VNFaceObservation) -> [CGPoint]? {
+        guard let p = parts(f) else { return nil }
+        let D = { (q: CGPoint) -> CGPoint in CGPoint(x: q.x, y: Align.topLeft ? q.y : 1 - q.y) }
+        let lp = p.lips.map(D)
+        return p.eyes.map(D) + [D(p.nose)] + [lp.min(by: { $0.x < $1.x })!, lp.max(by: { $0.x < $1.x })!]
     }
 
     /// 相似变换（旋转+等比缩放+平移）最小二乘：dst = [[a,-b],[b,a]]·src + t
@@ -462,6 +499,8 @@ enum CutEngine {
                            sideScale: Double) -> ([Float]?, Double, String, String) {
         let shortSide = min(face.boundingBox.width * CGFloat(image.width),
                             face.boundingBox.height * CGFloat(image.height)) * sideScale
+        // 这一帧是摆正的 ⇒ 只有在这里才有资格判 y 原点；判完 sendPoints 才用得上
+        let origin = Align.settleOrigin(face: face)
         let (kp, src) = Align.sendPoints(face: face, k: 0, w: image.width, h: image.height)
         let box = Align.pixelBox(face.boundingBox, image.width, image.height)
         var vec: [Float]? = nil
@@ -477,7 +516,7 @@ enum CutEngine {
             return true
         }
         if vec == nil && why.isEmpty { why = Ruler.shared.lastError }
-        return (vec, shortSide, why, src)
+        return (vec, shortSide, why, "\(src)｜\(origin)")
     }
 
     /// 整片扫描：每帧检测一次，只有脸短边（折算回源像素）达标的才裁脸跑尺子。
@@ -895,12 +934,14 @@ final class Cutter: ObservableObject {
         Task.detached { [weak self] in
             let (img, note) = CutEngine.frameImage(asset: a, at: at)
             let obs = img == nil ? [] : CutEngine.faces(in: img!)
+            // 这一帧摆正 ⇒ 先在第 1 张脸上把 y 原点判了：黄点是给人眼验收用的，画反了就没得验
+            let origin = obs.first.map { Align.settleOrigin(face: $0) } ?? "y 原点没判（没检到脸）"
             Task { @MainActor in
                 guard let self = self else { return }
                 self.busy = false
                 self.faces = obs
                 self.anchorNote = ""
-                self.status = "\(note)｜检到 \(obs.count) 张脸——点一个绿框当要保留的人"
+                self.status = "\(note)｜检到 \(obs.count) 张脸——点一个绿框当要保留的人\n\(origin)"
                 Journal.line("剪辑 静帧 \(note) 脸 \(obs.count)")
             }
         }
@@ -931,7 +972,7 @@ final class Cutter: ObservableObject {
                 vec = v
                 text = v == nil ? "这张脸算不出向量：\(why)"
                     : "锚点存下（这张脸源片短边 \(String(format: "%.0f", side)) px，点位 \(src)）｜\(vecFingerprint(v!))"
-                if v != nil && src == "框猜" {
+                if v != nil && src.hasPrefix("框猜") {
                     text += "\n⚠️ 这张脸没给到五官点，退回按框猜——同一个人也会掉分，扫出来的命中率会偏低。"
                 }
                 if v != nil && side < th {
@@ -1158,12 +1199,12 @@ struct CutView: View {
                     .position(x: box.minX + (r.minX + r.width / 2) * box.width,
                               y: box.minY + (1 - (r.minY + r.height / 2)) * box.height)
                 // 5 个黄点 = 真五官点落位了；一个都没有 = 这张脸退回了按框猜
-                ForEach(Array((Align.markerPoints(face: f) ?? []).enumerated()), id: \.offset) { _, p in
+                ForEach(Array((Align.markerPoints(f) ?? []).enumerated()), id: \.offset) { _, p in
                     Circle()
                         .fill(Color.yellow)
                         .frame(width: 4, height: 4)
                         .position(x: box.minX + p.x * box.width,
-                                  y: box.minY + (1 - p.y) * box.height)
+                                  y: box.minY + p.y * box.height)
                 }
             }
         })
