@@ -101,10 +101,11 @@ struct BenchView: View {
             .padding()
         }
         .fullScreenCover(isPresented: $bench.showVideoPicker) {
-            PickerHost(target: .video) { url, msg in bench.finishPick(url: url, failMessage: msg, target: .video) }
+            // onPicked 留空是故意的：自检页现在能用，finishPick 自己会收 cover，这轮不动它的行为
+            PickerHost(target: .video, onPicked: {}) { url, msg in bench.finishPick(url: url, failMessage: msg, target: .video) }
         }
         .fullScreenCover(isPresented: $bench.showPhotoPicker) {
-            PickerHost(target: .photo) { url, msg in bench.finishPick(url: url, failMessage: msg, target: .photo) }
+            PickerHost(target: .photo, onPicked: {}) { url, msg in bench.finishPick(url: url, failMessage: msg, target: .photo) }
         }
     }
 }
@@ -209,6 +210,9 @@ final class Bench: ObservableObject {
 
 struct PickerHost: UIViewControllerRepresentable {
     let target: PickTarget
+    /// 刚选完、后台还在把文件拷出相册时回调一次。相册拷贝对大视频能有十几秒，
+    /// cover 不等它就立刻收起，主界面先显示"取文件中…"，不然看着像卡死在选择页。
+    let onPicked: () -> Void
     let onDone: (URL?, String?) -> Void
 
     func makeUIViewController(context: Context) -> PHPickerViewController {
@@ -222,14 +226,16 @@ struct PickerHost: UIViewControllerRepresentable {
 
     func updateUIViewController(_ uiViewController: PHPickerViewController, context: Context) {}
 
-    func makeCoordinator() -> Coordinator { Coordinator(target, onDone) }
+    func makeCoordinator() -> Coordinator { Coordinator(target, onPicked, onDone) }
 
     final class Coordinator: NSObject, PHPickerViewControllerDelegate {
         let target: PickTarget
+        let onPicked: () -> Void
         let onDone: (URL?, String?) -> Void
 
-        init(_ target: PickTarget, _ onDone: @escaping (URL?, String?) -> Void) {
+        init(_ target: PickTarget, _ onPicked: @escaping () -> Void, _ onDone: @escaping (URL?, String?) -> Void) {
             self.target = target
+            self.onPicked = onPicked
             self.onDone = onDone
         }
 
@@ -238,6 +244,8 @@ struct PickerHost: UIViewControllerRepresentable {
                 report(nil, "没选到文件")
                 return
             }
+            let cb = self.onPicked
+            Task { @MainActor in cb() }
             let typeID = target == .video ? "public.movie" : "public.image"
             provider.loadFileRepresentation(forTypeIdentifier: typeID) { file, error in
                 guard let file = file else {

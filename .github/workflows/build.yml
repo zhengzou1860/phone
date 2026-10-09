@@ -67,6 +67,7 @@ jobs:
           grep -rhB2 -A6 "IdentityFeaturePrint" "$FW" 2>/dev/null | head -14 | ann "VIS-DECL " || true
 
       # 纯诊断：人脸特征点属性名从 SDK 头文件里抠，不靠猜（对齐要靠这 5 个点）
+      # 全文写到 /tmp/lm.txt 随 release 发布——annotation 一个 step 只有约 10 条、每条 200 字，上一轮属性名就是被它截没的
       - name: probe face landmark names
         continue-on-error: true
         run: |
@@ -74,15 +75,36 @@ jobs:
           ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=8{print "::error::" p substr($0,1,200)}'; }
           SDK=$(xcrun --sdk iphoneos --show-sdk-path)
           HDR="$SDK/System/Library/Frameworks/Vision.framework/Headers"
-          echo "hdr=$([ -d "$HDR" ] && echo 在 || echo 不在)" | ann "LM-HDR "
-          grep -rhoE "@interface VNFace(Landmark|Observation)[A-Za-z0-9_]*" "$HDR" 2>/dev/null | sort -u | ann "LM-CLASS "
-          awk '/@interface VNFaceLandmarks2D/,/@end/' "$HDR"/*.h 2>/dev/null \
-            | grep -E "^@property|^/" | sed -E 's/^@property[^)]*\)[[:space:]]*//' | ann "L2D "
-          awk '/@interface VNFaceLandmarkRegion2D/,/@end/' "$HDR"/*.h 2>/dev/null \
-            | grep -E "^@property" | sed -E 's/^@property[^)]*\)[[:space:]]*//' | ann "RGN "
-          awk '/@interface VNFaceObservation/,/@end/' "$HDR"/*.h 2>/dev/null \
-            | grep -E "^@property" | sed -E 's/^@property[^)]*\)[[:space:]]*//' | grep -iE "landmark|roll|yaw|pitch|expression" | ann "OBS "
-          grep -rhoE "VNDetectFace[A-Za-z0-9_]*Request" "$HDR" 2>/dev/null | sort -u | ann "LM-REQ "
+          : > /tmp/lm.txt
+          echo "hdr=$HDR" >> /tmp/lm.txt
+          ls "$HDR" 2>&1 | head -40 >> /tmp/lm.txt
+          for C in VNFaceLandmarks2D VNFaceLandmarks VNFaceLandmarkRegion2D VNFaceLandmarkRegion \
+                   VNFaceObservation VNDetectFaceLandmarksRequest VNDetectFaceRectanglesRequest; do
+            echo "===== $C =====" >> /tmp/lm.txt
+            awk -v c="$C" 'FNR==1{f=0}
+                           !f && $0 ~ "@interface " c " |@implementation " c " " {f=1}
+                           f {print}
+                           f && /^@end/ {f=0}' "$HDR"/*.h >> /tmp/lm.txt 2>/dev/null
+            echo "===== $C (class 前向声明) =====" >> /tmp/lm.txt
+            grep -hn "@interface $C" "$HDR"/*.h >> /tmp/lm.txt 2>/dev/null
+          done
+          echo "===== 所有 VNFaceLandmarkRegion2D 后面跟的名字 =====" >> /tmp/lm.txt
+          grep -rh "VNFaceLandmarkRegion2D" "$HDR"/*.h 2>/dev/null \
+            | sed -E 's/.*VNFaceLandmarkRegion2D[^A-Za-z_]*([A-Za-z_][A-Za-z0-9_]*).*/\1/' \
+            | sort -u | tr '\n' ' ' >> /tmp/lm.txt
+          echo "" >> /tmp/lm.txt
+          echo "===== 含 roll/yaw/pitch/expression/quality 的属性名 =====" >> /tmp/lm.txt
+          grep -rhE "^@property.*(roll|yaw|pitch|expression|Quality)" "$HDR"/*.h 2>/dev/null \
+            | sed -E 's/^@property[^;]*[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)( .*)?;/\1/' \
+            | sort -u | tr '\n' ' ' >> /tmp/lm.txt
+          echo "" >> /tmp/lm.txt
+          echo "===== 请求类 =====" >> /tmp/lm.txt
+          grep -rhoE "VN(Detect|Generate)[A-Za-z0-9_]*Request" "$HDR" 2>/dev/null | sort -u | tr '\n' ' ' >> /tmp/lm.txt
+          echo "" >> /tmp/lm.txt
+          echo "lm.txt bytes=$(wc -c < /tmp/lm.txt) 区块数=$(grep -c '^===== ' /tmp/lm.txt)" | ann "LM-FILE "
+          grep -c "@property" /tmp/lm.txt | awk '{print "抠到 @property 行 " $1 " 条"}' | ann "LM-COUNT "
+          sed -n '/VNFaceLandmarkRegion2D 后面跟的名字/,/^$/p' /tmp/lm.txt | head -3 | ann "RGN "
+          sed -n '/含 roll\/yaw\/pitch/,/^$/p' /tmp/lm.txt | head -3 | ann "OBS "
           exit 0
 
       - name: install xcodegen
@@ -149,8 +171,9 @@ jobs:
           set -uo pipefail
           ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=6{print "::error::" p substr($0,1,230)}'; }
           cp /tmp/build.log ./build.log
+          [ -s /tmp/lm.txt ] && cp /tmp/lm.txt ./lm.txt
           gh release delete channel-test --cleanup-tag -y >/dev/null 2>&1 || true
-          gh release create channel-test hello.ipa build.log \
+          gh release create channel-test hello.ipa build.log $([ -s lm.txt ] && echo lm.txt) \
             --title "HelloLC build" \
             --prerelease \
             --notes "CI artifact for commit $GITHUB_SHA" 2>&1 | ann "REL "

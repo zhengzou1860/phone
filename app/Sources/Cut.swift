@@ -677,7 +677,14 @@ final class Cutter: ObservableObject {
     /// 上一次扫描用的取样步进：导出必须照它切，不能用现在 Picker 上的值（扫完人可能顺手改了步进）
     var scannedStep = 1
 
+    /// 选完那一刻就收 cover：拷文件还在后台跑，主界面显示进度比停在相册里强
+    func pickStarted() {
+        showPicker = false
+        if videoURL == nil { status = "取文件中…" } else { status = "换片中…" }
+    }
+
     func picked(url: URL?, failMessage: String?) {
+        showPicker = false          // 必须自己收场：cover 不会因 PHPicker 选完而消失，不关就整屏卡在选择页
         guard let url = url else {
             status = failMessage ?? "没选到视频"
             return
@@ -963,7 +970,9 @@ struct CutView: View {
             .padding()
         }
         .fullScreenCover(isPresented: $cut.showPicker) {
-            PickerHost(target: .video) { url, msg in cut.picked(url: url, failMessage: msg) }
+            PickerHost(target: .video, onPicked: { cut.pickStarted() }) { url, msg in
+                cut.picked(url: url, failMessage: msg)
+            }
         }
     }
 
