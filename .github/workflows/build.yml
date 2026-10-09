@@ -117,18 +117,21 @@ jobs:
   # 独立 job：苹果的工具链认不认 insightface 的小模型，跟出 IPA 互不影响
   coreml:
     runs-on: macos-latest
-    timeout-minutes: 20
+    timeout-minutes: 35
     steps:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: install coremltools
+      - uses: actions/checkout@v4
+
+      - name: 检查试转脚本在不在
         run: |
           set -uo pipefail
-          ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=6{print "::error::" p substr($0,1,230)}'; }
-          pip install --no-cache-dir coremltools onnx numpy 2>&1 | tail -3 | ann "PIP "
-          python -c "import coremltools as ct; print('coremltools', ct.__version__)" 2>&1 | ann "PIP-VER "
+          ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=4{print "::error::" p substr($0,1,230)}'; }
+          ls -l ci/ | ann "TRY-LS "
+          cp ci/coreml_try.py /tmp/try.py
+          python -c "import ast; ast.parse(open('ci/coreml_try.py').read()); print('试转脚本语法 OK，已放到 /tmp/try.py')" | ann "TRY-CHK "
 
       - name: fetch onnx
         run: |
@@ -142,76 +145,22 @@ jobs:
           ls -la /tmp/sc | ann "UNZ " || true
           test -s /tmp/sc/w600k_mbf.onnx
 
-      - name: convert
+      - name: 逐版本试转 onnx → CoreML
         run: |
-          set +e          # GitHub 的 run 步默认是 bash -eo pipefail，不显式关掉就一步错、后面全不执行
-          ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=8{print "::error::" p substr($0,1,230)}'; }
-          echo "步骤已开始，errexit 已关" | ann "CV0 "
-          python - > /tmp/conv.log 2>&1 <<'PY'
-          import os
-
-          def shapeof(x):
-              return list(x.shape) if hasattr(x, "shape") else "(图像/无固定形)"
-
-          def brief(e):
-              return "%s: %s" % (type(e).__name__, " ".join(str(e).split())[:260])
-
-          def bytesof(path):
-              n = 0
-              if os.path.isdir(path):
-                  for root, _, files in os.walk(path):
-                      for f in files:
-                          n += os.path.getsize(os.path.join(root, f))
-              elif os.path.exists(path):
-                  n = os.path.getsize(path)
-              return " bytes=%d" % n
-
-          try:
-              import coremltools as ct
-              print("CT-VER", ct.__version__)
-          except Exception as e:
-              print("CT-IMPORT-FAIL", brief(e))
-              raise SystemExit(0)
-
-          src = "/tmp/sc/w600k_mbf.onnx"
-          m0 = None
-          try:
-              import onnx
-              m0 = onnx.load(src)
-              print("ONNX-OK nodes=%d ir=%d opset=%s" % (
-                  len(m0.graph.node), m0.ir_version,
-                  ",".join("%s:%s" % (o.domain or "ai.onnx", o.version) for o in m0.opset_import)))
-          except Exception as e:
-              print("ONNX-LOAD-FAIL", brief(e))
-
-          cands = []
-          for name in ("iOS18", "iOS15", "iOS13", "iOS12"):
-              t = getattr(ct.target, name, None)
-              if t is not None:
-                  cands.append((name, t))
-          cands.append(("legacy-nn", None))
-          print("TRY-ORDER", ",".join(n for n, _ in cands))
-          if m0 is None:
-              print("NO-MODEL onnx 没load进来，转换不试了")
-              raise SystemExit(0)
-
-          for label, target in cands:
-              try:
-                  kw = {} if target is None else {"minimum_deployment_target": target}
-                  m = ct.convert(m0, **kw)
-                  out = "/tmp/mbf_%s" % label
-                  m.save(out)
-                  spec = m.get_spec().description
-                  io = " in[" + ",".join("%s%s" % (i.name, shapeof(i)) for i in spec.input) + \
-                       "] out[" + ",".join("%s%s" % (o.name, shapeof(o)) for o in spec.output) + "]"
-                  print("CONVERT-OK %s %s%s" % (label, io, bytesof(out)))
-              except Exception as e:
-                  print("CONVERT-FAIL %s %s" % (label, brief(e)))
-          PY
-          grep -E "^(CT-|ONNX-|TRY-|CONVERT-|NO-MODEL)" /tmp/conv.log | ann "CV "
-          tail -4 /tmp/conv.log | ann "CV-TAIL "
-          grep -q "^CONVERT-OK" /tmp/conv.log || { echo "四个目标全都没转成，这把尺苹果不认" | ann "CV-VERDICT "; exit 1; }
-          echo "转换成功，见 CV 行的 in/out" | ann "CV-VERDICT "
+          set +e          # 本步末位是管道且恒回 0；红绿由下面 VERDICT 行显式下
+          ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=10{print "::error::" p substr($0,1,230)}'; }
+          rm -rf /tmp/venvs /tmp/mbf_* /tmp/ver.log /tmp/pip.log && mkdir -p /tmp/venvs
+          echo "开始逐版本试转" | ann "TRY0 "
+          for V in 9.0 8.0 7.2 6.0 5.2; do
+            python -m venv "/tmp/venvs/$V" >/dev/null 2>&1
+            "/tmp/venvs/$V/bin/pip" install --quiet --no-cache-dir "coremltools==$V" onnx >>/tmp/pip.log 2>&1
+            "/tmp/venvs/$V/bin/python" /tmp/try.py "$V" >>/tmp/ver.log 2>&1
+            echo "$V 跑完" | ann "TRY "
+          done
+          tail -5 /tmp/pip.log | ann "PIPLOG "
+          grep "^SUM " /tmp/ver.log | ann "SUM "
+          grep -q "OK(" /tmp/ver.log || { echo "这 5 个版本没有一个能吃下 w600k_mbf.onnx，逐版本原因见 SUM 行" | ann "VERDICT "; exit 1; }
+          echo "至少一个版本转成了，产物在 /tmp/mbf_*" | ann "VERDICT "
 
       - name: keep artifact
         if: always()
