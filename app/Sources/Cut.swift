@@ -130,6 +130,10 @@ final class Ruler {
     private var model: MLModel?
     private var inputName = ""
     private var outputName = ""
+    private var inputDims: [NSNumber] = []
+    private var inputIsImage = false
+    var failures = 0
+    var lastError = ""
     var note = "还没加载"
 
     func load() -> Bool {
@@ -145,15 +149,23 @@ final class Ruler {
             let t0 = DispatchTime.now().uptimeNanoseconds
             let m = try MLModel(contentsOf: url, configuration: cfg)
             let ms = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000
-            guard let name = m.modelDescription.inputDescriptionsByName.keys.first,
-                  let out = m.modelDescription.outputDescriptionsByName.keys.first else {
+            let md = m.modelDescription
+            guard let name = md.inputDescriptionsByName.keys.first,
+                  let desc = md.inputDescriptionsByName[name],
+                  let out = md.outputDescriptionsByName.keys.first else {
                 note = "模型没有输入/输出描述"
                 return false
+            }
+            inputIsImage = (desc.type == .image)
+            if let c = desc.multiArrayConstraint {
+                inputDims = c.shape.map { NSNumber(value: max(1, $0.intValue)) }
             }
             model = m
             inputName = name
             outputName = out
+            let dims = inputDims.map { $0.intValue }
             note = "加载 \(String(format: "%.0f", ms)) ms（\(loc.note)）"
+                + "\n输入 \(name) \(inputIsImage ? "图像" : "多数组") dims=\(dims)｜输出 \(out)"
             Journal.line("尺子 \(note)")
             return true
         } catch {
@@ -168,30 +180,61 @@ final class Ruler {
         model = nil
         inputName = ""
         outputName = ""
+        inputDims = []
         Journal.line("尺子 已释放 足迹\(Facts.footprintMB())MB")
     }
 
-    /// 3*112*112 归一化张量 → 512 维向量
+    /// 3*112*112 归一化张量 → 向量。任何一次失败都记进 failures + lastError，
+    /// 因为"尺子根本没跑起来"在报告里长得和"这片子里没有那个人"一模一样。
     func embed(_ rgb: [Float]) -> [Float]? {
-        guard rgb.count == 3 * Align.side * Align.side, load() else { return nil }
-        guard let model = model else { return nil }
+        func bail(_ why: String) -> [Float]? {
+            failures += 1
+            lastError = why
+            return nil
+        }
+        guard load() else { return bail(note) }
+        guard let model = model else { return bail("模型句柄没了") }
+        guard !inputIsImage else { return bail("这个 CoreML 模型要的是图像输入，不是多数组") }
+        let need = 3 * Align.side * Align.side
+        guard rgb.count == need else { return bail("送进来的张量 \(rgb.count) 个数，应为 \(need)") }
+        let dims = inputDims.isEmpty ? ([1, 3, Align.side, Align.side] as [Int]) : inputDims.map { $0.intValue }
+        guard dims.reduce(1, *) == need else {
+            return bail("模型声明的输入形状 \(dims) 乘出来是 \(dims.reduce(1, *))，和 \(need) 不等")
+        }
         let arr: MLMultiArray
         do {
-            arr = try MLMultiArray(shape: [1, 3, Align.side, Align.side].map { NSNumber(value: $0) },
-                                   dataType: .float32)
-        } catch { return nil }
+            arr = try MLMultiArray(shape: dims.map { NSNumber(value: $0) }, dataType: .float32)
+        } catch { return bail("造 MLMultiArray \(dims) 失败: \(error)") }
         let p = arr.dataPointer.assumingMemoryBound(to: Float32.self)
-        for i in 0..<rgb.count { p[i] = Float32(rgb[i]) }
-        guard let provider = try? MLDictionaryFeatureProvider(
-            dictionary: [inputName: MLFeatureValue(multiArray: arr)]),
-              let res = try? model.prediction(from: provider),
-              let v = res.featureValue(for: outputName),
-              let out = v.multiArrayValue else { return nil }
-        let n = out.count
-        guard n > 0 else { return nil }
-        let q = out.dataPointer.assumingMemoryBound(to: Float32.self)
-        var vec = [Float](repeating: 0, count: n)
-        for i in 0..<n { vec[i] = q[i] }
+        for i in 0..<need { p[i] = rgb[i] }
+        let provider: MLFeatureProvider
+        do {
+            provider = try MLDictionaryFeatureProvider(dictionary: [inputName: MLFeatureValue(multiArray: arr)])
+        } catch { return bail("装输入字典失败: \(error)") }
+        let res: MLPrediction
+        do {
+            res = try model.prediction(from: provider)
+        } catch { return bail("predict 失败: \(error)") }
+        guard let v = res.featureValue(for: outputName), let out = v.multiArrayValue, out.count > 0 else {
+            return bail("输出里没有多数数组（\(outputName)）")
+        }
+        // 按模型自己声明的元素类型读：输出是 float16 时拿 Float32 指针读会静默得到一堆垃圾，
+        // 而"垃圾向量"在报告里和"这片子里没有那个人"长得一模一样。
+        // 这三条指针写法就是 0.6 那版在真机上跑通的 ModelBench.makeInputs 里的同一套。
+        var vec = [Float](repeating: 0, count: out.count)
+        switch out.dataType {
+        case .float32:
+            let q = out.dataPointer.assumingMemoryBound(to: Float32.self)
+            for i in 0..<out.count { vec[i] = q[i] }
+        case .float16:
+            let q = out.dataPointer.assumingMemoryBound(to: Float16.self)
+            for i in 0..<out.count { vec[i] = Float(q[i]) }
+        case .double:
+            let q = out.dataPointer.assumingMemoryBound(to: Double.self)
+            for i in 0..<out.count { vec[i] = Float(q[i]) }
+        default:
+            return bail("输出元素类型 \(out.dataType.rawValue) 我还不会读（维数 \(out.count)）")
+        }
         return vec
     }
 }
@@ -248,6 +291,7 @@ final class StopFlag {
 
 struct ScanOutcome {
     var text = ""
+    var keep: [Bool] = []
     var segments: [Segment] = []
     var samples = 0
     var framesWithFace = 0
@@ -309,21 +353,27 @@ enum CutEngine {
         }
     }
 
-    /// 静帧里第 index 张脸 → 锚点向量。返回向量＋这张脸在源片坐标下的短边 px。
+    /// 静帧里第 index 张脸 → 锚点向量。返回向量＋这张脸在源片坐标下的短边 px＋失败原因。
     static func anchorFrom(image: CGImage, face: VNFaceObservation,
-                           sideScale: Double) -> ([Float]?, Double) {
+                           sideScale: Double) -> ([Float]?, Double, String) {
         let shortSide = min(face.boundingBox.width * CGFloat(image.width),
                             face.boundingBox.height * CGFloat(image.height)) * sideScale
         let box = Align.pixelBox(face.boundingBox, image.width, image.height)
         let kp = Align.keypoints(from: box)
         var vec: [Float]? = nil
+        var why = "这张静帧的像素锁不上"
         _ = withPixels(image) { base, bpr in
             guard let crop = Align.cropBGRA(base, bytesPerRow: bpr, w: image.width,
-                                            h: image.height, keypoints: kp) else { return false }
+                                            h: image.height, keypoints: kp) else {
+                why = "裁不出 112×112（脸框 \(Int(box.width))x\(Int(box.height)) px 出界或变换退化）"
+                return false
+            }
+            why = ""
             vec = Ruler.shared.embed(crop)
             return true
         }
-        return (vec, shortSide)
+        if vec == nil && why.isEmpty { why = Ruler.shared.lastError }
+        return (vec, shortSide, why)
     }
 
     /// 整片扫描：每帧检测一次，只有脸短边（折算回源像素）达标的才裁脸跑尺子。
@@ -339,7 +389,7 @@ enum CutEngine {
             return o
         }
         let natural = track.naturalSize
-        let fps = max(track.nominalFrameRate, 1)
+        let fps = Double(max(track.nominalFrameRate, 1))
         let duration = CMTimeGetSeconds(asset.duration)
         let totalFrames = max(1, Int((duration * fps).rounded()))
         let longNatural = max(Int(natural.width), Int(natural.height))
@@ -375,7 +425,7 @@ enum CutEngine {
         o.keep = Array(repeating: false, count: nSamples)
         var frameIndex = 0
         var sample = 0
-        var detectSum = 0.0, embedSum = 0.0, embedRuns = 0
+        var detectSum = 0.0, embedSum = 0.0, embedRuns = 0, cropFails = 0
         let mem0 = Facts.footprintMB()
         o.memMax = mem0
         var stopNote = ""
@@ -412,7 +462,7 @@ enum CutEngine {
                             o.gated += 1
                             let box = Align.pixelBox(f.boundingBox, w, h)
                             guard let crop = Align.cropBGRA(base, bytesPerRow: bpr, w: w, h: h,
-                                                            keypoints: Align.keypoints(from: box)) else { continue }
+                                                            keypoints: Align.keypoints(from: box)) else { cropFails += 1; continue }
                             let e0 = DispatchTime.now().uptimeNanoseconds
                             guard let v = Ruler.shared.embed(crop) else { continue }
                             embedSum += Double(DispatchTime.now().uptimeNanoseconds - e0) / 1_000_000
@@ -452,7 +502,7 @@ enum CutEngine {
         let wall = Double(DispatchTime.now().uptimeNanoseconds - wall0) / 1_000_000_000
         let pct = o.samples > 0 ? Double(o.hits) / Double(o.samples) * 100 : 0
         var line = "扫 \(o.samples) 取样帧（step=\(step)，源 \(totalFrames) 帧 / \(String(format: "%.1f", duration)) s，直出长边 \(decodedLong)→源折算 ×\(String(format: "%.2f", sideScale))）"
-        line += "\n有脸的帧 \(o.framesWithFace)/\(o.samples)；≥\(String(format: "%.0f", sideTh)) px 的脸 \(o.gated) 张"
+        line += "\n有脸的帧 \(o.framesWithFace)/\(o.samples)；≥\(String(format: "%.0f", sideTh)) px 的脸 \(o.gated) 张；裁脸失败 \(cropFails) 张"
         line += "\n**命中 \(o.hits)/\(o.samples) 帧（\(String(format: "%.0f", pct))%）→ \(o.segments.count) 段，合计 \(String(format: "%.1f", total)) s**"
         if let med = median(o.bigSims), let mx = o.bigSims.max() {
             line += "\n  过闸脸对锚点的余弦 中位 \(String(format: "%.3f", med)) 最高 \(String(format: "%.3f", mx))（闸门 \(String(format: "%.2f", cosTh))）"
@@ -460,6 +510,9 @@ enum CutEngine {
             line += "\n  没有任何 ≥\(String(format: "%.0f", sideTh)) px 的脸可判——锚点这闸一张都没过"
         }
         line += "\n单价：检测 \(String(format: "%.1f", o.detectMs)) ms/帧 + 尺子 \(String(format: "%.1f", o.embedMs)) ms/次；本次实耗 \(String(format: "%.1f", wall)) s"
+        if Ruler.shared.failures > 0 {
+            line += "\n**尺子失败 \(Ruler.shared.failures) 次**，最后一次：\(Ruler.shared.lastError)\n  \(Ruler.shared.note)"
+        }
         line += "\n足迹 \(mem0)→\(Facts.footprintMB()) MB，峰值 \(o.memMax) MB"
         if !stopNote.isEmpty { line += "\n半趟收兵：\(stopNote)（只扫到第 \(sample) 帧）" }
         o.text = line
@@ -482,7 +535,7 @@ enum CutEngine {
 
 enum CutExport {
 
-    static func compose(url: URL, segments: [Segment], preset: String) -> (URL?, String) {
+    static func compose(url: URL, segments: [Segment], step: Int, preset: String) -> (URL?, String) {
         let source = AVURLAsset(url: url)
         let sem = DispatchSemaphore(value: 0)
         source.loadValuesAsynchronously(forKeys: ["tracks", "duration"]) { sem.signal() }
@@ -501,25 +554,27 @@ enum CutExport {
             dstAudio = comp.addMutableTrack(withMediaType: .audio,
                                             preferredTrackID: kCMPersistentTrackID_Invalid)
         }
-        // 取样号→秒：秒 = 号 × step / fps，别把 step 除到分母外面（PC 那侧就错过一次，段表长差 step 倍）
-        let fps = max(srcVideo.nominalFrameRate, 1)
+        // 秒只从 Segment.seconds 这一处出：它才是"取样号→源秒"的唯一定义（号 × step / fps）。
+        // 之前这里自己按号/fps 算了一遍，step=1 时恰好对，隔帧扫就会把段插到错位置。
+        let fps = Double(max(srcVideo.nominalFrameRate, 1))
+        func t(_ seconds: Double) -> CMTime {
+            CMTime(value: CMTimeValue((seconds * 1000).rounded()), timescale: 1000)
+        }
         var cursor = CMTime.zero
         var appended = 0
         var failed = ""
         for s in segments {
-            let dur = CMTime(value: CMTimeValue(s.endSample - s.startSample + 1),
-                             timescale: CMTimeScale(fps * 100))
-            let start = CMTime(value: CMTimeValue(s.startSample), timescale: CMTimeScale(fps * 100))
-            let range = CMTimeRange(start: start, duration: dur)
+            let sec = s.seconds(fps: fps, step: step)
+            let range = CMTimeRange(start: t(sec.start), end: t(sec.end))
             do {
                 try dstVideo.insertTimeRange(range, of: srcVideo, at: cursor)
                 if let dstAudio = dstAudio, let srcAudio = srcAudio {
                     try? dstAudio.insertTimeRange(range, of: srcAudio, at: cursor)
                 }
-                cursor = CMTimeAdd(cursor, dur)
+                cursor = CMTimeAdd(cursor, t(sec.length))
                 appended += 1
             } catch {
-                failed = "第 \(appended + 1) 段插入失败: \(error)"
+                failed = "第 \(appended + 1) 段（\(String(format: "%.1f", sec.start))~\(String(format: "%.1f", sec.end)) s）插入失败: \(error)"
                 break
             }
         }
@@ -610,6 +665,8 @@ final class Cutter: ObservableObject {
 
     var asset: AVURLAsset?
     let stop = StopFlag()
+    /// 上一次扫描用的取样步进：导出必须照它切，不能用现在 Picker 上的值（扫完人可能顺手改了步进）
+    var scannedStep = 1
 
     func picked(url: URL?, failMessage: String?) {
         guard let url = url else {
@@ -639,7 +696,7 @@ final class Cutter: ObservableObject {
                 let r = t.preferredTransform
                 let rotated = abs(r.b) > 0.1 || abs(r.c) > 0.1
                 shown = rotated ? CGSize(width: nat.height, height: nat.width) : nat
-                f = max(t.nominalFrameRate, 1)
+                f = Double(max(t.nominalFrameRate, 1))
                 d = CMTimeGetSeconds(a.duration)
                 text = "显示 \(Int(shown.width))x\(Int(shown.height))｜\(String(format: "%.1f", d)) s @ \(String(format: "%.1f", f)) fps｜源 \(Int(nat.width))x\(Int(nat.height)) 旋转\(rotated ? "有" : "无")"
             }
@@ -703,9 +760,9 @@ final class Cutter: ObservableObject {
             var text = "取不到这一帧"
             var vec: [Float]? = nil
             if let img = img {
-                let (v, side) = CutEngine.anchorFrom(image: img, face: face, sideScale: scale)
+                let (v, side, why) = CutEngine.anchorFrom(image: img, face: face, sideScale: scale)
                 vec = v
-                text = v == nil ? "这张脸算不出向量"
+                text = v == nil ? "这张脸算不出向量：\(why)"
                     : "锚点存下（这张脸源片短边 \(String(format: "%.0f", side)) px）"
             }
             Task { @MainActor in
@@ -740,6 +797,7 @@ final class Cutter: ObservableObject {
         exportNote = ""
         PressureWatch.reset()
         let st = step, scth = sideTh
+        scannedStep = st
         status = "整片扫描中…（step=\(st)）"
         Journal.line("剪辑 扫描 开始 \(url.lastPathComponent) step=\(st) 闸0.30/\(scth) 足迹\(Facts.footprintMB())MB")
         let flag = stop
@@ -772,8 +830,9 @@ final class Cutter: ObservableObject {
         busy = true
         exportNote = "拼接导出中…"
         let segs = segments
+        let st = scannedStep
         Task.detached { [weak self] in
-            let (file, text) = CutExport.compose(url: url, segments: segs,
+            let (file, text) = CutExport.compose(url: url, segments: segs, step: st,
                                                  preset: AVAssetExportPresetHighestQuality)
             let photo = file == nil ? "" : CutExport.toPhotos(file!)
             Task { @MainActor in
@@ -876,7 +935,7 @@ struct CutView: View {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("段表（导出按这个拼）").font(.footnote)
                         ForEach(Array(cut.segments.enumerated()), id: \.offset) { _, s in
-                            let t = s.seconds(fps: cut.fps, step: cut.step)
+                            let t = s.seconds(fps: cut.fps, step: cut.scannedStep)
                             Text(String(format: "  %.2f - %.2f s（%.2f s）", t.start, t.end, t.length))
                                 .font(.system(size: 10, design: .monospaced))
                         }

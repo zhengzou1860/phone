@@ -76,9 +76,13 @@ jobs:
           HDR="$SDK/System/Library/Frameworks/Vision.framework/Headers"
           echo "hdr=$([ -d "$HDR" ] && echo 在 || echo 不在)" | ann "LM-HDR "
           grep -rhoE "@interface VNFace(Landmark|Observation)[A-Za-z0-9_]*" "$HDR" 2>/dev/null | sort -u | ann "LM-CLASS "
-          grep -rhE "^@property.*(andEye|Ear|Nose|Lip|Mouth|Chin|Contour|faceLandmarks)" "$HDR" 2>/dev/null \
-            | sed -E 's/^@property[^)]*\)[[:space:]]*//' | tr -d ';' | sort -u | ann "LM-PROP "
-          grep -rhoE "VNFaceLandmarkRegion[A-Za-z0-9_]*" "$HDR" 2>/dev/null | sort -u | ann "LM-REGION "
+          awk '/@interface VNFaceLandmarks2D/,/@end/' "$HDR"/*.h 2>/dev/null \
+            | grep -E "^@property|^/" | sed -E 's/^@property[^)]*\)[[:space:]]*//' | ann "L2D "
+          awk '/@interface VNFaceLandmarkRegion2D/,/@end/' "$HDR"/*.h 2>/dev/null \
+            | grep -E "^@property" | sed -E 's/^@property[^)]*\)[[:space:]]*//' | ann "RGN "
+          awk '/@interface VNFaceObservation/,/@end/' "$HDR"/*.h 2>/dev/null \
+            | grep -E "^@property" | sed -E 's/^@property[^)]*\)[[:space:]]*//' | grep -iE "landmark|roll|yaw|pitch|expression" | ann "OBS "
+          grep -rhoE "VNDetectFace[A-Za-z0-9_]*Request" "$HDR" 2>/dev/null | sort -u | ann "LM-REQ "
           exit 0
 
       - name: install xcodegen
