@@ -111,6 +111,15 @@ enum Align {
     }
 }
 
+/// 向量的体检项。喂错口径（通道序/归一化/内存布局）时模型照样回一个合法形状的向量，
+/// 屏幕上看不出任何毛病——唯一露馅的地方是它的模长和逐维量级。
+/// PC 上同一把尺子（w600k_mbf）的真实锚点模长实测 10.9~24.9，对不上就是前处理错了。
+func vecFingerprint(_ v: [Float]) -> String {
+    let n = v.reduce(0.0) { $0 + Double($1) * Double($1) }.squareRoot()
+    let head = v.prefix(3).map { String(format: "%.2f", $0) }.joined(separator: " ")
+    return "模长 \(String(format: "%.1f", n))｜维数 \(v.count)｜前 3 维 [\(head)]"
+}
+
 func cosine(_ a: [Float], _ b: [Float]) -> Double {
     guard a.count == b.count, !a.isEmpty else { return -9 }
     var dot = 0.0, na = 0.0, nb = 0.0
@@ -763,7 +772,7 @@ final class Cutter: ObservableObject {
                 let (v, side, why) = CutEngine.anchorFrom(image: img, face: face, sideScale: scale)
                 vec = v
                 text = v == nil ? "这张脸算不出向量：\(why)"
-                    : "锚点存下（这张脸源片短边 \(String(format: "%.0f", side)) px）"
+                    : "锚点存下（这张脸源片短边 \(String(format: "%.0f", side)) px）｜\(vecFingerprint(v!))"
             }
             Task { @MainActor in
                 guard let self = self else { return }
