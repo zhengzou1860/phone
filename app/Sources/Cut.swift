@@ -770,16 +770,20 @@ final class Cutter: ObservableObject {
         status = "裁这一张脸…"
         let face = faces[index]
         let at = seconds
-        let scale = sourceScale()
+        let th = sideTh
         Task.detached { [weak self] in
             let (img, _) = CutEngine.frameImage(asset: a, at: at)
             var text = "取不到这一帧"
             var vec: [Float]? = nil
             if let img = img {
-                let (v, side, why) = CutEngine.anchorFrom(image: img, face: face, sideScale: scale)
+                // frameImage 是直出全分辨率（不像扫描那趟会被压到 1920），所以换算系数是 1
+                let (v, side, why) = CutEngine.anchorFrom(image: img, face: face, sideScale: 1)
                 vec = v
                 text = v == nil ? "这张脸算不出向量：\(why)"
                     : "锚点存下（这张脸源片短边 \(String(format: "%.0f", side)) px）｜\(vecFingerprint(v!))"
+                if v != nil && side < th {
+                    text += "\n⚠️ 这张脸比下限 \(String(format: "%.0f", th)) px 还小：拿它当锚点，整片很可能一帧都判不过（＝输出 0 段）。停到脸大一点的帧再点。"
+                }
             }
             Task { @MainActor in
                 guard let self = self else { return }
@@ -790,15 +794,6 @@ final class Cutter: ObservableObject {
                 Journal.line("剪辑 锚点 \(text)")
             }
         }
-    }
-
-    /// 脸尺寸要按源片 naturalSize 量：直出封顶 1920，4K 就得折回去
-    func sourceScale() -> Double {
-        let nat = asset?.tracks(withMediaType: .video).first?.naturalSize ?? .zero
-        let longNatural = max(Int(nat.width), Int(nat.height))
-        guard longNatural > 0 else { return 1 }
-        let decoded = longNatural > 1920 ? 1920 : longNatural
-        return Double(longNatural) / Double(decoded)
     }
 
     func scan() {
