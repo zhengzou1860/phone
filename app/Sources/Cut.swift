@@ -65,7 +65,8 @@ enum Align {
         return (a, b, mdx - (a * msx - b * msy), mdy - (b * msx + a * msy))
     }
 
-    /// BGRA 像素 → 3*112*112 的 RGB 归一化张量（(v-127.5)/128，与 PC 那侧同口径）
+    /// BGRA 像素 → 3*112*112 的 RGB 归一化张量。(v-127.5)/127.5 是 insightface
+    /// arcface_onnx.get_feat 里 blobFromImages(mean=127.5, scale=1/127.5, swapRB=True) 的口径，逐字抄它。
     static func cropBGRA(_ base: UnsafeRawPointer, bytesPerRow: Int,
                          w: Int, h: Int, keypoints kp: [CGPoint]) -> [Float]? {
         guard kp.count == 5, let t = fit(src: kp, dst: template),
@@ -104,7 +105,7 @@ enum Align {
             let v = (ch(c, x0, y0) + (ch(c, x1, y0) - ch(c, x0, y0)) * dx)
                 + ((ch(c, x0, y1) + (ch(c, x1, y1) - ch(c, x0, y1)) * dx)
                    - (ch(c, x0, y0) + (ch(c, x1, y0) - ch(c, x0, y0)) * dx)) * dy
-            res.append((v - 127.5) / 128.0)
+            res.append((v - 127.5) / 127.5)
         }
         return (res[0], res[1], res[2])
     }
@@ -211,31 +212,30 @@ final class Ruler {
         do {
             provider = try MLDictionaryFeatureProvider(dictionary: [inputName: MLFeatureValue(multiArray: arr)])
         } catch { return bail("装输入字典失败: \(error)") }
-        let res: MLPrediction
         do {
-            res = try model.prediction(from: provider)
+            let res = try model.prediction(from: provider)
+            guard let v = res.featureValue(for: outputName), let out = v.multiArrayValue, out.count > 0 else {
+                return bail("输出里没有多数数组（\(outputName)）")
+            }
+            // 按模型自己声明的元素类型读：输出是 float16 时拿 Float32 指针读会静默得到一堆垃圾，
+            // 而"垃圾向量"在报告里和"这片子里没有那个人"长得一模一样。
+            // 这三条指针写法就是 0.6 那版在真机上跑通的 ModelBench.makeInputs 里的同一套。
+            var vec = [Float](repeating: 0, count: out.count)
+            switch out.dataType {
+            case .float32:
+                let q = out.dataPointer.assumingMemoryBound(to: Float32.self)
+                for i in 0..<out.count { vec[i] = q[i] }
+            case .float16:
+                let q = out.dataPointer.assumingMemoryBound(to: Float16.self)
+                for i in 0..<out.count { vec[i] = Float(q[i]) }
+            case .double:
+                let q = out.dataPointer.assumingMemoryBound(to: Double.self)
+                for i in 0..<out.count { vec[i] = Float(q[i]) }
+            default:
+                return bail("输出元素类型 \(out.dataType.rawValue) 我还不会读（维数 \(out.count)）")
+            }
+            return vec
         } catch { return bail("predict 失败: \(error)") }
-        guard let v = res.featureValue(for: outputName), let out = v.multiArrayValue, out.count > 0 else {
-            return bail("输出里没有多数数组（\(outputName)）")
-        }
-        // 按模型自己声明的元素类型读：输出是 float16 时拿 Float32 指针读会静默得到一堆垃圾，
-        // 而"垃圾向量"在报告里和"这片子里没有那个人"长得一模一样。
-        // 这三条指针写法就是 0.6 那版在真机上跑通的 ModelBench.makeInputs 里的同一套。
-        var vec = [Float](repeating: 0, count: out.count)
-        switch out.dataType {
-        case .float32:
-            let q = out.dataPointer.assumingMemoryBound(to: Float32.self)
-            for i in 0..<out.count { vec[i] = q[i] }
-        case .float16:
-            let q = out.dataPointer.assumingMemoryBound(to: Float16.self)
-            for i in 0..<out.count { vec[i] = Float(q[i]) }
-        case .double:
-            let q = out.dataPointer.assumingMemoryBound(to: Double.self)
-            for i in 0..<out.count { vec[i] = Float(q[i]) }
-        default:
-            return bail("输出元素类型 \(out.dataType.rawValue) 我还不会读（维数 \(out.count)）")
-        }
-        return vec
     }
 }
 
