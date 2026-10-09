@@ -2,13 +2,13 @@ name: HelloLC
 options:
   createIntermediateGroups: true
   deploymentTarget:
-    iOS: "16.0"
+    iOS: "18.0"
 settings:
   base:
     CODE_SIGNING_ALLOWED: "NO"
     CODE_SIGNING_REQUIRED: "NO"
     CODE_SIGN_IDENTITY: ""
-    IPHONEOS_DEPLOYMENT_TARGET: "16.0"
+    IPHONEOS_DEPLOYMENT_TARGET: "18.0"
 targets:
   HelloLC:
     type: application
@@ -23,8 +23,8 @@ targets:
         CFBundleExecutable: HelloLC
         CFBundleIdentifier: com.qoder.hellolc
         CFBundlePackageType: APPL
-        CFBundleShortVersionString: "0.4"
-        CFBundleVersion: "4"
+        CFBundleShortVersionString: "0.5"
+        CFBundleVersion: "5"
         CFBundleInfoDictionaryVersion: "6.0"
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true

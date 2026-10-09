@@ -6,6 +6,7 @@ import AVFoundation
 import CoreMedia
 import CoreVideo
 import Vision
+import CoreML
 import PhotosUI
 
 @main
@@ -39,6 +40,7 @@ struct ContentView: View {
                 }
                 HStack(spacing: 10) {
                     Button("选视频跑基准") { bench.showVideoPicker = true }
+                    Button("尺子自检") { bench.startModel() }
                     Button("发到电脑") { bench.sendReport() }
                 }
                 .buttonStyle(.borderedProminent)
@@ -106,6 +108,15 @@ final class Bench: ObservableObject {
         status = "照片正对照中…"
         Task.detached { [weak self] in
             let report = Runner.photoControl(url: url)
+            await MainActor.run { self?.finish(report) }
+        }
+    }
+
+    func startModel() {
+        busy = true
+        status = "尺子自检中…（加载 + 200 次 predict）"
+        Task.detached { [weak self] in
+            let report = ModelBench.probe(runs: 200)
             await MainActor.run { self?.finish(report) }
         }
     }
@@ -212,6 +223,7 @@ enum Facts {
             "Vision     \(NSClassFromString("VNDetectFaceRectanglesRequest") != nil ? "可用" : "缺失")",
             "AVFoundation \(NSClassFromString("AVAssetReader") != nil ? "可用" : "缺失")",
             "PhotosUI   \(NSClassFromString("PHPickerViewController") != nil ? "可用" : "缺失")",
+            "包内尺子   \(modelNote())",
             "身份尺候选 VNGenerateIdentityFeaturePrint=\(cls("VNGenerateIdentityFeaturePrintRequest")) "
                 + "VNFeaturePrintObs=\(cls("VNFeaturePrintObservation"))",
             "替身 API   ImageFeaturePrint=\(cls("VNGenerateImageFeaturePrintRequest")) "
@@ -219,6 +231,17 @@ enum Facts {
             "分割 API   PersonSegmentation=\(cls("VNGeneratePersonSegmentationRequest")) "
                 + "FaceLandmarks=\(cls("VNDetectFaceLandmarksRequest"))"
         ]
+    }
+
+    /// 只认包里有哪个文件，绝不在主线程调 locate()——那可能触发一次现场编译。
+    static func modelNote() -> String {
+        if Bundle.main.url(forResource: "mbf", withExtension: "mlmodelc") != nil {
+            return "mbf.mlmodelc 在包里"
+        }
+        if Bundle.main.url(forResource: "mbf", withExtension: "mlpackage") != nil {
+            return "mbf.mlpackage 在包里（点自检时才现场编译）"
+        }
+        return "包里没有模型：CI 那轮 onnx→CoreML 没成"
     }
 
     static func cls(_ name: String) -> String {
@@ -662,3 +685,156 @@ enum Runner {
         return ctx.makeImage()
     }
 }
+
+/// 包里的身份尺（CI 用 onnx2coreml 现转的 mbf）能不能在 A13 上加载、每个 compute unit
+/// 谁接、一次多少钱。这是"系统不认这个模型"这句话唯一的判据——PC 上转得再顺，
+/// 加载不了就是零。
+enum ModelBench {
+
+    static var seed: UInt64 = 0x9E3_779B9_7F4A_7C15
+
+    static func rand01() -> Double {
+        seed ^= seed << 13
+        seed ^= seed >> 7
+        seed ^= seed << 17
+        return Double(seed % 100_000) / 100_000.0
+    }
+
+    static var cachedModel: (url: URL?, note: String)?
+
+    static func locate() -> (url: URL?, note: String) {
+        if let c = cachedModel { return c }
+        let found: (url: URL?, note: String)
+        if let u = Bundle.main.url(forResource: "mbf", withExtension: "mlmodelc") {
+            found = (u, "包里带的是已编译 mlmodelc")
+        } else if let u = Bundle.main.url(forResource: "mbf", withExtension: "mlpackage") {
+            do {
+                found = (try MLModel.compile(at: u), "包里是 mlpackage，现场编译成功")
+            } catch {
+                found = (nil, "mlpackage 现场编译失败: \(error)")
+            }
+        } else {
+            found = (nil, "包里没有 mbf.mlmodelc 也没有 mbf.mlpackage")
+        }
+        cachedModel = found
+        return found
+    }
+
+    /// 按模型自己声明的输入形状造数据：浮点多数组就喂 [-1,1]（对应 (像素-127.5)/128），
+    /// 图像输入就喂随机 BGRA。造好几份轮换着用，同一份输入反复 predict 会命中缓存。
+    static func makeInputs(_ model: MLModel, count: Int) -> (list: [MLFeatureProvider], note: String) {
+        let md = model.modelDescription
+        guard let name = md.inputDescriptionsByName.keys.first,
+              let desc = md.inputDescriptionsByName[name] else {
+            return ([], "模型没有输入描述")
+        }
+        var list: [MLFeatureProvider] = []
+        if desc.type == .multiArray, let c = desc.multiArrayConstraint {
+            let dims = (c.dimensions ?? [NSNumber(value: 1)]).map { max(1, $0.intValue) }
+            let total = dims.reduce(1, *)
+            for _ in 0..<count {
+                let arr = MLMultiArray(dataType: c.dataType, dimensions: dims.map { NSNumber(value: $0) })
+                let p = arr.dataPointer.assumingMemoryBound(to: Float32.self)
+                for i in 0..<total { p[i] = Float32(rand01() * 2 - 1) }
+                if let f = MLDictionaryFeatureProvider(dictionary: [name: MLFeatureValue(multiArray: arr)]) {
+                    list.append(f)
+                }
+            }
+            return (list, "输入 \(name) multiArray dims=\(dims) 类型 \(c.dataType.rawValue)")
+        }
+        if desc.type == .image, let ic = desc.imageConstraint {
+            let w = max(16, ic.pixelsWide?.intValue ?? 112)
+            let h = max(16, ic.pixelsHigh?.intValue ?? 112)
+            let attrs: [String: Any] = [kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any]]
+            for _ in 0..<count {
+                var pb: CVPixelBuffer?
+                if CVPixelBufferCreate(kCFAllocatorDefault, w, h, kCVPixelFormatType_32BGRA,
+                                       attrs as CFDictionary, &pb) != noErr, pb == nil {
+                    return ([], "造 pixel buffer 失败 \(w)x\(h)")
+                }
+                guard let buf = pb else { continue }
+                CVPixelBufferLockBaseAddress(buf, [])
+                if let base = CVPixelBufferGetBaseAddress(buf) {
+                    let bytes = CVPixelBufferGetDataSize(buf)
+                    let p = base.assumingMemoryBound(to: UInt8.self)
+                    for i in 0..<bytes { p[i] = UInt8(rand01() * 255) }
+                }
+                CVPixelBufferUnlockBaseAddress(buf, [])
+                if let f = MLDictionaryFeatureProvider(dictionary: [name: MLFeatureValue(pixelBuffer: buf)]) {
+                    list.append(f)
+                }
+            }
+            return (list, "输入 \(name) image \(w)x\(h)")
+        }
+        return ([], "输入 \(name) 类型 \(desc.type.rawValue) 我还不会喂")
+    }
+
+    static func predict(_ model: MLModel, inputs: [MLFeatureProvider], runs: Int) -> (ms: [Double], note: String) {
+        var times: [Double] = []
+        for i in 0..<runs {
+            let f = inputs[i % inputs.count]
+            let t0 = DispatchTime.now().uptimeNanoseconds
+            do {
+                _ = try model.prediction(from: f)
+            } catch {
+                return (times, "第 \(i) 次 predict 抛错: \(error)")
+            }
+            times.append(Double(DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000)
+        }
+        return (times, "-")
+    }
+
+    static func digest(_ model: MLModel, inputs: [MLFeatureProvider]) -> String {
+        guard let md = model.modelDescription.outputDescriptionsByName.keys.first,
+              let res = try? model.prediction(from: inputs[0]),
+              let v = res.featureValue(for: md), let arr = v.multiArrayValue else {
+            return "输出去哪看：\(model.modelDescription.outputDescriptionsByName.keys.joined(separator: ","))（取不到 multiArray）"
+        }
+        let n = arr.count
+        let p = arr.dataPointer.assumingMemoryBound(to: Float32.self)
+        var sum = 0.0
+        for i in 0..<n { sum += Double(p[i]) * Double(p[i]) }
+        let head = (0..<min(4, n)).map { String(format: "%.4f", p[$0]) }.joined(separator: ", ")
+        return "输出 \(md) 维数 \(n) 模长 \(String(format: "%.2f", sum.squareRoot())) 前4维 [\(head)]"
+    }
+
+    static func probe(runs: Int) -> String {
+        var out: [String] = ["身份尺自检（包里的 mbf，转换器的数值对齐在 CI 只有 43 dB）"]
+        let found = locate()
+        guard let modelURL = found.url else {
+            out.append("  \(found.note)")
+            return out.joined(separator: "\n")
+        }
+        out.append("  \(found.note)")
+        for unit in [("cpuAndNeuralEngine", MLComputeUnits.cpuAndNeuralEngine),
+                     ("cpuAndGPU", MLComputeUnits.cpuAndGPU),
+                     ("all", MLComputeUnits.all),
+                     ("cpuOnly", MLComputeUnits.cpuOnly)] {
+            let cfg = MLModelConfiguration()
+            cfg.computeUnits = unit.1
+            let t0 = DispatchTime.now().uptimeNanoseconds
+            guard let model = try? MLModel(contentsOf: modelURL, configuration: cfg) else {
+                out.append("  \(unit.0): 加载失败")
+                continue
+            }
+            let loadMs = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000
+            let made = makeInputs(model, count: 8)
+            guard !made.list.isEmpty else {
+                out.append("  \(unit.0): 加载成功 \(Runner.ms(loadMs))，但\(made.note)")
+                continue
+            }
+            let warm = predict(model, inputs: made.list, runs: 5)
+            let timed = predict(model, inputs: made.list, runs: runs)
+            out.append("  \(unit.0): 加载 \(Runner.ms(loadMs))｜预热5次 \(Runner.stat(warm.ms))｜正式 \(runs) 次 \(Runner.stat(timed.ms))")
+            if timed.note != "-" { out.append("      \(timed.note)") }
+            if unit.0 == "cpuAndNeuralEngine" || unit.0 == "cpuOnly" {
+                out.append("      \(made.note)")
+                out.append("      \(digest(model, inputs: made.list))")
+            }
+        }
+        out.append("  对照：本机 PC 钉 CPU 单线程 22.48 ms/帧；ANE 若真吃到应当远低于这个数")
+        return out.joined(separator: "\n")
+    }
+
+}
+

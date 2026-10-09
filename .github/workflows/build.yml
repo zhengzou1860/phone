@@ -22,6 +22,37 @@ jobs:
       - name: show toolchain
         run: sw_vers && xcodebuild -version && xcodebuild -showsdks | grep -i ios
 
+      - name: 装 python 3.11（onnx2coreml 要 >=3.11）
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # 尺子（w600k_mbf）转成 CoreML 落到 Sources 里，让 xcodebuild 把它编进包。
+      # 转不出来也照样出包：app 自己的报告会写"包里没有模型"，那才是判据。
+      - name: 把尺子转成 CoreML 塞进包
+        run: |
+          set +e
+          ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=6{print "::error::" p substr($0,1,230)}'; }
+          rm -rf /tmp/m2c /tmp/sc app/Sources/mbf.mlpackage && mkdir -p /tmp/sc
+          python -m venv /tmp/m2c >/dev/null 2>&1
+          /tmp/m2c/bin/pip install --quiet --no-cache-dir onnx2coreml coremltools onnx >/tmp/m2cpip.log 2>&1
+          code=$(curl -fsL --retry 3 --max-time 300 -o /tmp/sc.zip -w "%{http_code}" \
+            https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_sc.zip)
+          echo "onnx 下载 http=$code bytes=$(wc -c < /tmp/sc.zip 2>/dev/null)" | ann "M-GET "
+          unzip -o -q /tmp/sc.zip -d /tmp/sc 2>&1 | ann "M-UNZ "
+          /tmp/m2c/bin/python ci/onnx_fix_shape.py /tmp/sc/w600k_mbf.onnx /tmp/sc/fixed.onnx 2>&1 | ann "M-FIX "
+          /tmp/m2c/bin/onnx2coreml convert /tmp/sc/fixed.onnx -o app/Sources/mbf.mlpackage \
+            --format mlpackage >/tmp/m2c.log 2>&1
+          rc=$?
+          if [ $rc -eq 0 ] && [ -d app/Sources/mbf.mlpackage ]; then
+            echo "模型已进包 app/Sources/mbf.mlpackage $(du -sk app/Sources/mbf.mlpackage 2>/dev/null | awk '{print $1"KB"}')" | ann "M-VERDICT "
+          else
+            echo "模型没进包（gh 退出码 $rc），这一版 IPA 里没有尺子" | ann "M-VERDICT "
+          fi
+          tail -3 /tmp/m2c.log | ann "M2C "
+          ls -R app/Sources | head -12 | ann "M-LS "
+          exit 0
+
       # 纯诊断：身份 API 到底在不在 SDK，不依赖手机端就能判
       - name: probe Vision SDK symbols
         continue-on-error: true
