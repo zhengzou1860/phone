@@ -148,10 +148,23 @@ jobs:
           ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=8{print "::error::" p substr($0,1,230)}'; }
           echo "步骤已开始，errexit 已关" | ann "CV0 "
           python - > /tmp/conv.log 2>&1 <<'PY'
-          import traceback
+          import os
+
+          def shapeof(x):
+              return list(x.shape) if hasattr(x, "shape") else "(图像/无固定形)"
 
           def brief(e):
               return "%s: %s" % (type(e).__name__, " ".join(str(e).split())[:260])
+
+          def bytesof(path):
+              n = 0
+              if os.path.isdir(path):
+                  for root, _, files in os.walk(path):
+                      for f in files:
+                          n += os.path.getsize(os.path.join(root, f))
+              elif os.path.exists(path):
+                  n = os.path.getsize(path)
+              return " bytes=%d" % n
 
           try:
               import coremltools as ct
@@ -161,12 +174,13 @@ jobs:
               raise SystemExit(0)
 
           src = "/tmp/sc/w600k_mbf.onnx"
+          m0 = None
           try:
               import onnx
-              g = onnx.load(src)
+              m0 = onnx.load(src)
               print("ONNX-OK nodes=%d ir=%d opset=%s" % (
-                  len(g.graph.node), g.ir_version,
-                  ",".join("%s:%s" % (o.domain or "ai.onnx", o.version) for o in g.opset_import)))
+                  len(m0.graph.node), m0.ir_version,
+                  ",".join("%s:%s" % (o.domain or "ai.onnx", o.version) for o in m0.opset_import)))
           except Exception as e:
               print("ONNX-LOAD-FAIL", brief(e))
 
@@ -177,28 +191,27 @@ jobs:
                   cands.append((name, t))
           cands.append(("legacy-nn", None))
           print("TRY-ORDER", ",".join(n for n, _ in cands))
+          if m0 is None:
+              print("NO-MODEL onnx 没load进来，转换不试了")
+              raise SystemExit(0)
 
           for label, target in cands:
               try:
                   kw = {} if target is None else {"minimum_deployment_target": target}
-                  m = ct.convert(src, source="onnx", **kw)
+                  m = ct.convert(m0, **kw)
                   out = "/tmp/mbf_%s" % label
                   m.save(out)
                   spec = m.get_spec().description
-                  print("CONVERT-OK %s -> %s" % (label, out))
-                  for i in spec.input:
-                      print("  in", i.name, i.type, list(i.shape) if hasattr(i, "shape") else "")
-                  for o in spec.output:
-                      print("  out", o.name, o.type)
-                  break
+                  io = " in[" + ",".join("%s%s" % (i.name, shapeof(i)) for i in spec.input) + \
+                       "] out[" + ",".join("%s%s" % (o.name, shapeof(o)) for o in spec.output) + "]"
+                  print("CONVERT-OK %s %s%s" % (label, io, bytesof(out)))
               except Exception as e:
                   print("CONVERT-FAIL %s %s" % (label, brief(e)))
-                  traceback.print_exc()
           PY
-          echo "conv.log 字节 $(wc -c < /tmp/conv.log)" | ann "CV1 "
-          grep -E "^(CT-|ONNX-|TRY-|CONVERT-)" /tmp/conv.log | ann "CV2 "
-          tail -6 /tmp/conv.log | ann "CV3 "
-          ls -d /tmp/mbf_* 2>/dev/null | ann "CV4 "
+          grep -E "^(CT-|ONNX-|TRY-|CONVERT-|NO-MODEL)" /tmp/conv.log | ann "CV "
+          tail -4 /tmp/conv.log | ann "CV-TAIL "
+          grep -q "^CONVERT-OK" /tmp/conv.log || { echo "四个目标全都没转成，这把尺苹果不认" | ann "CV-VERDICT "; exit 1; }
+          echo "转换成功，见 CV 行的 in/out" | ann "CV-VERDICT "
 
       - name: keep artifact
         if: always()
