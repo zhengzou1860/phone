@@ -132,11 +132,15 @@ jobs:
 
       - name: fetch onnx
         run: |
-          set -euo pipefail
-          curl -sL -o /tmp/sc.zip https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_sc.zip
+          set -uo pipefail
+          ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=6{print "::error::" p substr($0,1,230)}'; }
+          code=$(curl -fsL --retry 3 --max-time 300 -o /tmp/sc.zip -w "%{http_code}" \
+            https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_sc.zip)
+          { echo "http=$code bytes=$(wc -c < /tmp/sc.zip 2>/dev/null)"; file /tmp/sc.zip; } | ann "GET " || true
           rm -rf /tmp/sc && mkdir -p /tmp/sc
-          unzip -o -q /tmp/sc.zip -d /tmp/sc
-          ls -la /tmp/sc
+          unzip -o -q /tmp/sc.zip -d /tmp/sc 2>&1 | ann "UNZ " || echo "unzip 失败" | ann "UNZ "
+          ls -la /tmp/sc | ann "UNZ " || true
+          test -s /tmp/sc/w600k_mbf.onnx
 
       - name: convert
         run: |
