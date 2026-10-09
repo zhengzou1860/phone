@@ -131,7 +131,8 @@ jobs:
           ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=4{print "::error::" p substr($0,1,230)}'; }
           ls -l ci/ | ann "TRY-LS "
           cp ci/coreml_try.py /tmp/try.py
-          python -c "import ast; ast.parse(open('ci/coreml_try.py').read()); print('试转脚本语法 OK，已放到 /tmp/try.py')" | ann "TRY-CHK "
+          cp ci/onnx_fix_shape.py /tmp/fixshape.py
+          python -c "import ast;[ast.parse(open(f,encoding='utf-8').read()) for f in ('ci/coreml_try.py','ci/onnx_fix_shape.py')];print('两个脚本语法 OK，已放到 /tmp/try.py /tmp/fixshape.py')" | ann "TRY-CHK "
 
       - name: fetch onnx
         run: |
@@ -142,8 +143,12 @@ jobs:
           { echo "http=$code bytes=$(wc -c < /tmp/sc.zip 2>/dev/null)"; file /tmp/sc.zip; } | ann "GET " || true
           rm -rf /tmp/sc && mkdir -p /tmp/sc
           unzip -o -q /tmp/sc.zip -d /tmp/sc 2>&1 | ann "UNZ " || echo "unzip 失败" | ann "UNZ "
-          ls -la /tmp/sc | ann "UNZ " || true
           test -s /tmp/sc/w600k_mbf.onnx
+          # pytorch 1.8 导出的 batch 维是符号 None；转换器要求固定形状
+          pip install --quiet --no-cache-dir onnx >>/tmp/pipfix.log 2>&1
+          python /tmp/fixshape.py /tmp/sc/w600k_mbf.onnx /tmp/sc/w600k_fixed.onnx 2>&1 | ann "FIX "
+          ls -l /tmp/sc/*.onnx | ann "FIX-LS "
+          test -s /tmp/sc/w600k_fixed.onnx
 
       - name: 试 onnx2coreml（MIL 路线 + 数值对齐）
         run: |
@@ -152,8 +157,8 @@ jobs:
           rm -rf /tmp/o2c /tmp/mbf_o2c.mlpackage && mkdir -p /tmp/o2c
           python -m venv /tmp/o2c >/dev/null 2>&1
           /tmp/o2c/bin/pip install --quiet --no-cache-dir onnx2coreml coremltools onnx onnxruntime numpy >>/tmp/o2cpip.log 2>&1
-          /tmp/o2c/bin/onnx2coreml inspect /tmp/sc/w600k_mbf.onnx > /tmp/inspect.log 2>&1
-          /tmp/o2c/bin/onnx2coreml convert /tmp/sc/w600k_mbf.onnx -o /tmp/mbf_o2c.mlpackage \
+          /tmp/o2c/bin/onnx2coreml inspect /tmp/sc/w600k_fixed.onnx > /tmp/inspect.log 2>&1
+          /tmp/o2c/bin/onnx2coreml convert /tmp/sc/w600k_fixed.onnx -o /tmp/mbf_o2c.mlpackage \
             --format mlpackage --verify > /tmp/o2c.log 2>&1
           rc=$?
           if [ $rc -eq 0 ]; then echo "onnx2coreml 转成功且 --verify 数值对齐通过" | ann "O2C-VERDICT "; else echo "onnx2coreml 失败 退出码 $rc" | ann "O2C-VERDICT "; fi
@@ -163,6 +168,7 @@ jobs:
           [ $rc -eq 0 ] || exit 1
 
       - name: 逐版本试转 onnx → CoreML
+        if: always()
         run: |
           set +e          # 一个 step 只留约 10 条 annotation ⇒ 判定行排在明细之前
           ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=5{print "::error::" p substr($0,1,230)}'; }
@@ -183,17 +189,32 @@ jobs:
 
       - name: 把探测日志发到固定 release（无 token 也能读）
         if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set +e
+          ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=6{print "::error::" p substr($0,1,230)}'; }
           gh release delete channel-coreml --cleanup-tag -y >/dev/null 2>&1 || true
           rm -f ./*.log
           for f in /tmp/ver.log /tmp/o2c.log /tmp/inspect.log /tmp/pip.log /tmp/o2cpip.log; do
             [ -s "$f" ] && cp "$f" "./$(basename "$f")"
           done
-          ls -l ./*.log 2>/dev/null
           gh release create channel-coreml ./*.log \
             --title "coreml 探测日志" --prerelease \
-            --notes "逐版本 onnx→CoreML 与 onnx2coreml 数值对齐的完整日志" 2>&1 | tail -2
+            --notes "逐版本 onnx→CoreML 与 onnx2coreml 数值对齐的完整日志" >/tmp/rel.log 2>&1
+          rcrel=$?
+          echo "gh 退出码 $rcrel，待上传日志 $(ls ./*.log 2>/dev/null | wc -l) 个" >>/tmp/rel.log
+          # 发没发出去，只认从匿名接口能不能列出来
+          curl -fsSL -o /tmp/relcheck.json -w "%{http_code}\n" \
+            https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/channel-coreml >>/tmp/rel.log 2>&1
+          if grep -q '"tag_name": *"channel-coreml"' /tmp/relcheck.json; then
+            echo "日志已发到 channel-coreml，匿名可读" | ann "REL-VERDICT "
+          else
+            echo "日志没发出去（上轮就是栽在这：step 绿但 release 404）" | ann "REL-VERDICT "
+          fi
+          grep -oE '"name": *"[^"]*\.log"|"message": *"[^"]*"' /tmp/relcheck.json | ann "REL-GET "
+          cat /tmp/rel.log | ann "REL "
+          grep -q '"tag_name": *"channel-coreml"' /tmp/relcheck.json || exit 1
 
       - name: keep artifact
         if: always()
