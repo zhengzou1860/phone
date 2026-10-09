@@ -99,21 +99,38 @@ enum Align {
     static func parts(_ f: VNFaceObservation) -> (eyes: [CGPoint], nose: CGPoint, lips: [CGPoint])? {
         guard let lm = f.landmarks,
               let e1 = centroid(lm.leftEye), let e2 = centroid(lm.rightEye),
-              let nose = regionPoints(lm.noseCrest)?.last,
-              let lips = regionPoints(lm.outerLips), lips.count >= 3
+              let crest = regionPoints(lm.noseCrest), !crest.isEmpty,
+              let lips = regionPoints(lm.outerLips), lips.count >= 3,
+              let mouth = centroid(lm.outerLips)
         else { return nil }
+        // 鼻尖＝鼻梁这条线（眉→鼻尖）上**离嘴最近**的那个点。不认数组顺序：顺序我从没验过，
+        // 上机看着像取了眉尖那一头。离嘴最近必然是鼻尖，且和坐标口径无关。
+        let d2 = { (p: CGPoint) -> CGFloat in
+            let dx = p.x - mouth.x, dy = p.y - mouth.y
+            return dx * dx + dy * dy
+        }
+        let nose = crest.min(by: { d2($0) < d2($1) }) ?? crest[0]
         return (eyes: [e1, e2], nose: nose, lips: lips)
     }
 
-    /// 五官点的 y 原点。上机实测黄点上下反了（鼻尖差不多、眼和嘴互换）⇒ 点的口径和
-    /// boundingBox（左下原点，那个是我逐帧核过的）不是同一套。到底哪个对不猜，见 settleOrigin。
-    /// nil = 还没在摆正的帧上判过；判过之前先按 Apple 文档口径（左上原点、不翻）。
+    /// 五官点的 y 口径。0.9 上机实测把 5 点原样乘**整幅图**的宽高，黄点全飞出脸外、鼻子落在眉尖，
+    /// 而眼-嘴竖向间距算出来 912 px、比这张脸的框（短边 573 px）还高一大截——几何上不可能。
+    /// ⇒ 这些点是**脸框内的相对坐标**（0.41 眼距／0.475 眼到嘴，正是脸上该有的比例），
+    ///   必须先过一道脸框再乘图。乘错的净伤害＝绕质心的非等比拉伸，PC 扫下来 r=1.45 → 余弦 0.635，
+    ///   和手机上那个 0.627 是同一件事。y 朝上还是朝下仍然不猜，交给 settleOrigin 在摆正的帧上判。
     static var yTopLeftOrigin: Bool? = nil
     static var topLeft: Bool { yTopLeftOrigin ?? true }
 
-    /// 归一化五官点 → 像素点（原点左上、y 向下）。用 settleOrigin 判出来的那套 y 口径。
-    static func toPixels(_ p: CGPoint, _ w: Int, _ h: Int) -> CGPoint {
-        CGPoint(x: p.x * CGFloat(w), y: (topLeft ? p.y : 1 - p.y) * CGFloat(h))
+    /// 脸框内相对点 → 整幅图的归一化点（原点左下，和 boundingBox 同一套）
+    static func toImageNorm(_ q: CGPoint, _ b: CGRect) -> CGPoint {
+        CGPoint(x: b.minX + q.x * b.width,
+                y: b.minY + (topLeft ? 1 - q.y : q.y) * b.height)
+    }
+
+    /// 五官点 → 像素点（原点左上、y 向下）
+    static func toPixels(_ q: CGPoint, box b: CGRect, _ w: Int, _ h: Int) -> CGPoint {
+        let n = toImageNorm(q, b)
+        return CGPoint(x: n.x * CGFloat(w), y: (1 - n.y) * CGFloat(h))
     }
 
     /// 把 y 原点自己判出来并缓存（全片共用一个答案）。判据不需要任何 API 假设：
@@ -139,7 +156,9 @@ enum Align {
         else if yTopLeftOrigin == nil { yTopLeftOrigin = true; how = "两边同判→按文档(左上)" }
         else { how = "两边同判→沿用" }
         let raw = set.map { String(format: "%.2f/%.2f", $0.x, $0.y) }.joined(separator: " ")
-        return "y 原点 \(desc.joined(separator: "｜"))→「\(topLeft ? "不翻" : "翻")」(\(how))｜5点 \(raw)"
+        let b = f.boundingBox
+        let box = String(format: "框 %.2f/%.2f %.2fx%.2f", b.minX, b.minY, b.width, b.height)
+        return "y 原点 \(desc.joined(separator: "｜"))→「\(topLeft ? "不翻" : "翻")」(\(how))｜\(box)｜5点 \(raw)"
     }
 
     /// 一张脸送进尺子要的那 5 个点（模板口径：左眼、右眼、鼻尖、左嘴角、右嘴角，
@@ -151,7 +170,9 @@ enum Align {
         var up: [CGPoint]? = nil
         var src = "框猜"
         if let p = parts(f) {
-            let U = { (q: CGPoint) -> CGPoint in Align.toUpright(Align.toPixels(q, w, h), k: k, w: w, h: h) }
+            let U = { (q: CGPoint) -> CGPoint in
+                Align.toUpright(Align.toPixels(q, box: f.boundingBox, w, h), k: k, w: w, h: h)
+            }
             let e = p.eyes.map(U), lp = p.lips.map(U), n = U(p.nose)
             let eyes = e[0].x <= e[1].x ? [e[0], e[1]] : [e[1], e[0]]
             let corners = [lp.min(by: { $0.x < $1.x })!, lp.max(by: { $0.x < $1.x })!]
@@ -163,10 +184,15 @@ enum Align {
     }
 
     /// 屏幕上画黄点用的 5 个点，给成**显示口径的归一化点**（原点左上、y 向下，和绿框那套换算同向）。
-    /// 画点不再自己决定翻不翻：它跟着 settleOrigin 判出来的口径，所以点准不准＝那个口径对不对。
+    /// 走的是 toImageNorm 这一条路＝和喂给尺子的那 5 个点同一个换算，所以黄点准不准＝裁脸准不准，
+    /// 一次上机两件事一起验，不用再分开猜口径。
     static func markerPoints(_ f: VNFaceObservation) -> [CGPoint]? {
         guard let p = parts(f) else { return nil }
-        let D = { (q: CGPoint) -> CGPoint in CGPoint(x: q.x, y: Align.topLeft ? q.y : 1 - q.y) }
+        let b = f.boundingBox
+        let D = { (q: CGPoint) -> CGPoint in
+            let n = Align.toImageNorm(q, b)
+            return CGPoint(x: n.x, y: 1 - n.y)
+        }
         let lp = p.lips.map(D)
         return p.eyes.map(D) + [D(p.nose)] + [lp.min(by: { $0.x < $1.x })!, lp.max(by: { $0.x < $1.x })!]
     }
@@ -1075,11 +1101,17 @@ final class Cutter: ObservableObject {
                                                  preset: AVAssetExportPresetHighestQuality,
                                                  measuredRot: mr)
             let photo = file == nil ? "" : CutExport.toPhotos(file!)
+            // 相册收下之后这条临时成片就是纯占地方：一次 270 MB，不删＝同一部片存两遍
+            var cleaned = ""
+            if photo == "已存到相册", let f = file {
+                do { try FileManager.default.removeItem(at: f); cleaned = "，临时文件已删" }
+                catch { cleaned = "，临时文件没删: \(error.localizedDescription)" }
+            }
             Task { @MainActor in
                 guard let self = self else { return }
                 self.busy = false
-                self.exportNote = text + "\n" + photo
-                Journal.line("剪辑 导出 \(text)｜\(photo)")
+                self.exportNote = text + "\n" + photo + cleaned
+                Journal.line("剪辑 导出 \(text)｜\(photo)\(cleaned)")
             }
         }
     }

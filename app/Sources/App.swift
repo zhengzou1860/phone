@@ -371,7 +371,9 @@ enum Journal {
     static func line(_ text: String) {
         let f = DateFormatter()
         f.dateFormat = "MM-dd HH:mm:ss"
-        let entry = "\(f.string(from: Date())) 足迹\(Facts.footprintMB())/驻留\(Facts.residentMB())MB \(text)"
+        // 一条一行：日志是按行发给电脑的，条目里夹 \n 会把后半句丢在传输外（0.9 的「朝向」那半句就这么没了）
+        let oneLine = text.replacingOccurrences(of: "\n", with: " ／ ")
+        let entry = "\(f.string(from: Date())) 足迹\(Facts.footprintMB())/驻留\(Facts.residentMB())MB \(oneLine)"
         guard let url = url else { return }
         var lines = load().split(separator: "\n").map(String.init)
         lines.append(entry)
