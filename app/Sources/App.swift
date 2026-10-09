@@ -46,6 +46,14 @@ struct ContentView: View {
                 .pickerStyle(.segmented)
                 .font(.footnote)
 
+                Picker("同一条连跑遍数", selection: $bench.repeatCount) {
+                    Text("1 遍").tag(1)
+                    Text("3 遍").tag(3)
+                    Text("6 遍").tag(6)
+                }
+                .pickerStyle(.segmented)
+                .font(.footnote)
+
                 HStack(spacing: 10) {
                     Button("选视频跑基准") { bench.showVideoPicker = true }
                     Button("尺子自检") { bench.startModel() }
@@ -93,10 +101,12 @@ final class Bench: ObservableObject {
     @Published var showVideoPicker = false
     @Published var showPhotoPicker = false
     @Published var frameLimit = 90
+    @Published var repeatCount = 1
 
     init() {
         let info = Bundle.main.infoDictionary ?? [:]
         Journal.line("=== 启动 v\(info["CFBundleShortVersionString"] ?? "-") ===")
+        PressureWatch.start()
     }
 
     func finish(_ report: String) {
@@ -119,9 +129,10 @@ final class Bench: ObservableObject {
         showVideoPicker = false
         busy = true
         let limit = frameLimit
-        status = "视频基准运行中…（单趟上限 \(limit) 帧，2000 帧那档要跑一分多钟）"
+        let times = repeatCount
+        status = "视频基准运行中…（单趟上限 \(limit) 帧 ×连跑 \(times) 遍，2000 帧那档要跑一分多钟）"
         Task.detached { [weak self] in
-            let report = Runner.videoBenchmark(url: url, frameLimit: limit)
+            let report = Runner.videoBenchmark(url: url, frameLimit: limit, repeatCount: times)
             await MainActor.run { self?.finish(report) }
         }
     }
@@ -326,9 +337,34 @@ enum Journal {
     }
 }
 
+/// 闪退取证第二道闸：系统真要杀，通常会先喊内存压力。喊过 → 内存成因；
+/// 一声没喊就死 → 不是内存，得换方向查（原生崩溃 / 容器层）。
+enum PressureWatch {
+    static var sources: [DispatchSourceMemoryPressure] = []
+
+    static func start() {
+        guard sources.isEmpty else { return }
+        watch(.warning, "警告")
+        watch(.critical, "严重")
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.didReceiveMemoryWarningNotification, object: nil, queue: .main
+        ) { _ in
+            Journal.line("didReceiveMemoryWarning 驻留\(Facts.residentMB())MB")
+        }
+    }
+
+    private static func watch(_ level: DispatchSource.MemoryPressureEvent, _ label: String) {
+        let src = DispatchSource.makeMemoryPressureSource(eventMask: level, queue: .main)
+        src.setEventHandler {
+            Journal.line("内存压力\(label) 驻留\(Facts.residentMB())MB")
+        }
+        src.resume()
+        sources.append(src)
+    }
+}
+
 enum Uploader {
     static let endpoint = "http://192.168.31.99:8712/report"
-
     static func send(_ text: String) -> String {
         guard let url = URL(string: endpoint) else { return "发送失败: 地址非法" }
         var request = URLRequest(url: url)
@@ -572,7 +608,7 @@ enum Runner {
         return ctx.makeImage()
     }
 
-    static func videoBenchmark(url: URL, frameLimit: Int) -> String {
+    static func videoBenchmark(url: URL, frameLimit: Int, repeatCount: Int = 1) -> String {
         let asset = AVURLAsset(url: url)
 
         let ready = DispatchSemaphore(value: 0)
@@ -613,15 +649,27 @@ enum Runner {
                                target: capTarget, detect: true, videoFps: videoFps,
                                duration: duration,
                                tag: capTarget == nil ? "解码+检测" : "解码+检测（长边封顶 1920）")
-        var small = videoPass(asset: asset, track: track, limit: frameLimit,
-                              target: nil, detect: true, videoFps: videoFps,
-                              duration: duration, tag: "小尺寸(未启用)")
+        // 0.6.2 这里无条件先跑了一趟满尺寸带检测再把结果扔掉——那一趟正是闪退发生的地方，
+        // 而且它对本条视频的数字没有任何贡献（下面立刻被 640 趟覆盖）。
         let longSide = max(native.w, native.h)
+        let small: (text: String, w: Int, h: Int)
         if longSide > 640 {
             let s = fitSize(native.w, native.h, longEdge: 640)
             small = videoPass(asset: asset, track: track, limit: frameLimit,
                               target: (w: s.w, h: s.h), detect: true, videoFps: videoFps,
                               duration: duration, tag: "解码+检测, 让解码器直出 \(s.w)x\(s.h)")
+        } else {
+            small = (text: "[小尺寸趟] 源长边只有 \(longSide)，不重复跑", w: native.w, h: native.h)
+        }
+
+        var repeats = ""
+        if repeatCount > 1 {
+            for it in 2...repeatCount {
+                let r = videoPass(asset: asset, track: track, limit: frameLimit,
+                                  target: capTarget, detect: true, videoFps: videoFps,
+                                  duration: duration, tag: "连跑第\(it)/\(repeatCount)遍")
+                repeats += "\n" + r.text
+            }
         }
 
         let memEnd = Facts.residentMB()
@@ -631,7 +679,7 @@ enum Runner {
         源尺寸 \(String(format: "%.0fx%.0f", natW, natH))，全长 \(String(format: "%.1f", duration)) s，\(String(format: "%.1f", videoFps)) fps，大小 \(sizeText)
         \(onlyDecode.text)
         \(native.text)
-        \(small.text)
+        \(small.text)\(repeats)
         这条跑完 驻留 \(memBegin)→\(memEnd) MB（+\(memEnd - memBegin)）
         """
     }
@@ -728,14 +776,15 @@ enum Runner {
                 if detect { visionTimes.append(visionMs) }
             }
             frames += 1
-            if frames % 10 == 0 {
-                let now = Facts.residentMB()
-                if now > memMax { memMax = now }
-                if now > Runner.memCapMB {
-                    stoppedForMemory = true
-                    Journal.line("趟 主动停 \(tag) 第\(frames)帧 驻留\(now)MB 超 \(Runner.memCapMB)MB")
-                    break
-                }
+            let now = Facts.residentMB()
+            if now > memMax { memMax = now }
+            if now > Runner.memCapMB {
+                stoppedForMemory = true
+                Journal.line("趟 主动停 \(tag) 第\(frames)帧 驻留\(now)MB 超 \(Runner.memCapMB)MB")
+                break
+            }
+            if frames % 30 == 0 {
+                Journal.line("心跳 \(tag) 第\(frames)帧 驻留\(now)MB")
             }
         }
         reader.cancelReading()
