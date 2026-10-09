@@ -212,8 +212,8 @@ enum Facts {
             "Vision     \(NSClassFromString("VNDetectFaceRectanglesRequest") != nil ? "可用" : "缺失")",
             "AVFoundation \(NSClassFromString("AVAssetReader") != nil ? "可用" : "缺失")",
             "PhotosUI   \(NSClassFromString("PHPickerViewController") != nil ? "可用" : "缺失")",
-            "身份 API   VNGenerateIdentity=\(cls("VNGenerateIdentityRequest")) "
-                + "VNIdentityObs=\(cls("VNIdentityObservation"))",
+            "身份尺候选 VNGenerateIdentityFeaturePrint=\(cls("VNGenerateIdentityFeaturePrintRequest")) "
+                + "VNFeaturePrintObs=\(cls("VNFeaturePrintObservation"))",
             "替身 API   ImageFeaturePrint=\(cls("VNGenerateImageFeaturePrintRequest")) "
                 + "FaceCaptureQuality=\(cls("VNDetectFaceCaptureQualityRequest"))",
             "分割 API   PersonSegmentation=\(cls("VNGeneratePersonSegmentationRequest")) "
@@ -305,6 +305,75 @@ enum Runner {
         return (first, rest, count, detail)
     }
 
+    /// 动态起一个 feature print 请求。返回 nil = 这个系统里根本没这个类。
+    static func featurePrint(_ name: String, _ image: CGImage)
+        -> (obs: [Any], ms: Double, note: String)? {
+        guard let cls = NSClassFromString(name) as? NSObject.Type else { return nil }
+        let made = cls.init()
+        guard let vn = made as? VNRequest else {
+            return ([], -1, "有类但不是 VNRequest，交不给 handler")
+        }
+        let handler = VNImageRequestHandler(cgImage: image, orientation: .up, options: [:])
+        let t0 = DispatchTime.now().uptimeNanoseconds
+        do {
+            try handler.perform([vn])
+        } catch {
+            return ([], -1, "perform 抛错: \(error)")
+        }
+        let spent = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000
+        let raw = (vn.value(forKey: "results") as? [Any]) ?? []
+        return (raw, spent, "-")
+    }
+
+    static func vecOf(_ observation: Any) -> [Double] {
+        guard let fp = observation as? VNFeaturePrintObservation else { return [] }
+        return fp.data.withUnsafeBytes { raw in
+            raw.bindMemory(to: Float32.self).map { Double($0) }
+        }
+    }
+
+    static func cosine(_ a: [Double], _ b: [Double]) -> Double {
+        guard a.count == b.count, !a.isEmpty else { return -9 }
+        var dot = 0.0, na = 0.0, nb = 0.0
+        for i in 0..<a.count {
+            dot += a[i] * b[i]
+            na += a[i] * a[i]
+            nb += b[i] * b[i]
+        }
+        guard na > 0, nb > 0 else { return -9 }
+        return dot / (na.squareRoot() * nb.squareRoot())
+    }
+
+    /// 同一张脸的几种轻微变化，print 之间还剩多少一致性
+    static func printProbe(_ images: [(String, CGImage)]) -> String {
+        var out: [String] = ["feature print 探测（同一张脸做变化，余弦越接近 1 越像“身份不变”）"]
+        for name in ["VNGenerateIdentityFeaturePrintRequest", "VNGenerateImageFeaturePrintRequest"] {
+            guard let first = featurePrint(name, images[0].1) else {
+                out.append("  \(name): 系统里没有这个类")
+                continue
+            }
+            if first.note != "-" {
+                out.append("  \(name): \(first.note)")
+                continue
+            }
+            guard let obs = first.obs.first else {
+                out.append("  \(name): 跑通 \(ms(first.ms))，但 observation 0 条（这张图里没它要的东西）")
+                continue
+            }
+            var vecs: [(String, [Double])] = [(images[0].0, vecOf(obs))]
+            for (label, img) in images.dropFirst() {
+                guard let r = featurePrint(name, img), let o = r.obs.first else { continue }
+                vecs.append((label, vecOf(o)))
+            }
+            let baseVec = vecs[0].1
+            let pairs = vecs.dropFirst().map { "\($0.0) vs 基准 = \($0.1.isEmpty || baseVec.isEmpty ? "无data" : String(format: "%.4f", cosine(baseVec, $0.1)))" }
+            out.append("  \(name): 跑通 \(ms(first.ms)) obs=\(first.obs.count) "
+                + "类型 \(type(of: obs)) data=\((obs as? VNFeaturePrintObservation)?.data.count ?? -1)B")
+            for p in pairs { out.append("      \(p)") }
+        }
+        return out.joined(separator: "\n")
+    }
+
     static func visionSelfTest() -> String {
         guard let image = syntheticImage(width: 720, height: 1280) else {
             return "Vision 自检\n生成测试图失败"
@@ -315,6 +384,7 @@ enum Runner {
         冷启动一次: \(ms(r.first))；同图再跑 5 次: \(stat(r.rest))
         检到人脸数: \(r.count)（预期 0）
         注意: 同一张图重复请求会命中 Vision 的结果缓存，后面那几个 ms 不是单价，冷启动那个才是量级参考。
+        \(printProbe([("合成图", image)]))
         """
     }
 
@@ -354,7 +424,28 @@ enum Runner {
         检到 \(hit.count) 张脸  \(hit.detail)
         冷启动: \(ms(hit.first))；同图再跑 3 次: \(stat(hit.rest))
         尺寸曲线(送检尺寸:冷启动ms/检到数): \(curve.joined(separator: " | "))
+        \(facePrintProbe(base, degrees: hit.deg))
         """
+    }
+
+    static func facePrintProbe(_ base: CGImage, degrees: Int) -> String {
+        let candidate = degrees == 0 ? base : (rotated(base, degrees: degrees) ?? base)
+        let req = VNDetectFaceRectanglesRequest()
+        guard (try? VNImageRequestHandler(cgImage: candidate, orientation: .up, options: [:])
+                .perform([req])) != nil,
+              let box = req.results?.first?.boundingBox else {
+            return "feature print 探测\n  重检 boundingBox 失败"
+        }
+        let rect = CGRect(x: box.minX * CGFloat(candidate.width),
+                          y: box.minY * CGFloat(candidate.height),
+                          width: box.width * CGFloat(candidate.width),
+                          height: box.height * CGFloat(candidate.height))
+        guard let face = candidate.cropping(to: rect.integral), face.width > 20, face.height > 20 else {
+            return "feature print 探测\n  脸太小裁不出来（\(Int(rect.width))x\(Int(rect.height))）"
+        }
+        return printProbe([("脸\(face.width)x\(face.height)", face),
+                           ("右旋15°", rotated(face, degrees: 15) ?? face),
+                           ("缩小一半", scaled(face, longEdge: max(face.width, face.height) / 2))])
     }
 
     static func scaled(_ image: CGImage, longEdge: Int) -> CGImage {

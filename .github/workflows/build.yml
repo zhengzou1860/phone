@@ -22,6 +22,18 @@ jobs:
       - name: show toolchain
         run: sw_vers && xcodebuild -version && xcodebuild -showsdks | grep -i ios
 
+      # 纯诊断：身份 API 到底在不在 SDK，不依赖手机端就能判
+      - name: probe Vision SDK symbols
+        run: |
+          set -uo pipefail
+          ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=8{print "::error::" p substr($0,1,230)}'; }
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          FW="$SDK/System/Library/Frameworks/Vision.framework"
+          echo "sdk=$SDK" | ann "VIS-PATH "
+          strings -a "$FW/Vision" 2>/dev/null | grep -oE "VN[A-Za-z]*FeaturePrint[A-Za-z]*" | sort -u | ann "VIS-CLASS "
+          grep -rhoE "VN[A-Za-z]*FeaturePrint[A-Za-z]*" "$FW/Headers" 2>/dev/null | sort -u | ann "VIS-HDRSYM "
+          grep -rhE "IdentityFeaturePrint" "$FW/Headers" 2>/dev/null | head -6 | ann "VIS-DECL "
+
       - name: install xcodegen
         run: |
           set -euo pipefail
@@ -100,3 +112,67 @@ jobs:
             --title "CI failed log" \
             --prerelease \
             --notes "no ipa this round" 2>&1 | ann "GH-FAIL "
+
+  # 独立 job：苹果的工具链认不认 insightface 的小模型，跟出 IPA 互不影响
+  coreml:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: install coremltools
+        run: |
+          set -uo pipefail
+          ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=6{print "::error::" p substr($0,1,230)}'; }
+          pip install --no-cache-dir coremltools onnx numpy 2>&1 | tail -3 | ann "PIP "
+          python -c "import coremltools as ct; print('coremltools', ct.__version__)" 2>&1 | ann "PIP-VER "
+
+      - name: fetch onnx
+        run: |
+          set -euo pipefail
+          curl -sL -o /tmp/sc.zip https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_sc.zip
+          rm -rf /tmp/sc && mkdir -p /tmp/sc
+          unzip -o -q /tmp/sc.zip -d /tmp/sc
+          ls -la /tmp/sc
+
+      - name: convert
+        run: |
+          set -uo pipefail
+          ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=8{print "::error::" p substr($0,1,230)}'; }
+          python - > /tmp/conv.log 2>&1 <<'PY'
+          import traceback
+          import coremltools as ct
+
+          src = "/tmp/sc/w600k_mbf.onnx"
+          for label, target in (("iOS15/mlprogram", ct.target.iOS15),
+                                ("legacy/nn", None)):
+              try:
+                  kw = {} if target is None else {"minimum_deployment_target": target}
+                  m = ct.converters.onnx.convert(model=src, **kw)
+                  out = "/tmp/mbf_%s.mlpackage" % label.split("/")[0]
+                  m.save(out)
+                  spec = m.get_spec().description
+                  print("CONVERT-OK %s -> %s" % (label, out))
+                  for i in spec.input:
+                      print("  input", i.name, i.type,
+                            list(i.shape if hasattr(i, "shape") else []))
+                  for o in spec.output:
+                      print("  output", o.name, o.type)
+                  break
+              except Exception:
+                  print("CONVERT-FAIL %s" % label)
+                  traceback.print_exc()
+          PY
+          echo "--- convert log ---" | ann "CV "
+          cat /tmp/conv.log | ann "CV "
+          du -sh /tmp/mbf_* 2>/dev/null | ann "CV-SIZE "
+
+      - name: keep artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mbf-coreml
+          path: /tmp/mbf_iOS15.mlpackage
+          if-no-files-found: ignore
