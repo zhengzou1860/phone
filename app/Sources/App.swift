@@ -57,6 +57,14 @@ struct ContentView: View {
                     .font(.system(size: 10, design: .monospaced))
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
+
+                DisclosureGroup("磁盘日志（闪退后重开还在）") {
+                    Text(Journal.tail(12))
+                        .font(.system(size: 9, design: .monospaced))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .font(.footnote)
             }
             .padding()
         }
@@ -77,8 +85,14 @@ final class Bench: ObservableObject {
     @Published var showVideoPicker = false
     @Published var showPhotoPicker = false
 
+    init() {
+        let info = Bundle.main.infoDictionary ?? [:]
+        Journal.line("=== 启动 v\(info["CFBundleShortVersionString"] ?? "-") ===")
+    }
+
     func finish(_ report: String) {
         log.append(report)
+        if log.count > 8 { log.removeFirst(log.count - 8) }
         busy = false
         status = ""
     }
@@ -128,6 +142,7 @@ final class Bench: ObservableObject {
         status = "正在发往电脑…"
         let text = Facts.lines().joined(separator: "\n") + "\n\n"
             + log.joined(separator: "\n\n")
+            + "\n\n—— 磁盘日志最近 60 行 ——\n" + Journal.tail(60)
         Task.detached { [weak self] in
             let report = Uploader.send(text)
             await MainActor.run { self?.finish(report) }
@@ -270,6 +285,37 @@ enum Facts {
     }
 }
 
+/// 每一步都往 Documents/hello_log.txt 追加一行（带内存水位）。
+/// 闪退不会清掉它，重开就能看到"死在第几步、当时驻留多少 MB"——
+/// 没有 Mac 时这是唯一能拿到的现场证据。写盘失败一律不许把 app 带崩。
+enum Journal {
+    static var url: URL? {
+        guard let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else {
+            return nil
+        }
+        return dir.appendingPathComponent("hello_log.txt")
+    }
+
+    static func load() -> String {
+        guard let url = url else { return "" }
+        return (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+    }
+
+    static func line(_ text: String) {
+        let f = DateFormatter()
+        f.dateFormat = "MM-dd HH:mm:ss"
+        let entry = "\(f.string(from: Date())) 内存\(Facts.residentMB())MB \(text)\n"
+        guard let url = url, let data = (load() + entry).data(using: .utf8) else { return }
+        try? data.write(to: url)
+    }
+
+    static func tail(_ n: Int) -> String {
+        let lines = load().split(separator: "\n").map(String.init)
+        if lines.isEmpty { return "磁盘日志是空的（\(url?.path ?? "拿不到 documents 目录")）" }
+        return lines.suffix(n).joined(separator: "\n")
+    }
+}
+
 enum Uploader {
     static let endpoint = "http://192.168.31.99:8712/report"
 
@@ -301,6 +347,10 @@ enum Uploader {
 }
 
 enum Runner {
+
+    /// 驻留内存超过这个数就自己收手，不等系统来杀（iPhone 11 物理 3852 MB，
+    /// 单进程上限拿不到，只能拿实测水位当参照）。
+    static let memCapMB = 1500
 
     static func detectRuns(_ image: CGImage, runs: Int)
         -> (first: Double, rest: [Double], count: Int, detail: String) {
@@ -527,38 +577,56 @@ enum Runner {
         let duration = CMTimeGetSeconds(asset.duration)
         let nominal = track.nominalFrameRate
         let videoFps = nominal > 0 ? Double(nominal) : 30.0
+        let nat = track.naturalSize.applying(track.preferredTransform)
+        let natW = abs(Double(nat.width)), natH = abs(Double(nat.height))
         let sizeBytes: Int? = {
             let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
             return attrs?[.size] as? Int
         }()
         let sizeText = sizeBytes.map { "\($0 / 1048576) MB" } ?? "-"
+        Journal.line("视频基准 开始 \(url.lastPathComponent) 源 \(String(format: "%.0fx%.0f", natW, natH)) "
+                     + "\(String(format: "%.1f", duration))s@\(String(format: "%.0f", videoFps))fps \(sizeText)")
 
         let onlyDecode = videoPass(asset: asset, track: track, limit: frameLimit,
                                    target: nil, detect: false, videoFps: videoFps,
                                    duration: duration, tag: "只解码不检测")
+        // 长边封顶 1920：4K 源满尺寸解码 + Vision 是闪退头号嫌疑，先别让基准把自己挤死
+        let capTarget: (w: Int, h: Int)?
+        if max(natW, natH) > 1920 {
+            capTarget = fitSize(Int(natW), Int(natH), longEdge: 1920)
+        } else {
+            capTarget = nil
+        }
         let native = videoPass(asset: asset, track: track, limit: frameLimit,
-                               target: nil, detect: true, videoFps: videoFps,
-                               duration: duration, tag: "解码+检测")
+                               target: capTarget, detect: true, videoFps: videoFps,
+                               duration: duration,
+                               tag: capTarget == nil ? "解码+检测" : "解码+检测（长边封顶 1920）")
         var small = videoPass(asset: asset, track: track, limit: frameLimit,
                               target: nil, detect: true, videoFps: videoFps,
                               duration: duration, tag: "小尺寸(未启用)")
         let longSide = max(native.w, native.h)
         if longSide > 640 {
-            let ratio = 640.0 / Double(longSide)
-            let tw = max(16, Int(Double(native.w) * ratio)) & ~1
-            let th = max(16, Int(Double(native.h) * ratio)) & ~1
+            let s = fitSize(native.w, native.h, longEdge: 640)
             small = videoPass(asset: asset, track: track, limit: frameLimit,
-                              target: (w: tw, h: th), detect: true, videoFps: videoFps,
-                              duration: duration, tag: "解码+检测, 让解码器直出 \(tw)x\(th)")
+                              target: (w: s.w, h: s.h), detect: true, videoFps: videoFps,
+                              duration: duration, tag: "解码+检测, 让解码器直出 \(s.w)x\(s.h)")
         }
 
         return """
         视频基准 \(url.lastPathComponent)
-        全长 \(String(format: "%.1f", duration)) s，\(String(format: "%.1f", videoFps)) fps，大小 \(sizeText)
+        源尺寸 \(String(format: "%.0fx%.0f", natW, natH))，全长 \(String(format: "%.1f", duration)) s，\(String(format: "%.1f", videoFps)) fps，大小 \(sizeText)
         \(onlyDecode.text)
         \(native.text)
         \(small.text)
         """
+    }
+
+    /// 按长边等比缩放，宽高都取偶数（解码器对小数的处理不一致，钉成整数才可比）
+    static func fitSize(_ w: Int, _ h: Int, longEdge: Int) -> (w: Int, h: Int) {
+        let long = max(w, h)
+        guard long > longEdge else { return (w & ~1, h & ~1) }
+        let ratio = Double(longEdge) / Double(long)
+        return (max(16, Int(Double(w) * ratio)) & ~1, max(16, Int(Double(h) * ratio)) & ~1)
     }
 
     static func videoPass(asset: AVURLAsset, track: AVAssetTrack, limit: Int,
@@ -600,6 +668,10 @@ enum Runner {
         var widest = 0
         var tallest = 0
         var frames = 0
+        let mem0 = Facts.residentMB()
+        var memMax = mem0
+        var stoppedForMemory = false
+        Journal.line("趟 开始 \(tag) limit=\(limit)")
 
         while frames < limit {
             let d0 = DispatchTime.now().uptimeNanoseconds
@@ -639,7 +711,18 @@ enum Runner {
                 if detect { visionTimes.append(visionMs) }
             }
             frames += 1
+            if frames % 10 == 0 {
+                let now = Facts.residentMB()
+                if now > memMax { memMax = now }
+                if now > Runner.memCapMB {
+                    stoppedForMemory = true
+                    Journal.line("趟 主动停 \(tag) 第\(frames)帧 驻留\(now)MB 超 \(Runner.memCapMB)MB")
+                    break
+                }
+            }
         }
+        Journal.line("趟 结束 \(tag) 帧=\(frames) 峰值=\(memMax)MB"
+                     + (stoppedForMemory ? "（为躲 jetsam 自己收的）" : ""))
 
         guard frames > 3 else {
             return ("[\(tag)] 只解出 \(frames) 帧，不够计时（status=\(reader.status.rawValue)）", widest, tallest)
@@ -652,6 +735,10 @@ enum Runner {
         let wholeClip = duration * videoFps / serialFps
 
         var line = "[\(tag)] \(frames) 帧 @ \(widest)x\(tallest)  取帧 \(stat(decodeTimes))"
+        line += "\n  内存 \(mem0)→\(Facts.residentMB()) MB，本趟峰值 \(memMax) MB"
+            + (stoppedForMemory
+               ? "｜被 \(Runner.memCapMB) MB 闸提前停，速度只代表前 \(frames) 帧"
+               : "")
         if detect {
             line += "\n  Vision \(stat(visionTimes))  检到脸 \(faceTotals)/\(frames) 帧"
             if facePx.isEmpty {
