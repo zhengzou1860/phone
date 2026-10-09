@@ -1,4 +1,5 @@
 import SwiftUI
+import Darwin
 import AVFoundation
 import CoreMedia
 import CoreVideo
@@ -88,13 +89,12 @@ final class Bench: ObservableObject {
         }
     }
 
-    func finishPick(_ result: Result<URL, String>) {
+    func finishPick(url: URL?, failMessage: String?) {
         showPicker = false
-        switch result {
-        case .success(let url):
+        if let url = url {
             startVideo(url)
-        case .failure(let message):
-            log.append("取文件失败\n\(message)")
+        } else {
+            log.append("取文件失败\n\(failMessage ?? "未知原因")")
         }
     }
 }
@@ -122,25 +122,35 @@ struct PickerHost: UIViewControllerRepresentable {
 
         func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
             guard let provider = results.first?.itemProvider else {
-                Task { @MainActor in self.bench.finishPick(.failure("没选到文件")) }
+                Task { @MainActor in
+                    self.bench.finishPick(url: nil, failMessage: "没选到文件")
+                }
                 return
             }
             provider.loadFileRepresentation(forTypeIdentifier: "public.movie") { file, error in
-                if let file = file {
-                    let dst = FileManager.default.temporaryDirectory
-                        .appendingPathComponent(UUID().uuidString)
-                        .appendingPathExtension("mov")
-                    do {
-                        try FileManager.default.copyItem(at: file, to: dst)
-                        let url = dst
-                        Task { @MainActor in self.bench.finishPick(.success(url)) }
-                    } catch {
-                        let message = "拷贝到临时目录失败: \(error)"
-                        Task { @MainActor in self.bench.finishPick(.failure(message)) }
-                    }
-                } else {
+                guard let file = file else {
                     let message = "loadFileRepresentation 返回空: \(error?.localizedDescription ?? "-")"
-                    Task { @MainActor in self.bench.finishPick(.failure(message)) }
+                    Task { @MainActor in
+                        self.bench.finishPick(url: nil, failMessage: message)
+                    }
+                    return
+                }
+                let dst = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("pick_\(UUID().uuidString.prefix(8))")
+                    .appendingPathExtension(file.pathExtension)
+                do {
+                    if FileManager.default.fileExists(atPath: dst.path) {
+                        try FileManager.default.removeItem(at: dst)
+                    }
+                    try FileManager.default.copyItem(at: file, to: dst)
+                    Task { @MainActor in
+                        self.bench.finishPick(url: dst, failMessage: nil)
+                    }
+                } catch {
+                    let message = "拷贝到临时目录失败: \(error)"
+                    Task { @MainActor in
+                        self.bench.finishPick(url: nil, failMessage: message)
+                    }
                 }
             }
         }
@@ -156,7 +166,7 @@ enum Facts {
             "version    \(info["CFBundleShortVersionString"] ?? "-") (\(info["CFBundleVersion"] ?? "-"))",
             "iOS        \(pi.operatingSystemVersionString)",
             "machine    \(machineName())  cores=\(pi.processorCount)",
-            "memory     \(pi.physicalFootprint / 1048576) MB used of \(pi.physicalMemory / 1048576) MB",
+            "memory     已用 \(Self.footprintMB()) MB / 总量 \(pi.physicalMemory / 1048576) MB",
             "bundlePath \(Bundle.main.bundlePath)",
             "documents  \(FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first?.path ?? "-")",
             "Vision     \(NSClassFromString("VNDetectFaceRectanglesRequest") != nil ? "可用" : "缺失")",
@@ -171,6 +181,19 @@ enum Facts {
         return withUnsafeBytes(of: &u.machine) { raw in
             String(bytes: raw.prefix(while: { $0 != 0 }), encoding: .utf8) ?? "?"
         }
+    }
+
+    static func footprintMB() -> Int {
+        var info = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(
+            MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size)
+        let kr = withUnsafeMutablePointer(to: &info) { ptr in
+            ptr.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { rebound in
+                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), rebound, &count)
+            }
+        }
+        guard kr == KERN_SUCCESS else { return -1 }
+        return Int(info.phys_footprint) / 1_048_576
     }
 }
 
@@ -204,8 +227,7 @@ enum Runner {
     }
 
     static func videoBenchmark(url: URL, frameLimit: Int) -> String {
-        let asset = AVURLAsset()
-        asset.url = url
+        let asset = AVURLAsset(url: url)
 
         let ready = DispatchSemaphore(value: 0)
         asset.loadValuesAsynchronously(forKeys: ["tracks", "duration"]) { ready.signal() }

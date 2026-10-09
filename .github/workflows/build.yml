@@ -59,39 +59,44 @@ jobs:
           mkdir Payload
           cp -R "$APP" Payload/
           ditto -c -k --keepParent Payload hello.ipa
-          ls -la hello.ipa
+          ls -la hello.ipa | tee -a /tmp/build.log
 
-      - name: publish
+      # 每个 step 的 annotation 有独立额度，诊断按 step 拆开，别堆在一个 step 里被截断
+      - name: publish release
         working-directory: app
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -uo pipefail
-          ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" '{print "::error::" p substr($0,1,230)}'; }
-          cp /tmp/build.log ./build.log 2>/dev/null || echo "no build log" > ./build.log
-          grep -nE "error:|fatal error:" ./build.log | head -6 | ann "ERR "
-          gh release delete channel-test --cleanup-tag -y 2>/dev/null || true
+          ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=6{print "::error::" p substr($0,1,230)}'; }
+          cp /tmp/build.log ./build.log
+          gh release delete channel-test --cleanup-tag -y >/dev/null 2>&1 || true
           gh release create channel-test hello.ipa build.log \
-            --title "HelloLC 自测构建 OK" \
+            --title "HelloLC build" \
             --prerelease \
-            --notes "CI 自动产物 commit $GITHUB_SHA" 2>&1 | tail -6 | ann "GH-OK "
-          echo "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/channel-test/hello.ipa"
+            --notes "CI artifact for commit $GITHUB_SHA" 2>&1 | ann "REL "
+          echo "url=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/channel-test/hello.ipa" | ann "REL "
 
-      - name: publish failure log
+      - name: report compile errors
+        if: failure()
+        working-directory: app
+        run: |
+          set -uo pipefail
+          ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=8{print "::error::" p substr($0,1,230)}'; }
+          cp /tmp/build.log ./build.log 2>/dev/null || echo "no build log at all" > ./build.log
+          grep -nE "error:|fatal error:" ./build.log | ann "ERR "
+
+      - name: report release failure
         if: failure()
         working-directory: app
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -uo pipefail
-          ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" '{print "::error::" p substr($0,1,230)}'; }
+          ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=6{print "::error::" p substr($0,1,230)}'; }
           cp /tmp/build.log ./build.log 2>/dev/null || echo "no build log at all" > ./build.log
-          grep -nE "error:|fatal error:" ./build.log | head -14 | ann "ERR "
-          echo "--- gh version ---" | ann "ENV "
-          echo "GH_TOKEN length: ${#GH_TOKEN}" | ann "ENV "
-          gh --version 2>&1 | head -2 | ann "ENV "
-          gh release delete channel-test --cleanup-tag -y 2>&1 | tail -3 | ann "DEL "
+          gh release delete channel-test --cleanup-tag -y >/dev/null 2>&1 || true
           gh release create channel-test build.log \
-            --title "CI 构建失败日志" \
+            --title "CI failed log" \
             --prerelease \
-            --notes "这一轮没出成 IPA" 2>&1 | tail -6 | ann "GH-FAIL "
+            --notes "no ipa this round" 2>&1 | ann "GH-FAIL "
