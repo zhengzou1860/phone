@@ -77,8 +77,12 @@ jobs:
           # 先写 .part 再 mv：半途而废的文件留在最终路径上会骗过 package 那步的大小检查。
           fetch() {
             for U in https://huggingface.co https://hf-mirror.com; do
+              # URL 里必须带 $REPO：列清单用的是 "$U/api/models/$REPO/tree/main"，
+              # 取文件却写成 "$U/resolve/main/..." 少了仓库段 ⇒ HF 回 404 + 52 KB 的 HTML 页。
+              # 第 7 轮的 code=404 bytes=52410 就是这么来的（这个洞从第 4 轮的 $HOST 版本就在，
+              # 只是那时 -f 把状态码吞了，三轮都只留下"下不动"三个字）。
               code=$(curl -sS -L --retry 3 --retry-all-errors --max-time 900 \
-                     -o "$DST/$1.part" -w '%{http_code}' "$U/resolve/main/$1?download=true" 2>/tmp/curl.err)
+                     -o "$DST/$1.part" -w '%{http_code}' "$U/$REPO/resolve/main/$1?download=true" 2>/tmp/curl.err)
               sz=$(wc -c < "$DST/$1.part" 2>/dev/null | tr -d ' ')
               if [ "$code" = "200" ] && [ "${sz:-0}" -gt 0 ]; then
                 mv -f "$DST/$1.part" "$DST/$1"
