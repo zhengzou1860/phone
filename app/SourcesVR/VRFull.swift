@@ -1,5 +1,4 @@
 import Foundation
-import ObjectiveC
 import AVFoundation
 import CoreMedia
 import CoreVideo
@@ -285,18 +284,24 @@ enum VRFull {
             progress = "全片 第 \(zi + 1)/\(zps.count) 档 zp\(String(format: "%.2f", zp)) 出片中"
             doneFrames = 0
             totalFrames = n1
-            // 缓存句柄和解码器都在这条的最开头开：任一开不起来就还没起 writer，break 不会留下半成品
-            guard let src2 = try? FileHandle(forReadingFrom: cache) else {
-                outs.append("zp\(String(format: "%.2f", zp)): 缓存读不开"); break
+            // 这一档自己映一份只读缓存，帧循环走完就撒手（munmap）。不按帧 read：
+            // read(upToCount:) 每帧经 ObjC 递出来一块 812224 字节的 autoreleased NSData，而整趟跑在
+            // 同一个 work item 里 ⇒ 线程的自动释放池要等 run() 返回才清，实测足迹按 0.78 MB/帧涨到 559 MB。
+            // 只读映射的页是干净的，系统缺内存时当场回收，不往进程里攒。
+            var cacheMap = Data()
+            do {
+                cacheMap = try Data(contentsOf: cache, options: .mapped)
+            } catch {
+                outs.append("zp\(String(format: "%.2f", zp)): 缓存映射不了 \(error)"); break
             }
+            // 解码器在这条的最开头开：开不起来就还没起 writer，break 不会留下半成品
             guard let str2 = VRFrameStream(src: src) else {
-                try? src2.close()
                 outs.append("zp\(String(format: "%.2f", zp)): 第二趟顺序解码起不来"); break
             }
             let out = dir.appendingPathComponent("vr3d_\(tag)_zp\(String(format: "%.2f", zp)).mp4")
             try? FileManager.default.removeItem(at: out)
             guard let writer = try? AVAssetWriter(outputURL: out, fileType: .mp4) else {
-                try? src2.close(); str2.close()
+                str2.close()
                 outs.append("zp\(String(format: "%.2f", zp)): AVAssetWriter 建不起来"); break
             }
             let settings: [String: Any] = [
@@ -320,13 +325,13 @@ enum VRFull {
             let adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: input,
                                                               sourcePixelBufferAttributes: attrs)
             guard writer.canAdd(input) else {
-                try? src2.close(); str2.close()
+                str2.close()
                 outs.append("zp\(String(format: "%.2f", zp)): canAdd 为假，这套 outputSettings 本机不支持"); break
             }
             writer.add(input)
             let tHead0 = DispatchTime.now().uptimeNanoseconds
             do { try writer.startWriting() } catch {
-                try? src2.close(); str2.close()
+                str2.close()
                 outs.append("zp\(String(format: "%.2f", zp)): startWriting 抛错 \(error)"); break
             }
             writer.startSession(atSourceTime: .zero)
@@ -340,25 +345,20 @@ enum VRFull {
             var holes = 0.0
             var why = ""
             while true {
-                // 逐帧回收自动释放池：整趟跑在同一个 work item 里，线程的池要等 run() 返回才清，
-                // 而 read(upToCount:) 每帧递出来一块 812224 字节的 NSData ⇒ 足迹按 0.78 MB/帧单调上涨
-                // （10-10 实测 632 帧涨到 559 MB，涨幅与这块的尺寸三位数吻合）。defer 连 break 也接得住。
-                let arp = objc_autoreleasePoolPush()
-                defer { objc_autoreleasePoolPop(arp) }
                 let t0 = DispatchTime.now().uptimeNanoseconds
                 guard str2.next(into: framePB) else { break }
                 let dMs = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000
                 let tR = DispatchTime.now().uptimeNanoseconds
-                guard let blob = try? src2.read(upToCount: chunkBytes) else {
-                    why = "第 \(k + 1) 帧读缓存抛错"; break
+                let off = k * chunkBytes
+                guard cacheMap.count >= off + chunkBytes else {
+                    why = "第 \(k + 1) 帧的偏移 \(off) 加上 \(chunkBytes) 超出映射的 \(cacheMap.count) 字节"; break
                 }
-                readMs.append(Double(DispatchTime.now().uptimeNanoseconds - tR) / 1_000_000)
-                guard blob.count == chunkBytes else { why = "第 \(k + 1) 帧只读到 \(blob.count) 字节，每帧要 \(chunkBytes)"; break }
-                blob.withUnsafeBytes { raw in
+                cacheMap.withUnsafeBytes { raw in
                     if let b = raw.baseAddress {
-                        planeVals.withUnsafeMutableBytes { d in memcpy(d.baseAddress!, b, chunkBytes) }
+                        planeVals.withUnsafeMutableBytes { d in memcpy(d.baseAddress!, b.advanced(by: off), chunkBytes) }
                     }
                 }
+                readMs.append(Double(DispatchTime.now().uptimeNanoseconds - tR) / 1_000_000)
                 let tN = DispatchTime.now().uptimeNanoseconds
                 guard feed.reshaped(planeVals, w: maxPlaneW, h: maxPlaneH, into: &eyeVals),
                       eyeVals.count == px else {
@@ -419,7 +419,7 @@ enum VRFull {
                 if cancelRequested { why = "按了停止，这条就此收兵"; break }
                 if VRPressure.sawPressure { why = "系统喊内存压力，这条就此收兵"; break }
             }
-            try? src2.close()
+            cacheMap = Data()
             str2.close()
             input.markAsFinished()
             let tTail0 = DispatchTime.now().uptimeNanoseconds
