@@ -172,12 +172,14 @@ enum VRPilot {
                                                           sourcePixelBufferAttributes: attrs)
         guard writer.canAdd(input) else { return "canAdd(input) 为假：这套 outputSettings 本机不支持" }
         writer.add(input)
+        let tStart0 = DispatchTime.now().uptimeNanoseconds
         do {
             try writer.startWriting()
         } catch {
             return "startWriting 抛错: \(error)"
         }
         writer.startSession(atSourceTime: .zero)
+        let startMs = Double(DispatchTime.now().uptimeNanoseconds - tStart0) / 1_000_000
 
         // 每帧新造一块输出缓冲：adaptor 只保证"写进去的块在编码器用完前不死"，
         // isReadyForMoreMediaData 不代表上一帧已经消费完 ⇒ 复用同一块会把还在编的帧改花。
@@ -188,6 +190,12 @@ enum VRPilot {
         var uploadMs: [Double] = []
         var gpuMs: [Double] = []
         var holePct: [Double] = []
+        // 编码是异步的：帧交出去就返回，真正的编算发生在后台，只有两处看得见它——
+        // 队列满时的背压（waitMs）和收尾排空（tailMs）。不单独掐这两段，"编码成本"就永远混在总单价里。
+        var appendMs: [Double] = []
+        var waitMs: [Double] = []
+        var blocked = 0
+        var tailMs = 0.0
         var k = 0
         var encoded = 0
         for (zi, zp) in zps.enumerated() {
@@ -198,14 +206,23 @@ enum VRPilot {
             guard let headPB = VRTech.pixelBuffer(width: sbsW, height: h).pb else { werr = "标题帧分配失败"; break }
             allocMs.append(Double(DispatchTime.now().uptimeNanoseconds - ta0) / 1_000_000)
             drawTitle(headPB, [title, tip, "字是正的 ⇒ 链路没翻"])
-            if !append(adaptor, input, writer, headPB, at: Double(k) / outFps) { werr = "标题帧写不进去"; break }
+            let tAp0 = DispatchTime.now().uptimeNanoseconds
+            let headOk = append(adaptor, input, writer, headPB, at: Double(k) / outFps)
+            appendMs.append(Double(DispatchTime.now().uptimeNanoseconds - tAp0) / 1_000_000)
+            if !headOk { werr = "标题帧写不进去"; break }
             k += 1
             encoded += 1
             var holesHere: [Double] = []
             for i in 0..<samples.count {
+                let tw0 = DispatchTime.now().uptimeNanoseconds
+                var spins = 0
                 while !input.isReadyForMoreMediaData {
                     Thread.sleep(forTimeInterval: 0.005)
+                    spins += 1
                 }
+                let waitOne = Double(DispatchTime.now().uptimeNanoseconds - tw0) / 1_000_000
+                waitMs.append(waitOne)
+                if spins > 0 { blocked += 1 }
                 let tb0 = DispatchTime.now().uptimeNanoseconds
                 guard let framePB = VRTech.pixelBuffer(width: sbsW, height: h).pb else {
                     werr = "第 \(zi + 1) 段第 \(i + 1) 帧输出缓冲分配失败"
@@ -216,7 +233,10 @@ enum VRPilot {
                 guard r.err == nil else { werr = "第 \(zi + 1) 段第 \(i + 1) 帧形变失败: \(r.err ?? "")"; break }
                 if zi == 0 && i > 0 { uploadMs.append(r.upload); gpuMs.append(r.gpu) }
                 holesHere.append(r.holes)
-                if !append(adaptor, input, writer, framePB, at: Double(k) / outFps) { werr = "内容帧写不进去"; break }
+                let tAp1 = DispatchTime.now().uptimeNanoseconds
+                let frameOk = append(adaptor, input, writer, framePB, at: Double(k) / outFps)
+                appendMs.append(Double(DispatchTime.now().uptimeNanoseconds - tAp1) / 1_000_000)
+                if !frameOk { werr = "内容帧写不进去"; break }
                 k += 1
                 encoded += 1
                 let now = VRFacts.footprintMB()
@@ -227,10 +247,12 @@ enum VRPilot {
             VRJournal.line("试片 zp\(String(format: "%.2f", zp)) 洞 \(String(format: "%.2f", holePct.last ?? 0))%"
                 + " 形变 \(String(format: "%.1f", gpuMs.last ?? 0)) ms 足迹\(memMax)MB")
         }
+        let tTail0 = DispatchTime.now().uptimeNanoseconds
         input.markAsFinished()
         let esem = DispatchSemaphore(value: 0)
         writer.finishWriting { esem.signal() }
         esem.wait()
+        tailMs = Double(DispatchTime.now().uptimeNanoseconds - tTail0) / 1_000_000
         if writer.status != .completed {
             werr = werr.isEmpty ? "finishWriting 后 status=\(writer.status.rawValue): \(writer.error?.localizedDescription ?? "-")" : werr
         }
@@ -242,12 +264,20 @@ enum VRPilot {
         rep.append("单价 解码 \(VRUtil.stat(decodeMs))｜信箱 \(VRUtil.stat(prepMs))"
             + "｜深度 \(VRUtil.stat(predMs))｜dn 上传 \(VRUtil.stat(uploadMs))｜形变 \(VRUtil.stat(gpuMs))"
             + "｜成片帧分配 \(VRUtil.stat(allocMs))")
-        let perFrame = (avg(decodeMs) + avg(prepMs) + avg(predMs) + avg(uploadMs) + avg(gpuMs) + avg(allocMs))
+        rep.append("编码 头(startWriting+startSession 建编码器) \(VRUtil.ms(startMs))"
+            + "｜提交 \(VRUtil.stat(appendMs))｜背压 \(VRUtil.stat(waitMs))（\(blocked)/\(encoded) 帧等到过队列满）"
+            + "｜尾(markAsFinished+finishWriting 排空) \(String(format: "%.1f ms", tailMs))"
+            + "＝摊 \(String(format: "%.2f", tailMs / Double(max(1, encoded)))) ms/帧"
+            + "（背压按 5 ms 一轮睡，只能量化到 5 ms 一档：等到过最短也报 5，没等到报近 0）")
+        let perFrame = (avg(decodeMs) + avg(prepMs) + avg(predMs) + avg(uploadMs) + avg(gpuMs) + avg(allocMs)
+            + avg(appendMs) + avg(waitMs))
         if perFrame > 0 {
             let total = src.duration * src.fps * perFrame / 1000.0
             rep.append("整片预估 \(String(format: "%.1f", src.duration)) s 素材共 \(Int(src.duration * src.fps)) 帧"
                 + "×\(String(format: "%.1f", perFrame)) ms = \(String(format: "%.0f", total)) s"
                 + "＝\(String(format: "%.2f", total / max(src.duration, 0.01))) s/s（PC 的 m6 是 21.32 s/s）")
+            rep.append("整片另加两头一次性成本：头 \(String(format: "%.1f", startMs)) ms、尾按这条 33 帧排到 \(String(format: "%.1f", tailMs)) ms"
+                + "（尾是编码器把队列里剩下的编完，条越长摊到每帧越薄，全片只能当上限，不许乘帧数）")
         }
         rep.append("足迹 \(mem0)→\(VRFacts.footprintMB()) MB，本次峰值 \(memMax) MB")
         if encoded > 1 && writer.status == .completed {
