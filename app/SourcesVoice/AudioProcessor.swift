@@ -56,7 +56,22 @@ enum AudioProcessor {
     }
 
     /// 写 16 kHz 单声道 PCM（Vocos 出来的就是这个口径）
+    ///
+    /// 峰值过满刻度要压回来：fp16 整链在真素材上实测输出峰值 **1.084**（标准 euler 那版），
+    /// float WAV 存得下，但手机上放出来那一下是硬削顶。压的是整体线性增益，
+    /// 不改 mel、不改内容/音色那两把尺的读数。
     static func saveWAV(_ samples: [Float], to url: URL, sampleRate: Double = 16000) throws {
+        var samples = samples
+        var peak: Float = 0
+        for v in samples {
+            let a = abs(v)
+            if a > peak { peak = a }
+        }
+        if peak > 1.0 {
+            let gain: Float = 0.999 / peak
+            VoiceJournal.line(String(format: "输出峰值 %.4f 越过满刻度 ⇒ 整体乘 %.4f 压回", peak, gain))
+            for i in 0..<samples.count { samples[i] *= gain }
+        }
         guard let format = AVAudioFormat(commonFormat: .pcmFormatFloat32,
                                          sampleRate: sampleRate,
                                          channels: 1,
