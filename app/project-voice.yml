@@ -3,6 +3,10 @@ options:
   createIntermediateGroups: true
   deploymentTarget:
     iOS: "18.0"
+packages:
+  ONNXRuntime:
+    url: https://github.com/microsoft/onnxruntime
+    from: "1.16.0"
 settings:
   base:
     CODE_SIGNING_ALLOWED: "NO"
@@ -15,6 +19,9 @@ targets:
     platform: iOS
     sources:
       - SourcesVoice
+    dependencies:
+      - package: ONNXRuntime
+        product: onnxruntime-objc
     info:
       path: Info-Voice.plist
       properties:
