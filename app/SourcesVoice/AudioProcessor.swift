@@ -42,7 +42,7 @@ enum AudioProcessor {
                 outStatus.pointee = .endOfStream
                 return nil
             }
-            outStatus.pointee = .haveInput
+            outStatus.pointee = .haveData
             fed = true
             return inBuf
         }

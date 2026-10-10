@@ -30,7 +30,7 @@ enum ModelManifest {
         for (i, it) in items.enumerated() {
             progress?(i + 1, items.count, it.name)
             let p = dir.appendingPathComponent(it.name)
-            guard let sz = (try? FileManager.default.attributesOfItem(atPath: p))?[.size] as? NSNumber else {
+            guard let sz = (try? FileManager.default.attributesOfItem(atPath: p.path))?[.size] as? NSNumber else {
                 return "缺文件 \(it.name)"
             }
             if sz.int64Value != it.size {
@@ -82,8 +82,8 @@ enum ModelManifest {
         var h = SHA256()
         let chunk = 1 << 20
         while true {
-            guard let data = try? fh.read(upToCount: chunk), let d = data, !d.isEmpty else { break }
-            h.update(data: d)
+            guard let data = try? fh.read(upToCount: chunk), !data.isEmpty else { break }
+            h.update(data: data)
         }
         return h.finalize().map { String(format: "%02x", $0) }.joined()
     }
