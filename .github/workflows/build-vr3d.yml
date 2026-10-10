@@ -71,13 +71,28 @@ jobs:
           print("清单里属于 mlpackage 的文件 %d 个" % n)
           ' 2>&1 | rec | ann "M-LIST "
           ok=0; bad=0
+          # -f 会把状态码吞掉：第 6 轮三个文件全挂，日志里只剩"下不动"三个字，判不了是 429 还是 404。
+          # 改成不带 -f，自己取 %{http_code}，非 200 就把响应头记进日志；两个源逐文件轮试
+          # （清单能拿到不代表 resolve 能拿到，第 6 轮就是 API 通、CDN 全挂）。
+          # 先写 .part 再 mv：半途而废的文件留在最终路径上会骗过 package 那步的大小检查。
+          fetch() {
+            for U in https://huggingface.co https://hf-mirror.com; do
+              code=$(curl -sS -L --retry 3 --retry-all-errors --max-time 900 \
+                     -o "$DST/$1.part" -w '%{http_code}' "$U/resolve/main/$1?download=true" 2>/tmp/curl.err)
+              sz=$(wc -c < "$DST/$1.part" 2>/dev/null | tr -d ' ')
+              if [ "$code" = "200" ] && [ "${sz:-0}" -gt 0 ]; then
+                mv -f "$DST/$1.part" "$DST/$1"
+                echo "M-OK $1 code=$code bytes=$sz host=$U" | rec
+                return 0
+              fi
+              echo "M-TRY $1 code=${code:-?} bytes=${sz:-0} host=$U err=$(head -c 160 /tmp/curl.err 2>/dev/null)" | rec
+            done
+            rm -f "$DST/$1.part"
+            return 1
+          }
           while read -r f; do
             mkdir -p "$DST/$(dirname "$f")"
-            if curl -fsSL --retry 2 --max-time 600 -o "$DST/$f" "$HOST/resolve/main/$f"; then
-              ok=$((ok+1))
-            else
-              bad=$((bad+1)); echo "M-FAIL 下不动: $f" | rec | ann "M-FAIL "
-            fi
+            if fetch "$f"; then ok=$((ok+1)); else bad=$((bad+1)); echo "M-FAIL 两个源都没拿下: $f" | rec; fi
           done < /tmp/paths.txt
           echo "M-VERDICT 下载 $ok 成 / $bad 败 host=$HOST 体积=$(du -sk "$DST/$PKG" 2>/dev/null | awk '{print $1"KB"}') 权重=$(ls -l "$DST/$PKG/Data/com.apple.CoreML/weights/weight.bin" 2>/dev/null | awk '{print $5}')" | rec | ann "M-VERDICT "
           ls -lR "$DST/$PKG" 2>/dev/null | head -12 | rec
