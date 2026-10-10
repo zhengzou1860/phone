@@ -204,7 +204,9 @@ jobs:
             sleep 10
           done
           [ "$hit" = 1 ] || echo "::error::REL-GATE 匿名接口三次都列不到 channel-vr3d 的 vr3d.ipa ⇒ 这一版确实没发出去"
-          exit "$hit"
+          # ⚠️ hit 和退出码是反的：hit=1 是「列到了」，而 exit 1 在 bash 里是「这一步失败」。
+          # 第 13 轮就是这么红的——ipa 已经发上去、闸门也列到了，我 exit "$hit" 把它判成红。
+          if [ "$hit" = 1 ]; then exit 0; else exit 1; fi
 
       - name: report compile errors
         if: failure()
