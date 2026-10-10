@@ -29,6 +29,8 @@ jobs:
           L=/tmp/zt/step.log
           rm -rf /tmp/zt && mkdir -p /tmp/zt/src /tmp/zt/out
           echo "=== mkdir ===" > $L
+          ios=$(xcrun --sdk iphoneos --show-sdk-path)
+          echo "=== ios sdk = $ios ===" >> $L
 
           python3 - <<'PY' 2>>$L
           import os
@@ -38,18 +40,26 @@ jobs:
                              ('big.bin', 3*1024*1024)]:
               with open(f'/tmp/zt/src/{name}','wb') as f:
                   f.write(os.urandom(size))
+          # 随机数据 zip 会"stored"或"deflated 0%"，这条才是真能压下去的，走 inflate
+          with open('/tmp/zt/src/textible.txt','w') as f:
+              f.write('MEANVC 中文声音克隆 onnx 权重头 ' * 60000)
           PY
           echo "=== python rc=$? ===" >> $L
 
           (cd /tmp/zt/src && zip -r ../test.zip .) >> $L 2>&1
           echo "=== zip rc=$? ===" >> $L
           ls -l /tmp/zt/test.zip >> $L 2>&1
+          unzip -l /tmp/zt/test.zip >> $L 2>&1
 
           cat > /tmp/zt/main.swift <<'SW'
           import Foundation
           let zipURL = URL(fileURLWithPath: CommandLine.arguments[1])
           let outDir = URL(fileURLWithPath: CommandLine.arguments[2])
           do {
+              let es = try ZipExtractor.readEntries(zipURL: zipURL)
+              for e in es.sorted(by: { $0.filename < $1.filename }) {
+                  print("ENT \(e.filename) method=\(e.compressionMethod) c=\(e.compressedSize) u=\(e.uncompressedSize)")
+              }
               try ZipExtractor.extractAll(zipURL: zipURL, to: outDir)
               let files = try FileManager.default.contentsOfDirectory(atPath: outDir.path)
               for f in files.sorted() {
@@ -64,18 +74,22 @@ jobs:
           SW
           echo "=== main.swift 写了 ===" >> $L
 
-          swiftc -O \
-            -o /tmp/zt/zip_test \
-            "$GITHUB_WORKSPACE/app/SourcesVoice/ZipExtractor.swift" \
-            /tmp/zt/main.swift >> $L 2>&1
-          echo "=== swiftc rc=$? ===" >> $L
+          ZS="$GITHUB_WORKSPACE/app/SourcesVoice/ZipExtractor.swift"
+
+          # 关键：按 iphoneos SDK 静态检查。上一版 macOS 编得过、iOS 编不过，就是这个洞
+          swiftc -typecheck -sdk "$ios" -target arm64-apple-ios15.0 \
+            "$ZS" /tmp/zt/main.swift >> $L 2>&1
+          echo "=== iOS typecheck rc=$? ===" >> $L
+
+          swiftc -O -o /tmp/zt/zip_test "$ZS" /tmp/zt/main.swift >> $L 2>&1
+          echo "=== swiftc(macos) rc=$? ===" >> $L
           ls -l /tmp/zt/zip_test >> $L 2>&1
 
           /tmp/zt/zip_test /tmp/zt/test.zip /tmp/zt/out >> $L 2>&1
           echo "=== zip_test rc=$? ===" >> $L
 
           bad=0
-          for f in small.bin mid.bin big.bin; do
+          for f in small.bin mid.bin big.bin textible.txt; do
             if cmp -s /tmp/zt/src/$f /tmp/zt/out/$f; then
               echo "MATCH $f" >> $L
             else
@@ -83,11 +97,21 @@ jobs:
               bad=$((bad+1))
             fi
           done
+          # 必须真有条目走了 inflate，否则这轮自检等于没测解压
+          if grep -q "method=8" /tmp/zt/step.log; then
+            echo "DEFLATE 路径测到了" >> $L
+          else
+            echo "没有 method=8 条目，inflate 分支未被覆盖" >> $L
+            bad=$((bad+1))
+          fi
           echo "=== bad=$bad ===" >> $L
-
-          # 自检不拦路（step.log 会被"发编译日志"步骤带到 release 里，我那边看）
           echo "ZT-BAD=$bad" >> $L
-          true
+
+          # 自检恢复拦路：解压代码是下载后唯一的通路，坏包上机只是白折腾一次装机
+          if [ "$bad" != "0" ]; then
+            echo "ZipExtractor 自检没过，不出 IPA"
+            exit 1
+          fi
 
       - name: 装 XcodeGen
         run: brew install xcodegen

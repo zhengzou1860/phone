@@ -156,62 +156,79 @@ enum ZipExtractor {
                                 compressedSize: Int,
                                 uncompressedSize: Int,
                                 name: String) throws {
-        let inChunk = 1 << 20       // 1 MB 输入
-        let outChunk = 4 << 20      // 4 MB 输出
-        var srcArr = [UInt8](repeating: 0, count: inChunk)
-        var dstArr = [UInt8](repeating: 0, count: outChunk)
+        let inChunk  = 1 << 20      // 1 MB 输入缓冲
+        let outChunk = 4 << 20      // 4 MB 输出缓冲
+        let srcBuf = UnsafeMutablePointer<UInt8>.allocate(capacity: inChunk)
+        let dstBuf = UnsafeMutablePointer<UInt8>.allocate(capacity: outChunk)
+        defer { srcBuf.deallocate(); dstBuf.deallocate() }
 
-        var stream = compression_stream()
-        guard compression_stream_init(&stream, COMPRESSION_DECODE, COMPRESSION_ZLIB)
+        // Swift 不给导入的 C struct 生成无参 init，五个字段必须逐个给
+        var stream = compression_stream(dst_ptr: dstBuf, dst_size: 0,
+                                        src_ptr: UnsafePointer(srcBuf), src_size: 0,
+                                        state: nil)
+        guard compression_stream_init(&stream, COMPRESSION_STREAM_DECODE, COMPRESSION_ZLIB)
                 == COMPRESSION_STATUS_OK else {
             throw ZipError.inflateFailed("stream_init 失败 (\(name))")
         }
         defer { compression_stream_destroy(&stream) }
 
-        var remainingIn = compressedSize
-        var done = false
-        while !done {
-            let toRead = min(inChunk, remainingIn)
-            var filled = 0
-            if toRead > 0 {
-                let data = try fh.read(upToCount: toRead) ?? Data()
-                if data.isEmpty {
-                    throw ZipError.ioFailed("inflate 提前 EOF (\(name))")
+        var remainingIn = compressedSize   // zip 里还没读出来的压缩字节
+        var buffered = 0                   // srcBuf 头部待处理的字节
+        var producedTotal = 0
+        var iterations = 0
+
+        while true {
+            iterations += 1
+            if iterations > 4096 {
+                throw ZipError.inflateFailed("\(name) 迭代超上限 produced=\(producedTotal)")
+            }
+
+            if remainingIn > 0 && buffered < inChunk {
+                let want = min(remainingIn, inChunk - buffered)
+                let data = try fh.read(upToCount: want) ?? Data()
+                if data.isEmpty { throw ZipError.ioFailed("inflate 提前 EOF (\(name))") }
+                _ = data.withUnsafeBytes { raw in
+                    memcpy(srcBuf + buffered, raw.baseAddress!, data.count)
                 }
-                data.withUnsafeBytes { raw in
-                    memcpy(&srcArr, raw.baseAddress, data.count)
-                }
-                filled = data.count
+                buffered += data.count
                 remainingIn -= data.count
             }
-            let flags: compression_stream_flag = (remainingIn <= 0) ? COMPRESSION_STREAM_FINALIZE : 0
 
-            var statusOut: compression_status = COMPRESSION_STATUS_OK
-            var producedData: Data = Data()
-            srcArr.withUnsafeMutableBufferPointer { srcPtr in
-                dstArr.withUnsafeMutableBufferPointer { dstPtr in
-                    stream.src_ptr = srcPtr.baseAddress!
-                    stream.src_size = filled
-                    stream.dst_ptr = dstPtr.baseAddress!
-                    stream.dst_size = outChunk
-                    statusOut = compression_decode_stream(&stream, flags)
-                    let produced = outChunk - stream.dst_size
-                    if produced > 0 {
-                        producedData = Data(bytes: dstPtr.baseAddress!, count: produced)
-                    }
-                }
+            // 输入喂完 = 这一条 deflate 流的最后一块，必须带 FINALIZE，否则解不结束
+            let isLastInput = (remainingIn <= 0)
+            stream.src_ptr = UnsafePointer(srcBuf)
+            stream.src_size = buffered
+            stream.dst_ptr = dstBuf
+            stream.dst_size = outChunk
+
+            let status = compression_stream_process(&stream,
+                                                    isLastInput ? COMPRESSION_STREAM_FINALIZE : 0)
+
+            // process 会把 src_ptr 往前推、src_size 留成"还没吃掉的"，挪回头部再喂下一批
+            let unconsumed = stream.src_size
+            if unconsumed > 0 {
+                memmove(srcBuf, srcBuf + (buffered - unconsumed), unconsumed)
             }
-            if !producedData.isEmpty {
-                try outFH.write(contentsOf: producedData)
+            buffered = unconsumed
+
+            let produced = outChunk - stream.dst_size
+            if produced > 0 {
+                try outFH.write(contentsOf: UnsafeRawBufferPointer(start: dstBuf, count: produced))
+                producedTotal += produced
             }
-            switch statusOut {
+
+            switch status {
             case COMPRESSION_STATUS_END:
-                done = true
+                if producedTotal != uncompressedSize {
+                    throw ZipError.inflateFailed("\(name) 解出 \(producedTotal)，中央目录声明 \(uncompressedSize)")
+                }
+                return
             case COMPRESSION_STATUS_ERROR:
-                throw ZipError.inflateFailed("decode 报错 (\(name))")
+                throw ZipError.inflateFailed("decode 报错 (\(name)) produced=\(producedTotal)")
             default:
-                if remainingIn <= 0 && producedData.isEmpty && filled == 0 {
-                    done = true
+                // 没有 END 也没有 ERROR，但三方都没动 → 再转下去也不会变，判死
+                if produced == 0 && buffered == 0 && remainingIn <= 0 {
+                    throw ZipError.inflateFailed("流提前断 (\(name)) produced=\(producedTotal)/\(uncompressedSize)")
                 }
             }
         }
