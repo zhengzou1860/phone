@@ -122,6 +122,16 @@ func gate(_ name: String, _ m: Metric, relMaxLimit: Double, cosLimit: Double, ha
     }
 }
 
+/// 不长成 Metric 的那种判据（长度、增益、比值）就报一行数并按需拦路。
+func softCheck(_ name: String, _ ok: Bool, _ text: String) {
+    if ok {
+        print("     过 " + name + "：" + text)
+    } else {
+        print("     不过 " + name + "：" + text)
+        failures.append(name)
+    }
+}
+
 // MARK: - 帧主序 / 通道主序
 
 let nMels = MelFrontEnd.nMels
@@ -253,7 +263,9 @@ if let e2e = stage("e2e", { try drv.convert(source: src, reference: ref) }) {
 // AVAudioConverter 这一步。这一步以前一个数都没有：降采样要是把 12 kHz 的能量不滤就折进
 // 带内，fbank 看到的就多出一层尖峰，而这在逐段闸门里根本照不出来（那五段吃的是 fixture，
 // 不经过重采样）。所以这里用「48k 写盘 → loadWAV16K 读回」原样走一遍 app 的路。
-// 首轮只出数、不拦路——阈值等这轮读数定了再挂。
+// 首轮（2026-10-11）读数：带内 300/3000 Hz 增益 1.0000 / 0.9994，带外 12 kHz 折进带内
+// 只占真 4 kHz 的 0.0035% ⇒ AVAudioConverter 是带抗混叠滤波的，这一环可以放行；
+// 代价是长度少 213 样本（3 s 该 48000，实际 47787）。阈值按这四个数挂。
 
 /// 1 s 窗的 Goertzel 幅度。整数 Hz 在 16000 点里正好整数个周期 ⇒ 无泄漏，读数就是正弦振幅。
 /// 窗取末尾：转换器滤波器的建立段在前面，别把它算进幅度里。
@@ -293,9 +305,10 @@ func resampleProbe(_ tones: [(hz: Int, amp: Double)], tag: String) throws -> [Fl
 
 _ = stage("resample", { () throws -> Bool in
     let a = try resampleProbe([(300, 0.3), (3000, 0.3)], tag: "inband")
-    for hz in [300, 3000] {
-        let v = toneAmp(a, hz)
-        print(String(format: "RESAMPLE inband hz=%d 写 0.300000 读回 %.6f ⇒ 增益 %.4f", hz, v, v / 0.3))
+    let g300 = toneAmp(a, 300) / 0.3
+    let g3000 = toneAmp(a, 3000) / 0.3
+    for (hz, g) in [(300, g300), (3000, g3000)] {
+        print(String(format: "RESAMPLE inband hz=%d amp=%.6f ⇒ 增益 %.4f", hz, g * 0.3, g))
     }
     print(String(format: "RESAMPLE floor hz=7777 amp=%.6f（同一条里无关频点＝这把尺的本底）", toneAmp(a, 7777)))
 
@@ -310,8 +323,19 @@ _ = stage("resample", { () throws -> Bool in
         hz += 100
     }
     let ref = toneAmp(c, 4000)
-    print(String(format: "RESAMPLE alias 带外 12k 折进带内最大 %.6f @%d Hz ／ 天花板（真 4k）%.6f ⇒ %.4f%%",
-                 bestAmp, bestHz, ref, ref > 0 ? bestAmp / ref * 100.0 : -1))
+    let alias = ref > 0 ? bestAmp / ref : 1.0
+    print(String(format: "RESAMPLE alias 带外 12k 折进带内最大 %.6f @%d Hz ／ 天花板（真 4k）%.6f（增益 %.4f）⇒ %.4f%%",
+                 bestAmp, bestHz, ref, ref / 0.3, alias * 100.0))
+
+    // 阈值全是 2026-10-11 首轮实测挂的，括号里就是那次的读数
+    softCheck("resample", abs(a.count - 16000 * 3) <= 16000 * 3 * 2 / 100,
+              "长度 \(a.count)（3 s@16k 应 48000；实测少 213，容差 2%）")
+    softCheck("resample", g300 > 0.95 && g300 < 1.05,
+              String(format: "300 Hz 增益 %.4f（实测 1.0000，限 (0.95,1.05)）", g300))
+    softCheck("resample", g3000 > 0.90 && g3000 < 1.05,
+              String(format: "3000 Hz 增益 %.4f（实测 0.9994，限 (0.90,1.05)）", g3000))
+    softCheck("resample", alias < 0.001,
+              String(format: "带外 12k 折进带内 %.4f%%（实测 0.0035%%，限 0.1%%）", alias * 100))
     return true
 })
 
