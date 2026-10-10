@@ -180,7 +180,11 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -uo pipefail
+          # GitHub 给默认 bash shell 的是 `-e -o pipefail`，而 `set -uo pipefail` 关不掉那个 -e。
+          # 上一轮末尾那句 `exit 0` 就是这么根本没跑到的：核对用的 grep 因为 curl 没落下文件而回 2，
+          # 整步当场掐死——可 release 在 9 秒前就真发出去了（ipa 46,005,008 字节、body 里带着本轮 sha）。
+          # 红不等于没发出去，这个状态就没用了。改成：过程全 set +e 走到底，末尾只留一道真闸门。
+          set +e
           ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=6{print "::error::" p substr($0,1,230)}'; }
           cat /tmp/model.log /tmp/build.log > ./build.log 2>/dev/null || cp /tmp/build.log ./build.log
           gh release delete channel-vr3d --cleanup-tag -y >/dev/null 2>&1 || true
@@ -189,21 +193,26 @@ jobs:
             --prerelease \
             --notes "CI artifact for commit $GITHUB_SHA" 2>&1 | ann "REL "
           echo "url=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/channel-vr3d/vr3d.ipa" | ann "REL "
-          # 发没发出去只认匿名接口能不能列出来，不认 gh 的退出码
-          curl -fsSL -o /tmp/relcheck.json --max-time 60 \
-            https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/channel-vr3d || true
-          grep -oE '"name": *"vr3d.ipa"|"browser_download_url": *"[^"]*"|"message": *"[^"]*"' /tmp/relcheck.json | ann "REL-GET "
-          # 必须显式 exit 0：上面那句是"核对"不是"闸门"，而 grep 无匹配回 1 经过 pipefail
-          # 就成了整步的退出码。第 8 轮就是这样——包和模型全对、44 MB 的 ipa 明明已经在
-          # release 上（我匿名 HEAD 到 content-length=45995841），状态却报红。
-          # 后面装机阶段我要连着推好几轮，状态必须是能信的：绿=真绿。
-          exit 0
+          # 闸门：发没发出去只认匿名接口能不能列出 vr3d.ipa 这个 asset，不认 gh 的退出码。
+          # 不带 -f：403/404 的 JSON 正文也要落进文件，否则下一步 grep 是在一个不存在的文件上找线索。
+          hit=0
+          for i in 1 2 3; do
+            curl -sS -o /tmp/relcheck.json --max-time 60 \
+              https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/channel-vr3d
+            grep -oE '"name": *"[^"]*"|"browser_download_url": *"[^"]*"|"message": *"[^"]*"' /tmp/relcheck.json | ann "REL-GET "
+            grep -q '"name": *"vr3d.ipa"' /tmp/relcheck.json && { hit=1; break; }
+            sleep 10
+          done
+          [ "$hit" = 1 ] || echo "::error::REL-GATE 匿名接口三次都列不到 channel-vr3d 的 vr3d.ipa ⇒ 这一版确实没发出去"
+          exit "$hit"
 
       - name: report compile errors
         if: failure()
         working-directory: app
         run: |
-          set -uo pipefail
+          # 这一步只负责把 error 行捞出来给人看：grep 没捞到是好消息，不该让它把作业染红。
+          # 光在末尾写 exit 0 不够——默认的 -e 会在 grep 那一句就把脚本掐死，根本走不到末行。
+          set +e
           ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=8{print "::error::" p substr($0,1,230)}'; }
           cat /tmp/model.log /tmp/build.log > ./build.log 2>/dev/null || cp /tmp/build.log ./build.log 2>/dev/null || echo "no build log at all" > ./build.log
           grep -nE "error:|fatal error:" ./build.log | ann "ERR "
