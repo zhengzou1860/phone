@@ -135,7 +135,7 @@ final class VRDepthFeed {
                 return ([], (prepMs, 0), VRPlane.Out(), "输出 \(key) 取不到值")
             }
             let plane: VRPlane.Out
-            if let pb = v.imageBufferValue?.pixelBuffer {
+            if let pb = v.imageBufferValue {
                 plane = VRPlane.read(pb)
             } else if let arr = v.multiArrayValue {
                 plane = VRPlane.fromArray(arr)

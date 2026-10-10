@@ -88,17 +88,29 @@ enum VRDepth {
 
     // MARK: - 模型自述
 
+    /// MLImageConstraint 这边只给一个 sizeConstraint；"允许区间"和"只认这几个尺寸"是两套字段，
+    /// 得先看它的 type 再取，取错分支只会读到 NSRange(0,0) 这种假数字。
+    static func sizeNote(_ sc: MLImageSizeConstraint) -> String {
+        switch sc.type {
+        case .range:
+            let w = sc.pixelsWideRange, h = sc.pixelsHighRange
+            return "允许区间 宽 \(w.location)~\(w.location + w.length - 1) 高 \(h.location)~\(h.location + h.length - 1)"
+        case .enumerated:
+            let list = sc.enumeratedImageSizes.map { "\($0.pixelsWide)x\($0.pixelsHigh)" }
+            return "只认这几个尺寸 " + list.joined(separator: " ")
+        default:
+            return "没声明尺寸范围（走 pixelsWide x pixelsHigh 那个固定值）"
+        }
+    }
+
     static func describe(_ model: MLModel) -> String {
         let md = model.modelDescription
         var out: [String] = []
         for (name, d) in md.inputDescriptionsByName.sorted(by: { $0.key < $1.key }) {
             if let ic = d.imageConstraint {
-                let mn = ic.minSize, mx = ic.maxSize
-                let range = "\(Int(mn.width.rounded()))x\(Int(mn.height.rounded()))"
-                    + "~\(Int(mx.width.rounded()))x\(Int(mx.height.rounded()))"
                 let decl = "\(ic.pixelsWide)x\(ic.pixelsHigh)"
-                let kinds = ic.supportedCVPixelBufferTypes.count
-                out.append("  输入 \(name) image 声明 \(decl)｜允许区间 \(range)｜支持的像素缓冲 \(kinds) 种")
+                let fmt = VRUtil.fourcc(ic.pixelFormatType)
+                out.append("  输入 \(name) image 声明 \(decl) 像素格式 \(fmt)｜\(sizeNote(ic.sizeConstraint))")
             } else if let mc = d.multiArrayConstraint {
                 out.append("  输入 \(name) multiArray dims=\(mc.shape.map { $0.intValue }) 类型 \(mc.dataType.rawValue)")
             } else {
@@ -108,10 +120,8 @@ enum VRDepth {
         for (name, d) in md.outputDescriptionsByName.sorted(by: { $0.key < $1.key }) {
             if let ic = d.imageConstraint {
                 let decl = "\(ic.pixelsWide)x\(ic.pixelsHigh)"
-                let mn = ic.minSize, mx = ic.maxSize
-                let range = "\(Int(mn.width.rounded()))x\(Int(mn.height.rounded()))"
-                    + "~\(Int(mx.width.rounded()))x\(Int(mx.height.rounded()))"
-                out.append("  输出 \(name) image 声明 \(decl)｜区间 \(range)")
+                let fmt = VRUtil.fourcc(ic.pixelFormatType)
+                out.append("  输出 \(name) image 声明 \(decl) 像素格式 \(fmt)｜\(sizeNote(ic.sizeConstraint))")
             } else if let mc = d.multiArrayConstraint {
                 out.append("  输出 \(name) multiArray dims=\(mc.shape.map { $0.intValue }) 类型 \(mc.dataType.rawValue)")
             } else {
@@ -130,8 +140,14 @@ enum VRDepth {
             return (eyeW, eyeH, false, "输入不是图像，按眼尺寸喂")
         }
         let dw = ic.pixelsWide, dh = ic.pixelsHigh
-        let mnW = Int(ic.minSize.width.rounded()), mnH = Int(ic.minSize.height.rounded())
-        let mxW = Int(ic.maxSize.width.rounded()), mxH = Int(ic.maxSize.height.rounded())
+        let sc = ic.sizeConstraint
+        guard sc.type == .range else {
+            return (dw, dh, false,
+                    "模型不是「允许区间」口径（\(sizeNote(sc))）⇒ 按固定 \(dw)x\(dh) 等比留黑边，不拉伸")
+        }
+        let mnW = sc.pixelsWideRange.location, mnH = sc.pixelsHighRange.location
+        let mxW = sc.pixelsWideRange.location + sc.pixelsWideRange.length - 1
+        let mxH = sc.pixelsHighRange.location + sc.pixelsHighRange.length - 1
         let flexible = mxW > mnW || mxH > mnH || (mnW == 0 && mxW == 0)
         if !flexible {
             return (dw, dh, false, "模型只认固定 \(dw)x\(dh) ⇒ 等比塞进去留黑边，不拉伸")
@@ -247,7 +263,7 @@ enum VRDepth {
             }
             return "输出 \(key) multiArray dims=\(dims) 类型 \(arr.dataType.rawValue) 数值 \(String(format: "%.3f~%.3f", mn, mx))"
         }
-        guard let pb = v.imageBufferValue?.pixelBuffer else {
+        guard let pb = v.imageBufferValue else {
             return "输出 \(key) 类型 \(v.type.rawValue)：既不是 multiArray 也取不到 pixelBuffer"
         }
         let plane = VRPlane.read(pb)
