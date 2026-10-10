@@ -20,7 +20,7 @@ struct VRMainView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
-                Text("VR3D 验证件 v0.1")
+                Text("VR3D 验证件 v\(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "-")")
                     .font(.title2)
                     .foregroundColor(.green)
 
@@ -28,18 +28,42 @@ struct VRMainView: View {
                     .font(.system(size: 11, design: .monospaced))
                     .textSelection(.enabled)
 
-                Picker("抽帧数", selection: $job.frames) {
-                    Text("6 帧").tag(6)
-                    Text("10 帧").tag(10)
-                    Text("20 帧").tag(20)
+                Picker("出片模式", selection: $job.fullMode) {
+                    Text("试片 几秒").tag(false)
+                    Text("全片 整条").tag(true)
                 }
                 .pickerStyle(.segmented)
                 .font(.footnote)
 
-                Text("送检尺寸不可调：模型声明「只认 518x392」（上机实测）\n"
-                     + "竖屏画面等比进去只占约 215~220 px 宽，左右是黑边 ⇒ 深度单价与「每眼」档无关")
-                    .font(.system(size: 10, design: .monospaced))
-                    .foregroundColor(.orange)
+                if job.fullMode {
+                    Picker("全片出几条", selection: $job.fullZps) {
+                        Text("1 条 zp0.15").tag(1)
+                        Text("3 条 zp.15/.50/.85").tag(3)
+                    }
+                    .pickerStyle(.segmented)
+                    .font(.footnote)
+
+                    Text("全片不限时长：一趟扫（深度落盘 0.77 MB/帧＝518x392 的 Float32，按 30 fps 约 23 MB/秒素材）"
+                         + "＋每条一趟出片。开跑前先看磁盘闸门报的那一行：够就往下跑，不够就直接告诉你还能塞多少秒。"
+                         + "整片 p1/p99（PC 的 m6 口径）、时域平滑 0.4 都在这条路上，跟抽帧数的 6.6 s 样片无关\n"
+                         + "按 10-10 实测单价折：扫约 0.25 s/帧、出片约 0.15 s/帧 ⇒ 3 分钟片 1 条约 35 分钟、3 条约 1 小时"
+                         + "（这数是按单价乘出来的，全片这条链路本身还没上机跑过）")
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundColor(.orange)
+                } else {
+                    Picker("抽帧数", selection: $job.frames) {
+                        Text("6 帧").tag(6)
+                        Text("10 帧").tag(10)
+                        Text("20 帧").tag(20)
+                    }
+                    .pickerStyle(.segmented)
+                    .font(.footnote)
+
+                    Text("送检尺寸不可调：模型声明「只认 518x392」（上机实测）\n"
+                         + "竖屏画面等比进去只占约 215~220 px 宽，左右是黑边 ⇒ 深度单价与「每眼」档无关")
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundColor(.orange)
+                }
 
                 Picker("送检朝向", selection: $job.feedRot) {
                     Text("摆正").tag(false)
@@ -90,7 +114,7 @@ struct VRMainView: View {
                 .disabled(job.busy)
 
                 HStack(spacing: 10) {
-                    Button("选视频出试片") { job.showVideoPicker = true }
+                    Button(job.fullMode ? "选视频出全片" : "选视频出试片") { job.showVideoPicker = true }
                     Button("发到电脑") { job.sendReport() }
                 }
                 .buttonStyle(.borderedProminent)
@@ -101,6 +125,16 @@ struct VRMainView: View {
                     Text(job.status)
                         .font(.footnote)
                         .foregroundColor(.secondary)
+                    if job.fullRunning && VRFull.totalFrames > 0 {
+                        ProgressView(value: Double(VRFull.doneFrames), total: Double(VRFull.totalFrames))
+                            .tint(.green)
+                    }
+                }
+                if job.fullRunning && !job.stopPressed {
+                    Button("停止（已扫的和已出的照样收）") { job.stopFull() }
+                        .buttonStyle(.bordered)
+                        .tint(.red)
+                        .font(.footnote)
                 }
 
                 Text(job.log.joined(separator: "\n\n"))
@@ -137,6 +171,13 @@ final class VRJob: ObservableObject {
     @Published var unitTag = 3
     /// 默认摆正：所有已测数字都是这个口径下测的，换朝向要靠同一素材两版对看
     @Published var feedRot = false
+    /// 试片（抽 N 帧、只出几秒，指标全）／全片（整条，深度落盘跑两趟）
+    @Published var fullMode = false
+    /// 1 条 = PC m6 那个出货档 zp0.15；3 条 = 上中下三个零视差面对比
+    @Published var fullZps = 1
+    @Published var fullRunning = false
+    @Published var stopPressed = false
+    private var ticker: Timer?
 
     init() {
         let info = Bundle.main.infoDictionary ?? [:]
@@ -154,6 +195,9 @@ final class VRJob: ObservableObject {
     }
 
     func finish(_ report: String) {
+        ticker?.invalidate()
+        ticker = nil
+        fullRunning = false
         log.append(report)
         if log.count > 8 { log.removeFirst(log.count - 8) }
         busy = false
@@ -197,13 +241,45 @@ final class VRJob: ObservableObject {
         }
     }
 
+    func startFull(_ url: URL) {
+        showVideoPicker = false
+        busy = true
+        fullRunning = true
+        stopPressed = false
+        let b = Float(bpct)
+        let eye = eyeLong
+        let u = VRJob.unit(unitTag)
+        let rot = feedRot
+        let zps: [Float] = fullZps == 3 ? [0.15, 0.50, 0.85] : [0.15]
+        VRPressure.reset()
+        status = "全片起手…（读几何、载模型、过磁盘闸门）"
+        ticker = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                guard let self = self, self.busy else { return }
+                let p = VRFull.progress
+                guard !p.isEmpty else { return }
+                self.status = (VRFull.cancelRequested ? "正在收兵｜" : "") + p
+            }
+        }
+        Task.detached { [weak self] in
+            let r = VRFull.run(url: url, bpct: b, eyeLong: eye, zps: zps, smooth: 0.4, units: u, rot: rot)
+            await MainActor.run { self?.finish(r) }
+        }
+    }
+
+    func stopFull() {
+        VRFull.requestCancel()
+        stopPressed = true
+        status = "正在收兵：把手上这一帧/这一条做完就停，已扫的深度和已出的成片照样报"
+    }
+
     func finishPick(url: URL?, failMessage: String?) {
         showVideoPicker = false
         guard let url = url else {
             log.append("取文件失败\n\(failMessage ?? "未知原因")")
             return
         }
-        startPilot(url)
+        if fullMode { startFull(url) } else { startPilot(url) }
     }
 
     func sendReport() {

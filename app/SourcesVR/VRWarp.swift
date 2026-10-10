@@ -163,13 +163,17 @@ final class VRDepthFeed {
 
     /// 深度图（连黑边那圈一起）→ 眼格：只在深度图尺寸变了时重建索引表
     private func resample(_ plane: VRPlane.Out) -> [Float] {
-        guard plane.w > 0, plane.h > 0, !plane.vals.isEmpty else { return [] }
-        if mapForW != plane.w || mapForH != plane.h || map.count != eyeW * eyeH {
-            buildMap(dw: plane.w, dh: plane.h)
+        reshaped(plane.vals, w: plane.w, h: plane.h)
+    }
+
+    /// 全片第二趟从缓存读回来的只是平面数值，没有 VRPlane.Out 那层壳 ⇒ 入口按值给。
+    func reshaped(_ vals: [Float], w dw: Int, h dh: Int) -> [Float] {
+        guard dw > 0, dh > 0, vals.count >= dw * dh else { return [] }
+        if mapForW != dw || mapForH != dh || map.count != eyeW * eyeH {
+            buildMap(dw: dw, dh: dh)
         }
-        let v = plane.vals
         var out = [Float](repeating: 0, count: eyeW * eyeH)
-        for i in 0..<(eyeW * eyeH) { out[i] = v[map[i]] }
+        for i in 0..<(eyeW * eyeH) { out[i] = vals[map[i]] }
         return out
     }
 
