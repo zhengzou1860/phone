@@ -193,6 +193,11 @@ jobs:
           curl -fsSL -o /tmp/relcheck.json --max-time 60 \
             https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/channel-vr3d || true
           grep -oE '"name": *"vr3d.ipa"|"browser_download_url": *"[^"]*"|"message": *"[^"]*"' /tmp/relcheck.json | ann "REL-GET "
+          # 必须显式 exit 0：上面那句是"核对"不是"闸门"，而 grep 无匹配回 1 经过 pipefail
+          # 就成了整步的退出码。第 8 轮就是这样——包和模型全对、44 MB 的 ipa 明明已经在
+          # release 上（我匿名 HEAD 到 content-length=45995841），状态却报红。
+          # 后面装机阶段我要连着推好几轮，状态必须是能信的：绿=真绿。
+          exit 0
 
       - name: report compile errors
         if: failure()
@@ -202,6 +207,8 @@ jobs:
           ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=8{print "::error::" p substr($0,1,230)}'; }
           cat /tmp/model.log /tmp/build.log > ./build.log 2>/dev/null || cp /tmp/build.log ./build.log 2>/dev/null || echo "no build log at all" > ./build.log
           grep -nE "error:|fatal error:" ./build.log | ann "ERR "
+          # 同样：这一步只是把 error 行捞出来给人看，没捞到不代表这一步该红。
+          exit 0
 
       - name: report release failure
         if: failure()
