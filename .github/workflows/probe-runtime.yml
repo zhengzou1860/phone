@@ -1,0 +1,137 @@
+name: probe-runtime
+
+# 一次性探路，不动 Voice 的代码、不出 IPA。要回答的是两个我没法在 Windows 本机测的事实：
+#   1) ONNX Runtime 到底有没有能拉下来的 iOS 二进制（官方 GitHub release 1.31.0 里没有）
+#   2) macOS runner 上能不能把我们的 onnx 转成 CoreML mlpackage（coremltools 没有 Windows 版）
+# 结论以 release probe-runtime-log 的 probe.log 带回来，不看退出码。
+
+on:
+  push:
+    paths:
+      - '.github/workflows/probe-runtime.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: probe-runtime
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    runs-on: macos-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 探两条运行时路
+        run: |
+          set +e
+          P=/tmp/probe.log
+          : > $P
+          say() { echo "$@" >> $P; }
+
+          say "=== runner arch $(uname -m) / python $(python3 -V 2>&1) ==="
+
+          # ---------- 1. CocoaPods trunk：ONNX Runtime 的权威下载地址 ----------
+          say; say "--- 1) CocoaPods trunk 上 ONNXRuntime 的 source ---"
+          curl -sSL --max-time 90 "https://trunk.cocoapods.org/api/v1/pods/ONNXRuntime/specs/latest" -o /tmp/pod.json
+          say "curl rc=$?  bytes=$(wc -c </tmp/pod.json 2>/dev/null)"
+          python3 - <<'PY' >> $P 2>&1
+          import json
+          try:
+              d = json.load(open('/tmp/pod.json'))
+              if isinstance(d, list): d = d[0]
+              v = d.get("version") or d.get("name")
+              src = d.get("source") or {}
+              print("pod version =", v)
+              print("source http =", src.get("http"))
+              print("vendored    =", d.get("vendored_frameworks"))
+          except Exception as e:
+              print("解析失败:", e)
+          PY
+          head -c 400 /tmp/pod.json | tr -d '\0' >> $P 2>&1
+
+          # ---------- 2. 直接试一堆候选 URL，看谁回 200 + 真实尺寸 ----------
+          say; say "--- 2) 候选 iOS 二进制直连测试 ---"
+          for u in \
+            "https://github.com/microsoft/onnxruntime/releases/download/v1.19.2/onnxruntime-c-1.19.2-ios.zip" \
+            "https://github.com/microsoft/onnxruntime/releases/download/v1.18.1/onnxruntime-c-1.18.1-ios.zip" \
+            "https://github.com/microsoft/onnxruntime/releases/download/prerelease/onnxruntime-swift-package-arm64-ios-1.17.0.zip" \
+            "https://github.com/microsoft/onnxruntime-swift-package-ios/releases/download/1.16.3/onnxruntime-swift-package-arm64-ios.zip" \
+            ; do
+            code=$(curl -sSIL -o /dev/null -w '%{http_code} %{size_download}' --max-time 40 "$u" 2>/dev/null)
+            say "试 $u -> $code"
+          done
+
+          # ---------- 3. macOS runner 能不能装 coremltools ----------
+          say; say "--- 3) pip install coremltools ---"
+          python3 -m pip install --quiet coremltools >> $P 2>&1
+          say "pip coremltools rc=$?"
+          python3 -c "import coremltools as ct; print('coremltools', ct.__version__)" >> $P 2>&1
+          say "import rc=$?"
+
+          # coremltools 6.0 起删了 ONNX 前端，这是 CoreML 路线的成败关键
+          say; say "--- 3b) ct.convert 还认不认 onnx ---"
+          python3 -c "
+          import coremltools as ct, inspect
+          print('convert doc 首行:', (ct.convert.__doc__ or '').strip().splitlines()[:3])
+          try:
+              import coremltools.converters.onnx as o; print('onnx 前端在:', o.__file__)
+          except Exception as e:
+              print('onnx 前端没了:', e)
+          " >> $P 2>&1
+          say "rc=$?"
+
+          say; say "--- 3c) aimlmodelopt（官方的 onnx->coreml 通道）---"
+          python3 -m pip install --quiet aimlmodelopt >> $P 2>&1
+          say "pip aimlmodelopt rc=$?"
+          aimlmodelopt --help >> $P 2>&1
+          say "aimlmodelopt --help rc=$?"
+
+          # ---------- 4. 拿我们自己最小的那条 onnx 真转一次 ----------
+          say; say "--- 4) 真转换：vocos.onnx 17 MB（我们包里最小的）---"
+          curl -sSL --max-time 240 \
+            "https://github.com/zhengzou1860/phone/releases/download/voice-models/models-fp16.zip" \
+            -o /tmp/models.zip >> $P 2>&1
+          say "拉 zip rc=$? bytes=$(wc -c </tmp/models.zip 2>/dev/null)"
+          rm -rf /tmp/mm && mkdir -p /tmp/mm
+          unzip -o -q /tmp/models.zip 'vocos.onnx' -d /tmp/mm >> $P 2>&1
+          say "unzip rc=$?  vocos=$(wc -c </tmp/mm/vocos.onnx 2>/dev/null)"
+
+          cd /tmp/mm
+          aimlmodelopt convert --input_path vocos.onnx --format mlprogram \
+            --output_path /tmp/mm/vocos.mlpackage >> $P 2>&1
+          say "aimlmodelopt convert rc=$? 产出=$(du -sk /tmp/mm/vocos.mlpackage 2>/dev/null | awk '{print $1"KB"}')"
+          find /tmp/mm/vocos.mlpackage -type f 2>/dev/null | head -5 >> $P
+
+          python3 -c "
+          import coremltools as ct
+          m = ct.convert('vocos.onnx')
+          m.save('vocos.mlpackage')
+          print('ct.convert(onnx) 居然成了')
+          " >> $P 2>&1
+          say "ct.convert rc=$?"
+
+          # ---------- 5. mlpackage 在 iOS 侧的装载前提 ----------
+          say; say "--- 5) 转换目标的 iOS deployment target ---"
+          python3 -c "
+          import coremltools as ct
+          print('target 里可用的 ios 枚举:', [x for x in dir(ct.target) if x.startswith('ios_')])
+          " >> $P 2>&1
+
+          cat $P
+
+      - name: 把探测结果发到 release
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          cd /tmp
+          # cd /tmp 后 gh 找不到 git remote，必须显式 --repo
+          gh release delete probe-runtime-log --cleanup-tag -y --repo "$GITHUB_REPOSITORY" 2>&1 || true
+          gh release create probe-runtime-log /tmp/probe.log \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "运行时探测" --prerelease --notes "ORT iOS + CoreML 转换 实测结论" 2>&1
