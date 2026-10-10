@@ -478,8 +478,9 @@ final class VRSource {
         guard let mine = made.pb else { return (nil, 0, made.note) }
         do {
             let reader = try AVAssetReader(asset: asset)
-            // 真声明是可失败的 init?(videoTracks:videoSettings:)，videoComposition 是建好之后再挂的属性
-            // ——不是 throws、也没有 inputSettings 这个标签（查过 DocC JSON）。
+            // 这个 init 不返回 Optional（第 16 轮 CI 拿 guard let 绑它，报 conditional binding must have
+            // Optional type）。下面赋给一个 Optional 变量只是隐式提升，别把它当成可失败 init；
+            // videoComposition 是建好之后再挂的属性，真正的失败要到 startReading 才看得见。
             let madeOut: AVAssetReaderVideoCompositionOutput? = AVAssetReaderVideoCompositionOutput(
                 videoTracks: [track],
                 videoSettings: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA])

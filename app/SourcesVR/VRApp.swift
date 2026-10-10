@@ -20,7 +20,7 @@ struct VRMainView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
-                Text("VR3D 验证件 v\(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "-")")
+                Text("VR3D 验证件 v\((Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "-")")
                     .font(.title2)
                     .foregroundColor(.green)
 

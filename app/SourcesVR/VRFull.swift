@@ -454,12 +454,11 @@ final class VRFrameStream {
             VRJournal.line("流 reader 建不出来")
             return nil
         }
-        guard let o = AVAssetReaderVideoCompositionOutput(
+        // 这个 init 不返回 Optional（CI 上机报的：conditional binding must have Optional type）。
+        // 参数不被支持时它照样建得出来，真正的失败在下一步 startReading 里报。
+        let o = AVAssetReaderVideoCompositionOutput(
             videoTracks: [src.track],
-            videoSettings: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]) else {
-            VRJournal.line("流 VideoCompositionOutput 建不出来")
-            return nil
-        }
+            videoSettings: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA])
         o.videoComposition = src.vc
         r.add(o)
         guard r.startReading() else {
