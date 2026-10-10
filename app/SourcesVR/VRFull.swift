@@ -290,7 +290,7 @@ enum VRFull {
             // 只读映射的页是干净的，系统缺内存时当场回收，不往进程里攒。
             var cacheMap = Data()
             do {
-                cacheMap = try Data(contentsOf: cache, options: .mapped)
+                cacheMap = try Data(contentsOf: cache, options: .alwaysMapped)
             } catch {
                 outs.append("zp\(String(format: "%.2f", zp)): 缓存映射不了 \(error)"); break
             }
