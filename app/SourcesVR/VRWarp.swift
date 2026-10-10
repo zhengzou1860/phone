@@ -61,6 +61,11 @@ extension VRTech {
         }
         // 等完才放：这批纹理还在刚才那条 commandBuffer 里被引用着
         keep.removeAll()
+        // 放完必须当场退缓存：CVMetalTextureCache 会替经手的每一块像素缓冲留一份 MTLTexture，
+        // 而全片一趟是几百到几千块不同的成片缓冲 ⇒ 不清就是每帧 1.3 MB 只涨不回
+        // （10-10 上机实测足迹 1.65 MB/帧，423 帧涨到 715 MB，三条 zp 到 1364 MB）。
+        // Flush 只退「已经没人引用」的那些，跨帧自己按住的那份（送检框）不受影响。
+        if let tc = VRTech.cache { CVMetalTextureCacheFlush(tc, 0) }
     }
 }
 
@@ -168,13 +173,22 @@ final class VRDepthFeed {
 
     /// 全片第二趟从缓存读回来的只是平面数值，没有 VRPlane.Out 那层壳 ⇒ 入口按值给。
     func reshaped(_ vals: [Float], w dw: Int, h dh: Int) -> [Float] {
-        guard dw > 0, dh > 0, vals.count >= dw * dh else { return [] }
+        var o: [Float] = []
+        return reshaped(vals, w: dw, h: dh, into: &o) ? o : []
+    }
+
+    /// 写进调用方自己那块数组（容量不对当场补齐），成功返回真。
+    /// 全片一趟几千帧，每帧新造一块眼格数组（304x540 就是 0.66 MB）纯粹是给分配器添垃圾。
+    @discardableResult
+    func reshaped(_ vals: [Float], w dw: Int, h dh: Int, into out: inout [Float]) -> Bool {
+        guard dw > 0, dh > 0, vals.count >= dw * dh else { return false }
         if mapForW != dw || mapForH != dh || map.count != eyeW * eyeH {
             buildMap(dw: dw, dh: dh)
         }
-        var out = [Float](repeating: 0, count: eyeW * eyeH)
-        for i in 0..<(eyeW * eyeH) { out[i] = vals[map[i]] }
-        return out
+        let px = eyeW * eyeH
+        if out.count != px { out = [Float](repeating: 0, count: px) }
+        for i in 0..<px { out[i] = vals[map[i]] }
+        return true
     }
 
     /// 深度图 → 眼格，但走那张「不做旋转修正」的表：只为给朝向自证一个地板读数

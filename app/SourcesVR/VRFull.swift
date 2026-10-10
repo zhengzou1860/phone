@@ -249,6 +249,8 @@ enum VRFull {
         var planeVals = [Float](repeating: 0, count: maxPlaneW * maxPlaneH)
         var dn = [Float](repeating: 0, count: px)
         var prev = [Float](repeating: 0, count: px)
+        // 摊回眼格那块复用同一份数组：全片一趟几千帧，每帧新造 0.66 MB 是给分配器添垃圾
+        var eyeVals: [Float] = []
         let bitrate = max(4_000_000, Int(Double(sbsW * h * 6) * 1.2))
         var encStart = 0.0
         var encTail = 0.0
@@ -304,6 +306,10 @@ enum VRFull {
             }
             writer.startSession(atSourceTime: .zero)
             encStart += Double(DispatchTime.now().uptimeNanoseconds - tHead0) / 1_000_000
+            // 池要 startWriting 之后才建得出来。走池 = 同一批 IOSurface 反复用；
+            // 每帧新造 = 一条几百帧的片子在纹理缓存里攒几百份，涨完还不回来（10-10 实测 1.65 MB/帧）。
+            let pool = adaptor.pixelBufferPool
+            let bufFrom = pool == nil ? "每帧新造" : "adaptor 池"
 
             var k = 0
             var holes = 0.0
@@ -324,20 +330,29 @@ enum VRFull {
                     }
                 }
                 let tN = DispatchTime.now().uptimeNanoseconds
-                let e = feed.reshaped(planeVals, w: maxPlaneW, h: maxPlaneH)
-                guard e.count == px else { why = "第 \(k + 1) 帧摊回眼格得到 \(e.count) 个，应为 \(px)"; break }
-                for i in 0..<px { dn[i] = min(1.0, max(0.0, (e[i] - lo) / span)) }
+                guard feed.reshaped(planeVals, w: maxPlaneW, h: maxPlaneH, into: &eyeVals),
+                      eyeVals.count == px else {
+                    why = "第 \(k + 1) 帧摊回眼格失败或数量不对（应为 \(px)）"; break
+                }
+                for i in 0..<px { dn[i] = min(1.0, max(0.0, (eyeVals[i] - lo) / span)) }
                 if k > 0 && smooth > 0 {
                     for i in 0..<px { dn[i] = (1 - smooth) * dn[i] + smooth * prev[i] }
                 }
-                prev = dn
+                for i in 0..<px { prev[i] = dn[i] }
                 normMs.append(Double(DispatchTime.now().uptimeNanoseconds - tN) / 1_000_000)
                 d2.append(dMs)
                 let tb = DispatchTime.now().uptimeNanoseconds
-                // 每帧新造一块输出缓冲：adaptor 只保证「交出去的那块在编码器用完前不死」，
-                // isReadyForMoreMediaData 不代表上一帧已经吃进硬件 ⇒ 复用会把还在编的帧改花。
-                guard let outPB = VRTech.pixelBuffer(width: sbsW, height: h).pb else {
-                    why = "成片缓冲分配失败"; break
+                // 每帧的输出缓冲优先从 adaptor 的池里取：池要保证「这块的引用全松手了」才再发出去，
+                // 所以不存在「上一帧还在编码器里就被这一帧改花」，而表面总数就此封顶。
+                var got: CVPixelBuffer?
+                if let pool = pool {
+                    let pr = CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &got)
+                    if pr != kCVReturnSuccess { got = nil }
+                } else {
+                    got = VRTech.pixelBuffer(width: sbsW, height: h).pb
+                }
+                guard let outPB = got else {
+                    why = "第 \(k + 1) 帧成片缓冲拿不到（这条走的是\(bufFrom)）"; break
                 }
                 allocMs.append(Double(DispatchTime.now().uptimeNanoseconds - tb) / 1_000_000)
                 let rr = warp.render(srcPB: framePB, dn: dn, zp: Float(zp), outPB: outPB)
@@ -392,6 +407,7 @@ enum VRFull {
             let secs = Double(k) / max(fps, 1)
             outs.append("\(out.lastPathComponent) \(k) 帧≈\(String(format: "%.1f", secs)) s"
                 + " \(String(format: "%.1f", Double(size) / 1048576)) MB｜补洞 \(String(format: "%.2f", rate))%"
+                + "｜成片缓冲\(bufFrom)"
                 + (why.isEmpty ? "" : "｜\(why)"))
             VRJournal.line("全片 zp\(String(format: "%.2f", zp)) 出完 \(k) 帧 \(String(format: "%.1f", Double(size) / 1048576)) MB")
             let saved = VRPilot.toPhotos(out)
