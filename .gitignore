@@ -15,3 +15,5 @@ app/VR3D.xcodeproj/
 app/Info-VR3D.plist
 app/SourcesVR/*.mlpackage/
 app/SourcesVR/*.mlmodelc/
+# 模型必须待在工程看不见的目录：落进 SourcesVR 就会被 xcodegen 当编译输入交给 coremlc
+app/VRModel/

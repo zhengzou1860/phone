@@ -40,8 +40,13 @@ jobs:
           # 判决要落成文件：annotation 我这边匿名读不到，上一轮"编译绿但包里没模型"就是这么漏掉的。
           # 单独一个文件，不能并进 build.log——下一步 xcodebuild 的 tee 不带 -a 会把它截掉。
           rec() { tee -a /tmp/model.log; }
+          rm -f /tmp/model.log
           REPO=apple/coreml-depth-anything-v2-small
-          DST=app/SourcesVR
+          # 必须下在工程看不见的目录里：project-vr3d.yml 的 sources 就是 SourcesVR，
+          # 模型一旦落进 SourcesVR，xcodegen 就把 mlpackage 当编译输入交给 coremlc generate，
+          # 第 5 轮正是这么死在 build 阶段（Error: A valid manifest does not exist .../Manifest.json）。
+          # 原设计是模型不进工程：装包阶段原样拷进 .app，由手机自己 compileModel。
+          DST=app/VRModel
           PKG=DepthAnythingV2SmallF16.mlpackage
           HOST=""
           for H in https://huggingface.co https://hf-mirror.com; do
@@ -109,16 +114,25 @@ jobs:
         working-directory: app
         run: |
           set -euo pipefail
+          rec() { tee -a /tmp/model.log; }
           APP=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' | head -1)
           test -n "$APP"
           echo "built app: $APP" >> /tmp/build.log
           file "$APP/VR3D" | tee -a /tmp/build.log
-          if [ -d SourcesVR/DepthAnythingV2SmallF16.mlpackage ]; then
+          PKG=VRModel/DepthAnythingV2SmallF16.mlpackage
+          MAN="$PKG/Manifest.json"
+          WB="$PKG/Data/com.apple.CoreML/weights/weight.bin"
+          # 拷之前先验包完不完整：手机那侧 compileModel 读的就是 Manifest.json，
+          # 第 5 轮 coremlc 也卡在它上面。缺了它就别发出去浪费一次装机。
+          if [ -d "$PKG" ]; then
+            echo "P-FILES $(find "$PKG" -type f | wc -l | tr -d ' ') 个文件｜Manifest=$([ -s "$MAN" ] && echo "在 $(wc -c < "$MAN" | tr -d ' ')B" || echo 缺/空)｜weight.bin=$(wc -c < "$WB" 2>/dev/null | tr -d ' ')B" | rec
+          fi
+          if [ -s "$MAN" ] && [ "$(wc -c < "$WB" 2>/dev/null || echo 0)" -gt 40000000 ]; then
             rm -rf "$APP/DepthAnythingV2SmallF16.mlpackage"
-            cp -R SourcesVR/DepthAnythingV2SmallF16.mlpackage "$APP"/
-            echo "模型已拷进包 $APP/DepthAnythingV2SmallF16.mlpackage" | tee -a /tmp/build.log
+            cp -R "$PKG" "$APP"/
+            echo "P-VERDICT 模型已原样拷进包 $APP/DepthAnythingV2SmallF16.mlpackage（等手机上 compileModel）" | rec
           else
-            echo "模型没下下来，这一版包里没深度模型" | tee -a /tmp/build.log
+            echo "P-VERDICT 模型缺或没下全（Manifest 或 weight.bin 不达标），这一版包里没深度模型" | rec
           fi
           rm -rf Payload vr3d.ipa
           mkdir Payload
@@ -178,7 +192,7 @@ jobs:
         run: |
           set -uo pipefail
           ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=6{print "::error::" p substr($0,1,230)}'; }
-          cp /tmp/build.log ./build.log 2>/dev/null || echo "no build log at all" > ./build.log
+          cat /tmp/model.log /tmp/build.log > ./build.log 2>/dev/null || cp /tmp/build.log ./build.log 2>/dev/null || echo "no build log at all" > ./build.log
           gh release delete channel-vr3d-fail --cleanup-tag -y >/dev/null 2>&1 || true
           gh release create channel-vr3d-fail build.log \
             --title "VR3D CI failed log" \
