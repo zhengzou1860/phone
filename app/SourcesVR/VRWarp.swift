@@ -34,11 +34,11 @@ extension VRTech {
         if let open = currentCommand {
             cmd = open
         } else {
-            guard let fresh = queue?.commandBuffer() else { return nil }
+            guard let fresh = queue?.makeCommandBuffer() else { return nil }
             currentCommand = fresh
             cmd = fresh
         }
-        let enc = cmd.makeComputeCommandEncoder()
+        guard let enc = cmd.makeComputeCommandEncoder() else { return nil }
         enc.setComputePipelineState(pipe)
         for (i, t) in textures.enumerated() { enc.setTexture(t, index: i) }
         var p = params
@@ -103,7 +103,6 @@ final class VRDepthFeed {
         }
         inputTex = tex
         inputCv = cv
-        return true
     }
 
     /// 一帧：kScale 画进送检框 → CoreML → 输出平面按眼格重采样
@@ -136,7 +135,7 @@ final class VRDepthFeed {
                 return ([], (prepMs, 0), VRPlane.Out(), "输出 \(key) 取不到值")
             }
             let plane: VRPlane.Out
-            if let pb = v.imageValue?.pixelBuffer {
+            if let pb = v.imageBufferValue?.pixelBuffer {
                 plane = VRPlane.read(pb)
             } else if let arr = v.multiArrayValue {
                 plane = VRPlane.fromArray(arr)
@@ -204,7 +203,7 @@ final class VRWarp {
         budget = Float(eyeW) * bpct / 100.0
         func makeTex(_ w: Int, _ h: Int) -> MTLTexture? {
             let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm,
-                                                             width: w, height: h, mipLevelCount: 1)
+                                                             width: w, height: h, mipmapped: false)
             d.usage = [.shaderRead, .shaderWrite]
             return dev.makeTexture(descriptor: d)
         }
@@ -223,7 +222,6 @@ final class VRWarp {
         memset(b1.contents(), 0, px * 4)
         memset(b2.contents(), 0, px * 4)
         memset(b4.contents(), 0, 4)
-        return true
     }
 
     /// 一帧。dn 是已归一化到 0..1 的眼格深度；outPB 是 2W×H 的 BGRA 像素缓冲（成片的这一帧）。

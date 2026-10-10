@@ -93,11 +93,12 @@ enum VRDepth {
         var out: [String] = []
         for (name, d) in md.inputDescriptionsByName.sorted(by: { $0.key < $1.key }) {
             if let ic = d.imageConstraint {
-                let mn = ic.minimumSize, mx = ic.maximumSize
-                out.append("  输入 \(name) image 声明 \(ic.pixelsWide)x\(ic.pixelsHigh)"
-                    + "｜允许区间 \(Int(mn.width.rounded()))x\(Int(mn.height.rounded()))"
+                let mn = ic.minSize, mx = ic.maxSize
+                let range = "\(Int(mn.width.rounded()))x\(Int(mn.height.rounded()))"
                     + "~\(Int(mx.width.rounded()))x\(Int(mx.height.rounded()))"
-                    + "｜支持的像素缓冲 \(ic.supportedCVPixelBufferTypes.count) 种")
+                let decl = "\(ic.pixelsWide)x\(ic.pixelsHigh)"
+                let kinds = ic.supportedCVPixelBufferTypes.count
+                out.append("  输入 \(name) image 声明 \(decl)｜允许区间 \(range)｜支持的像素缓冲 \(kinds) 种")
             } else if let mc = d.multiArrayConstraint {
                 out.append("  输入 \(name) multiArray dims=\(mc.shape.map { $0.intValue }) 类型 \(mc.dataType.rawValue)")
             } else {
@@ -106,9 +107,11 @@ enum VRDepth {
         }
         for (name, d) in md.outputDescriptionsByName.sorted(by: { $0.key < $1.key }) {
             if let ic = d.imageConstraint {
-                out.append("  输出 \(name) image 声明 \(ic.pixelsWide)x\(ic.pixelsHigh)"
-                    + "｜区间 \(Int(ic.minimumSize.width.rounded()))x\(Int(ic.minimumSize.height.rounded()))"
-                    + "~\(Int(ic.maximumSize.width.rounded()))x\(Int(ic.maximumSize.height.rounded()))")
+                let decl = "\(ic.pixelsWide)x\(ic.pixelsHigh)"
+                let mn = ic.minSize, mx = ic.maxSize
+                let range = "\(Int(mn.width.rounded()))x\(Int(mn.height.rounded()))"
+                    + "~\(Int(mx.width.rounded()))x\(Int(mx.height.rounded()))"
+                out.append("  输出 \(name) image 声明 \(decl)｜区间 \(range)")
             } else if let mc = d.multiArrayConstraint {
                 out.append("  输出 \(name) multiArray dims=\(mc.shape.map { $0.intValue }) 类型 \(mc.dataType.rawValue)")
             } else {
@@ -127,8 +130,8 @@ enum VRDepth {
             return (eyeW, eyeH, false, "输入不是图像，按眼尺寸喂")
         }
         let dw = ic.pixelsWide, dh = ic.pixelsHigh
-        let mnW = Int(ic.minimumSize.width.rounded()), mnH = Int(ic.minimumSize.height.rounded())
-        let mxW = Int(ic.maximumSize.width.rounded()), mxH = Int(ic.maximumSize.height.rounded())
+        let mnW = Int(ic.minSize.width.rounded()), mnH = Int(ic.minSize.height.rounded())
+        let mxW = Int(ic.maxSize.width.rounded()), mxH = Int(ic.maxSize.height.rounded())
         let flexible = mxW > mnW || mxH > mnH || (mnW == 0 && mxW == 0)
         if !flexible {
             return (dw, dh, false, "模型只认固定 \(dw)x\(dh) ⇒ 等比塞进去留黑边，不拉伸")
@@ -244,7 +247,7 @@ enum VRDepth {
             }
             return "输出 \(key) multiArray dims=\(dims) 类型 \(arr.dataType.rawValue) 数值 \(String(format: "%.3f~%.3f", mn, mx))"
         }
-        guard let pb = v.imageValue?.pixelBuffer else {
+        guard let pb = v.imageBufferValue?.pixelBuffer else {
             return "输出 \(key) 类型 \(v.type.rawValue)：既不是 multiArray 也取不到 pixelBuffer"
         }
         let plane = VRPlane.read(pb)

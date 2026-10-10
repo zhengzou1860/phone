@@ -198,7 +198,7 @@ enum VRPilot {
             guard let headPB = VRTech.pixelBuffer(width: sbsW, height: h).pb else { werr = "标题帧分配失败"; break }
             allocMs.append(Double(DispatchTime.now().uptimeNanoseconds - ta0) / 1_000_000)
             drawTitle(headPB, [title, tip, "字是正的 ⇒ 链路没翻"])
-            if !append(adaptor, input, headPB, at: Double(k) / outFps) { werr = "标题帧写不进去"; break }
+            if !append(adaptor, input, writer, headPB, at: Double(k) / outFps) { werr = "标题帧写不进去"; break }
             k += 1
             encoded += 1
             var holesHere: [Double] = []
@@ -216,7 +216,7 @@ enum VRPilot {
                 guard r.err == nil else { werr = "第 \(zi + 1) 段第 \(i + 1) 帧形变失败: \(r.err ?? "")"; break }
                 if zi == 0 && i > 0 { uploadMs.append(r.upload); gpuMs.append(r.gpu) }
                 holesHere.append(r.holes)
-                if !append(adaptor, input, framePB, at: Double(k) / outFps) { werr = "内容帧写不进去"; break }
+                if !append(adaptor, input, writer, framePB, at: Double(k) / outFps) { werr = "内容帧写不进去"; break }
                 k += 1
                 encoded += 1
                 let now = VRFacts.footprintMB()
@@ -229,10 +229,10 @@ enum VRPilot {
         }
         input.markAsFinished()
         let esem = DispatchSemaphore(value: 0)
-        writer.endSession { esem.signal() }
+        writer.finishWriting { esem.signal() }
         esem.wait()
         if writer.status != .completed {
-            werr = werr.isEmpty ? "endSession 后 status=\(writer.status.rawValue): \(writer.error?.localizedDescription ?? "-")" : werr
+            werr = werr.isEmpty ? "finishWriting 后 status=\(writer.status.rawValue): \(writer.error?.localizedDescription ?? "-")" : werr
         }
         let size = ((try? FileManager.default.attributesOfItem(atPath: out.path)[.size]) as? Int) ?? 0
 
@@ -261,14 +261,16 @@ enum VRPilot {
         return rep.joined(separator: "\n")
     }
 
-    static func append(_ adaptor: AVAssetWriterInputPixelBufferAdaptor,
-                       _ input: AVAssetWriterInput, _ pb: CVPixelBuffer, at seconds: Double) -> Bool {
+    static func append(_ adaptor: AVAssetWriterInputPixelBufferAdaptor, _ input: AVAssetWriterInput,
+                       _ writer: AVAssetWriter,
+                       _ pb: CVPixelBuffer, at seconds: Double) -> Bool {
         let t = CMTime(seconds: seconds, preferredTimescale: 600)
         var tries = 0
         while !adaptor.append(pb, withPresentationTime: t) {
             tries += 1
-            if input.status == .failed {
-                VRJournal.line("append 失败 input.status failed \(input.error?.localizedDescription ?? "-")")
+            // AVAssetWriterInput 这边没有 status/error（编译器不认），失败只有 writer 那侧看得见
+            if writer.status == .failed {
+                VRJournal.line("append 失败 writer.status failed \(writer.error?.localizedDescription ?? "-")")
                 return false
             }
             if tries > 400 { return false }
@@ -304,7 +306,7 @@ enum VRPilot {
             ctx.textMatrix = .identity
             ctx.textPosition = CGPoint(x: 40, y: y)
             let line: CTLine? = CTLineCreateWithAttributedString(NSAttributedString(string: s, attributes: attr))
-            if let line = line { CTLineDraw(ctx, line) }
+            if let line = line { CTLineDraw(line, ctx) }
             y -= 78
         }
     }
@@ -404,7 +406,6 @@ final class VRSource {
                 return (nil, 0, "VideoCompositionOutput 建不出来（这套 videoSettings 不被支持）")
             }
             out.videoComposition = vc
-            out.alwaysDiscardsLateVideoFrames = true
             reader.timeRange = CMTimeRange(start: CMTime(seconds: seconds, preferredTimescale: 600),
                                            duration: CMTime(seconds: 0.3, preferredTimescale: 600))
             reader.add(out)

@@ -218,7 +218,7 @@ enum VRUtil {
     static func fourcc(_ f: OSType) -> String {
         let b = [UInt8((f >> 24) & 0xFF), UInt8((f >> 16) & 0xFF), UInt8((f >> 8) & 0xFF), UInt8(f & 0xFF)]
         let s = String(bytes: b, encoding: .ascii) ?? "????"
-        return s.map { $0.isLetter || $0.isNumber ? $0 : "?" }.joined()
+        return String(s.map { $0.isLetter || $0.isNumber ? $0 : "?" })
     }
 
     /// 送检尺寸：短边贴 short，长边凑 14 的倍数（ViT 的 patch 网格要求），再夹进模型允许的区间
@@ -299,7 +299,8 @@ enum VRTech {
         guard let tc = cache else { return (nil, nil, "Metal 没起来") }
         // 默认建出来的纹理只让读和采样，成片那块要往里写 ⇒ usage 里显式把 shaderWrite 也要上。
         // 键是 kCVMetalTextureUsage，值是一个数（option set 的位），不是数组。
-        let usage = MTLTextureUsage([.shaderRead, .shaderSample, .shaderWrite])
+        // 没有 .shaderSample：这个成员只在 macOS 的 MTLOptionSet 里有，iOS 上不认。
+        let usage = MTLTextureUsage([.shaderRead, .shaderWrite])
         let attrs = [kCVMetalTextureUsage: NSNumber(value: usage.rawValue)] as CFDictionary
         var cvTex: CVMetalTexture?
         var r = CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault, tc, pb, attrs,
