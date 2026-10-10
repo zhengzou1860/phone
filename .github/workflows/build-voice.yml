@@ -25,7 +25,7 @@ jobs:
 
       - name: 自检 ZipExtractor（不通过不出包）
         run: |
-          set -uo pipefail
+          set +e          # GH Actions 默认 bash -e，一失败整块退出，日志就丢了
           L=/tmp/zt/step.log
           rm -rf /tmp/zt && mkdir -p /tmp/zt/src /tmp/zt/out
           echo "=== mkdir ===" > $L
