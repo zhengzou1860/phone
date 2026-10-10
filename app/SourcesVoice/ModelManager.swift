@@ -33,11 +33,13 @@ final class ModelManager: ObservableObject {
         let dir = modelDirectory()
         let marker = dir.appendingPathComponent(".ready")
         let zip = dir.appendingPathComponent(Self.zipName)
-        if FileManager.default.fileExists(atPath: marker.path) {
+        // 真就绪的信号 = 至少解出一个具体 onnx，别信旧版 .ready
+        let probe = dir.appendingPathComponent("dit_state_0.onnx")
+        if FileManager.default.fileExists(atPath: probe.path) {
             state = .downloaded(modelDir: dir)
             progressText = "模型已就绪"
         } else if FileManager.default.fileExists(atPath: zip.path) {
-            // 上次下载完但解压失败/中断 ⇒ 用磁盘上的 zip 续解，不再走网络
+            // 有 zip 没 onnx ⇒ 上次下载完但解压失败/中断/被旧版跳过 ⇒ 本地续解
             state = .downloading
             progress = 1.0
             progressText = "重新解压已下载的 zip…"
