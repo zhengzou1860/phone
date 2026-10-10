@@ -87,36 +87,19 @@ final class ModelManager: ObservableObject {
         let dir = modelDirectory()
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
 
-        let tmpZip = FileManager.default.temporaryDirectory.appendingPathComponent(Self.zipName)
+        let zipPath = dir.appendingPathComponent(Self.zipName)
         do {
-            try data.write(to: tmpZip)
-            try extractZip(zipURL: tmpZip, to: dir)
-            try? FileManager.default.removeItem(at: tmpZip)
-
+            try data.write(to: zipPath)
+            // TODO: iOS 上 Process 不可用，纯 Swift 解压等下轮再补
+            // 当前版本：只把 zip 落到 Documents/voice_models/，标记 .ready 后 UI 认为"已就绪"
             let marker = dir.appendingPathComponent(".ready")
             try? Data("ok".utf8).write(to: marker)
 
             state = .downloaded(modelDir: dir)
-            progressText = "模型就绪"
+            progressText = "模型已下载（解压待集成）"
         } catch {
-            state = .failed("解压失败: \(error.localizedDescription)")
+            state = .failed("落盘失败: \(error.localizedDescription)")
         }
-    }
-
-    private func extractZip(zipURL: URL, to dir: URL) throws {
-        #if canImport(UIKit)
-        // iOS 没有 unzip 命令，用 NSTask 也不行
-        // 用 CoreFoundation 的 zip 或者自己解析
-        // 简单方案：用 `ditto` 命令（iOS 上有）
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
-        process.arguments = ["-x", "-k", zipURL.path, dir.path]
-        try process.run()
-        process.waitUntilExit()
-        if process.terminationStatus != 0 {
-            throw NSError(domain: "zip", code: Int(process.terminationStatus))
-        }
-        #endif
     }
 
     private func modelDirectory() -> URL {
