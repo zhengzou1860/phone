@@ -47,10 +47,29 @@ final class ModelDownload: NSObject, URLSessionDownloadDelegate {
     }
 
     func start(url: URL) {
-        let s = attach()
-        let t = s.downloadTask(with: url)
-        t.resume()
-        task = t
+        liveDownloadTask { [weak self] live in
+            guard let self = self else { return }
+            if let t = live {
+                self.log("已有在跑的任务，接手（已下 \(t.countOfBytesReceived) B）：再建一个 downloadTask 等于 609 MB 从头重下")
+                self.task = t
+                if t.state == .suspended { t.resume() }
+                return
+            }
+            let s = self.attach()
+            let t = s.downloadTask(with: url)
+            t.resume()
+            self.task = t
+        }
+    }
+
+    /// 系统那边有没有还活着的下载任务。background session 被重新拉起时，没跑完的任务
+    /// 会原样带回来（进度也在），这是唯一能看到它们的口子；界面据此决定「接手」还是「新开」。
+    func liveDownloadTask(_ body: @escaping (URLSessionDownloadTask?) -> Void) {
+        attach().getAllTasks { tasks in
+            let live = tasks.compactMap { $0 as? URLSessionDownloadTask }
+                .first { $0.state == .running || $0.state == .suspended }
+            DispatchQueue.main.async { body(live) }
+        }
     }
 
     /// AppDelegate 收到 handleEventsForBackgroundURLSession 时把 completionHandler 交进来。

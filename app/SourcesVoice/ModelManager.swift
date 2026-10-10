@@ -61,7 +61,27 @@ final class ModelManager: ObservableObject {
             startVerify(dir: dir)
             return
         }
-        state = .notDownloaded
+        // 磁盘上什么都没有 ≠ 没在下载。609 MB 这条任务在系统手里，进程被划掉再拉起来时
+        // 它照样在跑；这里直接判 notDownloaded 会把按钮点亮，用户再点一次就是从头重下。
+        ModelDownload.shared.liveDownloadTask { [weak self] live in
+            Task { @MainActor in
+                guard let self = self else { return }
+                guard let t = live else {
+                    self.state = .notDownloaded
+                    return
+                }
+                self.listen()
+                self.state = .downloading
+                let total = t.countOfBytesExpectedToReceive
+                if total > 0 {
+                    self.progress = Double(t.countOfBytesReceived) / Double(total)
+                    self.progressText = "接手后台那条下载 \(t.countOfBytesReceived / 1_048_576) / \(total / 1_048_576) MB"
+                } else {
+                    self.progressText = "接手后台那条下载 \(t.countOfBytesReceived / 1_048_576) MB"
+                }
+                VoiceJournal.line("check 接手在跑的任务 state=\(t.state.rawValue) \(t.countOfBytesReceived)/\(t.countOfBytesExpectedToReceive)")
+            }
+        }
     }
 
     /// 解压 + 校验都在后台线程：700 MB 的 inflate 放主线程会被系统当卡死杀掉。
@@ -120,18 +140,8 @@ final class ModelManager: ObservableObject {
         progressText = "模型就绪（\(ModelManifest.parseCount(dir)) 个文件已逐条校验）"
     }
 
-    func download() {
-        guard case .notDownloaded = state else { return }
-        guard let url = URL(string: Self.downloadURL) else {
-            state = .failed("URL 非法")
-            return
-        }
-
-        state = .downloading
-        progress = 0
-        progressText = "正在连接 GitHub…"
-        VoiceJournal.line("开始下载 \(Self.downloadURL)")
-
+    /// 把 singleton 的两个回调接到这个界面。新开和接手走同一份，别写两遍。
+    private func listen() {
         let d = ModelDownload.shared
         d.onProgress = { [weak self] received, total in
             Task { @MainActor in
@@ -165,7 +175,22 @@ final class ModelManager: ObservableObject {
                 }
             }
         }
-        d.start(url: url)
+    }
+
+    func download() {
+        guard case .notDownloaded = state else { return }
+        guard let url = URL(string: Self.downloadURL) else {
+            state = .failed("URL 非法")
+            return
+        }
+
+        state = .downloading
+        progress = 0
+        progressText = "正在连接 GitHub…"
+        VoiceJournal.line("开始下载 \(Self.downloadURL)")
+        listen()
+        // start 内部会先看系统手里有没有还在跑的同一条任务，有就接手，不会重下一遍
+        ModelDownload.shared.start(url: url)
     }
 
     private func handleDownloaded(destURL: URL) {
