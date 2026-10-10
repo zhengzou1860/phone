@@ -122,6 +122,9 @@ enum ZipExtractor {
         let dataStart = entry.localHeaderOffset + 30 + fnlen + extralen
         try fh.seek(toOffset: UInt64(dataStart))
 
+        // createFile 不截断已存在的文件：解压到一半被系统杀掉再重来，尾巴是上一轮的脏数据，
+        // 下面那句尺寸校验会直接把整包判坏。先删再写。
+        try? FileManager.default.removeItem(at: dest)
         FileManager.default.createFile(atPath: dest.path, contents: nil)
         let outFH = try FileHandle(forWritingTo: dest)
         defer { try? outFH.close() }

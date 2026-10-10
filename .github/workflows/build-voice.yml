@@ -407,12 +407,13 @@ jobs:
           # 顶层语句只能待在 main.swift 里，所以从仓库里那份复制过去
           cp "$GITHUB_WORKSPACE/ci/voice_chain_gate.swift" /tmp/gate/main.swift
 
-          xcrun clang -c -std=gnu17 -O2 -Wall -Wextra -I "$ORT_HD" -I "$SV" \
+          xcrun clang -c -std=gnu17 -O2 -Wall -Wextra -target arm64-apple-macos14.0 \
+            -I "$ORT_HD" -I "$SV" \
             "$SV/OrtShim.c" -o /tmp/gate/OrtShim.o >> $L 2>&1
           echo "=== clang rc=$? ===" >> $L
           nm -u /tmp/gate/OrtShim.o >> $L 2>&1
 
-          xcrun swiftc -O -target arm64-apple-macos13.0 \
+          xcrun swiftc -O -target arm64-apple-macos14.0 \
             -import-objc-header "$SV/Voice-Bridging-Header.h" \
             -Xcc -I -Xcc "$ORT_HD" \
             "$SV/MelFrontEnd.swift" "$SV/AudioProcessor.swift" \
@@ -421,6 +422,8 @@ jobs:
             -Xlinker -force_load -Xlinker "$ORT_BIN" \
             -Xlinker -lc++ \
             -Xlinker -framework -Xlinker Accelerate \
+            -Xlinker -framework -Xlinker Network \
+            -Xlinker -framework -Xlinker CoreML \
             -o /tmp/gate/chain_gate >> $L 2>&1
           echo "=== swiftc rc=$? ===" >> $L
           ls -l /tmp/gate/chain_gate >> $L 2>&1
