@@ -23,6 +23,76 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: 自检 ZipExtractor（不通过不出包）
+        run: |
+          set -uo pipefail
+          mkdir -p /tmp/zt/src /tmp/zt/out
+          ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=8{print "::error::" p substr($0,1,230)}'; }
+
+          # 造样本：三种尺寸（含超过 1 MB 输入 chunk 的），跑一遍 deflate
+          python3 - <<'PY'
+          import os
+          os.makedirs('/tmp/zt/src', exist_ok=True)
+          for name, size in [('small.bin', 4096),
+                             ('mid.bin', 512*1024),
+                             ('big.bin', 3*1024*1024)]:
+              with open(f'/tmp/zt/src/{name}','wb') as f:
+                  f.write(os.urandom(size))
+          PY
+          (cd /tmp/zt/src && zip -r ../test.zip .) > /tmp/zt/zip.log 2>&1
+          ls -l /tmp/zt/test.zip | ann "ZT-ZIP "
+
+          cat > /tmp/zt/main.swift <<'SW'
+          import Foundation
+          let zipURL = URL(fileURLWithPath: CommandLine.arguments[1])
+          let outDir = URL(fileURLWithPath: CommandLine.arguments[2])
+          do {
+              try ZipExtractor.extractAll(zipURL: zipURL, to: outDir)
+              let files = try FileManager.default.contentsOfDirectory(atPath: outDir.path)
+              for f in files.sorted() {
+                  let p = outDir.appendingPathComponent(f).path
+                  let s = ((try? FileManager.default.attributesOfItem(atPath: p))?[.size] as? NSNumber)?.int64Value ?? -1
+                  print("OK \(f) \(s)")
+              }
+          } catch {
+              FileHandle.standardError.write("FAIL \(error.localizedDescription)\n".data(using: .utf8)!)
+              exit(2)
+          }
+          SW
+
+          swiftc -O \
+            -o /tmp/zt/zip_test \
+            "$GITHUB_WORKSPACE/app/SourcesVoice/ZipExtractor.swift" \
+            /tmp/zt/main.swift > /tmp/zt/swiftc.log 2>&1
+          rc=$?
+          if [ $rc -ne 0 ]; then
+            tail -30 /tmp/zt/swiftc.log | ann "ZT-COMPILE-FAIL "
+            exit 1
+          fi
+          /tmp/zt/zip_test /tmp/zt/test.zip /tmp/zt/out > /tmp/zt/run.log 2>&1
+          rc=$?
+          cat /tmp/zt/run.log | ann "ZT-RUN "
+          if [ $rc -ne 0 ]; then
+            echo "ZipExtractor 运行失败 rc=$rc" | ann "ZT-VERDICT "
+            exit 1
+          fi
+
+          # 逐文件对拍
+          bad=0
+          for f in small.bin mid.bin big.bin; do
+            if cmp -s /tmp/zt/src/$f /tmp/zt/out/$f; then
+              echo "MATCH $f"
+            else
+              echo "DIFF  $f  src=$(wc -c </tmp/zt/src/$f) out=$(wc -c </tmp/zt/out/$f 2>/dev/null || echo 缺)"
+              bad=$((bad+1))
+            fi
+          done | ann "ZT-DIFF "
+          if [ "$bad" -ne 0 ]; then
+            echo "字节对拍失败 $bad 个文件" | ann "ZT-VERDICT "
+            exit 1
+          fi
+          echo "ZipExtractor 自检通过（3 个 deflate 文件，最大 3 MB）" | ann "ZT-VERDICT "
+
       - name: 装 XcodeGen
         run: brew install xcodegen
 

@@ -32,9 +32,24 @@ final class ModelManager: ObservableObject {
     func check() {
         let dir = modelDirectory()
         let marker = dir.appendingPathComponent(".ready")
+        let zip = dir.appendingPathComponent(Self.zipName)
         if FileManager.default.fileExists(atPath: marker.path) {
             state = .downloaded(modelDir: dir)
             progressText = "模型已就绪"
+        } else if FileManager.default.fileExists(atPath: zip.path) {
+            // 上次下载完但解压失败/中断 ⇒ 用磁盘上的 zip 续解，不再走网络
+            state = .downloading
+            progress = 1.0
+            progressText = "重新解压已下载的 zip…"
+            do {
+                try ZipExtractor.extractAll(zipURL: zip, to: dir)
+                try? Data("ok".utf8).write(to: marker)
+                try? FileManager.default.removeItem(at: zip)
+                state = .downloaded(modelDir: dir)
+                progressText = "模型就绪（本地 zip 已解出）"
+            } catch {
+                state = .failed("解压失败: \(error.localizedDescription)")
+            }
         } else {
             state = .notDownloaded
         }
@@ -101,13 +116,20 @@ final class ModelManager: ObservableObject {
                 state = .failed("下载文件过小 \(bytes) 字节，可能是 GitHub 重定向页")
                 return
             }
+            progress = 1.0
+            progressText = "解压中…"
+
+            try ZipExtractor.extractAll(zipURL: dest, to: dir)
+
             let marker = dir.appendingPathComponent(".ready")
             try? Data("ok".utf8).write(to: marker)
-            progress = 1.0
+            // 释空间：解压完删 zip
+            try? FileManager.default.removeItem(at: dest)
+
             state = .downloaded(modelDir: dir)
-            progressText = "模型已下载 \(bytes / 1_048_576) MB（解压待集成）"
+            progressText = "模型就绪（\(bytes / 1_048_576) MB zip 已解出）"
         } catch {
-            state = .failed("落盘失败: \(error.localizedDescription)")
+            state = .failed("解压/落盘失败: \(error.localizedDescription)")
         }
     }
 
