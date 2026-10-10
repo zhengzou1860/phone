@@ -286,6 +286,7 @@ enum Facts {
             "iOS        \(pi.operatingSystemVersionString)",
             "machine    \(machineName())  cores=\(pi.processorCount)",
             "memory     足迹 \(footprintMB()) / 驻留 \(residentMB()) MB / 物理 \(pi.physicalMemory / 1048576) MB",
+            "disk       可用 \(diskFreeGB()) GB",
             "endpoint   \(Uploader.endpoint)",
             "Vision     \(NSClassFromString("VNDetectFaceRectanglesRequest") != nil ? "可用" : "缺失")",
             "AVFoundation \(NSClassFromString("AVAssetReader") != nil ? "可用" : "缺失")",
@@ -298,6 +299,12 @@ enum Facts {
             "分割 API   PersonSegmentation=\(cls("VNGeneratePersonSegmentationRequest")) "
                 + "FaceLandmarks=\(cls("VNDetectFaceLandmarksRequest"))"
         ]
+    }
+
+    static func diskFreeGB() -> String {
+        guard let a = try? FileManager.default.attributesOfFileSystem(forPath: NSHomeDirectory()),
+              let n = a[.systemFreeSize] as? NSNumber else { return "-" }
+        return String(format: "%.1f", n.doubleValue / 1_073_741_824)
     }
 
     /// 只认包里有哪个文件，绝不在主线程调 locate()——那可能触发一次现场编译。

@@ -883,6 +883,48 @@ struct PlayerShell: UIViewRepresentable {
     }
 }
 
+struct TempFile: Identifiable {
+    let url: URL
+    let mb: Double
+    var id: String { url.path }
+}
+
+/// 选片＝往临时目录复制一整条 pick_*，导出＝往 Documents 写一条 cut_*。
+/// 这些全是副本（原片还在相册里），但旧版本一条都不删 ⇒ 剪几次就攒出一堆历史视频。
+enum Temps {
+    static let prefixes = ["pick_", "cut_"]
+
+    static func list(keep: URL?) -> [TempFile] {
+        let fm = FileManager.default
+        var dirs = [fm.temporaryDirectory]
+        if let d = fm.urls(for: .documentDirectory, in: .userDomainMask).first, d != fm.temporaryDirectory {
+            dirs.append(d)
+        }
+        var out: [TempFile] = []
+        let keepPath = keep?.path ?? ""
+        for dir in dirs {
+            guard let items = try? fm.contentsOfDirectory(at: dir,
+                                                          includingPropertiesForKeys: [.fileSizeKey],
+                                                          options: [.skipsSubdirectoryDescendants]) else { continue }
+            for u in items where prefixes.contains(where: { u.lastPathComponent.hasPrefix($) }) && u.path != keepPath {
+                let b = (try? u.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
+                out.append(TempFile(url: u, mb: Double(b) / 1048576))
+            }
+        }
+        return out.sorted { $0.mb > $1.mb }
+    }
+
+    static func dropOldPicks(keep: URL) -> Double {
+        let fm = FileManager.default
+        var freed = 0.0
+        for t in list(keep: keep) where t.url.lastPathComponent.hasPrefix("pick_")
+            && t.url.deletingLastPathComponent().path == fm.temporaryDirectory.path {
+            do { try fm.removeItem(at: t.url); freed += t.mb } catch { }
+        }
+        return freed
+    }
+}
+
 @MainActor
 final class Cutter: ObservableObject {
 
@@ -905,6 +947,8 @@ final class Cutter: ObservableObject {
     @Published var sideTh = 96.0
     /// 已选为锚点的是这一帧里的第几张脸（-1＝还没选）；绿框会把它描成橙色，让"选上了"这件事看得见
     @Published var chosen = -1
+    @Published var temps: [TempFile] = []
+    @Published var cleanArmed = false
 
     var asset: AVURLAsset?
     let stop = StopFlag()
@@ -926,12 +970,16 @@ final class Cutter: ObservableObject {
             return
         }
         videoURL = url
+        let freed = Temps.dropOldPicks(keep: url)
+        if freed > 0.05 { Journal.line("清理 换片自动删旧副本 释放 \(String(format: "%.1f", freed)) MB") }
         anchor = nil
         anchorNote = ""
         report = ""
         segments = []
         faces = []
         exportNote = ""
+        cleanArmed = false
+        temps = Temps.list(keep: url)
         status = ""
         let a = AVURLAsset(url: url)
         asset = a
@@ -1111,7 +1159,52 @@ final class Cutter: ObservableObject {
                 guard let self = self else { return }
                 self.busy = false
                 self.exportNote = text + "\n" + photo + cleaned
+                self.temps = Temps.list(keep: self.videoURL)
+                self.cleanArmed = false
                 Journal.line("剪辑 导出 \(text)｜\(photo)\(cleaned)")
+            }
+        }
+    }
+
+    func refreshTemps() { temps = Temps.list(keep: videoURL) }
+
+    /// 两段式：第一次点只报数并要确认。0.8/0.9 那批 cut_ 有可能是"存相册失败后唯一的一份"，不能一触即删。
+    func tapClean() {
+        if temps.isEmpty {
+            refreshTemps()
+            status = temps.isEmpty ? "没找到可清的历史文件" : "找到 \(temps.count) 个，再点一次确认删除"
+            cleanArmed = !temps.isEmpty
+            return
+        }
+        if !cleanArmed {
+            cleanArmed = true
+            return
+        }
+        cleanNow()
+    }
+
+    private func cleanNow() {
+        let doomed = temps
+        let keep = videoURL
+        busy = true
+        status = "清理中…"
+        Task.detached { [weak self] in
+            let fm = FileManager.default
+            var freed = 0.0, gone = 0, fails: [String] = []
+            for t in doomed {
+                do { try fm.removeItem(at: t.url); freed += t.mb; gone += 1 }
+                catch { fails.append("\(t.url.lastPathComponent): \(error.localizedDescription)") }
+            }
+            let left = Temps.list(keep: keep)
+            var text = "已删 \(gone) 个，释放 \(String(format: "%.1f", freed)) MB"
+            if !fails.isEmpty { text += "｜失败 \(fails.count) 个 \(fails.joined(separator: " / "))" }
+            text += left.isEmpty ? "｜现在干净了" : "｜还剩 \(left.count) 个 \(String(format: "%.1f", left.reduce(0.0) { $0 + $1.mb })) MB"
+            Journal.line("清理 \(text)")
+            Task { @MainActor in
+                self?.busy = false
+                self?.temps = left
+                self?.cleanArmed = false
+                self?.status = text
             }
         }
     }
@@ -1121,6 +1214,7 @@ final class Cutter: ObservableObject {
         text += "锚点：\(anchorNote)（有向量=\(anchor != nil)）\n"
         text += report.isEmpty ? "还没扫\n" : report + "\n"
         if !exportNote.isEmpty { text += "导出：\(exportNote)\n" }
+        text += "历史文件：\(temps.count) 个 \(String(format: "%.1f", temps.reduce(0.0) { $0 + $1.mb })) MB（不含当前这条）\n"
         text += "尺子：\(Ruler.shared.note)\n\n—— 自检 ——\n"
         text += Facts.lines().joined(separator: "\n")
         text += "\n\n—— 磁盘日志尾 ——\n" + Journal.tail(150)
@@ -1235,8 +1329,30 @@ struct CutView: View {
                             .frame(maxWidth: .infinity, alignment: .leading)
                     }
                 }
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("历史文件（选片与导出的副本，原片都在相册里）").font(.footnote)
+                    let mb = cut.temps.reduce(0.0) { $0 + $1.mb }
+                    Button(cut.cleanArmed && !cut.temps.isEmpty
+                            ? "确认删除这 \(cut.temps.count) 个（\(String(format: "%.1f", mb)) MB）"
+                            : (cut.temps.isEmpty ? "清理历史视频"
+                                                 : "清理历史视频（\(cut.temps.count) 个，\(String(format: "%.1f", mb)) MB）")) {
+                        cut.tapClean()
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(cut.cleanArmed ? .red : nil)
+                    .disabled(cut.busy)
+                    ForEach(cut.temps.prefix(12)) { t in
+                        Text("  \(t.url.lastPathComponent)  \(String(format: "%.1f", t.mb)) MB")
+                            .font(.system(size: 10, design: .monospaced))
+                    }
+                    if cut.temps.count > 12 {
+                        Text("  …另外 \(cut.temps.count - 12) 个").font(.system(size: 10, design: .monospaced))
+                    }
+                }
             }
             .padding()
+            .onAppear { cut.refreshTemps() }
         }
         .fullScreenCover(isPresented: $cut.showPicker) {
             PickerHost(target: .video, onPicked: { cut.pickStarted() }) { url, msg in
