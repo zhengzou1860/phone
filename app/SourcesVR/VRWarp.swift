@@ -5,7 +5,7 @@ import CoreVideo
 import CoreML
 import Metal
 
-/// Swift 侧的 VRP，字段顺序和 Shaders.metal 里那个 struct 一字不差（40 字节，全 4 字节对齐）。
+/// Swift 侧的 VRP，字段顺序和 Shaders.metal 里那个 struct 一字不差（44 字节，全 4 字节对齐）。
 struct VRParams {
     var W: UInt32 = 0
     var H: UInt32 = 0
@@ -17,6 +17,7 @@ struct VRParams {
     var zp: Float = 0
     var budget: Float = 0
     var SW: UInt32 = 0
+    var rot: UInt32 = 0
 }
 
 extension VRTech {
@@ -68,32 +69,42 @@ final class VRDepthFeed {
     let model: MLModel
     let eyeW: Int
     let eyeH: Int
+    let rot: Bool
     let mw: Int
     let mh: Int
     let scale: Float
     let ox: Float
     let oy: Float
+    /// 画面在送检框里真正占掉的像素数（两种朝向唯一被这个开关改变的量）
+    let usedPx: Int
     let inputName: String
     let inputPB: CVPixelBuffer
     let inputTex: MTLTexture
     /// inputTex 的命根子：commitWait 会清公共 keep 表，跨帧的这块必须自己按住
     let inputCv: CVMetalTexture
     private var map: [Int] = []
+    /// 同一张表但故意不做旋转修正：给「朝向自证」当地板读数（逆映射漏掉转 90° 就长这样）
+    private var mapMis: [Int] = []
     private var mapForW = 0
     private var mapForH = 0
 
-    init?(model: MLModel, eyeW: Int, eyeH: Int, mw: Int, mh: Int, note: inout String) {
+    init?(model: MLModel, eyeW: Int, eyeH: Int, mw: Int, mh: Int, rot: Bool, note: inout String) {
         self.model = model
         self.eyeW = eyeW
         self.eyeH = eyeH
         self.mw = mw
         self.mh = mh
+        self.rot = rot
         inputName = model.modelDescription.inputDescriptionsByName.keys.first ?? "image"
-        // 等比塞进送检框：取两方向里小的那个比例，剩下留黑边——拉伸会把深度也拉歪
-        let s = min(Float(mw) / Float(eyeW), Float(mh) / Float(eyeH))
+        // 等比塞进送检框：取两方向里小的那个比例，剩下留黑边——拉伸会把深度也拉歪。
+        // rot 时进框的是「转过 90° 的那张」，所以宽高在这一步就要换过来。
+        let lw = rot ? Float(eyeH) : Float(eyeW)
+        let lh = rot ? Float(eyeW) : Float(eyeH)
+        let s = min(Float(mw) / lw, Float(mh) / lh)
         scale = s
-        ox = (Float(mw) - Float(eyeW) * s) / 2.0
-        oy = (Float(mh) - Float(eyeH) * s) / 2.0
+        ox = (Float(mw) - lw * s) / 2.0
+        oy = (Float(mh) - lh * s) / 2.0
+        usedPx = Int(lw * s) * Int(lh * s)
         let mk = VRTech.pixelBuffer(width: mw, height: mh)
         guard let pb = mk.pb else { note = "造送检像素缓冲失败: \(mk.note)"; return nil }
         inputPB = pb
@@ -116,6 +127,7 @@ final class VRDepthFeed {
         p.W = UInt32(eyeW); p.H = UInt32(eyeH)
         p.MW = UInt32(mw); p.MH = UInt32(mh)
         p.scale = scale; p.ox = ox; p.oy = oy
+        p.rot = rot ? 1 : 0
         let t0 = DispatchTime.now().uptimeNanoseconds
         guard let enc = VRTech.encode("kScale", textures: [srcTex, inputTex],
                                       params: p, buffers: [], width: mw, height: mh) else {
@@ -161,22 +173,45 @@ final class VRDepthFeed {
         return out
     }
 
+    /// 深度图 → 眼格，但走那张「不做旋转修正」的表：只为给朝向自证一个地板读数
+    func resampleMis(_ plane: VRPlane.Out) -> [Float] {
+        guard plane.w > 0, plane.h > 0, !plane.vals.isEmpty else { return [] }
+        if mapForW != plane.w || mapForH != plane.h || map.count != eyeW * eyeH {
+            buildMap(dw: plane.w, dh: plane.h)
+        }
+        let v = plane.vals
+        var out = [Float](repeating: 0, count: eyeW * eyeH)
+        for i in 0..<(eyeW * eyeH) { out[i] = v[mapMis[i]] }
+        return out
+    }
+
     private func buildMap(dw: Int, dh: Int) {
         map = [Int](repeating: 0, count: eyeW * eyeH)
+        mapMis = [Int](repeating: 0, count: eyeW * eyeH)
         mapForW = dw; mapForH = dh
         let kx = Float(dw) / Float(mw)
         let ky = Float(dh) / Float(mh)
+        // rot 时画布那一行的来源是「眼列」，原来把 dy 提到行外的省法就不成立了；
+        // 这张表整轮只建一次（深度图尺寸不变就不重来），所以这不花钱。
         for y in 0..<eyeH {
-            let myp = (oy + (Float(y) + 0.5) * scale) * ky
-            var dy = Int(myp)
-            if dy < 0 { dy = 0 }
-            if dy > dh - 1 { dy = dh - 1 }
             for x in 0..<eyeW {
-                let mxp = (ox + (Float(x) + 0.5) * scale) * kx
-                var dx = Int(mxp)
+                let cx = rot ? Float(eyeH - 1 - y) : Float(x)
+                let cy = rot ? Float(x) : Float(y)
+                var dx = Int((ox + (cx + 0.5) * scale) * kx)
+                var dy = Int((oy + (cy + 0.5) * scale) * ky)
                 if dx < 0 { dx = 0 }
                 if dx > dw - 1 { dx = dw - 1 }
+                if dy < 0 { dy = 0 }
+                if dy > dh - 1 { dy = dh - 1 }
                 map[y * eyeW + x] = dy * dw + dx
+                // 地板：同一个眼格，逆映射里漏掉转回 90° 会取到哪儿
+                var mx2 = Int((ox + (Float(x) + 0.5) * scale) * kx)
+                var my2 = Int((oy + (Float(y) + 0.5) * scale) * ky)
+                if mx2 < 0 { mx2 = 0 }
+                if mx2 > dw - 1 { mx2 = dw - 1 }
+                if my2 < 0 { my2 = 0 }
+                if my2 > dh - 1 { my2 = dh - 1 }
+                mapMis[y * eyeW + x] = my2 * dw + mx2
             }
         }
     }

@@ -22,11 +22,13 @@ enum VRPilot {
     }
 
     static func run(url: URL, frames: Int, bpct: Float, eyeLong: Int,
-                    zps: [Float], outFps: Double, units: MLComputeUnits) -> String {
+                    zps: [Float], outFps: Double, units: MLComputeUnits, rot: Bool) -> String {
         var rep: [String] = []
         let mem0 = VRFacts.footprintMB()
         var memMax = mem0
-        VRJournal.line("试片 开始 \(url.lastPathComponent) 抽\(frames)帧 视差\(bpct)% 眼长边\(eyeLong)（送检尺寸由模型声明）")
+        let rotName = rot ? "转90°" : "摆正"
+        VRJournal.line("试片 开始 \(url.lastPathComponent) 抽\(frames)帧 视差\(bpct)% 眼长边\(eyeLong)"
+            + " 送检朝向\(rotName)")
         guard VRTech.boot() else { return "Metal 起不来：\(VRTech.initNote)" }
 
         guard let src = VRSource(url: url, eyeLong: eyeLong) else {
@@ -46,11 +48,16 @@ enum VRPilot {
         let tgt = VRDepth.inputTarget(model, eyeW: src.eyeW, eyeH: src.eyeH)
         var feedNote = ""
         guard let feed = VRDepthFeed(model: model, eyeW: src.eyeW, eyeH: src.eyeH,
-                                     mw: tgt.w, mh: tgt.h, note: &feedNote) else {
+                                     mw: tgt.w, mh: tgt.h, rot: rot, note: &feedNote) else {
             return "送检通道建不起来：\(feedNote)"
         }
-        rep.append("送检口径 \(tgt.note)｜信箱 scale \(String(format: "%.3f", feed.scale))"
-            + " 偏移 (\(String(format: "%.0f", feed.ox)),\(String(format: "%.0f", feed.oy)))")
+        let other = VRDepthFeed(model: model, eyeW: src.eyeW, eyeH: src.eyeH,
+                                mw: tgt.w, mh: tgt.h, rot: !rot, note: &feedNote)
+        var otherPx = "另一朝向没建成"
+        if let o = other { otherPx = "另一朝向实占 \(o.usedPx) px" }
+        rep.append("送检口径 \(tgt.note)｜朝向 \(rotName)｜信箱 scale \(String(format: "%.3f", feed.scale))"
+            + " 偏移 (\(String(format: "%.0f", feed.ox)),\(String(format: "%.0f", feed.oy)))"
+            + "｜框 \(tgt.w)x\(tgt.h)｜本次实占 \(feed.usedPx) px｜\(otherPx)")
 
         // —— 1. 抽帧 + 深度 ——
         var samples: [Sample] = []
@@ -128,6 +135,33 @@ enum VRPilot {
         }
         rep.append("深度分带（中位应当最靠前，反了就是翻了）\(bands.joined(separator: "｜"))")
 
+        // 朝向自证：正变换在 kScale 里、逆变换在 VRDepthFeed.buildMap 里，两处不同步的话
+        // 深度会和它的彩色帧错着 90°——画面只显得"有点怪"，补洞率、单价、分带一条都不会报。
+        // 比的是形状不是数值：模型每一趟自带一个仿射量纲，两种朝向的画面占比又不同，
+        // 绝对值本来就不该相等，所以这里看 r，并拿「故意不做旋转修正」的那张表当地板一起报。
+        // 不进单价数组：这趟是额外重跑，混进去会把 avg 污染成两个朝向的混合。
+        if let o = other {
+            let a = feed.infer(srcPB: samples[0].pb)
+            let b = o.infer(srcPB: samples[0].pb)
+            let up = rot ? b.raw : a.raw
+            let ro = rot ? a.raw : b.raw
+            let rotFeed = rot ? feed : o
+            let rotPlane = rot ? a.plane : b.plane
+            let mis = rotFeed.resampleMis(rotPlane)
+            let good = pearson(up, ro)
+            let bad = pearson(up, mis)
+            if good.r <= -8 || bad.r <= -8 {
+                rep.append("朝向自证 r 无从谈起：某一趟的深度几乎是常数（这条太干净或深度没跑出来），换一条素材再判")
+            } else {
+                rep.append("朝向自证 第1帧 摆正↔转90° 摊回眼格后 r=\(String(format: "%.4f", good.r))"
+                    + "（斜率 \(String(format: "%.2f", good.slope))）｜地板 r=\(String(format: "%.4f", bad.r))"
+                    + "（逆映射故意不转回来）｜判法：r 贴着 1 就是正逆对上，落到地板那一档就是错 90°"
+                    + "｜斜率是两种朝向各自量纲的比，不是对错")
+            }
+        } else {
+            rep.append("朝向自证 没做成：另一朝向的送检通道建不起来 \(feedNote)")
+        }
+
         // —— 3. 形变 + 编码 ——
         var wnote = ""
         guard let warp = VRWarp(eyeW: src.eyeW, eyeH: src.eyeH, bpct: bpct, note: &wnote) else {
@@ -200,7 +234,7 @@ enum VRPilot {
         var encoded = 0
         for (zi, zp) in zps.enumerated() {
             let head = zi == 0 ? "①" : (zi == 1 ? "②" : "③")
-            let title = "\(head) zp \(String(format: "%.2f", zp))｜每眼 \(src.eyeW)x\(h)｜视差 \(String(format: "%.0f", warp.budget)) px"
+            let title = "\(head) zp \(String(format: "%.2f", zp))｜每眼 \(src.eyeW)x\(h)｜视差 \(String(format: "%.0f", warp.budget)) px｜送检 \(rotName)"
             let tip = zi == 0 ? "主体浮出屏幕" : (zi == 1 ? "中间调" : "背景往后退")
             let ta0 = DispatchTime.now().uptimeNanoseconds
             guard let headPB = VRTech.pixelBuffer(width: sbsW, height: h).pb else { werr = "标题帧分配失败"; break }
@@ -355,6 +389,23 @@ enum VRPilot {
     }
 
     static func avg(_ v: [Double]) -> Double { v.isEmpty ? 0 : v.reduce(0, +) / Double(v.count) }
+
+    /// 相关系数 + 最小二乘斜率。某一侧几乎是常数时返回 -9（r 的定义本身失效），
+    /// 用它和"真的没关系（r≈0）"区分开——混成一个数就会把"这条素材太干净"误报成"映射错了"。
+    static func pearson(_ x: [Float], _ y: [Float]) -> (r: Double, slope: Double) {
+        guard x.count == y.count, x.count > 1 else { return (-9, -9) }
+        var sx = 0.0, sy = 0.0, sxx = 0.0, syy = 0.0, sxy = 0.0
+        for i in 0..<x.count {
+            let u = Double(x[i]), v = Double(y[i])
+            sx += u; sy += v; sxx += u * u; syy += v * v; sxy += u * v
+        }
+        let n = Double(x.count)
+        let vx = n * sxx - sx * sx
+        let vy = n * syy - sy * sy
+        guard vx > 1e-6, vy > 1e-6 else { return (-9, -9) }
+        let cov = n * sxy - sx * sy
+        return (cov / (vx * vy).squareRoot(), cov / vx)
+    }
 
     static func unitsName(_ u: MLComputeUnits) -> String {
         switch u {

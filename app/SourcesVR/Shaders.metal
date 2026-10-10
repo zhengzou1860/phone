@@ -13,12 +13,13 @@ struct VRP {
     uint  H;        // 每眼高
     uint  MW;       // 送检图宽
     uint  MH;       // 送检图高
-    float scale;    // 眼 → 送检 的等比缩放
+    float scale;    // 眼 → 送检 的等比缩放（rot=1 时是「转 90° 后的那张」→ 送检）
     float ox;       // 送检图里图像区的左边界（黑边宽度）
     float oy;       // 同上，上边界
     float zp;       // 零视差面：归一化深度等于它的正好落在屏幕上
     float budget;   // 最大视差（像素，按每眼宽算）
     uint  SW;       // 成片宽 = 2W
+    uint  rot;      // 0=摆正送检；1=顺时针转 90° 送检（只有 kScale 读它）
 };
 
 constexpr sampler lin(coord::normalized, filter::linear, address::clamp_to_edge);
@@ -35,16 +36,33 @@ static inline float ddOf(device const float* dn, uint idx, constant VRP& P) {
 }
 
 // 0) 眼尺寸的帧 → 送检尺寸：等比塞进去，四周留黑边。留边是为了不拉伸——拉伸会把深度也拉歪。
+// rot=1 时先顺时针转 90° 再塞：竖屏 540x960 摆正只能占 220x392，转过去能占满 518x291（有效像素 +75%），
+// 而模型那 518x392 的固定输入和单价一分不变。
+// ⚠️ 下面这条 画布 → 旋转视图 → 眼格 的换算，逆运算写在 VRDepthFeed.buildMap 里，两处必须同步改：
+// 不同步的话深度会和它的彩色帧错着 90°，而画面看着"还是有立体感"，指标一条都不报错。
 kernel void kScale(texture2d<float, access::sample> src [[texture(0)]],
                    texture2d<float, access::write>   dst [[texture(1)]],
                    constant VRP& P [[buffer(0)]],
                    uint2 g [[thread_position_in_grid]]) {
     if (g.x >= P.MW || g.y >= P.MH) return;
-    float ex = (float(g.x) + 0.5 - P.ox) / P.scale - 0.5;
-    float ey = (float(g.y) + 0.5 - P.oy) / P.scale - 0.5;
-    if (ex < -0.5 || ex > float(P.W) - 0.5 || ey < -0.5 || ey > float(P.H) - 0.5) {
-        dst.write(float4(0.0, 0.0, 0.0, 0.0), g);
-        return;
+    float rx = (float(g.x) + 0.5 - P.ox) / P.scale - 0.5;
+    float ry = (float(g.y) + 0.5 - P.oy) / P.scale - 0.5;
+    float ex, ey;
+    if (P.rot == 1u) {
+        // 旋转视图 R 的宽 = P.H、高 = P.W；R(rx, ry) = 眼(ry, P.H-1-rx)
+        if (rx < -0.5 || rx > float(P.H) - 0.5 || ry < -0.5 || ry > float(P.W) - 0.5) {
+            dst.write(float4(0.0, 0.0, 0.0, 0.0), g);
+            return;
+        }
+        ex = ry;
+        ey = float(P.H) - 1.0 - rx;
+    } else {
+        if (rx < -0.5 || rx > float(P.W) - 0.5 || ry < -0.5 || ry > float(P.H) - 0.5) {
+            dst.write(float4(0.0, 0.0, 0.0, 0.0), g);
+            return;
+        }
+        ex = rx;
+        ey = ry;
     }
     float2 uv = float2((ex + 0.5) / float(P.W), (ey + 0.5) / float(P.H));
     dst.write(src.sample(lin, uv), g);

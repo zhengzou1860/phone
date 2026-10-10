@@ -41,6 +41,17 @@ struct VRMainView: View {
                     .font(.system(size: 10, design: .monospaced))
                     .foregroundColor(.orange)
 
+                Picker("送检朝向", selection: $job.feedRot) {
+                    Text("摆正").tag(false)
+                    Text("转 90°").tag(true)
+                }
+                .pickerStyle(.segmented)
+                .font(.footnote)
+
+                Text("尺寸动不了，朝向能换画面在框里占多少：每眼 540x960 摆正 86k px（上机实测）／转 90° 按信箱公式算 151k px（+75%，这版自己会在报告里报「本次实占」）")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundColor(.secondary)
+
                 Picker("每眼长边", selection: $job.eyeLong) {
                     Text("540").tag(540)
                     Text("720").tag(720)
@@ -124,6 +135,8 @@ final class VRJob: ObservableObject {
     @Published var bpct = 5
     /// 默认 CPU：10-10 上机实测 184 ms/帧，比 all 的 853 ms 快 4.6 倍，且不交 ANE 那 122 s 的加载税
     @Published var unitTag = 3
+    /// 默认摆正：所有已测数字都是这个口径下测的，换朝向要靠同一素材两版对看
+    @Published var feedRot = false
 
     init() {
         let info = Bundle.main.infoDictionary ?? [:]
@@ -173,11 +186,13 @@ final class VRJob: ObservableObject {
         let eye = eyeLong
         let b = Float(bpct)
         let u = VRJob.unit(unitTag)
+        let rot = feedRot
+        let rn = rot ? "转90°" : "摆正"
         VRPressure.reset()
-        status = "出试片中…（抽 \(n) 帧 × 3 个零视差面；深度单元 \(VRPilot.unitsName(u))，单价见上方实测那行）"
+        status = "出试片中…（抽 \(n) 帧 × 3 个零视差面；送检\(rn)；深度单元 \(VRPilot.unitsName(u))，单价见上方实测那行）"
         Task.detached { [weak self] in
             let r = VRPilot.run(url: url, frames: n, bpct: b, eyeLong: eye,
-                                zps: [0.15, 0.50, 0.85], outFps: 5.0, units: u)
+                                zps: [0.15, 0.50, 0.85], outFps: 5.0, units: u, rot: rot)
             await MainActor.run { self?.finish(r) }
         }
     }
