@@ -36,7 +36,7 @@ targets:
         CFBundleIdentifier: com.qoder.voice
         CFBundlePackageType: APPL
         CFBundleShortVersionString: "0.1"
-        CFBundleVersion: "7"
+        CFBundleVersion: "8"
         CFBundleInfoDictionaryVersion: "6.0"
         NSMicrophoneUsageDescription: "要录你的声音来做声音转换"
         NSAppTransportSecurity:
@@ -58,3 +58,13 @@ targets:
         SWIFT_STRICT_CONCURRENCY: minimal
         ENABLE_BITCODE: "NO"
         GENERATE_INFOPLIST_FILE: "NO"
+        # Swift 只看 OrtShim.h（几百个函数指针的 OrtApi 结构体不给 Swift 导入器碰）。
+        SWIFT_OBJC_BRIDGING_HEADER: SourcesVoice/Voice-Bridging-Header.h
+        HEADER_SEARCH_PATHS:
+          - "$(PROJECT_DIR)/Vendor/onnxruntime.xcframework/ios-arm64/onnxruntime.framework/Headers"
+        # 这个切片是个 fat 容器套 !<arch> 静态库，-framework 链法一个符号都进不去，
+        # 只能 force_load 整档；ORT 本体是 C++，libc++ 要一起给。
+        OTHER_LDFLAGS:
+          - "-force_load"
+          - "$(PROJECT_DIR)/Vendor/onnxruntime.xcframework/ios-arm64/onnxruntime.framework/onnxruntime"
+          - "-lc++"

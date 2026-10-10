@@ -261,7 +261,12 @@ struct ContentView: View {
                 convertStatus = "提取音色特征…"
                 try await engine?.convert(inputWav: inputURL,
                                           refWav: inputURL,  // 当前版本用同一段音频
-                                          outputWav: output)
+                                          outputWav: output,
+                                          onStage: { text in
+                    // 推理线程回调 → 跳回主线程改文案（ContentView 是 struct，
+                    // @State 的 setter 是 nonmutating，闭包里捕获的副本写回同一块存储）。
+                    DispatchQueue.main.async { convertStatus = text }
+                })
                 await MainActor.run {
                     outputURL = output
                     isConverting = false

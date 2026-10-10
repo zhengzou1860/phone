@@ -189,6 +189,59 @@ jobs:
             exit 1
           fi
 
+      - name: 取 ONNX Runtime（自留副本，逐字节校验）
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          gh release download ort-c-1.30.0 -p 'ort-c-1.30.0.zip' -D /tmp \
+            --repo "$GITHUB_REPOSITORY"
+          ls -l /tmp/ort-c-1.30.0.zip
+          echo "e6f1670c14406fd9f082bb400ab197a9b0a9646058ca6366e440642e2b54a2ea  /tmp/ort-c-1.30.0.zip" \
+            | shasum -a 256 -c -
+          V="$GITHUB_WORKSPACE/app/Vendor"
+          rm -rf "$V" && mkdir -p "$V"
+          # 只解 iOS 真机那一片：simulator 和 macos 两片合起来比需要的多三倍
+          unzip -q /tmp/ort-c-1.30.0.zip -d "$V" 'onnxruntime.xcframework/ios-arm64/*'
+          F="$V/onnxruntime.xcframework/ios-arm64/onnxruntime.framework"
+          test -s "$F/onnxruntime"
+          test -s "$F/Headers/onnxruntime_c_api.h"
+          ls -l "$F"
+          du -sh "$V"
+
+      - name: 自检 OrtShim + Swift 互操作（只出诊断，不拦路）
+        run: |
+          set +e          # 这一格报错和后面 xcodebuild 是同一批错，权威闸门在 xcodebuild
+          L=/tmp/ot/step.log
+          rm -rf /tmp/ot && mkdir -p /tmp/ot
+          ios=$(xcrun --sdk iphoneos --show-sdk-path)
+          SV="$GITHUB_WORKSPACE/app/SourcesVoice"
+          HD="$GITHUB_WORKSPACE/app/Vendor/onnxruntime.xcframework/ios-arm64/onnxruntime.framework/Headers"
+          T=arm64-apple-ios18.0
+          { echo "=== ios sdk = $ios ==="; echo "=== headers ==="; ls "$HD" | head -5; } > $L 2>&1
+
+          # 本机没有 clang，OrtShim.c 这辈子只有 CI 编得动；先单独编它，
+          # 报错就是纯 C 的，不会被 Swift 的诊断盖住。
+          xcrun --sdk iphoneos clang -c -std=gnu17 -O2 -Wall -Wextra \
+            -target $T -isysroot "$ios" -I "$HD" -I "$SV" \
+            "$SV/OrtShim.c" -o /tmp/ot/OrtShim.o >> $L 2>&1
+          echo "=== clang rc=$? ===" >> $L
+          ls -l /tmp/ot/OrtShim.o >> $L 2>&1
+          echo "=== OrtShim.o 里待 force_load 解析的符号 ===" >> $L
+          nm -u /tmp/ot/OrtShim.o >> $L 2>&1
+
+          # Swift 侧：bridging header 真导得进来、Ort.swift 那些 C 指针写法真过得了类型。
+          # -Xcc -I 是给导入器的头文件路径（OrtShim.h 自己不 include ORT，这里带着无害）。
+          xcrun --sdk iphoneos swiftc -typecheck -target $T -isysroot "$ios" \
+            -import-objc-header "$SV/Voice-Bridging-Header.h" \
+            -Xcc -I -Xcc "$HD" \
+            "$SV"/*.swift >> $L 2>&1
+          echo "=== swiftc typecheck rc=$? ===" >> $L
+          # 计数别边读边写同一个文件：grep 读的是 step.log，输出再进 step.log 就读到自己的尾巴了
+          grep -c "error:" $L > /tmp/ot/errcount.txt 2>&1
+          echo "=== error 行数 $(cat /tmp/ot/errcount.txt) ===" >> $L
+          cat $L
+
       - name: 装 XcodeGen
         run: brew install xcodegen
 
@@ -237,6 +290,10 @@ jobs:
           cd /tmp
           { echo "### 自检 ZipExtractor（step.log）"; cat /tmp/zt/step.log 2>/dev/null || echo "(未跑或空)";
             echo; echo "### 自检 MelFrontEnd（step.log）"; cat /tmp/fe/step.log 2>/dev/null || echo "(未跑或空)";
+            echo; echo "### 自检 OrtShim + Swift 互操作（step.log）"; cat /tmp/ot/step.log 2>/dev/null || echo "(未跑或空)";
+            echo; echo "### vendored ONNX Runtime";
+            find "$GITHUB_WORKSPACE/app/Vendor" -maxdepth 4 2>/dev/null | head -20 || echo "(app/Vendor 不存在 = 取包那步没跑)";
+            du -sh "$GITHUB_WORKSPACE/app/Vendor" 2>/dev/null || true;
             echo; echo "### xcodegen"; cat /tmp/gen.log 2>/dev/null || echo "(空)";
             echo; echo "### SourcesVoice 清单"; ls -l "$GITHUB_WORKSPACE/app/SourcesVoice" 2>/dev/null || echo "(空)";
             echo; echo "### 编译错误（去重）";

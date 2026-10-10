@@ -10,3 +10,5 @@ app/HelloLC.xcodeproj/
 app/build/
 app/Payload/
 app/hello.ipa
+# CI 每次从 ort-c-1.30.0 那个发布件现取现解，本地不许留副本（48 MB 静态档）
+app/Vendor/
