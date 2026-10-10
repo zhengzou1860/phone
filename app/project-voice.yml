@@ -24,7 +24,7 @@ targets:
         CFBundleIdentifier: com.qoder.voice
         CFBundlePackageType: APPL
         CFBundleShortVersionString: "0.1"
-        CFBundleVersion: "3"
+        CFBundleVersion: "4"
         CFBundleInfoDictionaryVersion: "6.0"
         NSMicrophoneUsageDescription: "要录你的声音来做声音转换"
         NSAppTransportSecurity:

@@ -10,6 +10,8 @@ struct ContentView: View {
     @State private var outputURL: URL?
     @State private var isPlaying = false
     @State private var player: AVAudioPlayer?
+    @State private var sendStatus = ""
+    @State private var isSending = false
 
     var body: some View {
         NavigationView {
@@ -23,12 +25,49 @@ struct ContentView: View {
                             playbackSection(url: url)
                         }
                     }
+                    debugSection
                 }
                 .padding()
             }
             .navigationTitle("声音克隆")
             .onAppear {
+                VoiceJournal.line("ContentView.onAppear")
                 models.check()
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var debugSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("诊断")
+                .font(.headline)
+            Button(isSending ? "发送中…" : "发到电脑") {
+                sendReport()
+            }
+            .buttonStyle(.bordered)
+            .disabled(isSending)
+            if !sendStatus.isEmpty {
+                Text(sendStatus)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+        }
+    }
+
+    private func sendReport() {
+        isSending = true
+        sendStatus = ""
+        let facts = VoiceFacts.lines().joined(separator: "\n")
+        let text = "—— 现场读数 ——\n" + facts
+            + "\n\n—— 模型状态 ——\n" + models.progressText
+            + "\n\n—— 磁盘日志最近 200 行 ——\n" + VoiceJournal.tail(200)
+        Task.detached { [weak self] in
+            let r = VoiceUploader.send(text)
+            await MainActor.run {
+                self?.sendStatus = r
+                self?.isSending = false
+                VoiceJournal.line("发到电脑：\(r)")
             }
         }
     }

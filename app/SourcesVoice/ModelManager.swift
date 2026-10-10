@@ -4,7 +4,9 @@ import Combine
 
 @MainActor
 final class ModelManager: ObservableObject {
-    @Published var state: State = .checking
+    @Published var state: State = .checking {
+        didSet { VoiceJournal.line("state→\(describe(state))") }
+    }
     @Published var progress: Double = 0
     @Published var progressText: String = ""
 
@@ -22,11 +24,22 @@ final class ModelManager: ObservableObject {
     static let downloadURL = "https://github.com/\(repo)/releases/download/\(releaseTag)/\(zipName)"
 
     private var bridge: DownloadBridge?
+    private var session: URLSession?
     private var task: URLSessionDownloadTask?
 
     var modelDir: URL? {
         if case .downloaded(let url) = state { return url }
         return nil
+    }
+
+    private func describe(_ s: State) -> String {
+        switch s {
+        case .checking: return "checking"
+        case .notDownloaded: return "notDownloaded"
+        case .downloading: return "downloading \(Int(progress * 100))%"
+        case .downloaded: return "downloaded"
+        case .failed(let m): return "failed: \(m)"
+        }
     }
 
     func check() {
@@ -35,6 +48,7 @@ final class ModelManager: ObservableObject {
         let zip = dir.appendingPathComponent(Self.zipName)
         // 真就绪的信号 = 至少解出一个具体 onnx，别信旧版 .ready
         let probe = dir.appendingPathComponent("dit_state_0.onnx")
+        VoiceJournal.line("check() dir=\(dir.path)")
         if FileManager.default.fileExists(atPath: probe.path) {
             state = .downloaded(modelDir: dir)
             progressText = "模型已就绪"
@@ -43,6 +57,7 @@ final class ModelManager: ObservableObject {
             state = .downloading
             progress = 1.0
             progressText = "重新解压已下载的 zip…"
+            VoiceJournal.line("本地续解 \(Self.zipName)")
             do {
                 try ZipExtractor.extractAll(zipURL: zip, to: dir)
                 try? Data("ok".utf8).write(to: marker)
@@ -67,13 +82,16 @@ final class ModelManager: ObservableObject {
         state = .downloading
         progress = 0
         progressText = "正在连接 GitHub…"
+        VoiceJournal.line("开始下载 \(Self.downloadURL)")
 
-        let cfg = URLSessionConfiguration.background(withIdentifier: "voice.model.\(UUID().uuidString)")
-        cfg.timeoutIntervalForResource = 3600       // 整个下载允许 1 小时
-        cfg.isDiscretionary = false                 // 立刻开始，不等到 WiFi+充电
+        // background session 的 identifier 必须固定，不能用 UUID——挂了/被系统回收后再开
+        // 找不到同 id 的 session 就丢进度。
+        let cfg = URLSessionConfiguration.background(withIdentifier: "voice.model.main")
+        cfg.timeoutIntervalForResource = 3600
+        cfg.isDiscretionary = false
         cfg.sessionSendsLaunchEvents = true
 
-        let bridge = DownloadBridge()
+        let bridge = DownloadBridge(destDir: modelDirectory(), zipName: Self.zipName)
         self.bridge = bridge
         bridge.onProgress = { [weak self] received, total in
             Task { @MainActor in
@@ -90,48 +108,40 @@ final class ModelManager: ObservableObject {
             Task { @MainActor in
                 guard let self = self else { return }
                 switch result {
-                case .success(let localURL):
-                    self.handleDownloaded(localURL)
+                case .success(let payload):
+                    VoiceJournal.line("下载完成 \(payload.bytes / 1_048_576) MB → \(payload.url.lastPathComponent)")
+                    self.handleDownloaded(destURL: payload.url, bytes: payload.bytes)
                 case .failure(let err):
-                    self.state = .failed("下载失败: \(err.localizedDescription)")
+                    let ns = err as NSError
+                    VoiceJournal.line("下载失败 domain=\(ns.domain) code=\(ns.code) \(err.localizedDescription)")
+                    self.state = .failed("下载失败(\(ns.code)): \(err.localizedDescription)")
                 }
             }
         }
 
         let session = URLSession(configuration: cfg, delegate: bridge, delegateQueue: nil)
+        self.session = session
         let t = session.downloadTask(with: url)
         t.resume()
         self.task = t
     }
 
-    private func handleDownloaded(_ tmp: URL) {
+    private func handleDownloaded(destURL: URL, bytes: Int64) {
         let dir = modelDirectory()
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let dest = dir.appendingPathComponent(Self.zipName)
-        try? FileManager.default.removeItem(at: dest)
+        progress = 1.0
+        progressText = "解压中…"
+        VoiceJournal.line("开始解压")
         do {
-            // background session 的临时文件在 caches 里，move 到 Documents
-            try FileManager.default.moveItem(at: tmp, to: dest)
-            let attrs = try FileManager.default.attributesOfItem(atPath: dest.path)
-            let bytes = (attrs[.size] as? NSNumber)?.int64Value ?? 0
-            if bytes < 1_000_000 {
-                state = .failed("下载文件过小 \(bytes) 字节，可能是 GitHub 重定向页")
-                return
-            }
-            progress = 1.0
-            progressText = "解压中…"
-
-            try ZipExtractor.extractAll(zipURL: dest, to: dir)
-
+            try ZipExtractor.extractAll(zipURL: destURL, to: dir)
             let marker = dir.appendingPathComponent(".ready")
             try? Data("ok".utf8).write(to: marker)
-            // 释空间：解压完删 zip
-            try? FileManager.default.removeItem(at: dest)
-
+            try? FileManager.default.removeItem(at: destURL)
             state = .downloaded(modelDir: dir)
             progressText = "模型就绪（\(bytes / 1_048_576) MB zip 已解出）"
+            VoiceJournal.line("解压完成，zip 已删")
         } catch {
-            state = .failed("解压/落盘失败: \(error.localizedDescription)")
+            VoiceJournal.line("解压失败 \(error.localizedDescription)")
+            state = .failed("解压失败: \(error.localizedDescription)")
         }
     }
 
@@ -141,15 +151,42 @@ final class ModelManager: ObservableObject {
     }
 }
 
-/// 单独一个类做 delegate，避免 ModelManager 里的 @MainActor 与 URLSession 回调线程冲突
+/// 单独一个类做 delegate，避免 @MainActor 与 URLSession 回调线程冲突。
+/// 关键：didFinishDownloadingTo 里的临时 location **在方法返回后 iOS 会立刻删掉**，
+/// 必须在这个回调里同步 move 到 Documents，别交给 MainActor Task 排队。
 private final class DownloadBridge: NSObject, URLSessionDownloadDelegate {
     var onProgress: ((Int64, Int64) -> Void)?
-    var onFinish: ((Result<URL, Error>) -> Void)?
+    var onFinish: ((Result<DownloadedPayload, Error>) -> Void)?
+
+    struct DownloadedPayload {
+        let url: URL
+        let bytes: Int64
+    }
+
+    private let destDir: URL
+    private let zipName: String
+
+    init(destDir: URL, zipName: String) {
+        self.destDir = destDir
+        self.zipName = zipName
+    }
 
     func urlSession(_ session: URLSession,
                     downloadTask: URLSessionDownloadTask,
                     didFinishDownloadingTo location: URL) {
-        onFinish?(.success(location))
+        do {
+            try FileManager.default.createDirectory(at: destDir, withIntermediateDirectories: true)
+            let dest = destDir.appendingPathComponent(zipName)
+            try? FileManager.default.removeItem(at: dest)
+            // 优先 copy 再删（move 跨 volume 会失败），Documents 和 tmp 同 volume 但保险起见
+            try FileManager.default.copyItem(at: location, to: dest)
+            try? FileManager.default.removeItem(at: location)
+            let attrs = try FileManager.default.attributesOfItem(atPath: dest.path)
+            let bytes = (attrs[.size] as? NSNumber)?.int64Value ?? 0
+            onFinish?(.success(DownloadedPayload(url: dest, bytes: bytes)))
+        } catch {
+            onFinish?(.failure(error))
+        }
     }
 
     func urlSession(_ session: URLSession,
