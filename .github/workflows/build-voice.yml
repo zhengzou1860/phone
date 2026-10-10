@@ -26,11 +26,11 @@ jobs:
       - name: 自检 ZipExtractor（不通过不出包）
         run: |
           set -uo pipefail
-          mkdir -p /tmp/zt/src /tmp/zt/out
-          ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=8{print "::error::" p substr($0,1,230)}'; }
+          L=/tmp/zt/step.log
+          rm -rf /tmp/zt && mkdir -p /tmp/zt/src /tmp/zt/out
+          echo "=== mkdir ===" > $L
 
-          # 造样本：三种尺寸（含超过 1 MB 输入 chunk 的），跑一遍 deflate
-          python3 - <<'PY'
+          python3 - <<'PY' 2>>$L
           import os
           os.makedirs('/tmp/zt/src', exist_ok=True)
           for name, size in [('small.bin', 4096),
@@ -39,8 +39,11 @@ jobs:
               with open(f'/tmp/zt/src/{name}','wb') as f:
                   f.write(os.urandom(size))
           PY
-          (cd /tmp/zt/src && zip -r ../test.zip .) > /tmp/zt/zip.log 2>&1
-          ls -l /tmp/zt/test.zip | ann "ZT-ZIP "
+          echo "=== python rc=$? ===" >> $L
+
+          (cd /tmp/zt/src && zip -r ../test.zip .) >> $L 2>&1
+          echo "=== zip rc=$? ===" >> $L
+          ls -l /tmp/zt/test.zip >> $L 2>&1
 
           cat > /tmp/zt/main.swift <<'SW'
           import Foundation
@@ -59,39 +62,34 @@ jobs:
               exit(2)
           }
           SW
+          echo "=== main.swift 写了 ===" >> $L
 
           swiftc -O \
             -o /tmp/zt/zip_test \
             "$GITHUB_WORKSPACE/app/SourcesVoice/ZipExtractor.swift" \
-            /tmp/zt/main.swift > /tmp/zt/swiftc.log 2>&1
-          rc=$?
-          if [ $rc -ne 0 ]; then
-            tail -30 /tmp/zt/swiftc.log | ann "ZT-COMPILE-FAIL "
-            exit 1
-          fi
-          /tmp/zt/zip_test /tmp/zt/test.zip /tmp/zt/out > /tmp/zt/run.log 2>&1
-          rc=$?
-          cat /tmp/zt/run.log | ann "ZT-RUN "
-          if [ $rc -ne 0 ]; then
-            echo "ZipExtractor 运行失败 rc=$rc" | ann "ZT-VERDICT "
-            exit 1
-          fi
+            /tmp/zt/main.swift >> $L 2>&1
+          echo "=== swiftc rc=$? ===" >> $L
+          ls -l /tmp/zt/zip_test >> $L 2>&1
 
-          # 逐文件对拍
+          /tmp/zt/zip_test /tmp/zt/test.zip /tmp/zt/out >> $L 2>&1
+          echo "=== zip_test rc=$? ===" >> $L
+
           bad=0
           for f in small.bin mid.bin big.bin; do
             if cmp -s /tmp/zt/src/$f /tmp/zt/out/$f; then
-              echo "MATCH $f"
+              echo "MATCH $f" >> $L
             else
-              echo "DIFF  $f  src=$(wc -c </tmp/zt/src/$f) out=$(wc -c </tmp/zt/out/$f 2>/dev/null || echo 缺)"
+              echo "DIFF  $f src=$(wc -c </tmp/zt/src/$f) out=$(wc -c </tmp/zt/out/$f 2>/dev/null || echo 缺)" >> $L
               bad=$((bad+1))
             fi
-          done | ann "ZT-DIFF "
+          done
+          echo "=== bad=$bad ===" >> $L
+
+          ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=80{print "::error::" p substr($0,1,230)}'; }
+          cat $L | ann "ZT "
           if [ "$bad" -ne 0 ]; then
-            echo "字节对拍失败 $bad 个文件" | ann "ZT-VERDICT "
             exit 1
           fi
-          echo "ZipExtractor 自检通过（3 个 deflate 文件，最大 3 MB）" | ann "ZT-VERDICT "
 
       - name: 装 XcodeGen
         run: brew install xcodegen
