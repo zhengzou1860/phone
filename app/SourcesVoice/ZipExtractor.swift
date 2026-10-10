@@ -201,8 +201,11 @@ enum ZipExtractor {
             stream.dst_ptr = dstBuf
             stream.dst_size = outChunk
 
-            let status = compression_stream_process(&stream,
-                                                    isLastInput ? COMPRESSION_STREAM_FINALIZE : 0)
+            // CI 探测实证（iPhoneOS26.5.sdk）：process 的 flags 形参是 Int32，
+            // 而 COMPRESSION_STREAM_FINALIZE 被导入成 __C.compression_stream_flags(rawValue: 1)。
+            // truncatingIfNeeded 不依赖 rawValue 是 Int32 还是 UInt32。
+            let finalize = Int32(truncatingIfNeeded: COMPRESSION_STREAM_FINALIZE.rawValue)
+            let status = compression_stream_process(&stream, isLastInput ? finalize : 0)
 
             // process 会把 src_ptr 往前推、src_size 留成"还没吃掉的"，挪回头部再喂下一批
             let unconsumed = stream.src_size

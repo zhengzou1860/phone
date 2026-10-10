@@ -23,54 +23,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: 探 compression_stream_flags 的真实写法
-        run: |
-          set +e
-          P=/tmp/probe.log      # 别放 /tmp/zt 里，下一步自检会 rm -rf /tmp/zt
-          rm -rf /tmp/zt && mkdir -p /tmp/zt/src /tmp/zt/out
-          ios=$(xcrun --sdk iphoneos --show-sdk-path)
-          echo "=== ios sdk = $ios ===" > $P
-
-          # Apple 文档页写 flags 是 Int32，SDK 26.5 实际报 compression_stream_flags。
-          # 逐个候选写法单独 typecheck，用 rc 判哪个是真的，别再让我猜。
-          probe() {
-            name="$1"; expr="$2"
-            printf 'import Compression\nfunc t(_ s: UnsafeMutablePointer<compression_stream>) -> compression_status {\n    return compression_stream_process(s, %s)\n}\n' \
-              "$expr" > /tmp/zt/p.swift
-            swiftc -typecheck -sdk "$ios" -target arm64-apple-ios15.0 /tmp/zt/p.swift > /tmp/zt/p.err 2>&1
-            rc=$?
-            echo "PROBE [$name] expr=<$expr> rc=$rc" >> $P
-            if [ "$rc" != "0" ]; then
-              head -4 /tmp/zt/p.err | sed 's/^/      /' >> $P
-            fi
-          }
-          probe "字面量0"            "0"
-          probe "Int32(0)"           "Int32(0)"
-          probe "空数组[]->OptionSet" "[]"
-          probe "flags(rawValue:0)"  "compression_stream_flags(rawValue: 0)"
-          probe "FINALIZE 本身"       "COMPRESSION_STREAM_FINALIZE"
-          probe "FINALIZE.rawValue"  "compression_stream_flags(rawValue: COMPRESSION_STREAM_FINALIZE.rawValue)"
-
-          # FINALIZE 这个常量到底是什么类型、有没有 rawValue
-          cat > /tmp/zt/q.swift <<'SW'
-          import Compression
-          let f = COMPRESSION_STREAM_FINALIZE
-          print("type=\(String(reflecting: type(of: f))) raw=\(f.rawValue)")
-          SW
-          swiftc -typecheck -sdk "$ios" -target arm64-apple-ios15.0 /tmp/zt/q.swift > /tmp/zt/q.err 2>&1
-          echo "PROBE [typecheck rawValue] rc=$?" >> $P
-          head -6 /tmp/zt/q.err | sed 's/^/      /' >> $P
-          # 同一句在 macOS 上直接跑，让类型名打印出来
-          swiftc -O -o /tmp/zt/q /tmp/zt/q.swift > /tmp/zt/q2.err 2>&1
-          echo "PROBE [macos build] rc=$?" >> $P
-          /tmp/zt/q >> $P 2>&1
-          echo "PROBE [run rc=$?]" >> $P
-
-          # 顺带把 iOS SDK 里 compression.h 的真声明抓出来，这是唯一不会骗人的来源
-          grep -nE "compression_stream_process|compression_stream_init|COMPRESSION_STREAM_(EN|DE)CODE|COMPRESSION_STREAM_FINALIZE|typedef enum|} compression_stream" \
-            "$ios/usr/include/compression.h" >> $P 2>&1
-          true
-
       - name: 自检 ZipExtractor（不通过不出包）
         run: |
           set +e          # GH Actions 默认 bash -e，一失败整块退出，日志就丢了
@@ -207,8 +159,7 @@ jobs:
         run: |
           set -uo pipefail
           cd /tmp
-          { echo "### compression_stream_flags 探测"; cat /tmp/probe.log 2>/dev/null || echo "(未跑或空)";
-            echo; echo "### 自检 ZipExtractor（step.log）"; cat /tmp/zt/step.log 2>/dev/null || echo "(未跑或空)";
+          { echo "### 自检 ZipExtractor（step.log）"; cat /tmp/zt/step.log 2>/dev/null || echo "(未跑或空)";
             echo; echo "### xcodegen"; cat /tmp/gen.log 2>/dev/null || echo "(空)";
             echo; echo "### SourcesVoice 清单"; ls -l "$GITHUB_WORKSPACE/app/SourcesVoice" 2>/dev/null || echo "(空)";
             echo; echo "### 编译错误（去重）";
