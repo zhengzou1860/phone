@@ -19,7 +19,7 @@ enum ChainError: Error, LocalizedError {
 /// 改成 internal 只为 CI 那个 macOS 对拍：它逐段拿 python 落盘的中间量当输入
 /// （Fixtures/chain_fbank / chain_bn / chain_spks / chain_prompts / chain_mel），
 /// 这样每一段的残差就只可能是 Swift 自己的逻辑差，不会被前端 6.58e-05 的残差
-/// 一路放大成整段波形对不上（那个放大实测是 max_abs 1.79，见 chain_expect 的地板）。
+/// 一路放大糊掉（同一把尺重量的放大是 max_abs 0.576 / cos 0.9958，见 chain_expect 的地板）。
 struct ChainRows {
     var data: [Float]
     var frames: Int
@@ -230,6 +230,12 @@ final class ChainDriver {
 
     // MARK: - ③ DiT 去噪（7 态流式 + 2 步 euler）
 
+    /// 两个 euler 步各自都要吃**上一步更新后的 x**——别照抄 python 那两份脚本。
+    /// `tools/_f16_ab.py` / `tools/_mvc_onnx16.py` 以前把 `base = {"x": x.numpy()}` 建在循环外，
+    /// 那是张量的 numpy 视图，而 `x = x - (t-r)*u` 出块新张量、旧内存不动，于是第二步喂进图的
+    /// 还是初始噪声。同一条件同一串噪声在真素材上 A/B：那样 CER 0.077 / 音色 cos 0.763 /
+    /// mel 峰值 1.261（越出 vocos 归一化用的 [0,1]），标准写法 CER 0.026 / 0.728 / 0.958。
+    /// `_f16_ab.py` 已于 2026-10-11 改过来，Fixtures/chain_mel.f32 跟着重生成。
     func denoise(bn: ChainRows, spks: OrtTensor, prompts: [Float]) throws -> ChainRows {
         let nM = MelFrontEnd.nMels
         let chunks = (bn.frames + Self.ditChunk - 1) / Self.ditChunk

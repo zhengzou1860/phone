@@ -5,15 +5,20 @@ import Foundation
 ///
 /// 为什么逐段比而不是只比最后一帧波形：PC 侧实测过，只把 fbank/pmel 抖
 /// ±6.58e-05 / ±1.49e-06（= Swift 前端对 torch 的真实残差，前端闸门天天在量），
-/// 整链输出的最大逐元素差就冲到 1.79（信号峰值才 1.75）、余弦掉到 0.968。
-/// 也就是说端到端逐元素比根本测不出「Swift 有没有算错」，只会测出「前端残差被放大」。
+/// 整链输出的最大逐元素差就到 0.576、余弦掉到 0.9958（信号峰值 1.75、rms 0.211）。
+/// 也就是说端到端逐元素比测不出「Swift 有没有算错」，只会测出「前端残差被放大」，
 /// 所以每个阶段都直接吃 python 落盘的中间量（Fixtures/chain_*.f32），
 /// 输入逐字节相同 ⇒ 两边的差只可能是 Swift 自己的逻辑差。
 ///
-/// 阈值是首轮量出来的余量，不是精度上限：python 那边 onnxruntime 1.19.2、
-/// 这里链接的是 1.30.0，同图不同版本的 kernel 本来就有残差，所以第一版放得宽
-/// （rel_max 0.2 / cos 0.99），每段都另印一行 SUGGEST（= 实测的 3 倍），
-/// 看到真数以后按那一行收紧。
+/// 这一轮就是这么把唯一的分歧夹出来的：③ 报 rel_max 0.91814 / cos 0.882743，
+/// 而 ④ 喂逐字节相同的 mel 时 cos 0.999997。根因不在 Swift——tools/_f16_ab.py 的
+/// base = {"x": x.numpy()} 是张量的 numpy 视图，x = x - (t-r)*res[0] 出块新张量，
+/// 第二个 euler 步喂进图的还是初始噪声。PC 上「标准 euler vs 那份旧 fixture」量到
+/// rel_max 0.9183 / cos 0.882823，和 CI 的读数对到小数点后四位（差的 2e-4 就是
+/// ORT 1.19.2 与 1.30.0 的 kernel 残差）。_f16_ab 已改成标准 euler、fixture 重生成。
+///
+/// 阈值按首轮实测放 3~40 倍余量，每段另印一行 SUGGEST（= 实测 3 倍）继续收紧。
+/// 结构错（通道序、图选错、少喂 cache/kv）会当场红。
 enum VoiceJournal {
     static func line(_ text: String) { print("  [journal] " + text) }
 }
@@ -173,19 +178,22 @@ let myFB = MelFrontEnd.kaldiFbank(AudioProcessor.scaled(src))
 let myPM = MelFrontEnd.promptMel(ref, basis: basis)
 gate("fbank", measure(myFB, expFB), relMaxLimit: 1e-3, cosLimit: 0.99, hard: false,
      note: "输入自检：这点残差是链路已知的地板来源，逐段比用的是 python 那份 fbank，不受它影响")
-gate("pmel", measure(myPM, expPM), relMaxLimit: 1e-3, cosLimit: 0.99, hard: false)
+// chain_prompts.f32 是钉死的 [1,150,80]，Swift 这份是整段（501 帧），链路上只取前 150 帧，
+// 所以也只比前 150 帧——比全长必报一条假「长度对不上」。
+gate("pmel", measure(Array(myPM.prefix(expPM.count)), expPM), relMaxLimit: 1e-3, cosLimit: 0.99,
+     hard: false, note: "只比前 \(expPM.count / nMels) 帧：DiT 的 prompts 就吃这一段")
 
 // ① 音色嵌入：吃 chain_ref.f32，和 python 的 spk_emb 同一个图同一个输入
 if let emb = stage("emb", { try drv.speakerEmbedding(ref) }), case .f32(let ed, let ev) = emb {
     print("  emb dims=\(ed)")
-    gate("emb", measure(ev, expSpk), relMaxLimit: 0.2, cosLimit: 0.99)
+    gate("emb", measure(ev, expSpk), relMaxLimit: 0.1, cosLimit: 0.995)      // 实测 0.0338 / 0.99931
 }
 
 // ② 内容编码：吃 python 落盘的 fbank 原值（不是 Swift 自己算的那份）
 var bnRows: ChainRows?
 if let r = stage("bn", { try drv.encode(fbank: expFB, frames: fbFrames) }) {
     bnRows = r
-    gate("bn", measure(r.data, expBN), relMaxLimit: 0.2, cosLimit: 0.99,
+    gate("bn", measure(r.data, expBN), relMaxLimit: 0.005, cosLimit: 0.999,   // 实测 9.9e-04 / 1.000000
          note: "Swift \(r.frames)x\(r.dim) vs python \(expBN.count / 256)x256")
 }
 
@@ -195,8 +203,9 @@ if let rows = bnRows, let r = stage("mel", { try drv.denoise(bn: rows, spks: spk
     // python 存的是 ((mel+1)/2) 之后、通道主序的 mel_v，比较前先做同样两步
     var scaled = r.data
     for i in 0..<scaled.count { scaled[i] = (scaled[i] + 1.0) * 0.5 }
+    // 实测跨 ORT 版本约 2e-4（PC 上标准 euler 对同一份 fixture 量出来的）
     gate("mel", measure(toChannels(scaled, frames: r.frames), expMel),
-         relMaxLimit: 0.2, cosLimit: 0.99, note: "Swift \(r.frames)x\(r.dim) 已换通道主序并 (+1)/2")
+         relMaxLimit: 0.02, cosLimit: 0.998, note: "Swift \(r.frames)x\(r.dim) 已换通道主序并 (+1)/2")
 }
 
 // ④ 声码：吃 python 的 mel（先还原成 vocos 要的「未 (+1)/2」口径）
@@ -204,15 +213,15 @@ if let r = stage("wav", {
         try drv.vocode(ChainRows(data: toFrames(expMel.map { $0 * 2.0 - 1.0 }, frames: melFrames),
                                  frames: melFrames, dim: nMels))
     }) {
-    gate("wav", measure(r, expWav), relMaxLimit: 0.2, cosLimit: 0.99,
+    gate("wav", measure(r, expWav), relMaxLimit: 0.05, cosLimit: 0.999,       // 实测 0.0138 / 0.999997
          note: "逐字节相同的 mel 进 vocos；这一段的 cos 就是『同样输入下 Swift 链和 python 链差多少』的下限")
 }
 
 // ⑤ 端到端：Swift 自己算前端 + 自己灌噪声。已知会被前端残差放大，只报数不拦路，
-//    判读依据是 PC 侧量的地板（只抖前端 → cos 0.968 / max_abs 1.79）。
+//    判读依据是 PC 侧量的地板（标准 euler 下只抖前端 → cos 0.9958 / max_abs 0.576）。
 if let e2e = stage("e2e", { try drv.convert(source: src, reference: ref) }) {
-    gate("e2e", measure(e2e, expWav), relMaxLimit: 1e9, cosLimit: 0.85,
-         note: "地板：只抖前端（6.58e-05 / 1.49e-06）就到 cos 0.968；这一格只要求别掉到结构错的范围")
+    gate("e2e", measure(e2e, expWav), relMaxLimit: 1e9, cosLimit: 0.97,
+         note: "地板：只抖前端（6.58e-05 / 1.49e-06）就到 cos 0.9958 / max_abs 0.576；这一格只要求别掉到结构错的范围")
 }
 
 print(String(format: "总用时 %.1f s", Date().timeIntervalSince(tAll)))
