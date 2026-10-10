@@ -15,12 +15,18 @@ enum VoiceJournal {
         return (try? String(contentsOf: url, encoding: .utf8)) ?? ""
     }
 
+    /// 转换那几十条阶段日志跑在分离线程上，主线程同时在写（state 变化、下载回调）。
+    /// 下面的写法是「整读 + 整写」，两个线程撞车就互相盖行、还可能留下半截文件 ⇒ 串行化。
+    private static let lock = NSLock()
+
     static func line(_ text: String) {
         let f = DateFormatter()
         f.dateFormat = "MM-dd HH:mm:ss"
         let oneLine = text.replacingOccurrences(of: "\n", with: " ／ ")
         let entry = "\(f.string(from: Date())) 足迹\(VoiceFacts.footprintMB())/驻留\(VoiceFacts.residentMB())MB \(oneLine)"
         guard let url = url else { return }
+        lock.lock()
+        defer { lock.unlock() }
         var lines = load().split(separator: "\n").map(String.init)
         lines.append(entry)
         if lines.count > 500 { lines.removeFirst(lines.count - 500) }
@@ -29,7 +35,10 @@ enum VoiceJournal {
     }
 
     static func tail(_ n: Int) -> String {
-        let lines = load().split(separator: "\n").map(String.init)
+        lock.lock()
+        let all = load()
+        lock.unlock()
+        let lines = all.split(separator: "\n").map(String.init)
         if lines.isEmpty { return "磁盘日志是空的（\(url?.path ?? "拿不到 documents 目录")）" }
         return lines.suffix(n).joined(separator: "\n")
     }
