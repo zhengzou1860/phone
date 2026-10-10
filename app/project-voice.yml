@@ -24,13 +24,16 @@ targets:
         CFBundleIdentifier: com.qoder.voice
         CFBundlePackageType: APPL
         CFBundleShortVersionString: "0.1"
-        CFBundleVersion: "1"
+        CFBundleVersion: "2"
         CFBundleInfoDictionaryVersion: "6.0"
         NSMicrophoneUsageDescription: "要录你的声音来做声音转换"
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
         LSRequiresIPhoneOS: true
         UILaunchScreen: {}
+        UIBackgroundModes:
+          - fetch
+          - background-transfer
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
     settings:
