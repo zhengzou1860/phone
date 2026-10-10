@@ -62,11 +62,13 @@ struct ContentView: View {
         let text = "—— 现场读数 ——\n" + facts
             + "\n\n—— 模型状态 ——\n" + models.progressText
             + "\n\n—— 磁盘日志最近 200 行 ——\n" + VoiceJournal.tail(200)
-        Task.detached { [weak self] in
+        // ContentView 是 struct，不能 [weak self]；@State 的 setter 是 nonmutating，
+        // 闭包里捕获的 struct 副本写回去仍然是同一块存储。
+        Task.detached {
             let r = VoiceUploader.send(text)
             await MainActor.run {
-                self?.sendStatus = r
-                self?.isSending = false
+                sendStatus = r
+                isSending = false
                 VoiceJournal.line("发到电脑：\(r)")
             }
         }

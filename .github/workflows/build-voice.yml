@@ -137,18 +137,29 @@ jobs:
           cd /tmp
           { echo "### 自检 ZipExtractor（step.log）"; cat /tmp/zt/step.log 2>/dev/null || echo "(未跑或空)";
             echo; echo "### xcodegen"; cat /tmp/gen.log 2>/dev/null || echo "(空)";
-            echo; echo "### 编译错误抽取";
-            grep -E "error:|warning:" /tmp/build.log 2>/dev/null | head -80 || true;
+            echo; echo "### SourcesVoice 清单"; ls -l "$GITHUB_WORKSPACE/app/SourcesVoice" 2>/dev/null || echo "(空)";
+            echo; echo "### 编译错误（去重）";
+            grep -E "error:" /tmp/build.log 2>/dev/null | sort -u | head -60 || true;
+            echo; echo "### 第一个 error 的上下文";
+            ln=$(grep -n -m1 "error:" /tmp/build.log 2>/dev/null | cut -d: -f1 || true);
+            if [ -n "$ln" ]; then
+              sed -n "$(( ln > 12 ? ln - 12 : 1 )),$(( ln + 12 ))p" /tmp/build.log;
+            else
+              echo "(没有 error: 行)";
+            fi;
             echo; echo "### build.log 末尾";
-            tail -100 /tmp/build.log 2>/dev/null || echo "(空)";
+            tail -120 /tmp/build.log 2>/dev/null || echo "(空)";
             echo; echo "### pack";
             cat /tmp/pack.log 2>/dev/null || echo "(空)"; } > voice-build.log
           echo "### commit $GITHUB_SHA / run $GITHUB_RUN_ID" >> voice-build.log
           ls -l /tmp/voice-build.log
-          gh release delete voice-build-log --cleanup-tag -y 2>&1 || true
+          # cd /tmp 之后 gh 找不到 git remote，必须显式 --repo，否则每次都静默失败
+          gh release delete voice-build-log --cleanup-tag -y --repo "$GITHUB_REPOSITORY" 2>&1 || true
           gh release create voice-build-log /tmp/voice-build.log \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
             --title "voice 构建日志" --prerelease \
-            --notes "构建 xcodegen/xcodebuild 完整日志" 2>&1 || true
+            --notes "构建 xcodegen/xcodebuild 完整日志" 2>&1
           curl -sSI https://github.com/$GITHUB_REPOSITORY/releases/download/voice-build-log/voice-build.log | head -3
 
       - name: 发 IPA（独立步骤）
