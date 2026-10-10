@@ -173,7 +173,9 @@ final class ModelManager: ObservableObject {
         startUnpack(zip: destURL, dir: Self.modelDirectory())
     }
 
-    static func modelDirectory() -> URL {
+    /// nonisolated：background session 的 didFinishDownloadingTo 必须在方法返回前把临时文件
+    /// 同步搬进 Documents（一返回 iOS 就删），而那个回调不是主线程，排不回 @MainActor。
+    nonisolated static func modelDirectory() -> URL {
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
         return docs.appendingPathComponent("voice_models")
     }
