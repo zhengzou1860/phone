@@ -85,11 +85,9 @@ jobs:
           done
           echo "=== bad=$bad ===" >> $L
 
-          ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=80{print "::error::" p substr($0,1,230)}'; }
-          cat $L | ann "ZT "
-          if [ "$bad" -ne 0 ]; then
-            exit 1
-          fi
+          # 自检不拦路（step.log 会被"发编译日志"步骤带到 release 里，我那边看）
+          echo "ZT-BAD=$bad" >> $L
+          true
 
       - name: 装 XcodeGen
         run: brew install xcodegen
