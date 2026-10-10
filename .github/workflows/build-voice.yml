@@ -231,15 +231,17 @@ jobs:
           nm -u /tmp/ot/OrtShim.o >> $L 2>&1
 
           # Swift 侧：bridging header 真导得进来、Ort.swift 那些 C 指针写法真过得了类型。
-          # -Xcc -I 是给导入器的头文件路径（OrtShim.h 自己不 include ORT，这里带着无害）。
-          xcrun --sdk iphoneos swiftc -typecheck -target $T -isysroot "$ios" \
+          # swiftc 不认 -isysroot（上一轮就是 "unknown argument: '-isysroot'" rc=1，等于没测），
+          # 只用 -sdk；-Xcc -I 才是给 clang 导入器的头文件搜索路径。
+          xcrun --sdk iphoneos swiftc -typecheck -target $T -sdk "$ios" \
             -import-objc-header "$SV/Voice-Bridging-Header.h" \
             -Xcc -I -Xcc "$HD" \
-            "$SV"/*.swift >> $L 2>&1
+            "$SV"/*.swift > /tmp/ot/swift.log 2>&1
           echo "=== swiftc typecheck rc=$? ===" >> $L
-          # 计数别边读边写同一个文件：grep 读的是 step.log，输出再进 step.log 就读到自己的尾巴了
-          grep -c "error:" $L > /tmp/ot/errcount.txt 2>&1
-          echo "=== error 行数 $(cat /tmp/ot/errcount.txt) ===" >> $L
+          echo "=== error（去重，最多 40 条）===" >> $L
+          grep -E "error:" /tmp/ot/swift.log | sort -u | head -40 >> $L 2>&1
+          grep -c "error:" /tmp/ot/swift.log > /tmp/ot/errcount.txt 2>&1
+          echo "=== error 条数 $(cat /tmp/ot/errcount.txt) ===" >> $L
           cat $L
 
       - name: 装 XcodeGen
@@ -298,6 +300,12 @@ jobs:
             echo; echo "### SourcesVoice 清单"; ls -l "$GITHUB_WORKSPACE/app/SourcesVoice" 2>/dev/null || echo "(空)";
             echo; echo "### 编译错误（去重）";
             grep -E "error:" /tmp/build.log 2>/dev/null | sort -u | head -60 || true;
+            echo; echo "### 链接问题（ld 的报错不带 error:，单独捞）";
+            grep -A 25 "Undefined symbols" /tmp/build.log 2>/dev/null | head -60 || true;
+            grep -E "^ld: |ld64|clang: error|missing required architecture|building file list" /tmp/build.log 2>/dev/null | sort -u | head -20 || true;
+            echo "(上面两段都空 = 没走到链接或链接干净)";
+            echo; echo "### 产物体积";
+            find /tmp/derived/Build/Products -name "Voice" -type f -exec ls -lh {} \; 2>/dev/null || echo "(还没编出来)";
             echo; echo "### 第一个 error 的上下文";
             ln=$(grep -n -m1 "error:" /tmp/build.log 2>/dev/null | cut -d: -f1 || true);
             if [ -n "$ln" ]; then

@@ -6,6 +6,24 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* 对外句柄全是 void *（头文件里那两行注释记了原因），内部结构只有这个文件看得见。 */
+struct ShimEngine {
+    const OrtApi *api;
+    OrtEnv *env;
+    OrtMemoryInfo *mem;
+    OrtSessionOptions *opts;
+    OrtAllocator *alloc;
+};
+
+struct ShimGraph {
+    struct ShimEngine *eng;
+    OrtSession *sess;
+    char **names_in;
+    int n_in;
+    char **names_out;
+    int n_out;
+};
+
 /* 报错走线程局部缓冲：推理只在一条线程上跑，但 Swift 侧随时可能读，别用共享全局。 */
 static _Thread_local char g_msg[512] = "";
 
@@ -22,25 +40,8 @@ const char *ortshim_last_error(void)
     return g_msg;
 }
 
-struct OrtshimEngine {
-    const OrtApi *api;
-    OrtEnv *env;
-    OrtMemoryInfo *mem;
-    OrtSessionOptions *opts;
-    OrtAllocator *alloc;
-};
-
-struct OrtshimGraph {
-    OrtshimEngine *eng;
-    OrtSession *sess;
-    char **names_in;
-    int n_in;
-    char **names_out;
-    int n_out;
-};
-
 /* ORT 的每个调用都返回 OrtStatus*，NULL 才是成功。这里统一转成 0/1 并把文案抄进 g_msg。 */
-static int chk(OrtshimEngine *e, OrtStatus *st, const char *what)
+static int chk(struct ShimEngine *e, OrtStatus *st, const char *what)
 {
     const char *m;
     if (st == NULL) return 0;
@@ -51,11 +52,11 @@ static int chk(OrtshimEngine *e, OrtStatus *st, const char *what)
     return 1;
 }
 
-OrtshimEngine *ortshim_open(int intra_threads, int log_level)
+void *ortshim_open(int intra_threads, int log_level)
 {
     const OrtApiBase *base;
     const OrtApi *api;
-    OrtshimEngine *e;
+    struct ShimEngine *e;
     OrtLoggingLevel lv;
 
     g_msg[0] = '\0';
@@ -67,8 +68,8 @@ OrtshimEngine *ortshim_open(int intra_threads, int log_level)
              (unsigned)ORT_API_VERSION);
         return NULL;
     }
-    e = (OrtshimEngine *)calloc(1, sizeof(*e));
-    if (e == NULL) { note(" calloc 失败"); return NULL; }
+    e = (struct ShimEngine *)calloc(1, sizeof(*e));
+    if (e == NULL) { note("calloc 失败"); return NULL; }
     e->api = api;
 
     switch (log_level) {
@@ -88,7 +89,7 @@ OrtshimEngine *ortshim_open(int intra_threads, int log_level)
     if (chk(e, api->SetInterOpNumThreads(e->opts, 1), "SetInterOpNumThreads")) goto fail;
     /* 拿默认 allocator 只为了 SessionGetInputName/OutputName 那一块临时内存。 */
     if (chk(e, api->GetAllocatorWithDefaultOptions(&e->alloc), "GetAllocatorWithDefaultOptions")) goto fail;
-    return e;
+    return (void *)e;
 
 fail:
     if (e->opts) api->ReleaseSessionOptions(e->opts);
@@ -98,22 +99,24 @@ fail:
     return NULL;
 }
 
-void ortshim_close(OrtshimEngine *engine)
+void ortshim_close(void *engine)
 {
+    struct ShimEngine *e = (struct ShimEngine *)engine;
     const OrtApi *api;
-    if (engine == NULL) return;
-    api = engine->api;
+    if (e == NULL) return;
+    api = e->api;
     /* alloc 是 ORT 自己的默认 allocator，不归我们释放。 */
-    if (engine->opts) api->ReleaseSessionOptions(engine->opts);
-    if (engine->mem)  api->ReleaseMemoryInfo(engine->mem);
-    if (engine->env)  api->ReleaseEnv(engine->env);
-    free(engine);
+    if (e->opts) api->ReleaseSessionOptions(e->opts);
+    if (e->mem)  api->ReleaseMemoryInfo(e->mem);
+    if (e->env)  api->ReleaseEnv(e->env);
+    free(e);
 }
 
-OrtshimGraph *ortshim_load(OrtshimEngine *e, const char *path_utf8)
+void *ortshim_load(void *engine, const char *path_utf8)
 {
+    struct ShimEngine *e = (struct ShimEngine *)engine;
     const OrtApi *api;
-    OrtshimGraph *g;
+    struct ShimGraph *g;
     size_t ni = 0, no = 0, i;
     OrtSession *sess = NULL;
 
@@ -124,7 +127,7 @@ OrtshimGraph *ortshim_load(OrtshimEngine *e, const char *path_utf8)
 
     if (chk(e, api->CreateSession(e->env, path_utf8, e->opts, &sess), "CreateSession")) return NULL;
 
-    g = (OrtshimGraph *)calloc(1, sizeof(*g));
+    g = (struct ShimGraph *)calloc(1, sizeof(*g));
     if (g == NULL) { note("calloc 失败"); api->ReleaseSession(sess); return NULL; }
     g->eng = e;
     g->sess = sess;
@@ -153,49 +156,54 @@ OrtshimGraph *ortshim_load(OrtshimEngine *e, const char *path_utf8)
         api->AllocatorFree(e->alloc, nm);
         if (g->names_out[i] == NULL) { note("strdup 输出名失败"); goto fail; }
     }
-    return g;
+    return (void *)g;
 
 fail:
-    ortshim_unload(g);
+    ortshim_unload((void *)g);
     return NULL;
 }
 
-void ortshim_unload(OrtshimGraph *graph)
+void ortshim_unload(void *graph)
 {
+    struct ShimGraph *g = (struct ShimGraph *)graph;
     int i;
-    if (graph == NULL) return;
-    if (graph->sess) graph->eng->api->ReleaseSession(graph->sess);
-    if (graph->names_in) {
-        for (i = 0; i < graph->n_in; i++) free(graph->names_in[i]);
-        free(graph->names_in);
+    if (g == NULL) return;
+    if (g->sess) g->eng->api->ReleaseSession(g->sess);
+    if (g->names_in) {
+        for (i = 0; i < g->n_in; i++) free(g->names_in[i]);
+        free(g->names_in);
     }
-    if (graph->names_out) {
-        for (i = 0; i < graph->n_out; i++) free(graph->names_out[i]);
-        free(graph->names_out);
+    if (g->names_out) {
+        for (i = 0; i < g->n_out; i++) free(g->names_out[i]);
+        free(g->names_out);
     }
-    free(graph);
+    free(g);
 }
 
-int ortshim_input_count(const OrtshimGraph *graph)
+int ortshim_input_count(void *graph)
 {
-    return graph ? graph->n_in : -1;
+    struct ShimGraph *g = (struct ShimGraph *)graph;
+    return g ? g->n_in : -1;
 }
 
-int ortshim_output_count(const OrtshimGraph *graph)
+int ortshim_output_count(void *graph)
 {
-    return graph ? graph->n_out : -1;
+    struct ShimGraph *g = (struct ShimGraph *)graph;
+    return g ? g->n_out : -1;
 }
 
-const char *ortshim_input_name(const OrtshimGraph *graph, int index)
+const char *ortshim_input_name(void *graph, int index)
 {
-    if (graph == NULL || index < 0 || index >= graph->n_in) return NULL;
-    return graph->names_in[index];
+    struct ShimGraph *g = (struct ShimGraph *)graph;
+    if (g == NULL || index < 0 || index >= g->n_in) return NULL;
+    return g->names_in[index];
 }
 
-const char *ortshim_output_name(const OrtshimGraph *graph, int index)
+const char *ortshim_output_name(void *graph, int index)
 {
-    if (graph == NULL || index < 0 || index >= graph->n_out) return NULL;
-    return graph->names_out[index];
+    struct ShimGraph *g = (struct ShimGraph *)graph;
+    if (g == NULL || index < 0 || index >= g->n_out) return NULL;
+    return g->names_out[index];
 }
 
 static size_t elem_size(int dtype)
@@ -218,11 +226,12 @@ void ortshim_release(OrtshimFetch *outs, int n)
     }
 }
 
-int ortshim_run(OrtshimGraph *graph, const OrtshimFeed *feeds, int nfeeds,
+int ortshim_run(void *graph, const OrtshimFeed *feeds, int nfeeds,
                 const int *want_idx, int nwants, OrtshimFetch *outs)
 {
+    struct ShimGraph *g = (struct ShimGraph *)graph;
     const OrtApi *api;
-    OrtshimEngine *e;
+    struct ShimEngine *e;
     const char **in_names = NULL;
     const char **out_names = NULL;
     OrtValue **ins = NULL;
@@ -231,14 +240,14 @@ int ortshim_run(OrtshimGraph *graph, const OrtshimFeed *feeds, int nfeeds,
     int i, j;
 
     g_msg[0] = '\0';
-    if (graph == NULL || graph->sess == NULL) { note("graph 是空的"); return 2; }
+    if (g == NULL || g->sess == NULL) { note("graph 是空的"); return 2; }
     if (outs == NULL) { note("outs 是空的"); return 2; }
     if (nfeeds < 0 || nwants < 0) { note("条目数是负的"); return 2; }
     if (nfeeds > 0 && feeds == NULL) { note("feeds 是空的"); return 2; }
     if (nwants > 0 && want_idx == NULL) { note("want_idx 是空的"); return 2; }
-    e = graph->eng;
+    e = g->eng;
     api = e->api;
-    memset(outs, 0, (size_t)(nwants > 0 ? nwants : 1) * sizeof(*outs));
+    if (nwants > 0) memset(outs, 0, (size_t)nwants * sizeof(*outs));
 
     in_names = (const char **)calloc((size_t)(nfeeds > 0 ? nfeeds : 1), sizeof(char *));
     out_names = (const char **)calloc((size_t)(nwants > 0 ? nwants : 1), sizeof(char *));
@@ -250,11 +259,11 @@ int ortshim_run(OrtshimGraph *graph, const OrtshimFeed *feeds, int nfeeds,
     }
     for (j = 0; j < nwants; j++) {
         int k = want_idx[j];
-        if (k < 0 || k >= graph->n_out) {
-            note("要的第 %d 个输出下标 %d 超出图的范围（共 %d 个输出）", j, k, graph->n_out);
+        if (k < 0 || k >= g->n_out) {
+            note("要的第 %d 个输出下标 %d 超出图的范围（共 %d 个输出）", j, k, g->n_out);
             goto done;
         }
-        out_names[j] = graph->names_out[k];
+        out_names[j] = g->names_out[k];
     }
 
     for (i = 0; i < nfeeds; i++) {
@@ -286,7 +295,7 @@ int ortshim_run(OrtshimGraph *graph, const OrtshimFeed *feeds, int nfeeds,
                                                        t, &ins[i]), "CreateTensorWithDataAsOrtValue")) goto done;
     }
 
-    if (chk(e, api->Run(graph->sess, NULL, in_names, (const OrtValue *const *)ins, (size_t)nfeeds,
+    if (chk(e, api->Run(g->sess, NULL, in_names, (const OrtValue *const *)ins, (size_t)nfeeds,
                         out_names, (size_t)nwants, vals), "Run")) goto done;
 
     for (j = 0; j < nwants; j++) {

@@ -17,7 +17,8 @@ enum OrtTensor {
     /// 元素个数。dims 为空（标量）按 1 算，和 shim 那边的 ndims==0 口径一致。
     var count: Int {
         switch self {
-        case .f32(_, let a), .i64(_, let a): return a.count
+        case .f32(_, let a): return a.count
+        case .i64(_, let a): return a.count
         }
     }
 }
@@ -50,7 +51,9 @@ private func shimMessage(_ fallback: String) -> String {
 }
 
 final class OrtRuntime {
-    private let engine: UnsafeMutablePointer<OrtshimEngine>
+    // shim 的句柄在 C 里就是 void *，Swift 这边统一是裸指针；
+    // 不透明 struct 前向声明 clang 根本不给导入（CI 实测 "cannot find type"）。
+    private let engine: UnsafeMutableRawPointer
 
     /// intraThreads：CPU 推理线程数。iPhone 11 上 4 是稳的，再多也只是抢核。
     init(intraThreads: Int = 4, logLevel: Int = 4) throws {
@@ -68,11 +71,11 @@ final class OrtRuntime {
 }
 
 final class OrtGraph {
-    private var handle: UnsafeMutablePointer<OrtshimGraph>?
+    private var handle: UnsafeMutableRawPointer?
     let inputNames: [String]
     let outputNames: [String]
 
-    init(engine: UnsafeMutablePointer<OrtshimEngine>, path: String) throws {
+    init(engine: UnsafeMutableRawPointer, path: String) throws {
         guard let g = path.withCString({ ortshim_load(engine, $0) }) else {
             throw OrtError.loadFailed(shimMessage(path))
         }
@@ -109,7 +112,7 @@ final class OrtGraph {
     /// 跑一次。feeds 里的数组在本函数返回前都被闭包罩住，指针不会失效。
     /// wants 用输出名，函数内部换成下标——shim 只收下标数组。
     func run(_ feeds: [OrtNamedFeed], wants: [String]) throws -> [OrtTensor] {
-        guard let g = handle else { throw OrtError.missing("图已关闭") }
+        guard let g = handle else { throw OrtError.runFailed("图已经关了，没法再跑") }
         guard !feeds.isEmpty else { throw OrtError.runFailed("一个输入都没有，这张图不用跑") }
 
         var wantIdx: [Int32] = []
@@ -136,7 +139,8 @@ final class OrtGraph {
 
         for f in feeds {
             let nameAt = names.count
-            names.append(contentsOf: Array(f.name.utf8))
+            // utf8 给的是 UInt8，names 是 [CChar]（Int8），只能逐字节转，contentsOf 直接喂不进去。
+            for b in f.name.utf8 { names.append(CChar(bitPattern: b)) }
             names.append(0)
             let d = f.value.dims
             let dimAt = dimStore.count
