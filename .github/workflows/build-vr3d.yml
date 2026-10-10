@@ -1,0 +1,182 @@
+name: build-vr3d-ipa
+
+# 只跟 VR3D 自己的路径走；发布位用 channel-vr3d / vr3d.ipa，不碰剪辑项目的 channel-test。
+# 走独立分支 vr3d 的理由：剪辑那份 build.yml 是 "push 到 main 就触发"且没有 paths 过滤，
+# 我往 main 推任何东西都会把它的 hello.ipa 重建成 main 上那版（可能比它工作树里未提交的还旧）⇒ 那是写别人的发布位。
+# workflow_dispatch 在这个文件进 main 之前用不了，要重跑就：git commit --allow-empty && git push origin vr3d。
+on:
+  push:
+    branches: [main, vr3d]
+    paths:
+      - 'app/SourcesVR/**'
+      - 'app/project-vr3d.yml'
+      - '.github/workflows/build-vr3d.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: vr3d
+  cancel-in-progress: true
+
+jobs:
+  vr3d:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: show toolchain
+        run: sw_vers && xcodebuild -version && xcodebuild -showsdks | grep -i ios
+
+      # 深度模型只在这台机器上下载，不进 git（47 MB 的权重 + 仓库是公开的）。
+      # 走 huggingface 本体，不通就退 hf-mirror。下不到也照样出包：
+      # app 的环境行会写"包里没有深度模型"，那才是判据。
+      - name: 拉 Apple 官方 DepthAnythingV2SmallF16.mlpackage
+        run: |
+          set +e
+          ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=6{print "::error::" p substr($0,1,230)}'; }
+          REPO=apple/DepthAnythingV2SmallF16
+          DST=app/SourcesVR
+          PKG=DepthAnythingV2SmallF16.mlpackage
+          HOST=""
+          for H in https://huggingface.co https://hf-mirror.com; do
+            rm -f /tmp/tree.json
+            if curl -fsSL --retry 2 --max-time 90 -o /tmp/tree.json "$H/api/models/$REPO/tree/main?recursive=true"; then
+              [ -s /tmp/tree.json ] && { HOST="$H"; echo "文件清单来自 $H"; break; }
+            fi
+          done
+          if [ -z "$HOST" ]; then
+            echo "两个源都拿不到文件清单，这一版包里没有深度模型" | ann "M-VERDICT "
+            exit 0
+          fi
+          python3 -c '
+          import json,sys
+          d=json.load(open("/tmp/tree.json"))
+          n=0
+          with open("/tmp/paths.txt","w") as f:
+              for it in d:
+                  p=it.get("path","")
+                  if it.get("type")=="file" and p.startswith("DepthAnythingV2SmallF16.mlpackage/"):
+                      f.write(p+"\n"); n+=1
+          print("清单里属于 mlpackage 的文件 %d 个" % n)
+          ' 2>&1 | ann "M-LIST "
+          ok=0; bad=0
+          while read -r f; do
+            mkdir -p "$DST/$(dirname "$f")"
+            if curl -fsSL --retry 2 --max-time 600 -o "$DST/$f" "$HOST/resolve/main/$f"; then
+              ok=$((ok+1))
+            else
+              bad=$((bad+1)); echo "下不动: $f" | ann "M-FAIL "
+            fi
+          done < /tmp/paths.txt
+          echo "下载 $ok 成 / $bad 败 host=$HOST 体积=$(du -sk "$DST/$PKG" 2>/dev/null | awk '{print $1"KB"}')" | ann "M-VERDICT "
+          ls -lR "$DST/$PKG" 2>/dev/null | head -12 | ann "M-LS "
+          exit 0
+
+      - name: install xcodegen
+        run: |
+          set -euo pipefail
+          curl -sL -o /tmp/xg.zip https://github.com/yonaskolb/XcodeGen/releases/download/2.46.0/xcodegen.zip
+          rm -rf /tmp/xg && unzip -q /tmp/xg.zip -d /tmp/xg
+          sudo /tmp/xg/xcodegen/install.sh
+          xcodegen --version
+
+      - name: generate project
+        working-directory: app
+        run: xcodegen --spec project-vr3d.yml
+
+      - name: build
+        working-directory: app
+        run: |
+          set -euo pipefail
+          rm -rf build
+          xcodebuild -project VR3D.xcodeproj -scheme VR3D \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY= EXPANDED_CODE_SIGN_IDENTITY= \
+            build 2>&1 | tee /tmp/build.log
+
+      # 模型不当成工程文件交给 coremlc：直接拷进 .app，让"这个包 A13 认不认"由设备本人口述
+      # （app 里 VRDepth.locate() 找到 mlpackage 自己调 compileModel 并把耗时报出来）。
+      - name: package ipa
+        working-directory: app
+        run: |
+          set -euo pipefail
+          APP=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' | head -1)
+          test -n "$APP"
+          echo "built app: $APP" >> /tmp/build.log
+          file "$APP/VR3D" | tee -a /tmp/build.log
+          if [ -d SourcesVR/DepthAnythingV2SmallF16.mlpackage ]; then
+            rm -rf "$APP/DepthAnythingV2SmallF16.mlpackage"
+            cp -R SourcesVR/DepthAnythingV2SmallF16.mlpackage "$APP"/
+            echo "模型已拷进包 $APP/DepthAnythingV2SmallF16.mlpackage" | tee -a /tmp/build.log
+          else
+            echo "模型没下下来，这一版包里没深度模型" | tee -a /tmp/build.log
+          fi
+          rm -rf Payload vr3d.ipa
+          mkdir Payload
+          cp -R "$APP" Payload/
+          ditto -c -k --keepParent Payload vr3d.ipa
+          ls -la vr3d.ipa | tee -a /tmp/build.log
+
+      - name: bundle check
+        if: always()
+        working-directory: app
+        run: |
+          set +e
+          ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=5{print "::error::" p substr($0,1,230)}'; }
+          APP=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' 2>/dev/null | head -1)
+          { echo "app=$APP"
+            echo "metallib=$([ -f "$APP/default.metallib" ] && echo 在 || echo 不在) 大小=$(du -sk "$APP/default.metallib" 2>/dev/null | awk '{print $1"KB"}')"
+            echo "mlpackage=$([ -d "$APP/DepthAnythingV2SmallF16.mlpackage" ] && echo 在 || echo 不在) 大小=$(du -sk "$APP/DepthAnythingV2SmallF16.mlpackage" 2>/dev/null | awk '{print $1"KB"}')"
+            echo "mlmodelc=$(find "$APP" -maxdepth 1 -name '*.mlmodelc' 2>/dev/null | head -1)"
+            echo "整个 app=$(du -sk "$APP" 2>/dev/null | awk '{print $1"KB"}')"; } | ann "B-VERDICT "
+          find "$APP/DepthAnythingV2SmallF16.mlpackage" -type f 2>/dev/null | head -6 | ann "B-FILES "
+          exit 0
+
+      - name: publish release
+        working-directory: app
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=6{print "::error::" p substr($0,1,230)}'; }
+          cp /tmp/build.log ./build.log
+          gh release delete channel-vr3d --cleanup-tag -y >/dev/null 2>&1 || true
+          gh release create channel-vr3d vr3d.ipa build.log \
+            --title "VR3D build" \
+            --prerelease \
+            --notes "CI artifact for commit $GITHUB_SHA" 2>&1 | ann "REL "
+          echo "url=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/channel-vr3d/vr3d.ipa" | ann "REL "
+          # 发没发出去只认匿名接口能不能列出来，不认 gh 的退出码
+          curl -fsSL -o /tmp/relcheck.json --max-time 60 \
+            https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/channel-vr3d || true
+          grep -oE '"name": *"vr3d.ipa"|"browser_download_url": *"[^"]*"|"message": *"[^"]*"' /tmp/relcheck.json | ann "REL-GET "
+
+      - name: report compile errors
+        if: failure()
+        working-directory: app
+        run: |
+          set -uo pipefail
+          ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=8{print "::error::" p substr($0,1,230)}'; }
+          cp /tmp/build.log ./build.log 2>/dev/null || echo "no build log at all" > ./build.log
+          grep -nE "error:|fatal error:" ./build.log | ann "ERR "
+
+      - name: report release failure
+        if: failure()
+        working-directory: app
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=6{print "::error::" p substr($0,1,230)}'; }
+          cp /tmp/build.log ./build.log 2>/dev/null || echo "no build log at all" > ./build.log
+          gh release delete channel-vr3d-fail --cleanup-tag -y >/dev/null 2>&1 || true
+          gh release create channel-vr3d-fail build.log \
+            --title "VR3D CI failed log" \
+            --prerelease \
+            --notes "no ipa this round" 2>&1 | ann "GH-FAIL "

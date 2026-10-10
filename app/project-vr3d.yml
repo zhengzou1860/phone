@@ -1,0 +1,50 @@
+name: VR3D
+options:
+  createIntermediateGroups: true
+  deploymentTarget:
+    iOS: "18.0"
+settings:
+  base:
+    CODE_SIGNING_ALLOWED: "NO"
+    CODE_SIGNING_REQUIRED: "NO"
+    CODE_SIGN_IDENTITY: ""
+    IPHONEOS_DEPLOYMENT_TARGET: "18.0"
+targets:
+  VR3D:
+    type: application
+    platform: iOS
+    # 只吃自己的目录。深度模型不在这里出现：它由 CI 在装包阶段直接拷进 .app，
+    # 免得 xcodegen 怎么对待 mlpackage、coremlc 编不编，两件事混在上机判定里看不清。
+    # app 里的 VRDepth.locate() 找到 mlpackage 后自己调 compileModel，
+    # "A13 的编译器认不认这个包"这件事由设备本人口述。
+    sources:
+      - SourcesVR
+    info:
+      path: Info-VR3D.plist
+      properties:
+        CFBundleDisplayName: VR3D
+        CFBundleName: VR3D
+        CFBundleExecutable: VR3D
+        CFBundleIdentifier: com.qoder.vr3d
+        CFBundlePackageType: APPL
+        CFBundleShortVersionString: "0.1"
+        CFBundleVersion: "1"
+        CFBundleInfoDictionaryVersion: "6.0"
+        NSPhotoLibraryAddUsageDescription: "要把合成的 3D(SBS) 片段存回相册"
+        NSPhotoLibraryUsageDescription: "要选一条普通视频来转 3D"
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
+        LSRequiresIPhoneOS: true
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.qoder.vr3d
+        PRODUCT_NAME: VR3D
+        TARGETED_DEVICE_FAMILY: "1"
+        ARCHS: arm64
+        SWIFT_VERSION: "5.0"
+        SWIFT_STRICT_CONCURRENCY: minimal
+        ENABLE_BITCODE: "NO"
+        GENERATE_INFOPLIST_FILE: "NO"

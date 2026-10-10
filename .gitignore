@@ -10,3 +10,8 @@ app/HelloLC.xcodeproj/
 app/build/
 app/Payload/
 app/hello.ipa
+# VR3D 自己的生成物与模型（模型只在 CI 下载，公开仓库里不许出现权重）
+app/VR3D.xcodeproj/
+app/Info-VR3D.plist
+app/SourcesVR/*.mlpackage/
+app/SourcesVR/*.mlmodelc/
