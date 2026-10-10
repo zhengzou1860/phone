@@ -37,18 +37,21 @@ jobs:
         run: |
           set +e
           ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=6{print "::error::" p substr($0,1,230)}'; }
-          REPO=apple/DepthAnythingV2SmallF16
+          # 判决要落成文件：annotation 我这边匿名读不到，上一轮"编译绿但包里没模型"就是这么漏掉的。
+          # 单独一个文件，不能并进 build.log——下一步 xcodebuild 的 tee 不带 -a 会把它截掉。
+          rec() { tee -a /tmp/model.log; }
+          REPO=apple/coreml-depth-anything-v2-small
           DST=app/SourcesVR
           PKG=DepthAnythingV2SmallF16.mlpackage
           HOST=""
           for H in https://huggingface.co https://hf-mirror.com; do
             rm -f /tmp/tree.json
             if curl -fsSL --retry 2 --max-time 90 -o /tmp/tree.json "$H/api/models/$REPO/tree/main?recursive=true"; then
-              [ -s /tmp/tree.json ] && { HOST="$H"; echo "文件清单来自 $H"; break; }
+              [ -s /tmp/tree.json ] && { HOST="$H"; echo "文件清单来自 $H" | rec; break; }
             fi
           done
           if [ -z "$HOST" ]; then
-            echo "两个源都拿不到文件清单，这一版包里没有深度模型" | ann "M-VERDICT "
+            echo "M-VERDICT 两个源都拿不到 $REPO 的文件清单 ⇒ 这一版包里没有深度模型" | rec
             exit 0
           fi
           python3 -c '
@@ -61,18 +64,18 @@ jobs:
                   if it.get("type")=="file" and p.startswith("DepthAnythingV2SmallF16.mlpackage/"):
                       f.write(p+"\n"); n+=1
           print("清单里属于 mlpackage 的文件 %d 个" % n)
-          ' 2>&1 | ann "M-LIST "
+          ' 2>&1 | rec | ann "M-LIST "
           ok=0; bad=0
           while read -r f; do
             mkdir -p "$DST/$(dirname "$f")"
             if curl -fsSL --retry 2 --max-time 600 -o "$DST/$f" "$HOST/resolve/main/$f"; then
               ok=$((ok+1))
             else
-              bad=$((bad+1)); echo "下不动: $f" | ann "M-FAIL "
+              bad=$((bad+1)); echo "M-FAIL 下不动: $f" | rec | ann "M-FAIL "
             fi
           done < /tmp/paths.txt
-          echo "下载 $ok 成 / $bad 败 host=$HOST 体积=$(du -sk "$DST/$PKG" 2>/dev/null | awk '{print $1"KB"}')" | ann "M-VERDICT "
-          ls -lR "$DST/$PKG" 2>/dev/null | head -12 | ann "M-LS "
+          echo "M-VERDICT 下载 $ok 成 / $bad 败 host=$HOST 体积=$(du -sk "$DST/$PKG" 2>/dev/null | awk '{print $1"KB"}') 权重=$(ls -l "$DST/$PKG/Data/com.apple.CoreML/weights/weight.bin" 2>/dev/null | awk '{print $5}')" | rec | ann "M-VERDICT "
+          ls -lR "$DST/$PKG" 2>/dev/null | head -12 | rec
           exit 0
 
       - name: install xcodegen
@@ -134,7 +137,8 @@ jobs:
             echo "metallib=$([ -f "$APP/default.metallib" ] && echo 在 || echo 不在) 大小=$(du -sk "$APP/default.metallib" 2>/dev/null | awk '{print $1"KB"}')"
             echo "mlpackage=$([ -d "$APP/DepthAnythingV2SmallF16.mlpackage" ] && echo 在 || echo 不在) 大小=$(du -sk "$APP/DepthAnythingV2SmallF16.mlpackage" 2>/dev/null | awk '{print $1"KB"}')"
             echo "mlmodelc=$(find "$APP" -maxdepth 1 -name '*.mlmodelc' 2>/dev/null | head -1)"
-            echo "整个 app=$(du -sk "$APP" 2>/dev/null | awk '{print $1"KB"}')"; } | ann "B-VERDICT "
+            echo "整个 app=$(du -sk "$APP" 2>/dev/null | awk '{print $1"KB"}')"
+            echo "vr3d.ipa=$(wc -c < vr3d.ipa 2>/dev/null | tr -d ' ') 字节"; } | tee -a /tmp/model.log | ann "B-VERDICT "
           find "$APP/DepthAnythingV2SmallF16.mlpackage" -type f 2>/dev/null | head -6 | ann "B-FILES "
           exit 0
 
@@ -145,7 +149,7 @@ jobs:
         run: |
           set -uo pipefail
           ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=6{print "::error::" p substr($0,1,230)}'; }
-          cp /tmp/build.log ./build.log
+          cat /tmp/model.log /tmp/build.log > ./build.log 2>/dev/null || cp /tmp/build.log ./build.log
           gh release delete channel-vr3d --cleanup-tag -y >/dev/null 2>&1 || true
           gh release create channel-vr3d vr3d.ipa build.log \
             --title "VR3D build" \
@@ -163,7 +167,7 @@ jobs:
         run: |
           set -uo pipefail
           ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=8{print "::error::" p substr($0,1,230)}'; }
-          cp /tmp/build.log ./build.log 2>/dev/null || echo "no build log at all" > ./build.log
+          cat /tmp/model.log /tmp/build.log > ./build.log 2>/dev/null || cp /tmp/build.log ./build.log 2>/dev/null || echo "no build log at all" > ./build.log
           grep -nE "error:|fatal error:" ./build.log | ann "ERR "
 
       - name: report release failure
