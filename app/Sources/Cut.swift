@@ -906,7 +906,7 @@ enum Temps {
             guard let items = try? fm.contentsOfDirectory(at: dir,
                                                           includingPropertiesForKeys: [.fileSizeKey],
                                                           options: [.skipsSubdirectoryDescendants]) else { continue }
-            for u in items where prefixes.contains(where: { u.lastPathComponent.hasPrefix($) }) && u.path != keepPath {
+            for u in items where prefixes.contains(where: { u.lastPathComponent.hasPrefix($0) }) && u.path != keepPath {
                 let b = (try? u.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
                 out.append(TempFile(url: u, mb: Double(b) / 1048576))
             }
@@ -1340,7 +1340,6 @@ struct CutView: View {
                         cut.tapClean()
                     }
                     .buttonStyle(.bordered)
-                    .tint(cut.cleanArmed ? .red : nil)
                     .disabled(cut.busy)
                     ForEach(cut.temps.prefix(12)) { t in
                         Text("  \(t.url.lastPathComponent)  \(String(format: "%.1f", t.mb)) MB")
