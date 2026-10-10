@@ -62,12 +62,12 @@ jobs:
           zip -r /tmp/voice.ipa Payload > /tmp/pack.log
           ls -lh /tmp/voice.ipa >> /tmp/pack.log
 
-      - name: 发到固定 release + 挂日志
+      - name: 发编译日志（独立步骤，永远先发）
         if: always()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -e
+          set -uo pipefail
           cd /tmp
           { echo "### xcodegen"; cat /tmp/gen.log 2>/dev/null || echo "(空)";
             echo; echo "### 编译错误抽取";
@@ -77,16 +77,25 @@ jobs:
             echo; echo "### pack";
             cat /tmp/pack.log 2>/dev/null || echo "(空)"; } > voice-build.log
           echo "### commit $GITHUB_SHA / run $GITHUB_RUN_ID" >> voice-build.log
-
-          gh release delete channel-voice --cleanup-tag -y >/dev/null 2>&1 || true
-          gh release delete voice-build-log --cleanup-tag -y >/dev/null 2>&1 || true
-
-          if [ -f /tmp/voice.ipa ]; then
-            gh release create channel-voice /tmp/voice.ipa \
-              --title "Voice IPA" --prerelease \
-              --notes "Voice 声音克隆 app"
-          fi
-
-          gh release create voice-build-log voice-build.log \
+          ls -l /tmp/voice-build.log
+          gh release delete voice-build-log --cleanup-tag -y 2>&1 || true
+          gh release create voice-build-log /tmp/voice-build.log \
             --title "voice 构建日志" --prerelease \
-            --notes "构建 xcodegen/xcodebuild 完整日志（失败时排查用）"
+            --notes "构建 xcodegen/xcodebuild 完整日志" 2>&1 || true
+          curl -sSI https://github.com/$GITHUB_REPOSITORY/releases/download/voice-build-log/voice-build.log | head -3
+
+      - name: 发 IPA（独立步骤）
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          if [ ! -f /tmp/voice.ipa ]; then
+            echo "没有 IPA，跳过发布"
+            exit 0
+          fi
+          ls -lh /tmp/voice.ipa
+          gh release delete channel-voice --cleanup-tag -y 2>&1 || true
+          gh release create channel-voice /tmp/voice.ipa \
+            --title "Voice IPA" --prerelease \
+            --notes "Voice 声音克隆 app（LiveContainer 装载）" 2>&1
+          curl -sSI https://github.com/$GITHUB_REPOSITORY/releases/download/channel-voice/voice.ipa | head -3
