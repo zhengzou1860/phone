@@ -29,8 +29,8 @@ jobs:
       - name: 生成 Xcode 工程
         working-directory: app
         run: |
-          xcodegen generate --spec project-voice.yml
-          xcodebuild -list -project Voice.xcodeproj
+          xcodegen generate --spec project-voice.yml 2>&1 | tee /tmp/gen.log
+          xcodebuild -list -project Voice.xcodeproj 2>&1 | tee -a /tmp/gen.log
 
       - name: 构建 Voice.app
         run: |
@@ -44,7 +44,8 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             ARCHS=arm64 \
             ONLY_ACTIVE_ARCH=NO \
-            build
+            build 2>&1 | tee /tmp/build.log
+          echo "构建退出码 ${PIPESTATUS[0]}" >> /tmp/build.log
 
       - name: 打包 IPA
         run: |
@@ -52,30 +53,40 @@ jobs:
           mkdir -p /tmp/ipa/Payload
           APP=$(find /tmp/derived/Build/Products/Release-iphoneos -name "Voice.app" -type d | head -1)
           if [ -z "$APP" ]; then
-            echo "找不到 Voice.app，列出构建产物："
-            find /tmp/derived/Build/Products -type d -maxdepth 3 || true
+            echo "找不到 Voice.app" > /tmp/pack.log
+            find /tmp/derived/Build/Products -type d -maxdepth 3 >> /tmp/pack.log || true
             exit 1
           fi
           cp -R "$APP" /tmp/ipa/Payload/
           cd /tmp/ipa
-          zip -r /tmp/voice.ipa Payload
-          ls -lh /tmp/voice.ipa
+          zip -r /tmp/voice.ipa Payload > /tmp/pack.log
+          ls -lh /tmp/voice.ipa >> /tmp/pack.log
 
-      - name: 发到固定 release
+      - name: 发到固定 release + 挂日志
         if: always()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -e
+          cd /tmp
+          { echo "### xcodegen"; cat /tmp/gen.log 2>/dev/null || echo "(空)";
+            echo; echo "### 编译错误抽取";
+            grep -E "error:|warning:" /tmp/build.log 2>/dev/null | head -80 || true;
+            echo; echo "### build.log 末尾";
+            tail -100 /tmp/build.log 2>/dev/null || echo "(空)";
+            echo; echo "### pack";
+            cat /tmp/pack.log 2>/dev/null || echo "(空)"; } > voice-build.log
+          echo "### commit $GITHUB_SHA / run $GITHUB_RUN_ID" >> voice-build.log
+
           gh release delete channel-voice --cleanup-tag -y >/dev/null 2>&1 || true
+          gh release delete voice-build-log --cleanup-tag -y >/dev/null 2>&1 || true
+
           if [ -f /tmp/voice.ipa ]; then
             gh release create channel-voice /tmp/voice.ipa \
               --title "Voice IPA" --prerelease \
-              --notes "Voice 声音克隆 app（LiveContainer 装载）"
-            echo "IPA 已发布到 channel-voice"
-          else
-            echo "IPA 没构建出来，跳过发布"
-            gh release create channel-voice \
-              --title "Voice IPA（构建失败）" --prerelease \
-              --notes "构建失败，无 IPA 产出" || true
+              --notes "Voice 声音克隆 app"
           fi
+
+          gh release create voice-build-log voice-build.log \
+            --title "voice 构建日志" --prerelease \
+            --notes "构建 xcodegen/xcodebuild 完整日志（失败时排查用）"

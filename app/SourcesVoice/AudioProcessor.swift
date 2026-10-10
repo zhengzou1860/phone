@@ -57,40 +57,33 @@ enum AudioProcessor {
         return y
     }
 
-    /// 计算 mel 频谱（简化版，用 Accelerate 做 FFT）
+    /// 计算 mel 频谱（占位版：逐帧分 bin 求平均幅度取对数）
     /// 返回 [nFrames × nMels] 的展平数组
+    /// TODO: 换成精确 FFT + 三角 mel 滤波器组
     static func melSpectrogram(_ samples: [Float]) -> [Float] {
         let pre = preEmphasis(samples)
-        let nFrames = (pre.count - nFFT) / hopLength + 1
+        let nFrames = max(1, (pre.count - winLength) / hopLength + 1)
         var mels = [Float](repeating: 0, count: nFrames * nMels)
 
-        // 简化的 mel 滤波器组（实际应该用三角滤波器）
-        // 这里先用线性近似，后续可替换为精确的 mel 滤波器
         for frame in 0..<nFrames {
             let start = frame * hopLength
-            let end = start + nFFT
-            guard end <= pre.count else { break }
+            let end = min(start + winLength, pre.count)
+            guard end > start else { continue }
 
-            // 加汉宁窗
-            var windowed = [Float](repeating: 0, count: nFFT)
-            for i in 0..<nFFT {
-                let w = 0.5 * (1 - cos(2 * .pi * Float(i) / Float(nFFT - 1)))
-                windowed[i] = pre[start + i] * w
-            }
-
-            // FFT（用 Accelerate）
-            var real = [Float](repeating: 0, count: nFFT)
-            var imag = [Float](repeating: 0, count: nFFT)
-            windowed.withUnsafeBufferPointer { src in
-                real.withUnsafeMutableBufferPointer { dst in
-                    vDSP_ctoz(src.baseAddress!.assumingMemoryBound(to: DSPComplex.self),
-                              2, dst.baseAddress!, 1, vDSP_Length(nFFT / 2))
+            // 汉宁窗 + 分 bin 平均幅度（不是真 FFT，只是占位）
+            let binSize = max(1, (end - start) / nMels)
+            for b in 0..<nMels {
+                let bs = start + b * binSize
+                let be = min(bs + binSize, end)
+                guard be > bs else { continue }
+                var sum: Float = 0
+                for i in bs..<be {
+                    let t = Float(i - start)
+                    let w = 0.5 * (1 - cos(2 * .pi * t / Float(winLength - 1)))
+                    sum += abs(pre[i] * w)
                 }
-            }
-            // 这里简化：直接取幅度谱的前 nMels 个 bin
-            for i in 0..<nMels {
-                let mag = sqrtf(real[i] * real[i] + imag[i] * imag[i])
-                mels[frame * nMels + i] = logf(mag + 1e-5)
+                let mag = sum / Float(be - bs)
+                mels[frame * nMels + b] = logf(mag + 1e-5)
             }
         }
         return mels
