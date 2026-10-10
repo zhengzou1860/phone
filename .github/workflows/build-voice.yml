@@ -113,6 +113,82 @@ jobs:
             exit 1
           fi
 
+      - name: 自检 MelFrontEnd（Swift 数值对拍，不过不出包）
+        run: |
+          set +e
+          L=/tmp/fe/step.log
+          rm -rf /tmp/fe && mkdir -p /tmp/fe
+          ios=$(xcrun --sdk iphoneos --show-sdk-path)
+          FX="$GITHUB_WORKSPACE/app/SourcesVoice/Fixtures"
+          { echo "=== swift version ==="; swiftc --version;
+            echo "=== fixtures ==="; ls -l "$FX"; } > $L 2>&1
+
+          cat > /tmp/fe/main.swift <<'SW'
+          import Foundation
+
+          // 和 MelFrontEnd.loadFloats 同一套读法，只是从命令行给的目录读（裸可执行文件没有 bundle）
+          func floats(_ name: String) -> [Float]? {
+              let url = URL(fileURLWithPath: CommandLine.arguments[1]).appendingPathComponent(name)
+              guard let data = try? Data(contentsOf: url) else { return nil }
+              let n = data.count / MemoryLayout<Float>.size
+              guard n > 0 else { return nil }
+              var out = [Float](repeating: 0, count: n)
+              data.withUnsafeBytes { raw in
+                  for i in 0..<n { out[i] = raw.loadUnaligned(fromByteOffset: i * 4, as: Float.self) }
+              }
+              return out
+          }
+
+          func maxAbs(_ a: [Float], _ b: [Float]) -> Float? {
+              guard a.count == b.count, !a.isEmpty else { return nil }
+              var m: Float = 0
+              for i in 0..<a.count { let d = abs(a[i] - b[i]); if d > m { m = d } }
+              return m
+          }
+
+          guard let wave = floats("synth16k_scaled.f32"),
+                let expFB = floats("fbank_expect.f32"),
+                let expPM = floats("pmel_expect.f32"),
+                let basis = floats("librosa_mel_basis.f32") else {
+              print("FAIL fixture 读不到"); exit(3)
+          }
+          var bad = 0
+          let t0 = Date()
+          let fb = MelFrontEnd.kaldiFbank(wave)
+          let pm = MelFrontEnd.promptMel(wave.map { $0 / 32768.0 }, basis: basis)
+          let ms = Int(Date().timeIntervalSince(t0) * 1000)
+          if let d = maxAbs(fb, expFB) {
+              print("FBANK frames=\(fb.count / 80) expect=\(expFB.count / 80) max_abs=\(String(format: "%.4g", d)) 用时\(ms)ms")
+              if !(d < 5e-3) { bad += 1 }
+          } else { print("FBANK 帧数对不上 got=\(fb.count) expect=\(expFB.count)"); bad += 1 }
+          if let d = maxAbs(pm, expPM) {
+              print("PMEL frames=\(pm.count / 80) expect=\(expPM.count / 80) max_abs=\(String(format: "%.4g", d))")
+              if !(d < 5e-3) { bad += 1 }
+          } else { print("PMEL 帧数对不上 got=\(pm.count) expect=\(expPM.count)"); bad += 1 }
+          print("FE-BAD=\(bad)")
+          exit(bad == 0 ? 0 : 2)
+          SW
+          echo "=== main.swift 写了 ===" >> $L
+
+          swiftc -typecheck -sdk "$ios" -target arm64-apple-ios15.0 \
+            "$GITHUB_WORKSPACE/app/SourcesVoice/MelFrontEnd.swift" >> $L 2>&1
+          echo "=== iOS typecheck rc=$? ===" >> $L
+
+          swiftc -O -o /tmp/fe/fe_test \
+            "$GITHUB_WORKSPACE/app/SourcesVoice/MelFrontEnd.swift" /tmp/fe/main.swift >> $L 2>&1
+          echo "=== swiftc(macos) rc=$? ===" >> $L
+
+          /tmp/fe/fe_test "$FX" >> $L 2>&1
+          echo "=== fe_test rc=$? ===" >> $L
+          bad=$(grep -o 'FE-BAD=[0-9]*' /tmp/fe/step.log | tail -1 | cut -d= -f2)
+          echo "=== bad=$bad ===" >> $L
+
+          # 前端是整条链唯一的取数口，这里偏一个数量级，后面 700 MB 权重跑得再快也是废的
+          if [ "$bad" != "0" ]; then
+            echo "MelFrontEnd 数值自检没过，不出 IPA"
+            exit 1
+          fi
+
       - name: 装 XcodeGen
         run: brew install xcodegen
 
@@ -160,6 +236,7 @@ jobs:
           set -uo pipefail
           cd /tmp
           { echo "### 自检 ZipExtractor（step.log）"; cat /tmp/zt/step.log 2>/dev/null || echo "(未跑或空)";
+            echo; echo "### 自检 MelFrontEnd（step.log）"; cat /tmp/fe/step.log 2>/dev/null || echo "(未跑或空)";
             echo; echo "### xcodegen"; cat /tmp/gen.log 2>/dev/null || echo "(空)";
             echo; echo "### SourcesVoice 清单"; ls -l "$GITHUB_WORKSPACE/app/SourcesVoice" 2>/dev/null || echo "(空)";
             echo; echo "### 编译错误（去重）";

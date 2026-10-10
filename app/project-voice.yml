@@ -14,7 +14,19 @@ targets:
     type: application
     platform: iOS
     sources:
-      - SourcesVoice
+      # Fixtures 单独列：目录扫描会把整个目录当 folder reference 塞进包里的一层子目录，
+      # 那样 Bundle.main.url(forResource:withExtension:) 就找不到了。逐个文件列，落进 .app 根。
+      - path: SourcesVoice
+        excludes:
+          - "Fixtures/**"
+      - path: SourcesVoice/Fixtures/synth16k_scaled.f32
+        buildPhase: resources
+      - path: SourcesVoice/Fixtures/fbank_expect.f32
+        buildPhase: resources
+      - path: SourcesVoice/Fixtures/pmel_expect.f32
+        buildPhase: resources
+      - path: SourcesVoice/Fixtures/librosa_mel_basis.f32
+        buildPhase: resources
     info:
       path: Info-Voice.plist
       properties:
@@ -24,7 +36,7 @@ targets:
         CFBundleIdentifier: com.qoder.voice
         CFBundlePackageType: APPL
         CFBundleShortVersionString: "0.1"
-        CFBundleVersion: "5"
+        CFBundleVersion: "7"
         CFBundleInfoDictionaryVersion: "6.0"
         NSMicrophoneUsageDescription: "要录你的声音来做声音转换"
         NSAppTransportSecurity:

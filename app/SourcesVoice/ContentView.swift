@@ -12,6 +12,8 @@ struct ContentView: View {
     @State private var player: AVAudioPlayer?
     @State private var sendStatus = ""
     @State private var isSending = false
+    @State private var feReport = ""
+    @State private var isRunningFE = false
 
     var body: some View {
         NavigationView {
@@ -42,6 +44,21 @@ struct ContentView: View {
         VStack(alignment: .leading, spacing: 10) {
             Text("诊断")
                 .font(.headline)
+            Text("版本 \(appVersion())　\(VoiceFacts.lines()[2])")
+                .font(.caption)
+                .foregroundColor(.secondary)
+
+            Button(isRunningFE ? "自检跑着…" : "跑前端自检") {
+                runFrontEndSelfTest()
+            }
+            .buttonStyle(.bordered)
+            .disabled(isRunningFE)
+            if !feReport.isEmpty {
+                Text(feReport)
+                    .font(.caption)
+                    .textSelection(.enabled)
+            }
+
             Button(isSending ? "发送中…" : "发到电脑") {
                 sendReport()
             }
@@ -55,11 +72,33 @@ struct ContentView: View {
         }
     }
 
+    private func appVersion() -> String {
+        let info = Bundle.main.infoDictionary ?? [:]
+        return "\(info["CFBundleShortVersionString"] ?? "-") (\(info["CFBundleVersion"] ?? "-"))"
+    }
+
+    /// 前端自检拿包里的合成 fixture 对拍，逐元素量 max_abs。
+    /// 跑在后台线程：1 s 音频 98 帧 FFT，手机上也就几十毫秒，别卡住按钮的置灰动画。
+    private func runFrontEndSelfTest() {
+        isRunningFE = true
+        feReport = "算着…"
+        Task.detached {
+            let text = MelFrontEnd.selfTest()
+            VoiceJournal.line("前端自检：\(text.replacingOccurrences(of: "\n", with: " ／ "))")
+            await MainActor.run {
+                feReport = text
+                isRunningFE = false
+            }
+        }
+    }
+
     private func sendReport() {
         isSending = true
         sendStatus = ""
         let facts = VoiceFacts.lines().joined(separator: "\n")
+        let fe = feReport.isEmpty ? "（自检还没跑过——先点「跑前端自检」）" : feReport
         let text = "—— 现场读数 ——\n" + facts
+            + "\n\n—— 前端自检 ——\n" + fe
             + "\n\n—— 模型状态 ——\n" + models.progressText
             + "\n\n—— 磁盘日志最近 200 行 ——\n" + VoiceJournal.tail(200)
         // ContentView 是 struct，不能 [weak self]；@State 的 setter 是 nonmutating，
@@ -86,7 +125,7 @@ struct ContentView: View {
                     .foregroundColor(.secondary)
             case .notDownloaded:
                 VStack(alignment: .leading, spacing: 8) {
-                    Text("模型未下载（约 713 MB）")
+                    Text("模型未下载（下载 581 MB，解压后占 726 MB）")
                         .foregroundColor(.secondary)
                     Button("下载模型") {
                         models.download()

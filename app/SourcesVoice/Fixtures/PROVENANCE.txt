@@ -1,0 +1,8 @@
+这些 .f32 是纯 Float32 小端一维数组，给 app 的前端自检用（不是模型权重）。
+重新生成：./tools/mvc/Scripts/python.exe tools/_emit_fixtures.py
+信号：合成音（300/1200/3000 Hz 三音 + 0.01 白噪声 + 30%~35% 一段静音 + 5 Hz 慢包络），
+      种子 1234，16000 样本 = 1 s。不含用户素材。
+synth16k_scaled.f32  (16000,)      输入，已乘 1<<15（kaldi 侧直接吃它）
+fbank_expect.f32     (98, 80)     torchaudio.compliance.kaldi.fbank 的期望值
+pmel_expect.f32      (101, 80)     MeanVC MelSpectrogramFeatures 的期望值（输入要除以 32768）
+librosa_mel_basis.f32 (80, 513)    librosa.filters.mel(sr=16000,n_fft=1024,n_mels=80,fmin=0,fmax=8000)
