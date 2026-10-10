@@ -137,7 +137,8 @@ jobs:
         run: |
           set -uo pipefail
           cd /tmp
-          { echo "### xcodegen"; cat /tmp/gen.log 2>/dev/null || echo "(空)";
+          { echo "### 自检 ZipExtractor（step.log）"; cat /tmp/zt/step.log 2>/dev/null || echo "(未跑或空)";
+            echo; echo "### xcodegen"; cat /tmp/gen.log 2>/dev/null || echo "(空)";
             echo; echo "### 编译错误抽取";
             grep -E "error:|warning:" /tmp/build.log 2>/dev/null | head -80 || true;
             echo; echo "### build.log 末尾";
