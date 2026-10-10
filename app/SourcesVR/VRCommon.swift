@@ -286,7 +286,7 @@ enum VRTech {
             }
         }
         if !bad.isEmpty {
-            initNote = "这几个 kernel 没编出来: \(bad.joined(separator: ",")}"
+            initNote = "这几个 kernel 没编出来: \(bad.joined(separator: ","))"
             return false
         }
         initNote = "Metal \(dev.name) 就绪，6 个 kernel 全在（纹理走 bgra8Unorm / rgba8Unorm）"
