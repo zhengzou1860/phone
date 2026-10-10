@@ -21,12 +21,12 @@ enum VRPilot {
         var predict = 0.0
     }
 
-    static func run(url: URL, frames: Int, shortSide: Int, bpct: Float, eyeLong: Int,
+    static func run(url: URL, frames: Int, bpct: Float, eyeLong: Int,
                     zps: [Float], outFps: Double, units: MLComputeUnits) -> String {
         var rep: [String] = []
         let mem0 = VRFacts.footprintMB()
         var memMax = mem0
-        VRJournal.line("试片 开始 \(url.lastPathComponent) 抽\(frames)帧 短边\(shortSide) 视差\(bpct)% 眼长边\(eyeLong)")
+        VRJournal.line("试片 开始 \(url.lastPathComponent) 抽\(frames)帧 视差\(bpct)% 眼长边\(eyeLong)（送检尺寸由模型声明）")
         guard VRTech.boot() else { return "Metal 起不来：\(VRTech.initNote)" }
 
         guard let src = VRSource(url: url, eyeLong: eyeLong) else {
@@ -43,7 +43,7 @@ enum VRPilot {
         }
         rep.append("模型 \(unitsName(units)) 加载 \(VRUtil.ms(got.ms))｜\(modelURL.lastPathComponent)")
         rep.append(VRDepth.describe(model))
-        let tgt = VRDepth.inputTarget(model, eyeW: src.eyeW, eyeH: src.eyeH, shortSide: shortSide)
+        let tgt = VRDepth.inputTarget(model, eyeW: src.eyeW, eyeH: src.eyeH)
         var feedNote = ""
         guard let feed = VRDepthFeed(model: model, eyeW: src.eyeW, eyeH: src.eyeH,
                                      mw: tgt.w, mh: tgt.h, note: &feedNote) else {

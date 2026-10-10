@@ -36,13 +36,10 @@ struct VRMainView: View {
                 .pickerStyle(.segmented)
                 .font(.footnote)
 
-                Picker("送检短边", selection: $job.shortSide) {
-                    Text("252").tag(252)
-                    Text("392").tag(392)
-                    Text("504").tag(504)
-                }
-                .pickerStyle(.segmented)
-                .font(.footnote)
+                Text("送检尺寸不可调：模型声明「只认 518x392」（上机实测）\n"
+                     + "竖屏画面等比进去只占约 215~220 px 宽，左右是黑边 ⇒ 深度单价与「每眼」档无关")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundColor(.orange)
 
                 Picker("每眼长边", selection: $job.eyeLong) {
                     Text("540").tag(540)
@@ -61,13 +58,17 @@ struct VRMainView: View {
                 .font(.footnote)
 
                 Picker("试片计算单元", selection: $job.unitTag) {
+                    Text("CPU").tag(3)
                     Text("all").tag(0)
                     Text("GPU").tag(1)
                     Text("ANE").tag(2)
-                    Text("CPU").tag(3)
                 }
                 .pickerStyle(.segmented)
                 .font(.footnote)
+
+                Text("上机实测 518x392：CPU 184 ms/帧（加载 0.43 s）｜GPU 461｜ANE 697（加载 122 s）｜all 853（加载 132 s）")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundColor(.secondary)
 
                 HStack(spacing: 10) {
                     Button("环境自检") { job.startCheck() }
@@ -119,10 +120,10 @@ final class VRJob: ObservableObject {
     @Published var status = ""
     @Published var showVideoPicker = false
     @Published var frames = 10
-    @Published var shortSide = 392
     @Published var eyeLong = 540
     @Published var bpct = 5
-    @Published var unitTag = 0
+    /// 默认 CPU：10-10 上机实测 184 ms/帧，比 all 的 853 ms 快 4.6 倍，且不交 ANE 那 122 s 的加载税
+    @Published var unitTag = 3
 
     init() {
         let info = Bundle.main.infoDictionary ?? [:]
@@ -158,10 +159,9 @@ final class VRJob: ObservableObject {
 
     func startProbe() {
         busy = true
-        let short = shortSide
-        status = "深度自检中…（四个计算单元各加载一遍再跑 30 次，第一次可能要现场编译模型）"
+        status = "深度自检中…（四单元各加载一遍＋预热 5＋正式 30 次；带 ANE 的两个单元各自加载要 2 分钟，整轮实测 345 s）"
         Task.detached { [weak self] in
-            let r = VRDepth.probe(runs: 30, shortSide: short)
+            let r = VRDepth.probe(runs: 30)
             await MainActor.run { self?.finish(r) }
         }
     }
@@ -170,14 +170,13 @@ final class VRJob: ObservableObject {
         showVideoPicker = false
         busy = true
         let n = frames
-        let short = shortSide
         let eye = eyeLong
         let b = Float(bpct)
         let u = VRJob.unit(unitTag)
         VRPressure.reset()
-        status = "出试片中…（抽 \(n) 帧 × 3 个零视差面，深度和形变都要现跑）"
+        status = "出试片中…（抽 \(n) 帧 × 3 个零视差面；深度单元 \(VRPilot.unitsName(u))，单价见上方实测那行）"
         Task.detached { [weak self] in
-            let r = VRPilot.run(url: url, frames: n, shortSide: short, bpct: b, eyeLong: eye,
+            let r = VRPilot.run(url: url, frames: n, bpct: b, eyeLong: eye,
                                 zps: [0.15, 0.50, 0.85], outFps: 5.0, units: u)
             await MainActor.run { self?.finish(r) }
         }

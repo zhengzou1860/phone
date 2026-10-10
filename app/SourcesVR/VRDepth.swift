@@ -131,9 +131,12 @@ enum VRDepth {
         return out.joined(separator: "\n")
     }
 
-    /// 送检尺寸：优先按"短边 shortSide、长边凑 14 的倍数"的等比口径，
-    /// 但必须夹在模型自己声明的允许区间里；固定尺寸的模型就退化成那个尺寸（这时靠信箱不拉伸）。
-    static func inputTarget(_ model: MLModel, eyeW: Int, eyeH: Int, shortSide: Int)
+    /// 送检尺寸：模型自己声明「允许区间」时才按短边等比凑 14 的倍数；固定尺寸的模型退化成那个尺寸（这时靠信箱不拉伸）。
+    /// 上机实测这个包是 enumerated 固定 518x392，所以下面那个短边对本包不起作用——
+    /// 它只在换成「允许区间」口径的模型时才生效，届时取 PC 的 m6 同一条约定（短边 518）。
+    static let wantShort = 518
+
+    static func inputTarget(_ model: MLModel, eyeW: Int, eyeH: Int)
         -> (w: Int, h: Int, flexible: Bool, note: String) {
         guard let name = model.modelDescription.inputDescriptionsByName.keys.first,
               let ic = model.modelDescription.inputDescriptionsByName[name]?.imageConstraint else {
@@ -152,16 +155,16 @@ enum VRDepth {
         if !flexible {
             return (dw, dh, false, "模型只认固定 \(dw)x\(dh) ⇒ 等比塞进去留黑边，不拉伸")
         }
-        let want = VRUtil.modelSize(eyeW: eyeW, eyeH: eyeH, short: shortSide,
+        let want = VRUtil.modelSize(eyeW: eyeW, eyeH: eyeH, short: wantShort,
                                     minW: mnW, minH: mnH, maxW: mxW, maxH: mxH)
         return (want.w, want.h, true,
-                "模型允许 \(mnW)x\(mnH)~\(mxW)x\(mxH) ⇒ 本次送检 \(want.w)x\(want.h)（短边 \(shortSide)、长边 14 倍数）")
+                "模型允许 \(mnW)x\(mnH)~\(mxW)x\(mxH) ⇒ 本次送检 \(want.w)x\(want.h)（短边 \(wantShort)、长边 14 倍数）")
     }
 
     // MARK: - 四单元单价
 
-    static func probe(runs: Int, shortSide: Int) -> String {
-        var out: [String] = ["深度自检（\(resource)）"]
+    static func probe(runs: Int) -> String {
+        var out: [String] = ["深度自检（\(resource)，送检短边不可调：见下面各单元的声明）"]
         let found = locate()
         guard let url = found.url else {
             out.append("  \(found.note)")
@@ -179,7 +182,7 @@ enum VRDepth {
             }
             out.append("  \(unit.0): 加载 \(VRUtil.ms(got.ms))")
             out.append(describe(model))
-            let tgt = inputTarget(model, eyeW: 540, eyeH: 960, shortSide: shortSide)
+            let tgt = inputTarget(model, eyeW: 540, eyeH: 960)
             out.append("  送检口径 \(tgt.note)")
             let made = randomInputs(model: model, w: tgt.w, h: tgt.h, count: 8)
             guard !made.list.isEmpty else {
