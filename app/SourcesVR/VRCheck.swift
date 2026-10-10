@@ -57,6 +57,8 @@ enum VRCheck {
 
     static func colorRoundTrip(width: Int = 64, height: Int = 24) -> String {
         guard VRTech.boot() else { return "Metal 起不来：\(VRTech.initNote)" }
+        VRTech.gate.lock()
+        defer { VRTech.gate.unlock() }
         let a = VRTech.pixelBuffer(width: width, height: height)
         let b = VRTech.pixelBuffer(width: width, height: height)
         guard let pa = a.pb, let pb = b.pb else { return "造像素缓冲失败：\(a.note)｜\(b.note)" }

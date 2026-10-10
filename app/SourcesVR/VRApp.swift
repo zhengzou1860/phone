@@ -279,6 +279,13 @@ final class VRJob: ObservableObject {
             log.append("取文件失败\n\(failMessage ?? "未知原因")")
             return
         }
+        // 选片回调是异步的：拷一条一分钟的片子要好几秒，这期间按钮的 busy 还没置上，
+        // 再点一次就会有两段回调前后落到这里（10-10 22:27 就是这么起了两条全片、约 90 秒后闪退）。
+        // 界面的 busy 会在视图重建时丢；闸在 run() 入口那份带锁的状态上，问它才算数
+        if busy || VRFull.isBusy() {
+            log.append("已经有一条在跑，这条选片不算（进度：\(status)）。要换片先按「停止」。")
+            return
+        }
         if fullMode { startFull(url) } else { startPilot(url) }
     }
 

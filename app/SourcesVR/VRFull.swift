@@ -1,4 +1,5 @@
 import Foundation
+import ObjectiveC
 import AVFoundation
 import CoreMedia
 import CoreVideo
@@ -35,10 +36,33 @@ enum VRFull {
 
     /// 整片分位数用的样本池上限：1.2 MB，与素材长度无关
     static let poolCap = 300_000
+    /// run 入口的串行闸：全片一次只许一条（静态 Metal 地基不给并发踩）。
+    static let door = NSLock()
+    static var inside = false
+
+    /// 界面问「有没有在跑」走这里，不许直接读 inside：那是一次跨线程的静态可变读写。
+    static func isBusy() -> Bool {
+        door.lock(); defer { door.unlock() }
+        return inside
+    }
 
     static func run(url: URL, bpct: Float, eyeLong: Int, zps: [Float], smooth: Float,
                     units: MLComputeUnits, rot: Bool) -> String {
         var rep: [String] = []
+        // 硬闸在 run 入口，不只在界面的 busy 上：按钮 disabled 挡不住「选完回来又点一次」这类路径，
+        // 而两条并发会把静态 Metal 地基（currentCommand / keep / queue）踩成运行时 trap——
+        // 10-10 22:27 那条 63 s 素材就是同一秒起了两条、约 90 秒后闪退（深度单价也被顶到 270~300 ms）。
+        door.lock()
+        if inside {
+            let p = progress
+            door.unlock()
+            return "已经有一条全片在跑，这条不起（它此刻的进度：\(p.isEmpty ? "刚起手" : p)）。"
+                + "要换片请先按「停止」等它收兵。"
+        }
+        inside = true
+        door.unlock()
+        defer { door.lock(); inside = false; door.unlock() }
+
         let wall0 = DispatchTime.now().uptimeNanoseconds
         let mem0 = VRFacts.footprintMB()
         var memMax = mem0
@@ -49,8 +73,12 @@ enum VRFull {
         totalFrames = 0
         progress = "全片 起手（读几何、载模型）"
         let rotName = rot ? "转90°" : "摆正"
+        // 时间戳带毫秒：文件名到秒的话，万一真有两条并发就会写进同一个 .bin 互相截断
+        let stamp = DateFormatter()
+        stamp.dateFormat = "yyyyMMdd-HHmmss-SSS"
+        let tag = stamp.string(from: Date())
         VRJournal.line("全片 开始 \(url.lastPathComponent) 视差\(bpct)% 眼长边\(eyeLong) zp\(zps.count)档"
-            + " 平滑\(smooth) 送检朝向\(rotName)")
+            + " 平滑\(smooth) 送检朝向\(rotName)｜run \(tag)")
         defer { progress = "" }
 
         guard VRTech.boot() else { return "Metal 起不来：\(VRTech.initNote)" }
@@ -81,9 +109,6 @@ enum VRFull {
 
         let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
             ?? URL(fileURLWithPath: NSTemporaryDirectory())
-        let stamp = DateFormatter()
-        stamp.dateFormat = "yyyyMMdd-HHmmss"
-        let tag = stamp.string(from: Date())
         let cache = dir.appendingPathComponent("vr3d_depth_\(tag).bin")
         // 上一轮没收干净的话这里就欠着几个 GB：先清掉再算这次要占多少，不然闸门会被自己骗过去
         var reclaimed = 0
@@ -315,6 +340,11 @@ enum VRFull {
             var holes = 0.0
             var why = ""
             while true {
+                // 逐帧回收自动释放池：整趟跑在同一个 work item 里，线程的池要等 run() 返回才清，
+                // 而 read(upToCount:) 每帧递出来一块 812224 字节的 NSData ⇒ 足迹按 0.78 MB/帧单调上涨
+                // （10-10 实测 632 帧涨到 559 MB，涨幅与这块的尺寸三位数吻合）。defer 连 break 也接得住。
+                let arp = objc_autoreleasePoolPush()
+                defer { objc_autoreleasePoolPop(arp) }
                 let t0 = DispatchTime.now().uptimeNanoseconds
                 guard str2.next(into: framePB) else { break }
                 let dMs = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000

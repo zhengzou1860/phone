@@ -251,6 +251,10 @@ enum VRTech {
     static var initNote = ""
     /// 从上次 commitWait 到现在造出的所有 CVMetalTexture，托住它们底下的 MTLTexture 别中途作废。
     static var keep: [CVMetalTexture] = []
+    /// 一整套 texture → encode → commitWait 必须**整段独占**：`keep` 和 `currentCommand` 都是静态的，
+    /// 两条线程交错进来就会互相把对方还在用的纹理放开（commitWait 里那句 removeAll），
+    /// 10-10 22:27 两条并发全片就是这么在约 90 秒后闪退的。三个入口各锁一次，锁里不再嵌套。
+    static let gate = NSLock()
 
     /// 一次性把 shader 编好。失败就把原因留在 initNote 里，界面直接显示——
     /// default.metallib 没进包这件事必须看得见，不能变成"按钮按了没反应"。

@@ -124,6 +124,8 @@ final class VRDepthFeed {
     /// 一帧：kScale 画进送检框 → CoreML → 输出平面按眼格重采样
     func infer(srcPB: CVPixelBuffer) -> (raw: [Float], ms: (prep: Double, predict: Double),
                                          plane: VRPlane.Out, err: String?) {
+        VRTech.gate.lock()
+        defer { VRTech.gate.unlock() }
         let got = VRTech.texture(from: srcPB, width: eyeW, height: eyeH)
         guard let srcTex = got.tex else {
             return ([], (0, 0), VRPlane.Out(), "帧纹理建不出来: \(got.note)")
@@ -280,6 +282,8 @@ final class VRWarp {
     /// 一帧。dn 是已归一化到 0..1 的眼格深度；outPB 是 2W×H 的 BGRA 像素缓冲（成片的这一帧）。
     func render(srcPB: CVPixelBuffer, dn: [Float], zp: Float, outPB: CVPixelBuffer)
         -> (upload: Double, gpu: Double, holes: Double, err: String?) {
+        VRTech.gate.lock()
+        defer { VRTech.gate.unlock() }
         let sg = VRTech.texture(from: srcPB, width: eyeW, height: eyeH)
         let og = VRTech.texture(from: outPB, width: sbsW, height: eyeH)
         guard let srcTex = sg.tex, let outTex = og.tex else {
