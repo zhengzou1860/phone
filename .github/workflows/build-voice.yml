@@ -1,0 +1,123 @@
+name: voice-coreml-probe
+
+# 声音 app 的第一轮：只在 runner 上回答"这 11 张图能不能以 CoreML 出货、失真多大"。
+# 不出包、不碰手机 ⇒ 你这边零下载。判据全文发固定 release `channel-voice-coreml`，
+# 我这台 Windows 无凭据匿名 curl 就能读，然后自己改自己再推（剪辑项目就是这么办的）。
+#
+# 走独立分支 voice 的理由：`.github/workflows/build.yml` 是 push 到 main 就触发且没有 paths 过滤
+# ⇒ 我往 main 推任何东西都会重建别人的 `hello.ipa`（写别人的发布位）。
+# workflow_dispatch 在文件进默认分支之前用不了，要重跑就 git commit --allow-empty && git push origin voice。
+on:
+  push:
+    branches: [voice]
+    paths:
+      - 'ci/voice_probe.py'
+      - '.github/workflows/build-voice.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: voice
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # 图从社区 Android 导出的 release 现下，不进 git（660 MB，且仓库是公开的）。
+      - name: 下 11 张 ONNX
+        run: |
+          set -uo pipefail
+          ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=6{print "::error::" p substr($0,1,230)}'; }
+          SRC=/tmp/vonnx; rm -rf $SRC && mkdir -p $SRC
+          BASE=https://github.com/kt-kamura/meanvc-android-assets/releases/download/v1
+          ok=0; bad=0; tot=0
+          for f in vocos.onnx dit_state_0.onnx dit_state_1.onnx dit_state_2.onnx dit_state_3.onnx \
+                   dit_state_4.onnx dit_state_5.onnx dit_state_6.onnx \
+                   fastu2plusplus_state_a_first.onnx fastu2plusplus_state_b_second.onnx \
+                   fastu2plusplus_state_c_steady.onnx; do
+            code=$(curl -sS -L --retry 3 --retry-all-errors --max-time 600 -o "$SRC/$f.part" \
+                       -w '%{http_code}' "$BASE/$f" 2>/tmp/curl.err)
+            sz=$(wc -c < "$SRC/$f.part" 2>/dev/null | tr -d ' ')
+            if [ "$code" = "200" ] && [ "${sz:-0}" -gt 1000000 ]; then
+              mv -f "$SRC/$f.part" "$SRC/$f"; ok=$((ok+1)); tot=$((tot+sz))
+            else
+              bad=$((bad+1)); rm -f "$SRC/$f.part"
+              echo "G-FAIL $f code=${code:-?} bytes=${sz:-0} err=$(head -c 120 /tmp/curl.err 2>/dev/null)" | ann "G "
+            fi
+          done
+          echo "G-VERDICT 下成 $ok / 败 $bad 合计 $((tot/1024/1024)) MB" | ann "G-VERDICT "
+          ls -l $SRC | ann "G-LS "
+          [ "$ok" -ge 1 ] || exit 1
+
+      - name: 装 onnx2coreml 环境
+        run: |
+          set -uo pipefail
+          ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=6{print "::error::" p substr($0,1,230)}'; }
+          rm -rf /tmp/vo2c && mkdir -p /tmp/vopkg
+          python -m venv /tmp/vo2c >/dev/null 2>&1
+          /tmp/vo2c/bin/pip install --quiet --no-cache-dir --upgrade pip >/tmp/pip.log 2>&1
+          /tmp/vo2c/bin/pip install --quiet --no-cache-dir \
+            onnx2coreml coremltools onnx onnxruntime numpy >>/tmp/pip.log 2>&1
+          rc=$?
+          if [ $rc -eq 0 ]; then
+            echo "P-VERDICT 依赖装好（pip rc=0）" | ann "P-VERDICT "
+          else
+            echo "P-VERDICT 依赖装失败 rc=$rc" | ann "P-VERDICT "
+            tail -6 /tmp/pip.log | ann "PIP "
+            exit 1
+          fi
+          /tmp/vo2c/bin/pip show onnx2coreml coremltools onnx onnxruntime numpy 2>/dev/null \
+            | grep -E '^(Name|Version)' | ann "P-VERS "
+
+      # 30 分钟预算：撞到了前面几张的判决已经在日志里了，这一步不许把日志带走。
+      - name: 逐图转换 + 与 onnxruntime 对拍
+        timeout-minutes: 33
+        run: |
+          set -uo pipefail
+          ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=8{print "::error::" p substr($0,1,230)}'; }
+          cp ci/voice_probe.py /tmp/voice_probe.py
+          /tmp/vo2c/bin/python /tmp/voice_probe.py /tmp/vonnx /tmp/vopkg /tmp/voice_probe.log 1500 \
+            >/tmp/probe_stdout.log 2>&1
+          echo "探针退出码 $?" >> /tmp/probe_stdout.log
+          grep "^SUM " /tmp/voice_probe.log | ann "SUM "
+          grep "^ENV " /tmp/voice_probe.log | ann "ENV "
+          tail -3 /tmp/probe_stdout.log | ann "OUT "
+          exit 0
+
+      - name: 把判据发到固定 release（无 token 也能读）
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=6{print "::error::" p substr($0,1,230)}'; }
+          cd /tmp
+          rm -f voice-probe.log
+          { echo "### voice_probe.log"; cat /tmp/voice_probe.log 2>/dev/null || echo "(空)";
+            echo; echo "### stdout"; tail -60 /tmp/probe_stdout.log 2>/dev/null;
+            echo; echo "### pip"; tail -20 /tmp/pip.log 2>/dev/null; } > voice-probe.log
+          echo "### 本次 commit $GITHUB_SHA / run $GITHUB_RUN_ID attempt $GITHUB_RUN_ATTEMPT" >> voice-probe.log
+          ls -l voice-probe.log | ann "REL-SIZE "
+          gh release delete channel-voice-coreml --cleanup-tag -y >/dev/null 2>&1 || true
+          gh release create channel-voice-coreml voice-probe.log \
+            --title "voice coreml 探测日志" --prerelease \
+            --notes "11 张图逐图 onnx2coreml 转换与数值对拍的完整日志" 2>&1 | ann "GH "
+          curl -fsSL -o /tmp/relcheck.json --max-time 60 \
+            https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/channel-voice-coreml || true
+          if grep -q '"tag_name": *"channel-voice-coreml"' /tmp/relcheck.json; then
+            echo "日志已发到 channel-voice-coreml，匿名可读" | ann "REL-VERDICT "
+          else
+            echo "日志没发出去（剪辑项目栽过一次：step 绿但 release 404）" | ann "REL-VERDICT "
+          fi
+          grep -oE '"name": *"[^"]*"|"size": *[0-9]+|"message": *"[^"]*"' /tmp/relcheck.json | ann "REL-GET "
+          exit 0
