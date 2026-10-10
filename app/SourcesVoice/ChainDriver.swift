@@ -14,7 +14,13 @@ enum ChainError: Error, LocalizedError {
 }
 
 /// 一段「帧 × 维度」的浮点序列，行主序展平。bn 和 mel 都是这个形态。
-private struct ChainRows {
+///
+/// 下面四个阶段方法（speakerEmbedding / encode / denoise / vocode）本来是私有的，
+/// 改成 internal 只为 CI 那个 macOS 对拍：它逐段拿 python 落盘的中间量当输入
+/// （Fixtures/chain_fbank / chain_bn / chain_spks / chain_prompts / chain_mel），
+/// 这样每一段的残差就只可能是 Swift 自己的逻辑差，不会被前端 6.58e-05 的残差
+/// 一路放大成整段波形对不上（那个放大实测是 max_abs 1.79，见 chain_expect 的地板）。
+struct ChainRows {
     var data: [Float]
     var frames: Int
     var dim: Int
@@ -59,6 +65,9 @@ final class ChainDriver {
     var onStage: (String) -> Void = { VoiceJournal.line($0) }
     /// 端到端对拍用的噪声（PC 侧录下来的 fixture）。给了就不用自己生成。
     var noiseOverride: [Float]?
+    /// librosa mel 基的注入点。装机走 bundle；CI 的 macOS 对拍是裸可执行文件，
+    /// 那儿没有 bundle 可查（MelFrontEnd.loadFloats 必然返回 nil），只能从命令行给的目录读。
+    var melBasisOverride: [Float]?
 
     init(modelDir: URL, intraThreads: Int = 4) throws {
         self.modelDir = modelDir
@@ -72,7 +81,7 @@ final class ChainDriver {
     /// source / reference 都是 16 kHz 单声道 [-1,1]。返回同口径的转换结果。
     func convert(source: [Float], reference: [Float]) throws -> [Float] {
         let t0 = Date()
-        guard let basis = AudioProcessor.melBasis() else {
+        guard let basis = melBasisOverride ?? AudioProcessor.melBasis() else {
             throw ChainError.input("bundle 里没有 librosa_mel_basis.f32，prompt 通道算不出来")
         }
 
@@ -108,7 +117,7 @@ final class ChainDriver {
 
     // MARK: - ① 音色嵌入
 
-    private func speakerEmbedding(_ wav: [Float]) throws -> OrtTensor {
+    func speakerEmbedding(_ wav: [Float]) throws -> OrtTensor {
         let t0 = Date()
         onStage("① 音色嵌入：载入 \(Self.fileSV)")
         let g = try graph(Self.fileSV)
@@ -121,7 +130,7 @@ final class ChainDriver {
 
     // MARK: - ② 内容编码（fastu2++ 三态流式）
 
-    private func encode(fbank: [Float], frames: Int) throws -> ChainRows {
+    func encode(fbank: [Float], frames: Int) throws -> ChainRows {
         let nM = MelFrontEnd.nMels
         let t0 = Date()
         onStage("② 内容编码：\(frames) 帧 fbank")
@@ -221,7 +230,7 @@ final class ChainDriver {
 
     // MARK: - ③ DiT 去噪（7 态流式 + 2 步 euler）
 
-    private func denoise(bn: ChainRows, spks: OrtTensor, prompts: [Float]) throws -> ChainRows {
+    func denoise(bn: ChainRows, spks: OrtTensor, prompts: [Float]) throws -> ChainRows {
         let nM = MelFrontEnd.nMels
         let chunks = (bn.frames + Self.ditChunk - 1) / Self.ditChunk
         let need = chunks * Self.ditChunk * nM
@@ -334,7 +343,7 @@ final class ChainDriver {
 
     // MARK: - ④ 声码
 
-    private func vocode(_ mel: ChainRows) throws -> [Float] {
+    func vocode(_ mel: ChainRows) throws -> [Float] {
         let nM = MelFrontEnd.nMels
         let T = mel.frames
         guard mel.dim == nM else {

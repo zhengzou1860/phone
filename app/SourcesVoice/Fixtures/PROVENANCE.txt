@@ -6,3 +6,28 @@ synth16k_scaled.f32  (16000,)      输入，已乘 1<<15（kaldi 侧直接吃它
 fbank_expect.f32     (98, 80)     torchaudio.compliance.kaldi.fbank 的期望值
 pmel_expect.f32      (101, 80)     MeanVC MelSpectrogramFeatures 的期望值（输入要除以 32768）
 librosa_mel_basis.f32 (80, 513)    librosa.filters.mel(sr=16000,n_fft=1024,n_mels=80,fmin=0,fmax=8000)
+
+—— 第二批：整链对拍（ChainDriver）——
+重新生成：D:/anaconda3/envs/simswap/python.exe tools/_chainfix.py
+素材：合成谐波堆（14 次谐波 + 4.5 Hz 颤音 + 1.7 Hz 包络 + PCG64 噪声），峰值 0.75；
+      源 F0=118、参考 F0=197，各 5 s @16k = 80000 样本，种子 11 / 23。不含用户素材。
+链路和评分口径与 tools/_f16_ab.py 一致（那份实测 CER 0.077、音色余弦 0.72）。
+这批不进 .app：project-voice.yml 的 resources 只逐个列了上面四个，所以不占 IPA 体积，
+只有 CI 的 macOS 闸门（ci/voice_chain_gate.swift）按路径读。
+
+chain_src.f32     (80000,)      源音频，= Swift 的 convert(source:)
+chain_ref.f32     (80000,)      参考音频，= Swift 的 convert(reference:)
+chain_fbank.f32   (498, 80)     python 的 kaldi fbank，喂 ② 内容编码
+chain_spks.f32    (1, 256)      python 的 sv_dynamic_len 输出，喂 ③ 去噪的 spks
+chain_prompts.f32 (1, 150, 80)  python 的 prompt mel，喂 ③ 去噪的 prompts
+chain_bn.f32      (1, 500, 256) 编码器 + ×4 上采样之后，喂 ③ 去噪的 cond
+chain_mel.f32     (1, 80, 500)  ③ 的输出：通道主序、且已经过 (x+1)/2
+chain_noise.f32   (40000,)      run_chain 真正用的那串噪声（torch seed 7 逐片 randn 拼接）
+chain_expect.f32  (80000,)      整链最终波形，未截幅（峰值 1.75）
+
+为什么每段各钉一份输入，而不是从头比到尾：实测只把 fbank/pmel 抖
+±6.58e-05 / ±1.49e-06（= Swift 前端对 torch 的真实残差，前端闸门天天在量），
+整链输出的 max_abs 就到 1.79、余弦掉到 0.968 —— 前端残差会被链路放大成
+比信号本身还大的差，端到端逐元素比根本测不出「Swift 有没有算错」。
+所以每一段直接吃 python 的中间量：输入逐字节相同，差就只可能是逻辑差。
+那个地板是 _chainfix.py 跑第二遍 jitter（同一 seed、同一串噪声）量出来的。

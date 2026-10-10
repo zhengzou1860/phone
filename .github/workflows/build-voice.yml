@@ -6,6 +6,7 @@ on:
     paths:
       - 'app/SourcesVoice/**'
       - 'app/project-voice.yml'
+      - 'ci/voice_chain_gate.swift'
       - '.github/workflows/build-voice.yml'
   workflow_dispatch:
 
@@ -343,3 +344,129 @@ jobs:
             --title "Voice IPA" --prerelease \
             --notes "Voice 声音克隆 app（LiveContainer 装载）" 2>&1
           curl -sSI https://github.com/$GITHUB_REPOSITORY/releases/download/channel-voice/voice.ipa | head -3
+
+  chain-gate:
+    # 整链数值对拍，独立一个 job：它要下 609 MB 权重、把 12 张图真跑一遍，
+    # 和「出包」这件事互不拖累 —— 这一格红了照样发 IPA（明天装机靠的是 IPA），
+    # IPA 那格炸了也不影响这里读数。日志发到自己名下的 release，不碰 channel-voice。
+    name: 整链数值对拍（macOS 直跑 12 张图）
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 取 ONNX Runtime 的 macOS 片（同一个校验过的 zip）
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          gh release download ort-c-1.30.0 -p 'ort-c-1.30.0.zip' -D /tmp \
+            --repo "$GITHUB_REPOSITORY"
+          ls -l /tmp/ort-c-1.30.0.zip
+          echo "e6f1670c14406fd9f082bb400ab197a9b0a9646058ca6366e440642e2b54a2ea  /tmp/ort-c-1.30.0.zip" \
+            | shasum -a 256 -c -
+          rm -rf /tmp/ortmac && mkdir -p /tmp/ortmac
+          unzip -q /tmp/ort-c-1.30.0.zip -d /tmp/ortmac 'onnxruntime.xcframework/macos-arm64_x86_64/*'
+          # macOS 的真身在 Versions/A/ 下面；framework 根上那个同名文件是一条 28 字节的
+          # 软链文本（python 打的包会把它落成普通文件），拿去 -force_load 只会报一句看不懂的话。
+          BIN=/tmp/ortmac/onnxruntime.xcframework/macos-arm64_x86_64/onnxruntime.framework/Versions/A/onnxruntime
+          HD=/tmp/ortmac/onnxruntime.xcframework/macos-arm64_x86_64/onnxruntime.framework/Versions/A/Headers
+          test -s "$BIN"
+          test -s "$HD/onnxruntime_c_api.h"
+          { echo "=== file ==="; file "$BIN"; echo "=== size ==="; ls -l "$BIN";
+            echo "=== 头文件 ==="; ls "$HD" | head -5; } 2>&1
+          echo "ORT_BIN=$BIN" >> $GITHUB_ENV
+          echo "ORT_HD=$HD" >> $GITHUB_ENV
+
+      - name: 取 fp16 权重（609 MB / 12 张图，逐字节校验）
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          gh release download voice-models -p 'models-fp16.zip' -D /tmp \
+            --repo "$GITHUB_REPOSITORY"
+          ls -l /tmp/models-fp16.zip
+          echo "6304efb1444d2b76210ee0d001fcf60393bd09e7cef27f7673ef62ca278450a4  /tmp/models-fp16.zip" \
+            | shasum -a 256 -c -
+          rm -rf /tmp/models && mkdir -p /tmp/models
+          # 条目全在 zip 根目录（和手机端 ModelManager 探测 Documents/voice_models/*.onnx 同一口径）
+          unzip -q /tmp/models-fp16.zip -d /tmp/models
+          ls -l /tmp/models
+          test -s /tmp/models/sv_dynamic_len.onnx
+          test -s /tmp/models/dit_state_6.onnx
+
+      - name: 编闸门可执行文件
+        run: |
+          set +e
+          rm -rf /tmp/gate && mkdir -p /tmp/gate
+          L=/tmp/gate/step.log
+          SV="$GITHUB_WORKSPACE/app/SourcesVoice"
+          { echo "=== swift ==="; swiftc --version;
+            echo "=== sdk ==="; xcrun --show-sdk-path;
+            echo "=== 参与编译的 Swift ==="; ls -l "$SV"; } > $L 2>&1
+          # 顶层语句只能待在 main.swift 里，所以从仓库里那份复制过去
+          cp "$GITHUB_WORKSPACE/ci/voice_chain_gate.swift" /tmp/gate/main.swift
+
+          xcrun clang -c -std=gnu17 -O2 -Wall -Wextra -I "$ORT_HD" -I "$SV" \
+            "$SV/OrtShim.c" -o /tmp/gate/OrtShim.o >> $L 2>&1
+          echo "=== clang rc=$? ===" >> $L
+          nm -u /tmp/gate/OrtShim.o >> $L 2>&1
+
+          xcrun swiftc -O -target arm64-apple-macos13.0 \
+            -import-objc-header "$SV/Voice-Bridging-Header.h" \
+            -Xcc -I -Xcc "$ORT_HD" \
+            "$SV/MelFrontEnd.swift" "$SV/AudioProcessor.swift" \
+            "$SV/Ort.swift" "$SV/ChainDriver.swift" \
+            /tmp/gate/main.swift /tmp/gate/OrtShim.o \
+            -Xlinker -force_load -Xlinker "$ORT_BIN" \
+            -Xlinker -lc++ \
+            -Xlinker -framework -Xlinker Accelerate \
+            -o /tmp/gate/chain_gate >> $L 2>&1
+          echo "=== swiftc rc=$? ===" >> $L
+          ls -l /tmp/gate/chain_gate >> $L 2>&1
+          echo "=== error（去重，最多 40 条）===" >> $L
+          grep -E "error:" $L | sort -u | head -40 >> $L 2>&1
+          cat $L
+          if [ ! -x /tmp/gate/chain_gate ]; then
+            echo "闸门可执行文件没编出来，见上一步日志"
+            exit 1
+          fi
+
+      - name: 跑整链数值对拍
+        run: |
+          set +e
+          FX="$GITHUB_WORKSPACE/app/SourcesVoice/Fixtures"
+          /tmp/gate/chain_gate --models /tmp/models --fixtures "$FX" > /tmp/gate/run.log 2>&1
+          rc=$?
+          echo "=== chain_gate rc=$rc ===" >> /tmp/gate/run.log
+          cat /tmp/gate/run.log
+          echo "GATE_RC=$rc" >> $GITHUB_ENV
+          # 首轮阈放开得宽（rel_max 0.2 / cos 0.99）：python 那边是 onnxruntime 1.19.2、
+          # 这里链的是 1.30.0，同图不同版本的 kernel 本来就有残差。跑完按每段印的
+          # SUGGEST 行收紧，别凭手感定数。结构错（通道序、图选错、少喂 cache）会当场红。
+          if [ "$rc" != "0" ]; then
+            echo "数值对拍不过（rc=$rc）—— IPA 那格不受影响，但这一格不许当没看见"
+          fi
+          exit "$rc"
+
+      - name: 发对拍日志
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          cd /tmp
+          { echo "### commit $GITHUB_SHA / run $GITHUB_RUN_ID / chain_gate rc=${GATE_RC:-未跑到}";
+            echo; echo "### 编译（step.log）"; cat /tmp/gate/step.log 2>/dev/null || echo "(空)";
+            echo; echo "### 对拍（run.log）"; cat /tmp/gate/run.log 2>/dev/null || echo "(空)";
+            echo; echo "### 权重目录"; ls -l /tmp/models 2>/dev/null || echo "(没取到)";
+            echo; echo "### vendored ORT"; ls -l "$(cat /tmp/gate/step.log 2>/dev/null | grep -o '/tmp/ortmac[^ ]*Versions/A/onnxruntime' | head -1)" 2>/dev/null || echo "(没取到)"; } > voice-chain-gate.log
+          ls -l /tmp/voice-chain-gate.log
+          # cd /tmp 之后 gh 找不到 git remote，必须显式 --repo
+          gh release delete voice-chain-gate --cleanup-tag -y --repo "$GITHUB_REPOSITORY" 2>&1 || true
+          gh release create voice-chain-gate /tmp/voice-chain-gate.log \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "voice 整链对拍日志" --prerelease \
+            --notes "ChainDriver 逐段和 python 参考链的数值差" 2>&1
+          curl -sSI https://github.com/$GITHUB_REPOSITORY/releases/download/voice-chain-gate/voice-chain-gate.log | head -3
