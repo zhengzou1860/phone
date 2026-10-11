@@ -12,6 +12,8 @@ enum PickSlot: String, Identifiable {
     case text
     /// 也借用这一个呈现：嗓音清单页（不是文件选择，见 body 里那个 if）。
     case voice
+    /// 同上：历史文件清理页。
+    case history
     var id: String { rawValue }
 }
 
@@ -63,6 +65,12 @@ struct ContentView: View {
     @State private var readNote = ""
     @State private var rawTTSURL: URL?
 
+    /// 历史文件清理页：Documents 根目录里留下的源/中间/成品。
+    /// `wipeArmed` 是「全部删除」的第一次按下 —— 删的是他的录音，一指点没了找不回来，要连点两次。
+    @State private var history: [FileHistory.Item] = []
+    @State private var historyNote = ""
+    @State private var wipeArmed = false
+
     var body: some View {
         NavigationView {
             ScrollView {
@@ -83,6 +91,8 @@ struct ContentView: View {
                             playbackSection(url: url)
                         }
                     }
+                    // 放在 if 外面：模型没下（或像 0.1/24 那样被误删）时，留下的录音照样要能删。
+                    historySection
                     debugSection
                 }
                 .padding()
@@ -91,6 +101,7 @@ struct ContentView: View {
             .onAppear {
                 VoiceJournal.line("ContentView.onAppear")
                 samples = SampleStore.list()
+                history = FileHistory.scan()
                 voiceRows = SystemTTS.voiceRows()
                 logVoiceRows()
                 models.check()
@@ -104,12 +115,15 @@ struct ContentView: View {
         }
     }
 
-    /// 一个呈现两种内容：`.voice` 是我们自己铺的嗓音清单，其余三个槽还是系统文件选择器。
+    /// 一个呈现四种内容：`.voice` 是自己铺的嗓音清单、`.history` 是自己铺的历史文件清单，
+    /// 其余三个槽还是系统文件选择器。
     /// 分支写在带 `@ViewBuilder` 的函数里，不赌 `fullScreenCover` 那个闭包是不是 ViewBuilder。
     @ViewBuilder
     private func coverPage(_ slot: PickSlot) -> some View {
         if slot == .voice {
             voiceListPage
+        } else if slot == .history {
+            historyPage
         } else {
             DocumentPickerHost(onPick: { url in
                 if slot == .text {
@@ -265,6 +279,7 @@ struct ContentView: View {
                 Button("停止") {
                     rec.stopRecording()
                     url.wrappedValue = rec.recordedURL
+                    history = FileHistory.scan()
                 }
                 .buttonStyle(.bordered)
                 .disabled(!rec.isRecording)
@@ -305,6 +320,7 @@ struct ContentView: View {
             let size = ((try? FileManager.default.attributesOfItem(atPath: dest.path))?[.size] as? NSNumber)?.int64Value ?? 0
             let probe = probeAudio(dest)
             pickNote = "已拷进 app：" + dest.lastPathComponent + "（\(size / 1024) KB）" + probe
+            history = FileHistory.scan()
             VoiceJournal.line("选文件 \(src.lastPathComponent) → \(dest.lastPathComponent) \(size / 1024) KB，\(probe)")
             return dest
         } catch {
@@ -387,6 +403,151 @@ struct ContentView: View {
         let f = DateFormatter()
         f.dateFormat = "MM-dd HH:mm"
         return f.string(from: Date())
+    }
+
+    // MARK: - 历史文件（Documents 根目录里留下的源 / 中间 / 成品）
+
+    @ViewBuilder
+    private var historySection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("历史文件（源 / 中间 / 成品）").font(.headline)
+            Button {
+                history = FileHistory.scan()
+                wipeArmed = false
+                historyNote = ""
+                VoiceJournal.line("打开历史文件页：\(history.count) 个 / "
+                                  + FileHistory.human(FileHistory.total(history)))
+                pickSlot = .history
+            } label: {
+                Text(history.isEmpty ? "查看并清空（app 目录里没有留下的音频）"
+                                     : "查看并清空（\(history.count) 个 / \(FileHistory.human(FileHistory.total(history)))）")
+            }
+            .buttonStyle(.bordered)
+            Text("「选文件」拷进来的、录的、系统原声、转换成品都一直留在 app 目录里，播完不会自动删 ⇒ 「文件」app 里直接翻得到。这页逐条删、整类删、一键清空。模型目录（581 MB）、voice_log.txt、样本清单不在这页里，也删不到。")
+                .font(.caption)
+                .foregroundColor(.secondary)
+        }
+    }
+
+    /// 清理页：一行一个文件各带一个「删」，每类头上一个「删本类」，最上面「全部删除」连点两次才动手。
+    /// 和嗓音清单同一个做法——自己铺行，不用 `List`/`.onDelete`、也不用 navigationLink
+    /// （ScrollView 里的系统控件在这台机上有 8/8 闪退的记录）。
+    @ViewBuilder
+    private var historyPage: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("历史文件 \(history.count) 个 / \(FileHistory.human(FileHistory.total(history)))")
+                    .font(.headline)
+
+                Button(wipeArmed ? "再点一次：确认删掉这 \(history.count) 个" : "全部删除") {
+                    wipeAll()
+                }
+                .buttonStyle(.bordered)
+                .disabled(history.isEmpty)
+
+                if wipeArmed {
+                    Text("第二次按下就真删，删完找不回来。").font(.caption).foregroundColor(.red)
+                }
+
+                ForEach(FileHistory.Kind.allCases) { k in
+                    historyGroup(k)
+                }
+                if history.isEmpty {
+                    Text("空的：app 目录里没有留下的音频。")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+                if !historyNote.isEmpty {
+                    Text(historyNote).font(.caption).foregroundColor(.orange)
+                }
+
+                HStack(spacing: 12) {
+                    Button("刷新") {
+                        history = FileHistory.scan()
+                        wipeArmed = false
+                    }
+                    .buttonStyle(.bordered)
+                    Button("关闭") { pickSlot = nil }
+                        .buttonStyle(.borderedProminent)
+                }
+            }
+            .padding()
+        }
+    }
+
+    @ViewBuilder
+    private func historyGroup(_ k: FileHistory.Kind) -> some View {
+        let rows = history.filter { $0.kind == k }
+        if !rows.isEmpty {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 8) {
+                    Text("\(k.rawValue) \(rows.count) 个 / \(FileHistory.human(FileHistory.total(rows)))")
+                        .font(.subheadline)
+                    Spacer(minLength: 6)
+                    Button("删本类") { deleteFiles(rows, what: "已删这一类「\(k.rawValue)」") }
+                        .buttonStyle(.bordered)
+                }
+                ForEach(rows) { it in
+                    historyLine(it)
+                }
+            }
+            .padding(.vertical, 4)
+        }
+    }
+
+    @ViewBuilder
+    private func historyLine(_ it: FileHistory.Item) -> some View {
+        HStack(spacing: 8) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(it.name).font(.caption)
+                Text(FileHistory.human(it.bytes) + (currentPaths.contains(it.id) ? "　这一格正在用" : ""))
+                    .font(.caption2)
+                    .foregroundColor(currentPaths.contains(it.id) ? .accentColor : .secondary)
+            }
+            Spacer(minLength: 6)
+            Button("删") { deleteFiles([it], what: "已删 \(it.name)") }
+                .buttonStyle(.bordered)
+        }
+    }
+
+    /// 界面上四个槽现在指着哪些文件（删掉时要一起清引用，清单里也要标出来）。
+    private var currentPaths: Set<String> {
+        var s = Set<String>()
+        for u in [sourceURL, refURL, outputURL, rawTTSURL] {
+            if let u = u { s.insert(u.path) }
+        }
+        return s
+    }
+
+    /// 「全部删除」两道：第一次只把按钮改文案、把待确认这件事写进日志，第二次才动 `removeItem`。
+    private func wipeAll() {
+        guard !history.isEmpty else { return }
+        if wipeArmed {
+            deleteFiles(history, what: "全部删除")
+            return
+        }
+        wipeArmed = true
+        historyNote = "再点一次「全部删除」就真删这 \(history.count) 个"
+        VoiceJournal.line("历史文件「全部删除」第一次按下（待第二次确认）")
+    }
+
+    private func deleteFiles(_ items: [FileHistory.Item], what: String) {
+        let r = FileHistory.deleteAll(items)
+        clearReferences(of: items.map { $0.url })
+        history = FileHistory.scan()
+        wipeArmed = false
+        historyNote = what + "：删掉 \(r.deleted) 个、拿回 \(FileHistory.human(r.freed))"
+            + (r.failed > 0 ? "／\(r.failed) 个删不掉（逐条原因在日志）" : "")
+    }
+
+    /// 删掉的正好是界面上现在指着的那一格 ⇒ 引用一起清掉。
+    /// 不清的话「当前：pick_x.wav」还挂着，要等下一次点转换才在读文件那步报找不到，绕一圈。
+    private func clearReferences(of urls: [URL]) {
+        let paths = Set(urls.map { $0.path })
+        if let u = sourceURL, paths.contains(u.path) { sourceURL = nil }
+        if let u = refURL, paths.contains(u.path) { refURL = nil }
+        if let u = outputURL, paths.contains(u.path) { outputURL = nil }
+        if let u = rawTTSURL, paths.contains(u.path) { rawTTSURL = nil }
     }
 
     // MARK: - 模型状态
@@ -776,6 +937,7 @@ struct ContentView: View {
                     outputURL = output
                     rawTTSURL = raw
                     isReading = false
+                    history = FileHistory.scan()
                     readStatus = r.tts.line
                     readNote = String(format: "读完：%d 句合成 %.0f s → %d 片转换出 %.0f s，整趟墙钟 %.0f s（合成占 %.0f s）",
                                       r.tts.sentences, r.tts.seconds, r.passes, r.convertedSeconds,
@@ -787,6 +949,7 @@ struct ContentView: View {
                     isReading = false
                     readStatus = "失败：\(error.localizedDescription)"
                     readNote = "没读成，原因在上面那一行。"
+                    history = FileHistory.scan()
                     VoiceJournal.line("读小说失败：\(error.localizedDescription)")
                 }
             }
@@ -890,11 +1053,13 @@ struct ContentView: View {
                     outputURL = output
                     isConverting = false
                     convertStatus = "转换完成"
+                    history = FileHistory.scan()
                 }
             } catch {
                 await MainActor.run {
                     isConverting = false
                     convertStatus = "失败：\(error.localizedDescription)"
+                    history = FileHistory.scan()
                     VoiceJournal.line("转换失败：\(error.localizedDescription)")
                 }
             }
