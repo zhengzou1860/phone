@@ -104,8 +104,8 @@ final class TTSPump {
     private var frames = 0
 
     init(voice: AVSpeechSynthesisVoice?) {
+        // 语音挂在 utterance 上就行：AVSpeechSynthesizer 自己没有 voice 这个属性（CI 编译器报的）。
         self.voice = voice
-        synth.voice = voice
     }
 
     /// 念一句。回调一次都没来就抛错（A0 的判据就是这一条）。
@@ -129,10 +129,10 @@ final class TTSPump {
                 self.report.nativeRate = fmt.sampleRate
                 self.report.nativeChannels = Int(fmt.channelCount)
                 self.report.nativeCommon = String(describing: fmt.commonFormat)
-                self.report.nativeInterleaved = fmt.interleaved
+                self.report.nativeInterleaved = fmt.isInterleaved
             }
             let key = String(format: "%.0f/%d/%@/%d", fmt.sampleRate, Int(fmt.channelCount),
-                            String(describing: fmt.commonFormat), fmt.interleaved ? 1 : 0)
+                            String(describing: fmt.commonFormat), fmt.isInterleaved ? 1 : 0)
             if self.converter == nil || self.convInKey != key {
                 self.converter = AVAudioConverter(from: fmt, to: Self.out16K)
                 self.convInKey = key
@@ -193,7 +193,7 @@ final class TTSPump {
         let fmt = b.format
         let n = Int(b.frameLength)
         if abs(fmt.sampleRate - SystemTTS.sampleRate) < 1, fmt.channelCount == 1,
-           fmt.commonFormat == .pcmFormatFloat32, !fmt.interleaved,
+           fmt.commonFormat == .pcmFormatFloat32, !fmt.isInterleaved,
            let p = b.floatChannelData {
             return Array(UnsafeBufferPointer(start: p[0], count: n))
         }
