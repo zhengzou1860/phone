@@ -200,8 +200,10 @@ final class VoiceEngine {
                 }
             }
             pump.finish()
-            rawWriter.finish()
-            outWriter.finish()
+            // 先收输出那份：收尾现在能抛（seek 是 throws 的），他要听的文件先落定，
+            // 免得原声那步炸了把两个都留在「头里长度还是 0」的状态。
+            try outWriter.finish()
+            try rawWriter.finish()
 
             VoiceJournal.line(pump.report.line)
             VoiceJournal.line(String(format: "读小说完成：%d 片，转换后 %.2f s，整趟墙钟 %.1f s → %@（本片最大峰值 %.3f）",

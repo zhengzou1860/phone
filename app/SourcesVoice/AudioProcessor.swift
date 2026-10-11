@@ -197,13 +197,15 @@ enum AudioProcessor {
             frames += samples.count
         }
 
-        func finish() {
+        /// `seek(toOffset:)` 在 iOS 13.4 之后的 SDK 上是 throws 的（CI 就是这么炸的）。
+        /// 回填失败 ⇒ 头里两个长度字段还是 0 ⇒ 播放器读出来 0 秒，所以这个错要传出去，不能吞。
+        func finish() throws {
             guard let handle = handle else { return }
             self.handle = nil
             let bytes = UInt32(frames * 2)
-            handle.seek(toOffset: 4)
+            try handle.seek(toOffset: 4)
             handle.write(Self.u32(36 + bytes))
-            handle.seek(toOffset: 40)
+            try handle.seek(toOffset: 40)
             handle.write(Self.u32(bytes))
             handle.closeFile()
             VoiceJournal.line(String(format: "%@ 收尾：%.1f s 音频／%d 字节",
