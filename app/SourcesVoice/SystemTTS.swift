@@ -288,7 +288,7 @@ final class TTSPump: NSObject, AVSpeechSynthesizerDelegate {
     ///
     /// 这一格是为了把两件事分开——「语音引擎在 LiveContainer 里根本起不来」和
     /// 「只有 `write` 这条离线生成路不通」。前者 speak 也没有回调，后者 speak 正常。
-    /// 只报计数，不下结论：回调到了但他耳朵没听见是另一回事（会话/路由），那要他自己报。
+    /// 固定 `volume = 0` 静音跑，只回答引擎活不活；外放与否不归它管，别把诊断做成噪音。
     private func probeSpeaking(_ sentence: String) -> String {
         bump {
             self.spStart = 0
@@ -297,6 +297,10 @@ final class TTSPump: NSObject, AVSpeechSynthesizerDelegate {
         }
         let utt = AVSpeechUtterance(string: sentence)
         utt.voice = voice
+        // 必须静音：这条探针 0.1/20 是全音量跑的，他在手机上听到的
+        // 「只播了最后一句、还是系统原音」就是它，而不是任何转换结果。
+        utt.volume = 0
+        VoiceJournal.line("诊断：静音朗读一次（不外放），看引擎起不起得来")
         synth.speak(utt)
         let est = max(1.0, Double(sentence.count) / 4.1)
         let t0 = Date()
