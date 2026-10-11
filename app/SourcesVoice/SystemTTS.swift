@@ -63,8 +63,55 @@ enum SystemTTS {
         AVSpeechSynthesisVoice.speechVoices().filter { $0.language.hasPrefix("zh") }
     }
 
-    /// 优先 zh-CN，其次任何 zh，都没有就 nil（交给系统默认语音）。
-    static func pickVoice() -> AVSpeechSynthesisVoice? {
+    /// 界面上的一行嗓音。`gender` 是 iOS 13 就有的真 API（`.unspecified/.male/.female`），
+    /// 拿来把男声排前面——「音高太低太尖」这件事最终是他耳朵定的，这里只负责把候选摊开。
+    struct VoiceRow: Identifiable {
+        let identifier: String
+        let name: String
+        let language: String
+        let gender: String
+        let quality: String
+        var id: String { identifier }
+
+        /// 尾段：`com.apple.voice.compact.zh-CN.Tingting` → `zh-CN.Tingting`。
+        var tail: String {
+            let p = identifier.split(separator: ".", omittingEmptySubsequences: true)
+            return p.count >= 2 ? "\(p[p.count - 2]).\(p[p.count - 1])" : identifier
+        }
+
+        var label: String { "\(name)｜\(gender)｜\(quality)｜\(tail)" }
+    }
+
+    /// 这台机装了哪些中文语音，排好序给界面：zh-CN 在前，然后男声在前（要找「低一点」的先看这批）。
+    static func voiceRows() -> [VoiceRow] {
+        chineseVoices().map { v in
+            let g: String
+            switch v.gender {
+            case .male: g = "男"
+            case .female: g = "女"
+            @unknown default: g = "未标"
+            }
+            return VoiceRow(identifier: v.identifier, name: v.name, language: v.language,
+                            gender: g, quality: String(describing: v.quality))
+        }
+        .sorted { a, b in
+            let aCN = a.language.hasPrefix("zh-CN"), bCN = b.language.hasPrefix("zh-CN")
+            if aCN != bCN { return aCN }
+            let aM = a.gender == "男", bM = b.gender == "男"
+            if aM != bM { return aM }
+            if a.name != b.name { return a.name < b.name }
+            return a.identifier < b.identifier
+        }
+    }
+
+    /// 优先用户选中的 identifier，其次 zh-CN，再次任何 zh，都没有就 nil（交给系统默认语音）。
+    static func pickVoice(identifier: String? = nil) -> AVSpeechSynthesisVoice? {
+        if let id = identifier, !id.isEmpty {
+            // 这个 init 在有/无 Optional 两种 SDK 声明里都能编：接成可选就两头都不赌。
+            let chosen: AVSpeechSynthesisVoice? = AVSpeechSynthesisVoice(identifier: id)
+            if let chosen { return chosen }
+            VoiceJournal.line("存的语音 \(id) 在这台机上取不回来（可能被系统换掉了）⇒ 退回默认选法")
+        }
         let zh = chineseVoices()
         return zh.first { $0.language == "zh-CN" } ?? zh.first
     }
@@ -387,3 +434,31 @@ final class TTSPump: NSObject, AVSpeechSynthesizerDelegate {
         return Array(UnsafeBufferPointer(start: p, count: Int(dst.frameLength)))
     }
 }
+
+/// 「试听」：把选中的嗓音外放念一句，不跑链、不落盘。
+///
+/// 存在的理由：音高高低、温柔不温柔是他耳朵定的，而一整章要跑几十分钟 ⇒
+/// 挑嗓音必须能在几十秒内反复比，不能每换一个都点一次「读给我听」。
+/// `speak()` 那条外放路真机确认过（didStart 1／didFinish 1），所以这里不需要兜底。
+///
+/// 自带一个 `AVSpeechSynthesizer`，和 TTSPump 那个隔开：试听不许污染正式朗读的计数。
+final class Audition {
+    static let shared = Audition()
+    static let sampleLine = "他慢慢转过身去，窗外那条巷子还亮着最后一点灯。"
+
+    private let synth = AVSpeechSynthesizer()
+
+    func play(identifier: String?) {
+        let voice = SystemTTS.pickVoice(identifier: identifier)
+        synth.stopSpeaking(at: .immediate)
+        let utt = AVSpeechUtterance(string: Self.sampleLine)
+        utt.voice = voice
+        VoiceJournal.line("试听：\(voice?.identifier ?? "系统默认语音")")
+        synth.speak(utt)
+    }
+
+    func stop() {
+        synth.stopSpeaking(at: .immediate)
+    }
+}
+

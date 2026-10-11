@@ -110,6 +110,75 @@ enum AudioProcessor {
         try file.write(from: buf)
     }
 
+    /// 流式写 16 kHz 单声道 **int16** WAV：一片进来落一片，整章不在内存里攒。
+    ///
+    /// 替掉 `saveWAV` 那条路的理由有两条，都是读小说逼出来的：
+    /// ① 原来原声＋转换后两条 float 数组要揣到读完（30 分钟 = 2×115 MB），所以开跑前
+    ///    有一道 30 分钟的内存闸门；流式之后常驻只有当前一片（≤120 s ≈ 7.7 MB）。
+    /// ② 守卫原来在整章末尾按**全章**长峰乘一个线性增益 ⇒ 某一片过冲会把整章一起压小。
+    ///    这里改成每片自己算峰值、自己压回，片与片之间互不牵连。
+    /// int16 顺带把磁盘也省一半（32 KB/秒，30 分钟 58 MB）。
+    static let writerRate: Double = 16000
+
+    final class WAVWriter {
+        private let url: URL
+        private let format: AVAudioFormat
+        /// 关掉才落最终的头（长度字段由 ExtAudioFile 在关闭时补），所以 finish() 必须调到。
+        private var file: AVAudioFile?
+        private(set) var frames = 0
+        /// 各片里最大的那个原始峰值，只进日志，不参与增益计算。
+        private(set) var maxPeak: Float = 0
+
+        init(url: URL) throws {
+            guard let format = AVAudioFormat(commonFormat: .pcmFormatInt16,
+                                             sampleRate: AudioProcessor.writerRate,
+                                             channels: 1,
+                                             interleaved: true) else {
+                throw AudioProcessor.fail("写盘格式建不出来（int16）")
+            }
+            self.url = url
+            self.format = format
+            self.file = try AVAudioFile(forWriting: url, settings: format.settings)
+        }
+
+        /// 落一片。峰值过满刻度就按**这片自己**的长峰压回，不动别的片。
+        func append(_ samples: [Float]) throws {
+            guard let file = file else { throw AudioProcessor.fail("WAVWriter 已经收尾了，不能再写") }
+            guard !samples.isEmpty else { return }
+            var peak: Float = 0
+            for v in samples {
+                let a = abs(v)
+                if a > peak { peak = a }
+            }
+            if peak > maxPeak { maxPeak = peak }
+            let gain: Float = peak > 1.0 ? 0.999 / peak : 1.0
+            if gain < 1.0 {
+                VoiceJournal.line(String(format: "%@：本片峰值 %.4f 越过满刻度 ⇒ 乘 %.4f 压回",
+                                         url.lastPathComponent, peak, gain))
+            }
+            guard let buf = AVAudioPCMBuffer(pcmFormat: format,
+                                             frameCapacity: AVAudioFrameCount(samples.count)) else {
+                throw AudioProcessor.fail("写盘 buffer 分配失败（\(samples.count) 帧）")
+            }
+            buf.frameLength = AVAudioFrameCount(samples.count)
+            guard let dst = buf.int16ChannelData?[0] else {
+                throw AudioProcessor.fail("拿不到 int16ChannelData")
+            }
+            for i in 0..<samples.count {
+                var v = samples[i] * gain
+                if v > 1.0 { v = 1.0 } else if v < -1.0 { v = -1.0 }
+                dst[i] = Int16(v * 32767.0)
+            }
+            try file.write(from: buf)
+            frames += samples.count
+        }
+
+        func finish() {
+            // 断掉引用就是关掉文件：头里的长度字段在这一步补上。
+            file = nil
+        }
+    }
+
     /// kaldi 那一侧的定标：训练时 fbank 吃的是乘过 1<<15 的整数域样本
     static func scaled(_ norm: [Float]) -> [Float] {
         norm.map { $0 * 32768.0 }
@@ -118,7 +187,8 @@ enum AudioProcessor {
     /// librosa 的 mel 基（80×513 行主序）。训练侧前端的常量，随包发数据、不在 Swift 里重抄公式。
     static func melBasis() -> [Float]? { MelFrontEnd.loadFloats("librosa_mel_basis") }
 
-    private static func fail(_ text: String) -> NSError {
+    /// 给 `WAVWriter` 也用，所以不写 private（嵌套类型拿外层 private 是编译一轮才见分晓的那种坑）。
+    static func fail(_ text: String) -> NSError {
         VoiceJournal.line("AudioProcessor: \(text)")
         return NSError(domain: "AudioProcessor", code: -1,
                        userInfo: [NSLocalizedDescriptionKey: text])

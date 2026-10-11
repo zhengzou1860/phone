@@ -4,9 +4,12 @@ import UIKit
 import UniformTypeIdentifiers
 
 /// 哪个槽在选文件。共用一个呈现，源槽和参考槽不再各挂一个 fileImporter。
+/// `text` 也走这一个呈现：读小说选的是 .txt/.md，不是音频，但呈现器只管把文件拿进来，
+/// 能不能用由我们自己验（见 `TextFile.load`）。
 enum PickSlot: String, Identifiable {
     case source
     case ref
+    case text
     var id: String { rawValue }
 }
 
@@ -45,6 +48,14 @@ struct ContentView: View {
 
     // 读小说：文本 → 系统 TTS → 现有样本那条链（②③④）。音色仍然来自上面选中的样本。
     @State private var novelText = ""
+    /// 「文件模式」：选了 txt 就用这份全文，界面不再把它塞进编辑器（几十万字塞进去滚动会卡）。
+    @State private var novelFileURL: URL?
+    @State private var novelFileText = ""
+    @State private var novelFileEnc = ""
+    /// 选中的嗓音。空 = 没选过，交给 `SystemTTS.pickVoice` 的老判据（第一个 zh-CN）。
+    /// 存在 UserDefaults 里：重开 app 不用重挑，也不必每章都试听一遍。
+    @State private var voiceID = UserDefaults.standard.string(forKey: "novelVoiceID") ?? ""
+    @State private var voiceRows: [SystemTTS.VoiceRow] = []
     @State private var isReading = false
     @State private var readStatus = ""
     @State private var readNote = ""
@@ -78,22 +89,42 @@ struct ContentView: View {
             .onAppear {
                 VoiceJournal.line("ContentView.onAppear")
                 samples = SampleStore.list()
+                voiceRows = SystemTTS.voiceRows()
+                logVoiceRows()
                 models.check()
             }
         }
-        // 一个呈现给两个槽。fileImporter 换成自己包的 picker：
+        // 一个呈现给三个槽。fileImporter 换成自己包的 picker：
         // 同视图挂两个 fileImporter 只有一个生效（① 点了没反应），且 [.audio,…] 的
         // 类型过滤在这环境下把列表全刷灰（② 进了目录选不了文件）。
         .fullScreenCover(item: $pickSlot) { slot in
             DocumentPickerHost(onPick: { url in
-                let got = copyIn(url)
-                if slot == .source { sourceURL = got } else { refURL = got }
+                if slot == .text {
+                    loadNovelFile(url)
+                } else {
+                    let got = copyIn(url)
+                    if slot == .source { sourceURL = got } else { refURL = got }
+                }
             }, onCancel: { msg in
                 pickNote = "没选成：" + msg
                 VoiceJournal.line("选文件取消（槽=\(slot.rawValue)）：\(msg)")
             }, onDismiss: {
                 pickSlot = nil
             })
+        }
+    }
+
+    /// 把这台机装的中文语音整份报回电脑：男/女/未标各几个 + 每一行的 label。
+    /// 「哪个嗓音低、哪个温柔」最终是他耳朵定的，但候选名单和 identifier 得先看得见。
+    private func logVoiceRows() {
+        let males = voiceRows.filter { $0.gender == "男" }.count
+        let females = voiceRows.filter { $0.gender == "女" }.count
+        VoiceJournal.line("本机中文 voice \(voiceRows.count) 个（男 \(males)／女 \(females)／未标 \(voiceRows.count - males - females)）")
+        var i = 0
+        while i < voiceRows.count {
+            let chunk = voiceRows[i..<min(i + 6, voiceRows.count)].map { $0.label }.joined(separator: " ;; ")
+            VoiceJournal.line("嗓音 [\(i + 1)…] \(chunk)")
+            i += 6
         }
     }
 
@@ -433,19 +464,24 @@ struct ContentView: View {
         VStack(alignment: .leading, spacing: 10) {
             Text("读小说（文本 → 系统朗读 → 上面那个样本的音色）").font(.headline)
 
-            TextEditor(text: $novelText)
-                .font(.body)
-                .frame(height: 170)
-                .padding(6)
-                .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.gray.opacity(0.35)))
-                .disabled(isReading)
+            voiceRow
+
+            textSource
 
             HStack(spacing: 12) {
+                Button("选文件") {
+                    VoiceJournal.line("点「选文件」槽=text")
+                    pickSlot = .text
+                }
+                .buttonStyle(.bordered)
+                .disabled(isReading)
+
                 Button("粘贴") {
                     let s = UIPasteboard.general.string ?? ""
                     if s.isEmpty {
                         readNote = "剪贴板里没有文字"
                     } else {
+                        novelFileURL = nil        // 粘进来就退回手打模式：两种来源不许混着读
                         novelText = s
                         readNote = "粘进来 \(s.count) 字"
                         VoiceJournal.line("粘进文本 \(s.count) 字")
@@ -454,21 +490,25 @@ struct ContentView: View {
                 .buttonStyle(.bordered)
                 .disabled(isReading)
 
-                Button("清空") { novelText = ""; readNote = ""; VoiceJournal.line("清空朗读文本") }
-                    .buttonStyle(.bordered)
-                    .disabled(isReading || novelText.isEmpty)
+                Button("清空") {
+                    novelText = ""; novelFileURL = nil; novelFileText = ""
+                    readNote = ""
+                    VoiceJournal.line("清空朗读文本")
+                }
+                .buttonStyle(.bordered)
+                .disabled(isReading || novelChars == 0)
 
                 Button(isReading ? "读着…" : "读给我听") { startReading() }
                     .buttonStyle(.borderedProminent)
-                    .disabled(isReading || novelText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    .disabled(isReading || novelChars == 0
                               || isConverting || srcRec.isRecording || refRec.isRecording)
                 Spacer()
-                Text("\(novelText.count) 字")
+                Text(estimateLine)
                     .font(.caption)
                     .foregroundColor(.secondary)
             }
 
-            Text("音色就用在「样本清单」里点中的那个样本（现在：\(pickedSampleNote)）；没点样本就用 ② 那段参考。0 MB 新模型，走的是手机自带的中文语音。实测：系统念中文 ≈4.1 字/秒，链子 ≈2.7× 实时 ⇒ 6000 字一章约 25 分钟音频、转换约 5 分钟。原声和转换后的都落盘，下面能对着听。上限 30 分钟音频（两段波形要同时在内存里），超了会一行话告诉你，不闪退。")
+            Text("音色就用在「样本清单」里点中的那个样本（现在：\(pickedSampleNote)）；没点样本就用 ② 那段参考。嗓音是从手机自带的中文语音里挑，「试听」只外放念一句、不跑链（挑嗓音几十秒就够，别拿整章去试）。实测：系统念中文 ≈4.1 字/秒（≈5.5× 实时），链子 ≈2.5× 实时 ⇒ 6000 字一章约 25 分钟音频、整趟约 12 分钟。念满 120 秒就整片过链子、**转完立刻写盘**，常驻内存只有那一片，所以整章多长都不会撑；上限不再是 30 分钟而变成这台机剩下的盘（两条 wav 每秒共占 64 KB，另留 1 GB 余量），不够会一行话告诉你，不闪退。")
                 .font(.caption)
                 .foregroundColor(.secondary)
 
@@ -500,6 +540,103 @@ struct ContentView: View {
         }
     }
 
+    /// 嗓音一行：这台机装的中文语音全摊开（zh-CN 在前、男声在前——「要低一点」的先从这批找），
+    /// 右边「试听」只外放念一句样本行，不跑链、不落盘、几十秒能比完一批。
+    @ViewBuilder
+    private var voiceRow: some View {
+        HStack(spacing: 10) {
+            Picker("朗读嗓音", selection: $voiceID) {
+                Text("默认（第一个 zh-CN）").tag("")
+                ForEach(voiceRows) { r in
+                    Text(r.label).tag(r.identifier)
+                }
+            }
+            .pickerStyle(.navigationLink)
+            .disabled(isReading)
+            .onChange(of: voiceID) { v in
+                UserDefaults.standard.set(v, forKey: "novelVoiceID")
+                VoiceJournal.line("选嗓音：\(v.isEmpty ? "默认" : v)")
+            }
+
+            Button("试听") {
+                Audition.shared.play(identifier: voiceID.isEmpty ? nil : voiceID)
+            }
+            .buttonStyle(.bordered)
+            .disabled(isReading || isConverting)
+        }
+    }
+
+    /// 文本来源：选了文件就显示那张卡——几十万字塞进 TextEditor 会把界面滚出卡顿，
+    /// 而且文件模式本来就是「整篇读、不改字」，给个编辑器反而误导。手打/粘贴照旧走编辑器。
+    @ViewBuilder
+    private var textSource: some View {
+        if let f = novelFileURL {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("文件：\(f.lastPathComponent)／\(novelFileText.count) 字／编码 \(novelFileEnc)")
+                    .font(.subheadline)
+                Text("开头：" + String(novelFileText.prefix(60).replacingOccurrences(of: "\n", with: " ")))
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                Button("改用手动输入") {
+                    novelFileURL = nil; novelFileText = ""
+                    VoiceJournal.line("退出文件模式，回到手打")
+                }
+                .buttonStyle(.bordered)
+                .disabled(isReading)
+            }
+            .padding(10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.accentColor.opacity(0.5)))
+        } else {
+            TextEditor(text: $novelText)
+                .font(.body)
+                .frame(height: 170)
+                .padding(6)
+                .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.gray.opacity(0.35)))
+                .disabled(isReading)
+        }
+    }
+
+    private var novelChars: Int {
+        novelFileURL != nil ? novelFileText.count
+                            : novelText.trimmingCharacters(in: .whitespacesAndNewlines).count
+    }
+
+    /// 开跑前就把账摊在界面上：字数 → 音频分钟 → 整趟分钟。
+    /// 三个系数全是真机量的（念字 4.1 字/秒、合成 5.5× 实时、整链 2.5× 实时），不是估的。
+    private var estimateLine: String {
+        let n = novelChars
+        let secs = Double(n) / 4.1
+        let wall = secs * (1.0 / 5.5 + 1.0 / 2.5)
+        return String(format: "%d 字 ≈ %.0f 分钟音频 ≈ %.0f 分钟整趟", n, secs / 60, wall / 60)
+    }
+
+    /// 选完就地解出来验一遍：读不出字就当场说，别等点「读给我听」才发现选错了文件。
+    /// 编码是 `TextFile` 自己试出来的（UTF-8/UTF-16/GB18030/Big5），报回来是为了「字看着不对」
+    /// 这种投诉能立刻分清是解错了还是本来就错。
+    private func loadNovelFile(_ url: URL) {
+        do {
+            let got = try TextFile.load(url)
+            let text = got.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else {
+                readNote = "\(url.lastPathComponent) 读出来是空的（按 \(got.encoding) 解的）"
+                VoiceJournal.line("选文本文件 \(url.lastPathComponent) ⇒ 空（\(got.encoding)）")
+                return
+            }
+            novelFileText = text
+            novelFileEnc = got.encoding
+            novelFileURL = url
+            novelText = ""
+            readNote = "读了 \(text.count) 字（\(got.encoding)）"
+            VoiceJournal.line(String(format: "选文本文件 %@ → %d 字／编码 %@／开头「%@」",
+                                     url.lastPathComponent, text.count, got.encoding,
+                                     String(text.prefix(24))))
+        } catch {
+            readNote = "这个文件读不出来：\(error.localizedDescription)"
+            VoiceJournal.line("选文本文件失败 \(url.lastPathComponent)：\(error.localizedDescription)")
+        }
+    }
+
     private var pickedSampleNote: String {
         if let p = samples.first(where: { $0.id == pickedID }) { return "样本「\(p.info.name)」" }
         if refURL != nil { return "② 那段参考" }
@@ -508,7 +645,8 @@ struct ContentView: View {
 
     private func startReading() {
         guard let modelDir = models.modelDir else { return }
-        let text = novelText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let fromFile = novelFileURL != nil
+        let text = fromFile ? novelFileText : novelText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
         let picked = samples.first { $0.id == pickedID }
         guard picked != nil || refURL != nil else {
@@ -521,9 +659,12 @@ struct ContentView: View {
         readNote = ""
         outputURL = nil
         rawTTSURL = nil
-        VoiceJournal.line(String(format: "点「读给我听」%d 字 音色=%@ 音高 %+.0f 半音",
-                                 text.count, picked != nil ? "样本「\(picked!.info.name)」" : "现场参考",
-                                 semitones))
+        VoiceJournal.line(String(format: "点「读给我听」%d 字（%@）音色=%@ 音高 %+.0f 半音 嗓音=%@",
+                                 text.count,
+                                 fromFile ? "文件 \(novelFileURL!.lastPathComponent)/\(novelFileEnc)" : "手打",
+                                 picked != nil ? "样本「\(picked!.info.name)」" : "现场参考",
+                                 semitones,
+                                 voiceID.isEmpty ? "默认" : voiceID))
         if engine == nil { engine = VoiceEngine(modelDir: modelDir) }
         let eng = engine!
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
@@ -540,6 +681,7 @@ struct ContentView: View {
                                                outputWav: output,
                                                rawTTSWav: raw,
                                                pitchCents: semitones * 100.0,
+                                               voiceID: voiceID.isEmpty ? nil : voiceID,
                                                onStage: { txt in
                     DispatchQueue.main.async { readStatus = txt }
                 })

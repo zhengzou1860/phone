@@ -96,33 +96,52 @@ final class VoiceEngine {
     /// 一片进链的时长。按片而不是按句的理由写在下面那条注释里。
     static let novelPassSeconds: Double = 120
 
-    /// 原声和转换后两条 16 kHz float 数组要一起揣在兜里的上限：1800 s 音频 = 2×115 MB。
-    /// 超线在开跑之前就拒（拿实测的 4.1 字/秒估），别等顶到前台水位线被系统杀掉。
-    static let maxNovelSeconds: Double = 1800
+    /// 原声＋转换后两条 16 kHz int16 单声道，每秒音频占 32000×2 字节 ⇒ 两条 64 KB/秒。
+    static let novelBytesPerSecond: Double = 64_000
 
-    /// 文本 → 分句系统朗读 → 按片过 ②③④ → 拼成一个 wav（播放器只吃一个文件）。
+    /// 上限这一格从「内存」换成了「磁盘」：流式落盘之后常驻只有当前一片（≤120 s ≈ 8 MB），
+    /// 但写到一半把盘填满会更难看（半个 wav，播不了还占着）。所以开跑前照可用空间算，
+    /// 留 1 GB 余量，超线照样在开跑之前一行话拒掉。
+    static func novelSecondsCap(dir: URL) -> Double {
+        let free = (try? dir.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]))?
+            .volumeAvailableCapacityForImportantUsage ?? 0
+        let room = max(0.0, Double(free) - 1_000_000_000.0)
+        return room / novelBytesPerSecond
+    }
+
+    /// 文本 → 分句系统朗读 → 按片过 ②③④ → **每片直接落盘**，最后是一个 wav（播放器只吃一个文件）。
     ///
     /// 为什么按片：ChainDriver 每段跑完就把图关掉（编码器三张 + DiT 七张 + vocos 一张
     /// ≈343 MB 的载入）。按句转换 = 每句重开一遍图，300 句就是 300 次。按片切只落在句读上
     /// ⇒ 编码器缓存清零正好赶上停顿，听不见接缝；图和样本条件整趟只载一次。
+    ///
+    /// 为什么落盘也按片：整章的原声和转换后都不在内存里攒了（见 `AudioProcessor.WAVWriter`），
+    /// 峰值守卫跟着变成**每片**一个——一片过冲不再把整章一起压小。
     ///
     /// 音色来源和 `convert` 一样：样本优先，没样本就用现场参考；两者都空直接报错
     /// （文本没有"自转换"这一说——源是合成声，转给自己听没意义）。
     /// rawTTSWav: 系统原声也存一份，好和转换后的对着听。
     func readNovel(text: String, sample: SampleStore.Sample?, refWav: URL?,
                    outputWav: URL, rawTTSWav: URL, pitchCents: Double = 0.0,
+                   voiceID: String? = nil,
                    onStage: @escaping (String) -> Void = { VoiceJournal.line($0) }) async throws -> NovelResult {
         let dir = modelDir
         return try await Task.detached(priority: .userInitiated) {
             let sents = SystemTTS.sentences(from: text)
             guard !sents.isEmpty else { throw ChainError.input("文本切完是空的（全是空白？）") }
             let est = Double(text.count) / 4.1          // PC 实测：系统 TTS 念中文 ≈4.1 字/秒
-            guard est <= VoiceEngine.maxNovelSeconds else {
-                throw ChainError.input(String(format: "%d 字 ≈ %.0f 分钟音频，超 %.0f 分钟的上限"
-                                                + "（原声＋转换后两条波形都要同时在内存里）⇒ 请分章",
-                                              text.count, est / 60, VoiceEngine.maxNovelSeconds / 60))
+            let cap = VoiceEngine.novelSecondsCap(dir: outputWav.deletingLastPathComponent())
+            guard est <= cap else {
+                throw ChainError.input(String(format: "%d 字 ≈ %.0f 分钟音频，这台机剩下的盘只够 %.0f 分钟"
+                                                + "（两条 wav 每秒共占 64 KB，另留 1 GB 余量）⇒ 请按章分开读",
+                                              text.count, est / 60, cap / 60))
             }
-            let voice = SystemTTS.pickVoice()
+            // 实测两个倍率：合成 ≈5.5× 实时、整链 ≈2.5× 实时 ⇒ 墙钟约 = 音频秒×(1/5.5+1/2.5)
+            let estWall = est * (1.0 / 5.5 + 1.0 / 2.5)
+            VoiceJournal.line(String(format: "读小说预算：%d 字 ≈ %.1f 分钟音频 ≈ 盘上 %.1f MB ≈ 墙钟 %.0f 分钟（盘剩 %.0f 分钟额度）",
+                                     text.count, est / 60, est * VoiceEngine.novelBytesPerSecond / 1e6,
+                                     estWall / 60, cap / 60))
+            let voice = SystemTTS.pickVoice(identifier: voiceID)
             let how = voice.map { "语音 \($0.identifier)（\($0.language)）" } ?? "系统默认语音"
             VoiceJournal.line("读小说开跑：\(text.count) 字 → \(sents.count) 句／\(how)／装了的中文 voice \(SystemTTS.chineseVoices().count) 个／会话 \(SystemTTS.sessionLine())")
             onStage("TTS 探针：\(how)")
@@ -145,10 +164,11 @@ final class VoiceEngine {
             }
 
             let pump = TTSPump(voice: voice)
-            var rawAll: [Float] = []
-            var convAll: [Float] = []
+            let rawWriter = try AudioProcessor.WAVWriter(url: rawTTSWav)
+            let outWriter = try AudioProcessor.WAVWriter(url: outputWav)
             var pending: [Float] = []
             var passes = 0
+            var outSamples = 0
             let t0 = Date()
             for (i, s) in sents.enumerated() {
                 pending.append(contentsOf: try pump.speak(s))
@@ -160,24 +180,36 @@ final class VoiceEngine {
                                              passes, i + 1, sents.count, inSec, pump.report.seconds))
                     onStage(String(format: "第 %d 片进链（%.0f s 音频，累计 %d/%d 句）",
                                    passes, inSec, i + 1, sents.count))
-                    convAll.append(contentsOf: try driver.convert(source: pending, sample: parts))
-                    rawAll.append(contentsOf: pending)
+                    // 一片走完「转换 → 移调 → 落盘」就全部丢掉，下一片重新分配：
+                    // 常驻内存因此只有这一片，和整章多长无关。
+                    let shaped = PostProcessor.pitchShift(
+                        try driver.convert(source: pending, sample: parts), cents: pitchCents)
+                    try outWriter.append(shaped)
+                    try rawWriter.append(pending)
+                    outSamples += shaped.count
+                    let done = Double(outSamples) / SystemTTS.sampleRate
+                    VoiceJournal.line(String(format: "第 %d 片落盘：累计输出 %.1f s／两个文件共 %.1f MB（墙钟 %.0f s）",
+                                             passes, done,
+                                             done * VoiceEngine.novelBytesPerSecond / 1e6,
+                                             Date().timeIntervalSince(t0)))
+                    onStage(String(format: "第 %d 片已落盘：累计 %.0f s 音频（%.1f MB）",
+                                   passes, done, done * VoiceEngine.novelBytesPerSecond / 1e6))
                     pending.removeAll(keepingCapacity: true)
                 } else if i % 10 == 9 {
                     onStage(String(format: "念到第 %d/%d 句，累计 %.0f s 音频", i + 1, sents.count, pump.report.seconds))
                 }
             }
             pump.finish()
+            rawWriter.finish()
+            outWriter.finish()
 
-            let shaped = PostProcessor.pitchShift(convAll, cents: pitchCents)
-            try AudioProcessor.saveWAV(rawAll, to: rawTTSWav)
-            try AudioProcessor.saveWAV(shaped, to: outputWav)
             VoiceJournal.line(pump.report.line)
-            VoiceJournal.line(String(format: "读小说完成：%d 片，转换后 %.2f s，整趟墙钟 %.1f s → %@",
-                                     passes, Double(shaped.count) / SystemTTS.sampleRate,
-                                     Date().timeIntervalSince(t0), outputWav.lastPathComponent))
+            VoiceJournal.line(String(format: "读小说完成：%d 片，转换后 %.2f s，整趟墙钟 %.1f s → %@（本片最大峰值 %.3f）",
+                                     passes, Double(outSamples) / SystemTTS.sampleRate,
+                                     Date().timeIntervalSince(t0), outputWav.lastPathComponent,
+                                     outWriter.maxPeak))
             return NovelResult(tts: pump.report, passes: passes,
-                               convertedSeconds: Double(shaped.count) / SystemTTS.sampleRate,
+                               convertedSeconds: Double(outSamples) / SystemTTS.sampleRate,
                                rawURL: rawTTSWav)
         }.value
     }
