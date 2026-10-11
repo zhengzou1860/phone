@@ -53,6 +53,15 @@ final class ChainDriver {
     static let kvKeep = 100          // off>40 之后 kv 缓存只留最后这么多个时间步
     static let kvTrimAfter = 40
     static let promptFrames = 150    // DiT 的 prompts 输入钉死 150 帧
+    /// ② 一遍（= 一次从头开始的流式编码）能吃下的最多 fbank 帧。
+    ///
+    /// 墙在图里，不在代码里：`enc.embed.pos_enc.pe` 这张绝对位置表只有 **5000 行**，
+    /// 每窗切 `pe[offset-10 : offset+5]` 共 15 行给 self_attn 加。offset 每窗 +5，
+    /// 所以合法的最大 offset = 4995 ⇒ **1000 窗**，每窗推进 20 帧 ⇒ 20000 帧 fbank = 200 s。
+    /// 本机在同一份待发布 fp16 图上扫出来：a_first/b_second/c_steady 三张全部
+    /// offset 4995 过、4996 炸；手机上那条 `10 by 15` 正是 offset 5000（5010−5000=10 行）那一格。
+    /// ③ 的 rope 不受这个罪（offset 喂到 40000 照样过），所以这条上限只属于 ②。
+    static let encMaxFbankFrames = 1000 * encStride
     static let vocosWindow = 173
     static let melHop = 160          // mel 帧 → 样本
     static let noiseSeed: UInt64 = 7
@@ -116,12 +125,9 @@ final class ChainDriver {
                            prompts: Array(pm.prefix(Self.promptFrames * MelFrontEnd.nMels)))
     }
 
-    /// source / reference 都是 16 kHz 单声道 [-1,1]。返回同口径的转换结果。
-    func convert(source: [Float], reference: [Float]) throws -> [Float] {
-        return try convert(source: source, sample: try makeSample(reference: reference))
-    }
-
     /// 吃样本的那条：跳过 ①，直接 ②③④。
+    /// 一条长音频要按片调用它多次（见 `VoiceEngine.convPassSeconds`），所以音色条件 `SampleParts`
+    /// 由调用方算一次带着走 —— ① 那 386 MB 的 sv 图不该每片重载一遍。
     func convert(source: [Float], sample: SampleParts) throws -> [Float] {
         let t0 = Date()
         guard sample.prompts.count == Self.promptFrames * MelFrontEnd.nMels else {
@@ -171,6 +177,15 @@ final class ChainDriver {
     func encode(fbank: [Float], frames: Int) throws -> ChainRows {
         let nM = MelFrontEnd.nMels
         let t0 = Date()
+        // 兜底闸门：调用方（VoiceEngine）负责分段，真超线时要一行话说得清，
+        // 不能留给 ORT 那句 `10 by 15` 让人猜。
+        guard frames <= Self.encMaxFbankFrames else {
+            let fps = Double(AudioProcessor.sampleRate) / Double(MelFrontEnd.kaldiShift)
+            throw ChainError.input(String(format: "② 一遍最多 %d 帧 fbank（%.0f s 音频，位置表只有 5000 行），这一片要 %d 帧 ≈ %.0f s",
+                                           Self.encMaxFbankFrames,
+                                           Double(Self.encMaxFbankFrames) / fps,
+                                           frames, Double(frames) / fps))
+        }
         onStage("② 内容编码：\(frames) 帧 fbank")
         let gFirst = try graph(Self.fileEncFirst)
         let gSecond = try graph(Self.fileEncSecond)

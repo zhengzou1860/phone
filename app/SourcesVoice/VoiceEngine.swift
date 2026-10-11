@@ -17,6 +17,43 @@ final class VoiceEngine {
         self.modelDir = modelDir
     }
 
+    /// 一条源音频进链的最长片。硬顶是 200 s（`ChainDriver.encMaxFbankFrames`），
+    /// 这里取 150 s：留 25% 余量，而且 122 s 那一跑的真机足迹（峰 280 MB／驻留 458 MB）
+    /// 正好是这一档已知的实测样本——片长不超过它，内存这一格就不引入新变量。
+    static let convPassSeconds: Double = 150
+
+    /// 在硬切点前后各 ±15 s 里找最安静的 50 ms 下刀。
+    /// 每片都把编码器的 att/cnn 缓存清零，落在停顿上才听不见接缝（读小说按句切的同一个理由）。
+    /// 取法：按 50 ms 一格算采样平方的和（隔 8 个样本取一个，够稳也快），选最小那格的中点。
+    static func quietCut(_ src: [Float], target: Int, radiusSec: Double = 15) -> Int {
+        let radius = Int(radiusSec * AudioProcessor.sampleRate)
+        let lo = max(0, target - radius)
+        let hi = min(src.count, target + radius)
+        let grid = Int(0.05 * AudioProcessor.sampleRate)      // 50 ms
+        guard hi - lo >= grid else { return min(max(target, 1), src.count) }
+        var best = target
+        var bestSum = Double.greatestFiniteMagnitude
+        var p = lo
+        while p + grid <= hi {
+            var s = 0.0
+            var k = p
+            while k < p + grid {
+                let v = Double(src[k])
+                s += v * v
+                k += 8
+            }
+            if s < bestSum {
+                bestSum = s
+                best = p + grid / 2
+            }
+            p += grid
+        }
+        VoiceJournal.line(String(format: "切点：%.1f s 处找最安静的一格 ⇒ %.1f s（搜索 ±%.0f s）",
+                                 Double(target) / AudioProcessor.sampleRate,
+                                 Double(best) / AudioProcessor.sampleRate, radiusSec))
+        return best
+    }
+
     /// 把一段音频炼成样本存进清单。① 那一次载入是真成本（实测 4.1 s / 峰值足迹 726 MB），
     /// 所以每条参考只做一次，之后反复用。
     ///
@@ -58,28 +95,60 @@ final class VoiceEngine {
                 VoiceJournal.line(text)
                 onStage(text)
             }
-            let wav: [Float]
+            let parts: ChainDriver.SampleParts
             if let s = sample {
-                let parts = try SampleStore.load(s)
+                parts = try SampleStore.load(s)
                 onStage("用样本：跳过 ①，不载 sv 图")
-                wav = try driver.convert(source: source, sample: parts)
             } else if let r = refWav {
                 let reference = try AudioProcessor.loadWAV16K(r, maxSeconds: ChainDriver.svMaxSecs)
                 onStage("读数完成：参考 \(reference.count) 样本")
-                wav = try driver.convert(source: source, reference: reference)
+                parts = try driver.makeSample(reference: reference)
             } else {
                 throw ChainError.input("参考没准备起来")
             }
-            let shaped = PostProcessor.pitchShift(wav, cents: pitchCents)
+
+            // 为什么要分段：② 的绝对位置表只有 5000 行 ⇒ 一遍最多 200 s（ChainDriver.encMaxFbankFrames）。
+            // 那条 8 分钟素材不是内存不够、也不是闪退，就是走到第 1000 窗撞了这面墙。
+            // 切法和读小说一致：每片各跑一遍「②③④ → 移调 → 落盘」，缓存只在切点清零 ⇒ 刀要落在停顿上。
+            let totalSec = Double(source.count) / AudioProcessor.sampleRate
+            let passSamples = Int(VoiceEngine.convPassSeconds * AudioProcessor.sampleRate)
+            VoiceJournal.line(String(format: "转换预算：源 %.1f s ⇒ %d 片（每片 ≤%.0f s）",
+                                     totalSec, (source.count + passSamples - 1) / passSamples,
+                                     VoiceEngine.convPassSeconds))
+            let writer = try AudioProcessor.WAVWriter(url: outputWav)
             if abs(pitchCents) > 1e-6 {
-                VoiceJournal.line(String(format: "后处理 音高 %+.0f 音分：%.2f s → %.2f s",
-                                         pitchCents,
-                                         Double(wav.count) / AudioProcessor.sampleRate,
-                                         Double(shaped.count) / AudioProcessor.sampleRate))
-                onStage(String(format: "音高已移 %+.0f 音分", pitchCents))
+                VoiceJournal.line(String(format: "后处理 音高 %+.0f 音分：每片各自移", pitchCents))
             }
-            try AudioProcessor.saveWAV(shaped, to: outputWav)
-            VoiceJournal.line("已写出 \(shaped.count) 样本 → \(outputWav.lastPathComponent)")
+            var start = 0
+            var passes = 0
+            var outSamples = 0
+            let t0 = Date()
+            while start < source.count {
+                let hardEnd = min(start + passSamples, source.count)
+                let end = hardEnd < source.count ? VoiceEngine.quietCut(source, target: hardEnd)
+                                                 : hardEnd
+                let chunk = Array(source[start..<end])
+                passes += 1
+                VoiceJournal.line(String(format: "转换第 %d 片：源 %.1f~%.1f s（进链 %.1f s／整条 %.1f s）",
+                                         passes, Double(start) / AudioProcessor.sampleRate,
+                                         Double(end) / AudioProcessor.sampleRate,
+                                         Double(chunk.count) / AudioProcessor.sampleRate, totalSec))
+                onStage(String(format: "第 %d 片进链（%.0f s 音频，整条 %.0f s）",
+                               passes, Double(chunk.count) / AudioProcessor.sampleRate, totalSec))
+                let shaped = PostProcessor.pitchShift(try driver.convert(source: chunk, sample: parts),
+                                                      cents: pitchCents)
+                try writer.append(shaped)
+                outSamples += shaped.count
+                start = end
+                onStage(String(format: "第 %d 片已落盘：累计 %.0f s（墙钟 %.0f s）",
+                               passes, Double(outSamples) / AudioProcessor.sampleRate,
+                               Date().timeIntervalSince(t0)))
+            }
+            try writer.finish()
+            VoiceJournal.line(String(format: "转换完成：%d 片 → 输出 %.2f s／墙钟 %.1f s／%@（单片峰值最高 %.3f）",
+                                     passes, Double(outSamples) / AudioProcessor.sampleRate,
+                                     Date().timeIntervalSince(t0), outputWav.lastPathComponent,
+                                     writer.maxPeak))
         }.value
     }
 
