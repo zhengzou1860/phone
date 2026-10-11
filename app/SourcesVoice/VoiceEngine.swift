@@ -124,7 +124,7 @@ final class VoiceEngine {
             }
             let voice = SystemTTS.pickVoice()
             let how = voice.map { "语音 \($0.identifier)（\($0.language)）" } ?? "系统默认语音"
-            VoiceJournal.line("读小说开跑：\(text.count) 字 → \(sents.count) 句／\(how)／装了的中文 voice \(SystemTTS.chineseVoices().count) 个")
+            VoiceJournal.line("读小说开跑：\(text.count) 字 → \(sents.count) 句／\(how)／装了的中文 voice \(SystemTTS.chineseVoices().count) 个／会话 \(SystemTTS.sessionLine())")
             onStage("TTS 探针：\(how)")
 
             let driver = try ChainDriver(modelDir: dir)
