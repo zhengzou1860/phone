@@ -2,6 +2,13 @@ import SwiftUI
 import AVFoundation
 import UniformTypeIdentifiers
 
+/// 哪个槽在选文件。共用一个呈现，源槽和参考槽不再各挂一个 fileImporter。
+enum PickSlot: String, Identifiable {
+    case source
+    case ref
+    var id: String { rawValue }
+}
+
 struct ContentView: View {
     @StateObject private var models = ModelManager()
     @StateObject private var srcRec = AudioEngine()
@@ -19,8 +26,7 @@ struct ContentView: View {
     // 两个音频槽：源（要转换的那段）和参考（目标音色）。各自要么录一段、要么从「文件」里选一个。
     @State private var sourceURL: URL?
     @State private var refURL: URL?
-    @State private var pickingSource = false
-    @State private var pickingRef = false
+    @State private var pickSlot: PickSlot?
     @State private var pickNote = ""
 
     // 样本清单
@@ -36,9 +42,6 @@ struct ContentView: View {
     @State private var semitones: Double = 0
     @State private var showShare = false
 
-    /// public.audio 是个大类，wav/m4a/mp3/aiff 全在里面；列出来只是让「文件」里默认看得见它们。
-    private let pickTypes: [UTType] = [.audio, .wav, .mpeg4Audio, .mp3, .aiff]
-
     var body: some View {
         NavigationView {
             ScrollView {
@@ -46,7 +49,7 @@ struct ContentView: View {
                     modelSection
                     if case .downloaded = models.state {
                         audioSlot("① 源音频（要转换的那段）", rec: srcRec,
-                                  url: $sourceURL, picking: $pickingSource)
+                                  url: $sourceURL, slot: .source)
                         refSlot
                         sampleList
                         paramSection
@@ -69,11 +72,19 @@ struct ContentView: View {
                 models.check()
             }
         }
-        .fileImporter(isPresented: $pickingSource, allowedContentTypes: pickTypes) { result in
-            sourceURL = handlePick(result)
-        }
-        .fileImporter(isPresented: $pickingRef, allowedContentTypes: pickTypes) { result in
-            refURL = handlePick(result)
+        // 一个呈现给两个槽。fileImporter 换成自己包的 picker：
+        // 同视图挂两个 fileImporter 只有一个生效（① 点了没反应），且 [.audio,…] 的
+        // 类型过滤在这环境下把列表全刷灰（② 进了目录选不了文件）。
+        .fullScreenCover(item: $pickSlot) { slot in
+            DocumentPickerHost(onPick: { url in
+                let got = copyIn(url)
+                if slot == .source { sourceURL = got } else { refURL = got }
+            }, onCancel: { msg in
+                pickNote = "没选成：" + msg
+                VoiceJournal.line("选文件取消（槽=\(slot.rawValue)）：\(msg)")
+            }, onDismiss: {
+                pickSlot = nil
+            })
         }
     }
 
@@ -83,7 +94,7 @@ struct ContentView: View {
     private var refSlot: some View {
         VStack(alignment: .leading, spacing: 10) {
             audioSlotBody("② 参考音频（目标音色；不选也不选样本就自转换）", rec: refRec,
-                          url: $refURL, picking: $pickingRef)
+                          url: $refURL, slot: .ref)
             HStack(spacing: 12) {
                 TextField("样本名字（留空＝按时间）", text: $sampleName)
                     .textFieldStyle(.roundedBorder)
@@ -179,15 +190,15 @@ struct ContentView: View {
 
     @ViewBuilder
     private func audioSlot(_ title: String, rec: AudioEngine,
-                           url: Binding<URL?>, picking: Binding<Bool>) -> some View {
+                           url: Binding<URL?>, slot: PickSlot) -> some View {
         VStack(alignment: .leading, spacing: 10) {
-            audioSlotBody(title, rec: rec, url: url, picking: picking)
+            audioSlotBody(title, rec: rec, url: url, slot: slot)
         }
     }
 
     @ViewBuilder
     private func audioSlotBody(_ title: String, rec: AudioEngine,
-                               url: Binding<URL?>, picking: Binding<Bool>) -> some View {
+                               url: Binding<URL?>, slot: PickSlot) -> some View {
         let anyRecording = srcRec.isRecording || refRec.isRecording
         VStack(alignment: .leading, spacing: 10) {
             Text(title).font(.headline)
@@ -205,7 +216,10 @@ struct ContentView: View {
                 .buttonStyle(.bordered)
                 .disabled(!rec.isRecording)
 
-                Button("选文件") { picking.wrappedValue = true }
+                Button("选文件") {
+                    VoiceJournal.line("点「选文件」槽=\(slot.rawValue)")
+                    pickSlot = slot
+                }
                     .buttonStyle(.bordered)
                     .disabled(isConverting)
             }
@@ -221,23 +235,9 @@ struct ContentView: View {
         }
     }
 
-    /// fileImporter（不带 allowsMultipleSelection 那一版）给的是单个 URL；
-    /// 那是安全作用域 URL，回调一返回就失效 ⇒ 当场拷进 Documents 再用。
-    /// 不拷的话就是手机上那一类「文件明明在，读的时候说不存在」。
-    private func handlePick(_ result: Result<URL, any Error>) -> URL? {
-        switch result {
-        case .failure(let err):
-            pickNote = "选文件失败：" + err.localizedDescription
-            VoiceJournal.line("选文件失败：\(err.localizedDescription)")
-            return nil
-        case .success(let url):
-            return copyIn(url)
-        }
-    }
-
+    /// asCopy:true 给的 URL 已经在沙盒临时区、当场可读，但那个区随时会被清 ⇒ 立刻拷进 Documents 固化。
+    /// 顺手就地开一次：能开就报真实格式读数，开不了就是"这不是能播的音频"，别等到转换才炸。
     private func copyIn(_ src: URL) -> URL? {
-        let granted = src.startAccessingSecurityScopedResource()
-        defer { if granted { src.stopAccessingSecurityScopedResource() } }
         let ext = src.pathExtension.isEmpty ? "wav" : src.pathExtension
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
         let dest = docs.appendingPathComponent("pick_\(Int(Date().timeIntervalSince1970)).\(ext)")
@@ -245,14 +245,28 @@ struct ContentView: View {
             try? FileManager.default.removeItem(at: dest)
             try FileManager.default.copyItem(at: src, to: dest)
             let size = ((try? FileManager.default.attributesOfItem(atPath: dest.path))?[.size] as? NSNumber)?.int64Value ?? 0
-            pickNote = "已拷进 app：" + dest.lastPathComponent + "（\(size / 1024) KB）"
-            VoiceJournal.line("选文件 \(src.lastPathComponent) → \(dest.lastPathComponent) \(size / 1024) KB，授权=\(granted)")
+            let probe = probeAudio(dest)
+            pickNote = "已拷进 app：" + dest.lastPathComponent + "（\(size / 1024) KB）" + probe
+            VoiceJournal.line("选文件 \(src.lastPathComponent) → \(dest.lastPathComponent) \(size / 1024) KB，\(probe)")
             return dest
         } catch {
             pickNote = "拷进来失败：" + error.localizedDescription
             VoiceJournal.line("拷选中的文件失败：\(error.localizedDescription)")
             return nil
         }
+    }
+
+    /// 就地开一次 AVAudioFile，读真实格式；打不开就退回"不是能播的音频"这句话。
+    /// 这一步只读文件头，不解码，几百微秒，不影响按钮的置灰动画。
+    private func probeAudio(_ url: URL) -> String {
+        guard let f = try? AVAudioFile(forReading: url) else {
+            return "／ 打不开：不像音频文件"
+        }
+        let fmt = f.processingFormat
+        let frames = Int(f.length)
+        return String(format: "／ %d 帧 / %d Hz / %d 声道 / %.2f s",
+                      frames, Int(fmt.sampleRate), Int(fmt.channelCount),
+                      Double(frames) / fmt.sampleRate)
     }
 
     // MARK: - 样本动作
