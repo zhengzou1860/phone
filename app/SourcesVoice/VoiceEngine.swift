@@ -19,11 +19,13 @@ final class VoiceEngine {
 
     /// 把一段音频炼成样本存进清单。① 那一次载入是真成本（实测 4.1 s / 峰值足迹 726 MB），
     /// 所以每条参考只做一次，之后反复用。
+    ///
+    /// 只解前 `ChainDriver.svMaxSecs` 秒：① 的内存随参考长度平方涨，而音色尺 6~11 s 就平了。
     func makeSample(fromWav url: URL, name: String) async throws -> SampleStore.Sample {
         let dir = modelDir
         return try await Task.detached(priority: .userInitiated) {
             VoiceJournal.line("生成样本「\(name)」← \(url.lastPathComponent)")
-            let wav = try AudioProcessor.loadWAV16K(url)
+            let wav = try AudioProcessor.loadWAV16K(url, maxSeconds: ChainDriver.svMaxSecs)
             let driver = try ChainDriver(modelDir: dir)
             let parts = try driver.makeSample(reference: wav)
             return try SampleStore.save(name: name, parts: parts, wav16k: wav)

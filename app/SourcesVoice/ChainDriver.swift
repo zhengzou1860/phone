@@ -58,6 +58,12 @@ final class ChainDriver {
     static let noiseSeed: UInt64 = 7
     static let timesteps: [Double] = [1.0, 0.8, 0.0]
 
+    /// ① 只吃参考音频的前这么秒。sv（WavLM 全注意力）的耗时和内存都随参考长度的**平方**涨：
+    /// 真机实测 5.1 s→2.4 s / 458 MB，13.4 s→4.1 s / 726 MB，40.6 s→18.0 s / 足迹 1749 MB
+    /// （iPhone 11 前台水位线约 2040 MB ⇒ 那一格只差 250 MB 就被系统杀掉）。
+    /// 而 PC 那把音色尺 6 s 就到 0.748、10.9 s 才 0.759，20 s 以外的部分买不到音色。
+    static let svMaxSecs = 20.0
+
     private let runtime: OrtRuntime
     private let modelDir: URL
 
@@ -145,10 +151,16 @@ final class ChainDriver {
 
     func speakerEmbedding(_ wav: [Float]) throws -> OrtTensor {
         let t0 = Date()
+        let cap = Int(Self.svMaxSecs * AudioProcessor.sampleRate)
+        let fed = wav.count > cap ? Array(wav.prefix(cap)) : wav
+        if fed.count != wav.count {
+            onStage(String(format: "① 参考 %.1f s 超线 ⇒ 只取前 %.0f s 算音色（sv 内存随长度平方涨）",
+                           Double(wav.count) / AudioProcessor.sampleRate, Self.svMaxSecs))
+        }
         onStage("① 音色嵌入：载入 \(Self.fileSV)")
         let g = try graph(Self.fileSV)
         defer { g.close() }
-        let out = try g.run([feedF32("wave", [1, wav.count], wav)], wants: ["emb"])
+        let out = try g.run([feedF32("wave", [1, fed.count], fed)], wants: ["emb"])
         guard let emb = out.first else { throw ChainError.shape("sv 没吐出 emb") }
         onStage(String(format: "① emb %@（%.1f s）", dimText(emb.dims), Date().timeIntervalSince(t0)))
         return emb
