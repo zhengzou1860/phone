@@ -417,7 +417,7 @@ jobs:
             -import-objc-header "$SV/Voice-Bridging-Header.h" \
             -Xcc -I -Xcc "$ORT_HD" \
             "$SV/MelFrontEnd.swift" "$SV/AudioProcessor.swift" \
-            "$SV/Ort.swift" "$SV/ChainDriver.swift" \
+            "$SV/Ort.swift" "$SV/ChainDriver.swift" "$SV/PostProcessor.swift" \
             /tmp/gate/main.swift /tmp/gate/OrtShim.o \
             -Xlinker -force_load -Xlinker "$ORT_BIN" \
             -Xlinker -lc++ \

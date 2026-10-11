@@ -16,12 +16,25 @@ struct ContentView: View {
     @State private var feReport = ""
     @State private var isRunningFE = false
 
-    // 两个槽：源（要转换的那段）和参考（目标音色）。各自要么录一段、要么从「文件」里选一个。
+    // 两个音频槽：源（要转换的那段）和参考（目标音色）。各自要么录一段、要么从「文件」里选一个。
     @State private var sourceURL: URL?
     @State private var refURL: URL?
     @State private var pickingSource = false
     @State private var pickingRef = false
     @State private var pickNote = ""
+
+    // 样本清单
+    @State private var samples: [SampleStore.Sample] = []
+    @State private var pickedID: String?
+    @State private var sampleName = ""
+    @State private var isMakingSample = false
+    @State private var makeNote = ""
+    @State private var renamingID: String?
+    @State private var renameDraft = ""
+
+    // 链外旋钮：只要音高（语速不做——播放软件都有）
+    @State private var semitones: Double = 0
+    @State private var showShare = false
 
     /// public.audio 是个大类，wav/m4a/mp3/aiff 全在里面；列出来只是让「文件」里默认看得见它们。
     private let pickTypes: [UTType] = [.audio, .wav, .mpeg4Audio, .mp3, .aiff]
@@ -34,8 +47,9 @@ struct ContentView: View {
                     if case .downloaded = models.state {
                         audioSlot("① 源音频（要转换的那段）", rec: srcRec,
                                   url: $sourceURL, picking: $pickingSource)
-                        audioSlot("② 参考音频（目标音色；不选就是自转换）", rec: refRec,
-                                  url: $refURL, picking: $pickingRef)
+                        refSlot
+                        sampleList
+                        paramSection
                         if !pickNote.isEmpty {
                             Text(pickNote).font(.caption).foregroundColor(.secondary)
                         }
@@ -51,6 +65,7 @@ struct ContentView: View {
             .navigationTitle("声音克隆")
             .onAppear {
                 VoiceJournal.line("ContentView.onAppear")
+                samples = SampleStore.list()
                 models.check()
             }
         }
@@ -62,11 +77,116 @@ struct ContentView: View {
         }
     }
 
-    // MARK: - 两个音频槽
+    // MARK: - ② 参考槽（多一个「生成样本」的动作）
+
+    @ViewBuilder
+    private var refSlot: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            audioSlotBody("② 参考音频（目标音色；不选也不选样本就自转换）", rec: refRec,
+                          url: $refURL, picking: $pickingRef)
+            HStack(spacing: 12) {
+                TextField("样本名字（留空＝按时间）", text: $sampleName)
+                    .textFieldStyle(.roundedBorder)
+                Button(isMakingSample ? "生成中…" : "生成样本") { makeSampleFromRef() }
+                    .buttonStyle(.bordered)
+                    .disabled(refURL == nil || isMakingSample || isConverting || srcRec.isRecording || refRec.isRecording)
+            }
+            Text("样本 = 音色向量 1 KB + 150 帧 prompt mel 47 KB，做一次反复用；参考音频要 ≥1.5 s（DiT 的 prompts 钉死 150 帧）。")
+                .font(.caption)
+                .foregroundColor(.secondary)
+            if !makeNote.isEmpty {
+                Text(makeNote).font(.caption).foregroundColor(.orange)
+            }
+        }
+    }
+
+    // MARK: - 样本清单
+
+    @ViewBuilder
+    private var sampleList: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("样本清单（转换时用哪个音色）")
+                .font(.headline)
+            if samples.isEmpty {
+                Text("空的。在 ② 录一段或选一个文件，然后点「生成样本」。")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+            ForEach(samples) { s in
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 10) {
+                        Button {
+                            pickedID = (pickedID == s.id) ? nil : s.id
+                            VoiceJournal.line("选样本 \(s.info.name)（\(s.id)）")
+                        } label: {
+                            Image(systemName: pickedID == s.id ? "largecircle.fill.circle" : "circle")
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundColor(pickedID == s.id ? .accentColor : .secondary)
+
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(s.info.name)
+                            Text(String(format: "%@　%.1f s　%@",
+                                        s.info.created, s.info.seconds, s.id))
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                        }
+                        Spacer()
+                        Button("改名") {
+                            renamingID = s.id
+                            renameDraft = s.info.name
+                        }
+                        .buttonStyle(.bordered)
+                        Button("删") {
+                            deleteSample(s)
+                        }
+                        .buttonStyle(.bordered)
+                    }
+                    if renamingID == s.id {
+                        HStack(spacing: 10) {
+                            TextField("新名字", text: $renameDraft).textFieldStyle(.roundedBorder)
+                            Button("保存") { commitRename(s) }.buttonStyle(.borderedProminent)
+                            Button("取消") { renamingID = nil }.buttonStyle(.bordered)
+                        }
+                    }
+                }
+                .padding(.vertical, 2)
+            }
+        }
+    }
+
+    // MARK: - 链外旋钮：音高
+
+    @ViewBuilder
+    private var paramSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("音高").font(.headline)
+            HStack {
+                Text(String(format: "%+.0f 半音", semitones))
+                    .frame(width: 80, alignment: .leading)
+                Slider(value: $semitones, in: -12...12, step: 1)
+            }
+            Button("归零") { semitones = 0 }
+                .buttonStyle(.bordered)
+            Text("加在④声码之后的波形上（链外移调，官方模型自己没这个参数）：只动音高不动时长。男声转女声一般抬 +2 ~ +5。语速不做——播放器都有。")
+                .font(.caption)
+                .foregroundColor(.secondary)
+        }
+    }
+
+    // MARK: - 两个音频槽的公共部分
 
     @ViewBuilder
     private func audioSlot(_ title: String, rec: AudioEngine,
                            url: Binding<URL?>, picking: Binding<Bool>) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            audioSlotBody(title, rec: rec, url: url, picking: picking)
+        }
+    }
+
+    @ViewBuilder
+    private func audioSlotBody(_ title: String, rec: AudioEngine,
+                               url: Binding<URL?>, picking: Binding<Bool>) -> some View {
         let anyRecording = srcRec.isRecording || refRec.isRecording
         VStack(alignment: .leading, spacing: 10) {
             Text(title).font(.headline)
@@ -134,6 +254,62 @@ struct ContentView: View {
         }
     }
 
+    // MARK: - 样本动作
+
+    private func makeSampleFromRef() {
+        guard let ref = refURL, let modelDir = models.modelDir else { return }
+        let name = sampleName.trimmingCharacters(in: .whitespaces).isEmpty
+            ? "样本 " + Self.dayStamp() : sampleName
+        isMakingSample = true
+        makeNote = "生成中…这一步要载 sv 图（实测约 4 s）"
+        VoiceJournal.line("点「生成样本」名字=\(name) 参考=\(ref.lastPathComponent)")
+        if engine == nil { engine = VoiceEngine(modelDir: modelDir) }
+        let eng = engine!
+        Task {
+            do {
+                let s = try await eng.makeSample(fromWav: ref, name: name)
+                await MainActor.run {
+                    samples = SampleStore.list()
+                    pickedID = s.id
+                    isMakingSample = false
+                    makeNote = "已生成「\(s.info.name)」，已选中"
+                    sampleName = ""
+                }
+            } catch {
+                await MainActor.run {
+                    isMakingSample = false
+                    makeNote = "生成失败：" + error.localizedDescription
+                    VoiceJournal.line("生成样本失败：\(error.localizedDescription)")
+                }
+            }
+        }
+    }
+
+    private func commitRename(_ s: SampleStore.Sample) {
+        let name = renameDraft.trimmingCharacters(in: .whitespaces)
+        guard !name.isEmpty else { renamingID = nil; return }
+        do {
+            let updated = try SampleStore.rename(s, to: name)
+            if let i = samples.firstIndex(where: { $0.id == s.id }) { samples[i] = updated }
+            renamingID = nil
+        } catch {
+            pickNote = "改名失败：" + error.localizedDescription
+            renamingID = nil
+        }
+    }
+
+    private func deleteSample(_ s: SampleStore.Sample) {
+        SampleStore.delete(s)
+        if pickedID == s.id { pickedID = nil }
+        samples = SampleStore.list()
+    }
+
+    private static func dayStamp() -> String {
+        let f = DateFormatter()
+        f.dateFormat = "MM-dd HH:mm"
+        return f.string(from: Date())
+    }
+
     // MARK: - 模型状态
 
     @ViewBuilder
@@ -148,7 +324,7 @@ struct ContentView: View {
                     .foregroundColor(.secondary)
             case .notDownloaded:
                 VStack(alignment: .leading, spacing: 8) {
-                    Text("模型未下载（下载 581 MB，解压后占 726 MB）")
+                    Text("模型未下载（下载 581 MB，解压后占 700 MB）")
                         .foregroundColor(.secondary)
                     Button("下载模型") {
                         models.download()
@@ -188,18 +364,18 @@ struct ContentView: View {
             Text("转换")
                 .font(.headline)
 
-            Button("开始转换") {
+            Button(isConverting ? "转换中…" : "开始转换") {
                 startConversion()
             }
             .buttonStyle(.borderedProminent)
-            .disabled(sourceURL == nil || isConverting || srcRec.isRecording || refRec.isRecording)
+            .disabled(!canConvert || isConverting)
 
             if sourceURL == nil {
                 Text("先在 ① 录一段或选一个音频文件")
                     .font(.caption)
                     .foregroundColor(.secondary)
-            } else if refURL == nil {
-                Text("② 空的 ⇒ 这次是自转换（音色还是你自己的）")
+            } else if pickedID == nil && refURL == nil {
+                Text("没选样本、② 也空的 ⇒ 这次是自转换（音色还是你自己的）")
                     .font(.caption)
                     .foregroundColor(.secondary)
             }
@@ -209,6 +385,10 @@ struct ContentView: View {
                     .foregroundColor(.secondary)
             }
         }
+    }
+
+    private var canConvert: Bool {
+        sourceURL != nil && !srcRec.isRecording && !refRec.isRecording
     }
 
     @ViewBuilder
@@ -234,6 +414,23 @@ struct ContentView: View {
                 }
                 .buttonStyle(.bordered)
                 .disabled(!player.isPlaying)
+
+                Button {
+                    VoiceJournal.line("点「导出」 \(url.lastPathComponent)")
+                    showShare = true
+                } label: {
+                    Label("导出", systemImage: "square.and.arrow.up")
+                }
+                .buttonStyle(.bordered)
+            }
+            .sheet(isPresented: $showShare) {
+                // LiveContainer 里 UIActivityViewController 没实测过；起不来就是这一片空白，
+                // 日志里那句「导出面板已弹起」不出现即是证据，兜底是路径本身就在屏幕上。
+                ShareSheet(items: [url],
+                           onDismiss: { showShare = false },
+                           onPresent: {
+                    VoiceJournal.line("导出面板已弹起（可「存储到“文件”」）")
+                })
             }
 
             if !player.status.isEmpty {
@@ -241,25 +438,35 @@ struct ContentView: View {
                     .font(.caption)
                     .foregroundColor(.secondary)
             }
-            Text(url.lastPathComponent)
-                .font(.caption)
+            Text(url.path)
+                .font(.caption2)
                 .foregroundColor(.secondary)
+                .textSelection(.enabled)
         }
     }
 
     private func startConversion() {
-        guard let modelDir = models.modelDir,
-              let inputURL = sourceURL else { return }
-        // ② 没填就退回源自己 —— 和上一版行为一致，界面上也已经写了「这次是自转换」
-        let refInput = refURL ?? inputURL
+        guard let modelDir = models.modelDir, let inputURL = sourceURL else { return }
+        let picked = samples.first { $0.id == pickedID }
+        let using: String
+        if let p = picked {
+            using = "样本「\(p.info.name)」"
+        } else if let r = refURL {
+            using = "现场参考 \(r.lastPathComponent)"
+        } else {
+            using = "自转换（源自己当参考）"
+        }
 
         isConverting = true
         convertStatus = "加载模型…"
-        VoiceJournal.line("开始转换 源=\(inputURL.lastPathComponent) 参考=\(refInput.lastPathComponent)")
-
+        VoiceJournal.line(String(format: "开始转换 源=%@ 音色=%@ 音高 %+.0f 半音",
+                                 inputURL.lastPathComponent, using, semitones))
         if engine == nil {
             engine = VoiceEngine(modelDir: modelDir)
         }
+        let eng = engine!
+        // 选了样本就不必给参考；没样本时用 ②；② 也空 ⇒ 拿源自己当参考（自转换）
+        let refForJob: URL? = picked != nil ? nil : (refURL ?? inputURL)
 
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
         let output = docs.appendingPathComponent("output_\(Int(Date().timeIntervalSince1970)).wav")
@@ -267,10 +474,12 @@ struct ContentView: View {
         Task {
             do {
                 convertStatus = "提取音色特征…"
-                try await engine?.convert(inputWav: inputURL,
-                                          refWav: refInput,
-                                          outputWav: output,
-                                          onStage: { text in
+                try await eng.convert(inputWav: inputURL,
+                                      sample: picked,
+                                      refWav: refForJob,
+                                      outputWav: output,
+                                      pitchCents: semitones * 100.0,
+                                      onStage: { text in
                     // 推理线程回调 → 跳回主线程改文案（ContentView 是 struct，
                     // @State 的 setter 是 nonmutating，闭包里捕获的副本写回同一块存储）。
                     DispatchQueue.main.async { convertStatus = text }
@@ -350,9 +559,12 @@ struct ContentView: View {
         sendStatus = ""
         let facts = VoiceFacts.lines().joined(separator: "\n")
         let fe = feReport.isEmpty ? "（自检还没跑过——先点「跑前端自检」）" : feReport
+        let names = samples.isEmpty ? "（样本清单空）" :
+            samples.map { $0.info.name }.joined(separator: "、")
         let text = "—— 现场读数 ——\n" + facts
             + "\n\n—— 前端自检 ——\n" + fe
             + "\n\n—— 模型状态 ——\n" + models.progressText
+            + "\n\n—— 样本清单 ——\n" + names
             + "\n\n—— 磁盘日志最近 200 行 ——\n" + VoiceJournal.tail(200)
         // ContentView 是 struct，不能 [weak self]；@State 的 setter 是 nonmutating，
         // 闭包里捕获的 struct 副本写回去仍然是同一块存储。

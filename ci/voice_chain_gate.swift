@@ -339,6 +339,65 @@ _ = stage("resample", { () throws -> Bool in
     return true
 })
 
+// MARK: - ⑦ 链外旋钮（音调）的尺
+//
+// 官方模型的推理脚本只有 --steps / --chunk-size / --seed —— 没有语速也没有音调，因为输出的
+// mel 帧数和源内容是逐帧对齐的。音调只能加在 ④ 之后的波形上（PostProcessor 的 WSOLA），
+// 自己写的东西必须有尺：pitchShift = 「先重采样把音高抬上去、再 WSOLA 拉回原时长」，
+// 所以 stretch 那一段量的是它的内部半步，长度比照样是硬指标（拉不回原时长就是漏了）；
+// 频率不许串到隔壁（300 Hz 拉伸后最大峰仍须在 300 Hz；+1200 音分后须换到 600 Hz 而时长不动）。
+func tone16k(hz: Int, secs: Double, amp: Double = 0.6) -> [Float] {
+    let n = Int(AudioProcessor.sampleRate * secs)
+    var s = [Float](repeating: 0, count: n)
+    let w = 2.0 * Double.pi * Double(hz) / AudioProcessor.sampleRate
+    for i in 0..<n { s[i] = Float(amp * sin(Double(i) * w)) }
+    return s
+}
+func secsOf(_ x: [Float]) -> Double { Double(x.count) / AudioProcessor.sampleRate }
+
+_ = stage("stretch", { () throws -> Bool in
+    let tone = tone16k(hz: 300, secs: 2.0)
+    let a0 = toneAmp(tone, 300)
+    softCheck("stretch 基准", a0 > 0.5, String(format: "2 s 的 300 Hz 单音幅度 %.4f（应 ≈0.6）", a0))
+
+    let fast = PostProcessor.timeStretch(tone, rate: 1.5)
+    let want = 2.0 / 1.5
+    let ratio = secsOf(fast) / want
+    let keep = toneAmp(fast, 300)
+    let leak = toneAmp(fast, 600)
+    print(String(format: "STRETCH rate=1.5 长度 %.3f s（应 %.3f s）比 %.4f ／ 300 Hz %.6f ／ 600 Hz %.6f ／ 原 %.6f",
+                 secsOf(fast), want, ratio, keep, leak, a0))
+    softCheck("stretch 长度", abs(ratio - 1) < 0.03, String(format: "长度比 %.4f（限 ±3%%）", ratio))
+    softCheck("stretch 音高不动", keep > a0 * 0.6 && keep > leak * 4,
+              String(format: "拉伸后 300 Hz %.4f（原 %.4f）／泄漏到 600 Hz %.4f", keep, a0, leak))
+
+    let slow = PostProcessor.timeStretch(tone, rate: 0.7)
+    softCheck("stretch 变慢", abs(secsOf(slow) / (2.0 / 0.7) - 1) < 0.03,
+              String(format: "rate=0.7 长度 %.3f s（应 %.3f s）", secsOf(slow), 2.0 / 0.7))
+    return true
+})
+
+_ = stage("pitch", { () throws -> Bool in
+    let tone = tone16k(hz: 300, secs: 2.0)
+    let a0 = toneAmp(tone, 300)
+    let up = PostProcessor.pitchShift(tone, cents: 1200)
+    let lo = toneAmp(up, 300)
+    let hi = toneAmp(up, 600)
+    print(String(format: "PITCH +1200 音分 长度 %.3f s ／ 300 Hz %.6f ／ 600 Hz %.6f ／ 原 300 Hz %.6f",
+                 secsOf(up), lo, hi, a0))
+    softCheck("pitch 时长不动", abs(secsOf(up) / 2.0 - 1) < 0.03,
+              String(format: "长度 %.3f s（应 2.000 s）", secsOf(up)))
+    softCheck("pitch 落到 600", hi > lo && hi > a0 * 0.4,
+              String(format: "600 Hz %.4f 要大于 300 Hz %.4f", hi, lo))
+
+    let down = PostProcessor.pitchShift(tone, cents: -1200)
+    let d150 = toneAmp(down, 150)
+    let d300 = toneAmp(down, 300)
+    softCheck("pitch 降八度", d150 > d300 && abs(secsOf(down) / 2.0 - 1) < 0.03,
+              String(format: "150 Hz %.6f / 300 Hz %.6f，时长 %.3f s", d150, d300, secsOf(down)))
+    return true
+})
+
 print(String(format: "总用时 %.1f s", Date().timeIntervalSince(tAll)))
 if failures.isEmpty {
     print("CHAIN GATE PASS")

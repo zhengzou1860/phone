@@ -78,19 +78,21 @@ final class ChainDriver {
         return try runtime.graph(at: modelDir.appendingPathComponent(name))
     }
 
-    /// source / reference 都是 16 kHz 单声道 [-1,1]。返回同口径的转换结果。
-    func convert(source: [Float], reference: [Float]) throws -> [Float] {
-        let t0 = Date()
+    /// 一个「样本」= 官方 scripts/infer.sh 要的那两样：`--spk-emb-path` 的音色向量 +
+    /// `--prompt-path` 的 150 帧 prompt mel。算一次存下来，以后每次转换都不必再载 386 MB 的
+    /// sv 图（真机实测那一次是 4.1 s、峰值足迹 726 MB）。
+    struct SampleParts {
+        var spkDims: [Int]
+        var spk: [Float]
+        /// promptFrames × 80，行主序
+        var prompts: [Float]
+    }
+
+    /// ① + prompt mel。参考音频必须够长：DiT 的 prompts 钉死 150 帧 ≈ 1.5 s。
+    func makeSample(reference: [Float]) throws -> SampleParts {
         guard let basis = melBasisOverride ?? AudioProcessor.melBasis() else {
             throw ChainError.input("bundle 里没有 librosa_mel_basis.f32，prompt 通道算不出来")
         }
-
-        let fb = MelFrontEnd.kaldiFbank(AudioProcessor.scaled(source))
-        let fbFrames = fb.count / MelFrontEnd.nMels
-        guard fbFrames >= 1 else {
-            throw ChainError.input("源音频只有 \(source.count) 样本，凑不满一个 25 ms 帧（要 ≥\(MelFrontEnd.kaldiFrame)）")
-        }
-
         let pm = MelFrontEnd.promptMel(reference, basis: basis)
         let pmFrames = pm.count / MelFrontEnd.nMels
         let needSamples = Self.promptFrames * Self.melHop
@@ -100,11 +102,35 @@ final class ChainDriver {
             let rule = "DiT 的 prompts 输入钉死 \(Self.promptFrames) 帧"
             throw ChainError.input(got + "，" + rule + "，至少要 \(needSamples) 样本 ≈ \(needSec) s")
         }
+        let emb = try speakerEmbedding(reference)
+        guard case .f32(let dims, let data) = emb else {
+            throw ChainError.shape("sv 的 emb 不是 f32：\(emb)")
+        }
+        return SampleParts(spkDims: dims, spk: data,
+                           prompts: Array(pm.prefix(Self.promptFrames * MelFrontEnd.nMels)))
+    }
 
-        let spks = try speakerEmbedding(reference)
+    /// source / reference 都是 16 kHz 单声道 [-1,1]。返回同口径的转换结果。
+    func convert(source: [Float], reference: [Float]) throws -> [Float] {
+        return try convert(source: source, sample: try makeSample(reference: reference))
+    }
+
+    /// 吃样本的那条：跳过 ①，直接 ②③④。
+    func convert(source: [Float], sample: SampleParts) throws -> [Float] {
+        let t0 = Date()
+        guard sample.prompts.count == Self.promptFrames * MelFrontEnd.nMels else {
+            throw ChainError.shape("样本里的 prompt 是 \(sample.prompts.count) 个数，"
+                                   + "要 \(Self.promptFrames)×\(MelFrontEnd.nMels)")
+        }
+        let fb = MelFrontEnd.kaldiFbank(AudioProcessor.scaled(source))
+        let fbFrames = fb.count / MelFrontEnd.nMels
+        guard fbFrames >= 1 else {
+            throw ChainError.input("源音频只有 \(source.count) 样本，凑不满一个 25 ms 帧（要 ≥\(MelFrontEnd.kaldiFrame)）")
+        }
+
+        let spks = OrtTensor.f32(dims: sample.spkDims, data: sample.spk)
         let bn = try encode(fbank: fb, frames: fbFrames)
-        let promptSlice = Array(pm.prefix(Self.promptFrames * MelFrontEnd.nMels))
-        let mel = try denoise(bn: bn, spks: spks, prompts: promptSlice)
+        let mel = try denoise(bn: bn, spks: spks, prompts: sample.prompts)
         let wav = try vocode(mel)
         let wall = max(Date().timeIntervalSince(t0), 0.001)
         let srcSec = Double(source.count) / AudioProcessor.sampleRate
