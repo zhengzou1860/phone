@@ -13,7 +13,7 @@ import AVFoundation
 /// 顺带把这条 wav 的峰值/rms 写进磁盘日志：手机上「链子到底有没有出声」只有这一处能看出来，
 /// 别靠耳朵猜。
 @MainActor
-final class PlayController: NSObject, ObservableObject, AVAudioPlayerDelegate {
+final class PlayController: NSObject, ObservableObject {
     @Published var isPlaying = false
     @Published var status = ""
 
@@ -32,14 +32,12 @@ final class PlayController: NSObject, ObservableObject, AVAudioPlayerDelegate {
 
         do {
             let p = try AVAudioPlayer(contentsOf: url)
-            p.delegate = self
             player = p
-            VoiceJournal.line(String(format: "准备播 %@：%d Hz / %d 声道 / %.2f s / 音量 %.4f",
-                                     url.lastPathComponent, Int(p.sampleRate),
-                                     Int(p.numberOfChannels), p.duration, p.volume))
+            VoiceJournal.line("准备播 \(url.lastPathComponent)：" + formatText(url))
             if p.play() {
                 isPlaying = true
                 status = "播放中"
+                watch(p)
             } else {
                 isPlaying = false
                 status = "play() 返回 false（详见日志）"
@@ -65,6 +63,16 @@ final class PlayController: NSObject, ObservableObject, AVAudioPlayerDelegate {
             .joined(separator: ",")
     }
 
+    /// AVAudioPlayer 没有 sampleRate 这个成员，真实格式要从文件头读。
+    private func formatText(_ url: URL) -> String {
+        guard let f = try? AVAudioFile(forReading: url) else { return "格式读不出来" }
+        let fmt = f.processingFormat
+        let frames = Int(f.length)
+        return String(format: "%d 帧 / %d Hz / %d 声道 / %.2f s",
+                      frames, Int(fmt.sampleRate), Int(fmt.channelCount),
+                      Double(frames) / fmt.sampleRate)
+    }
+
     private func measure(_ url: URL) {
         Task.detached(priority: .utility) {
             guard let s = try? AudioProcessor.loadWAV16K(url) else {
@@ -85,20 +93,21 @@ final class PlayController: NSObject, ObservableObject, AVAudioPlayerDelegate {
         }
     }
 
-    // MARK: - AVAudioPlayerDelegate（回调线程不保证在主线程，一律跳回去改状态）
-
-    nonisolated func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
-        Task { @MainActor in
-            self.isPlaying = false
-            self.status = flag ? "放完了" : "播放中途停了"
-        }
-    }
-
-    nonisolated func audioPlayerDecodeErrorDidOccur(_ player: AVAudioPlayer, error: Error?) {
-        Task { @MainActor in
-            self.isPlaying = false
-            self.status = "解码出错：\(error?.localizedDescription ?? "无")"
-            VoiceJournal.line("AVAudioPlayer 解码出错 " + (error?.localizedDescription ?? "无"))
+    /// 播完自己把状态收回来。
+    ///
+    /// 没用 AVAudioPlayerDelegate：那个协议的回调到底在不在主线程没有保证，
+    /// 声明成 nonisolated 还是 MainActor 都可能撞上隔离不匹配，编译先过不去。
+    /// 100 ms 轮询一次，代价是状态最多晚 0.1 s 翻转。
+    private func watch(_ p: AVAudioPlayer) {
+        Task { [weak self] in
+            while let s = self, s.player === p, s.isPlaying {
+                try? await Task.sleep(nanoseconds: 100_000_000)
+                if !p.isPlaying {
+                    s.isPlaying = false
+                    s.status = p.currentTime > 0 ? "放完了" : "播放中途停了"
+                    break
+                }
+            }
         }
     }
 }

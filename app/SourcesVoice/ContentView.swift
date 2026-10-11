@@ -55,10 +55,10 @@ struct ContentView: View {
             }
         }
         .fileImporter(isPresented: $pickingSource, allowedContentTypes: pickTypes) { result in
-            sourceURL = adopt(result)
+            sourceURL = handlePick(result)
         }
         .fileImporter(isPresented: $pickingRef, allowedContentTypes: pickTypes) { result in
-            refURL = adopt(result)
+            refURL = handlePick(result)
         }
     }
 
@@ -100,36 +100,37 @@ struct ContentView: View {
         }
     }
 
-    /// fileImporter 给的是安全作用域 URL，回调一返回就失效 ⇒ 当场拷进 Documents 再用。
+    /// fileImporter（不带 allowsMultipleSelection 那一版）给的是单个 URL；
+    /// 那是安全作用域 URL，回调一返回就失效 ⇒ 当场拷进 Documents 再用。
     /// 不拷的话就是手机上那一类「文件明明在，读的时候说不存在」。
-    private func adopt(_ result: Result<[URL], Error>) -> URL? {
+    private func handlePick(_ result: Result<URL, any Error>) -> URL? {
         switch result {
         case .failure(let err):
             pickNote = "选文件失败：" + err.localizedDescription
             VoiceJournal.line("选文件失败：\(err.localizedDescription)")
             return nil
-        case .success(let urls):
-            guard let src = urls.first else {
-                pickNote = "没选中文件"
-                return nil
-            }
-            let granted = src.startAccessingSecurityScopedResource()
-            defer { if granted { src.stopAccessingSecurityScopedResource() } }
-            let ext = src.pathExtension.isEmpty ? "wav" : src.pathExtension
-            let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
-            let dest = docs.appendingPathComponent("pick_\(Int(Date().timeIntervalSince1970)).\(ext)")
-            do {
-                try? FileManager.default.removeItem(at: dest)
-                try FileManager.default.copyItem(at: src, to: dest)
-                let size = ((try? FileManager.default.attributesOfItem(atPath: dest.path))?[.size] as? NSNumber)?.int64Value ?? 0
-                pickNote = "已拷进 app：" + dest.lastPathComponent + "（\(size / 1024) KB）"
-                VoiceJournal.line("选文件 \(src.lastPathComponent) → \(dest.lastPathComponent) \(size / 1024) KB，授权=\(granted)")
-                return dest
-            } catch {
-                pickNote = "拷进来失败：" + error.localizedDescription
-                VoiceJournal.line("拷选中的文件失败：\(error.localizedDescription)")
-                return nil
-            }
+        case .success(let url):
+            return copyIn(url)
+        }
+    }
+
+    private func copyIn(_ src: URL) -> URL? {
+        let granted = src.startAccessingSecurityScopedResource()
+        defer { if granted { src.stopAccessingSecurityScopedResource() } }
+        let ext = src.pathExtension.isEmpty ? "wav" : src.pathExtension
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+        let dest = docs.appendingPathComponent("pick_\(Int(Date().timeIntervalSince1970)).\(ext)")
+        do {
+            try? FileManager.default.removeItem(at: dest)
+            try FileManager.default.copyItem(at: src, to: dest)
+            let size = ((try? FileManager.default.attributesOfItem(atPath: dest.path))?[.size] as? NSNumber)?.int64Value ?? 0
+            pickNote = "已拷进 app：" + dest.lastPathComponent + "（\(size / 1024) KB）"
+            VoiceJournal.line("选文件 \(src.lastPathComponent) → \(dest.lastPathComponent) \(size / 1024) KB，授权=\(granted)")
+            return dest
+        } catch {
+            pickNote = "拷进来失败：" + error.localizedDescription
+            VoiceJournal.line("拷选中的文件失败：\(error.localizedDescription)")
+            return nil
         }
     }
 
