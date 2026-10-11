@@ -133,7 +133,19 @@ final class VoiceAppDelegate: NSObject, UIApplicationDelegate {
     func application(_ application: UIApplication,
                      didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
         _ = ModelDownload.shared.attach()
+        // 没有 Mac 可看崩溃报告 ⇒ AVFoundation 那类 ObjC 异常在死之前先把原因落到磁盘日志。
+        // 只写盘、不指望网络：进程当场死，发不出去了；下次「发到电脑」整份文件会带走。
+        NSSetUncaughtExceptionHandler { ex in
+            let frames = ex.callStackSymbols.prefix(6).joined(separator: " ‖ ")
+            VoiceJournal.line("未捕获异常 \(ex.name.rawValue)：\(ex.reason ?? "无 reason")｜\(frames)")
+        }
         return true
+    }
+
+    /// 0.1/23 有一趟死在 ② 的分配峰上（`② 内容编码` 之后就没声了）。要知道那是不是 jetsam：
+    /// 被系统杀之前通常会先喊这一声，喊了就是水位问题，没喊就是我自己的 bug。
+    func applicationDidReceiveMemoryWarning(_ application: UIApplication) {
+        VoiceJournal.line("收到内存警告（余量 \(VoiceFacts.headroomMB()) MB）")
     }
 
     func application(_ application: UIApplication,

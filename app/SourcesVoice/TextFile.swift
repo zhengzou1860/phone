@@ -30,9 +30,29 @@ enum TextFile {
                               url.lastPathComponent, Double(size) / 1e6, Double(maxBytes) / 1e6))
         }
         let data = try Data(contentsOf: url)
-        // 只掐头三个字节看 BOM，别为此把整份文件再复制一遍（上限是 32 MB）。
-        let head = Array(data.prefix(3))
+        // 只掐头几个字节看 BOM 和魔数，别为此把整份文件再复制一遍（上限是 32 MB）。
+        let head = Array(data.prefix(8))
         func byte(_ i: Int) -> UInt8 { i < head.count ? head[i] : 0 }
+        func starts(_ magic: [UInt8]) -> Bool {
+            guard data.count >= magic.count else { return false }
+            for i in 0..<magic.count where head[i] != magic[i] { return false }
+            return true
+        }
+        // 0.1/23 真机：一份 `林华.pdf` 被当成「UTF-8 有损」读了 45470 字乱码，界面上看不出来。
+        // 撞上任一个二进制魔数就直接拒，别让他拿一章乱码去跑二十分钟。
+        let binaries: [(String, [UInt8])] = [
+            ("PDF", [0x25, 0x50, 0x44, 0x46]),        // %PDF
+            ("zip／epub／docx", [0x50, 0x4B]),        // PK
+            ("RTF", [0x7B, 0x5C, 0x72, 0x74, 0x66]),  // {\rtf
+            ("mp3／带标签音频", [0x49, 0x44, 0x33]),   // ID3
+            ("GIF", [0x47, 0x49, 0x46, 0x38]),        // GIF8
+            ("PNG", [0x89, 0x50, 0x4E, 0x47]),
+            ("WAV／AVI", [0x52, 0x49, 0x46, 0x46]),   // RIFF
+            ("Ogg", [0x4F, 0x67, 0x67, 0x53])
+        ]
+        for (name, magic) in binaries where starts(magic) {
+            throw fail("\(url.lastPathComponent) 开头是 \(name) 那种格式（不是纯文本）⇒ 请选 .txt/.md")
+        }
 
         // 带 BOM 的先按 BOM 走，并把 BOM 本身摘掉（留着会在第一句前面杵一个不可见字符）。
         func stripBOM(_ s: String) -> String { s.hasPrefix("\u{FEFF}") ? String(s.dropFirst()) : s }
@@ -56,8 +76,15 @@ enum TextFile {
         if let s = String(data: data, encoding: Self.nsEncoding(.big5)) {
             return (s, "Big5")
         }
-        // 有损兜底：整篇读进来，坏字节替换成 U+FFFD，让他看见哪里坏了。
-        return (String(decoding: data, as: UTF8.self), "UTF-8 有损（有字节不合编码）")
+        // 有损兜底：整篇读进来，坏字节替换成 U+FFFD。坏得多就不是「几个字节不合编码」，
+        // 是这文件的口径根本不在这条试法里 ⇒ 宁可不读，也不给他一章乱码去跑链子。
+        let lossy = String(decoding: data, as: UTF8.self)
+        let bad = lossy.reduce(0) { $1 == "\u{FFFD}" ? $0 + 1 : $0 }
+        guard lossy.isEmpty || Double(bad) / Double(lossy.count) < 0.01 else {
+            throw fail(String(format: "%@ 有 %d/%d 个字解不出来（超过 1%%）⇒ 不是 UTF-8/GB18030/Big5 任一种，先转成纯文本再选",
+                              url.lastPathComponent, bad, lossy.count))
+        }
+        return (lossy, bad == 0 ? "UTF-8 有损" : "UTF-8 有损（\(bad) 个坏字节）")
     }
 
     private static func fail(_ text: String) -> NSError {

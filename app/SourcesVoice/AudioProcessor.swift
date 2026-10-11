@@ -122,28 +122,55 @@ enum AudioProcessor {
 
     final class WAVWriter {
         private let url: URL
-        private let format: AVAudioFormat
-        /// 关掉才落最终的头（长度字段由 ExtAudioFile 在关闭时补），所以 finish() 必须调到。
-        private var file: AVAudioFile?
+        private var handle: FileHandle?
         private(set) var frames = 0
         /// 各片里最大的那个原始峰值，只进日志，不参与增益计算。
         private(set) var maxPeak: Float = 0
 
         init(url: URL) throws {
-            guard let format = AVAudioFormat(commonFormat: .pcmFormatInt16,
-                                             sampleRate: AudioProcessor.writerRate,
-                                             channels: 1,
-                                             interleaved: true) else {
-                throw AudioProcessor.fail("写盘格式建不出来（int16）")
-            }
             self.url = url
-            self.format = format
-            self.file = try AVAudioFile(forWriting: url, settings: format.settings)
+            FileManager.default.createFile(atPath: url.path, contents: Self.header(dataBytes: 0))
+            guard let handle = FileHandle(forWritingAtPath: url.path) else {
+                throw AudioProcessor.fail("打不开写盘句柄（\(url.lastPathComponent)）")
+            }
+            handle.seekToEndOfFile()
+            self.handle = handle
+        }
+
+        /// 小端 4 字节／2 字节。WAV 头的两个长度字段和整份采样数据都走这两个口。
+        private static func u32(_ v: UInt32) -> Data {
+            var out = Data()
+            withUnsafeBytes(of: v.littleEndian) { out.append(contentsOf: $0) }
+            return out
+        }
+        private static func u16(_ v: UInt16) -> Data {
+            var out = Data()
+            withUnsafeBytes(of: v.littleEndian) { out.append(contentsOf: $0) }
+            return out
+        }
+
+        /// 标准 44 字节 PCM 头。两个长度字段先填 0，`finish()` 回填——所以 finish 必须调到，
+        /// 没回填的文件播放器读出来是 0 秒。
+        private static func header(dataBytes: UInt32) -> Data {
+            var d = Data(capacity: 44)
+            func put(_ s: String) { d.append(contentsOf: Array(s.utf8)) }
+            func u32(_ v: UInt32) { d.append(contentsOf: Self.u32(v)) }
+            func u16(_ v: UInt16) { d.append(contentsOf: Self.u16(v)) }
+            put("RIFF"); u32(36 + dataBytes); put("WAVE")
+            put("fmt "); u32(16)
+            u16(1)                                  // 1 = 未压缩 PCM
+            u16(1)                                  // 单声道
+            u32(UInt32(AudioProcessor.writerRate))
+            u32(UInt32(AudioProcessor.writerRate) * 2)   // 字节率 = 采样率 × 2 字节
+            u16(2)                                  // 块对齐
+            u16(16)                                 // 位深
+            put("data"); u32(dataBytes)
+            return d
         }
 
         /// 落一片。峰值过满刻度就按**这片自己**的长峰压回，不动别的片。
         func append(_ samples: [Float]) throws {
-            guard let file = file else { throw AudioProcessor.fail("WAVWriter 已经收尾了，不能再写") }
+            guard let handle = handle else { throw AudioProcessor.fail("WAVWriter 已经收尾了，不能再写") }
             guard !samples.isEmpty else { return }
             var peak: Float = 0
             for v in samples {
@@ -156,26 +183,32 @@ enum AudioProcessor {
                 VoiceJournal.line(String(format: "%@：本片峰值 %.4f 越过满刻度 ⇒ 乘 %.4f 压回",
                                          url.lastPathComponent, peak, gain))
             }
-            guard let buf = AVAudioPCMBuffer(pcmFormat: format,
-                                             frameCapacity: AVAudioFrameCount(samples.count)) else {
-                throw AudioProcessor.fail("写盘 buffer 分配失败（\(samples.count) 帧）")
-            }
-            buf.frameLength = AVAudioFrameCount(samples.count)
-            guard let dst = buf.int16ChannelData?[0] else {
-                throw AudioProcessor.fail("拿不到 int16ChannelData")
-            }
+            VoiceJournal.line(String(format: "准备落盘 %@：本片 %d 帧", url.lastPathComponent, samples.count))
+            var ints = [Int16](repeating: 0, count: samples.count)
             for i in 0..<samples.count {
                 var v = samples[i] * gain
                 if v > 1.0 { v = 1.0 } else if v < -1.0 { v = -1.0 }
-                dst[i] = Int16(v * 32767.0)
+                ints[i] = Int16(v * 32767.0)
             }
-            try file.write(from: buf)
+            ints.withUnsafeBytes { raw in
+                guard let base = raw.baseAddress else { return }
+                handle.write(Data(bytes: base, count: raw.count))
+            }
             frames += samples.count
         }
 
         func finish() {
-            // 断掉引用就是关掉文件：头里的长度字段在这一步补上。
-            file = nil
+            guard let handle = handle else { return }
+            self.handle = nil
+            let bytes = UInt32(frames * 2)
+            handle.seek(toOffset: 4)
+            handle.write(Self.u32(36 + bytes))
+            handle.seek(toOffset: 40)
+            handle.write(Self.u32(bytes))
+            handle.closeFile()
+            VoiceJournal.line(String(format: "%@ 收尾：%.1f s 音频／%d 字节",
+                                     url.lastPathComponent, Double(frames) / AudioProcessor.writerRate,
+                                     frames * 2 + 44))
         }
     }
 

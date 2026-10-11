@@ -79,7 +79,20 @@ enum SystemTTS {
             return p.count >= 2 ? "\(p[p.count - 2]).\(p[p.count - 1])" : identifier
         }
 
-        var label: String { "\(name)｜\(gender)｜\(quality)｜\(tail)" }
+        /// 标识符中间那一段 = 这一档嗓子的来路：`eloquence`（角色嗓：爷爷／奶奶／小子…，
+        /// 系统不给性别）、`compact`／`super-compact`（省空间的合成）、`enhanced`／`premium`
+        /// （要下载的成品）。`voiceRows` 里已经把 quality 翻成中文，这里给的是英文原档名。
+        var kind: String {
+            let p = identifier.split(separator: ".")
+            guard let li = p.firstIndex(where: { $0.hasPrefix("zh-") }), li > 1 else { return "" }
+            return p[1..<li].filter { String($0) != "voice" }.joined(separator: "-")
+        }
+
+        var label: String {
+            let k = kind
+            return k.isEmpty ? "\(name)｜\(gender)｜\(quality)"
+                             : "\(name)｜\(gender)｜\(quality)｜\(k)"
+        }
     }
 
     /// 这台机装了哪些中文语音，排好序给界面：zh-CN 在前，然后男声在前（要找「低一点」的先看这批）。
@@ -91,8 +104,17 @@ enum SystemTTS {
             case .female: g = "女"
             @unknown default: g = "未标"
             }
+            // 按 rawValue 判而不是 `case .default:`：`default` 是关键字、而只列几个 case
+            // 又过不了穷尽检查。0 未标／1 标准／2 增强／3 最优（Apple 那四个档）。
+            let q: String
+            switch Int(v.quality.rawValue) {
+            case 3: q = "最优"
+            case 2: q = "增强"
+            case 1: q = "标准"
+            default: q = "未标"
+            }
             return VoiceRow(identifier: v.identifier, name: v.name, language: v.language,
-                            gender: g, quality: String(describing: v.quality))
+                            gender: g, quality: q)
         }
         .sorted { a, b in
             let aCN = a.language.hasPrefix("zh-CN"), bCN = b.language.hasPrefix("zh-CN")

@@ -1,5 +1,6 @@
 import Foundation
 import UIKit
+import os
 
 /// 每一步往 Documents/voice_log.txt 追加一行（带水位）。闪退/失败不清盘，"发到电脑"能一次带走。
 enum VoiceJournal {
@@ -23,7 +24,7 @@ enum VoiceJournal {
         let f = DateFormatter()
         f.dateFormat = "MM-dd HH:mm:ss"
         let oneLine = text.replacingOccurrences(of: "\n", with: " ／ ")
-        let entry = "\(f.string(from: Date())) 足迹\(VoiceFacts.footprintMB())/驻留\(VoiceFacts.residentMB())MB \(oneLine)"
+        let entry = "\(f.string(from: Date())) 足迹\(VoiceFacts.footprintMB())/驻留\(VoiceFacts.residentMB())/余量\(VoiceFacts.headroomMB())MB \(oneLine)"
         guard let url = url else { return }
         lock.lock()
         defer { lock.unlock() }
@@ -53,7 +54,7 @@ enum VoiceFacts {
             "version    \(info["CFBundleShortVersionString"] ?? "-") (\(info["CFBundleVersion"] ?? "-"))",
             "iOS        \(pi.operatingSystemVersionString)",
             "machine    \(machineName())  cores=\(pi.processorCount)",
-            "memory     足迹 \(footprintMB()) / 驻留 \(residentMB()) MB / 物理 \(pi.physicalMemory / 1048576) MB",
+            "memory     足迹 \(footprintMB()) / 驻留 \(residentMB()) / 余量 \(headroomMB()) MB / 物理 \(pi.physicalMemory / 1048576) MB",
             "disk       可用 \(diskFreeGB()) GB",
             "endpoint   \(VoiceUploader.endpoint)",
             "模型目录   \(modelsDirNote())"
@@ -98,6 +99,12 @@ enum VoiceFacts {
         }
         guard kr == KERN_SUCCESS else { return -1 }
         return Int(info.phys_footprint) / 1_048_576
+    }
+
+    /// 系统给这个进程留的余量（jetsam 口径）。`足迹` 只能看用了多少，这个才回答
+    /// 「离被杀还差多少」——0.1/23 有一趟死在 ② 的分配峰上，有这两个数才能判是不是水位问题。
+    static func headroomMB() -> Int {
+        Int(os_proc_available_memory()) / 1_048_576
     }
 
     static func modelsDirNote() -> String {

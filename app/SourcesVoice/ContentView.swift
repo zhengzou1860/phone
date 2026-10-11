@@ -10,6 +10,8 @@ enum PickSlot: String, Identifiable {
     case source
     case ref
     case text
+    /// 也借用这一个呈现：嗓音清单页（不是文件选择，见 body 里那个 if）。
+    case voice
     var id: String { rawValue }
 }
 
@@ -98,6 +100,17 @@ struct ContentView: View {
         // 同视图挂两个 fileImporter 只有一个生效（① 点了没反应），且 [.audio,…] 的
         // 类型过滤在这环境下把列表全刷灰（② 进了目录选不了文件）。
         .fullScreenCover(item: $pickSlot) { slot in
+            coverPage(slot)
+        }
+    }
+
+    /// 一个呈现两种内容：`.voice` 是我们自己铺的嗓音清单，其余三个槽还是系统文件选择器。
+    /// 分支写在带 `@ViewBuilder` 的函数里，不赌 `fullScreenCover` 那个闭包是不是 ViewBuilder。
+    @ViewBuilder
+    private func coverPage(_ slot: PickSlot) -> some View {
+        if slot == .voice {
+            voiceListPage
+        } else {
             DocumentPickerHost(onPick: { url in
                 if slot == .text {
                     loadNovelFile(url)
@@ -540,30 +553,103 @@ struct ContentView: View {
         }
     }
 
-    /// 嗓音一行：这台机装的中文语音全摊开（zh-CN 在前、男声在前——「要低一点」的先从这批找），
-    /// 右边「试听」只外放念一句样本行，不跑链、不落盘、几十秒能比完一批。
+    /// 嗓音一行：只显示当前选中的那个，点开才列全 24 个。
+    /// 上一版是 `Picker(...).pickerStyle(.navigationLink)`，真机八次改嗓音八次闪退
+    /// （`选嗓音：…` 那行日志之后同一秒就 `ContentView.onAppear`），改成按钮 + 自己铺的清单页。
     @ViewBuilder
     private var voiceRow: some View {
         HStack(spacing: 10) {
-            Picker("朗读嗓音", selection: $voiceID) {
-                Text("默认（第一个 zh-CN）").tag("")
-                ForEach(voiceRows) { r in
-                    Text(r.label).tag(r.identifier)
+            Button { pickSlot = .voice } label: {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("朗读嗓音（点开换，共 \(voiceRows.count) 个可选）")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    Text(currentVoiceLabel)
+                        .font(.body)
                 }
             }
-            .pickerStyle(.navigationLink)
+            .buttonStyle(.bordered)
             .disabled(isReading)
-            .onChange(of: voiceID) { v in
-                UserDefaults.standard.set(v, forKey: "novelVoiceID")
-                VoiceJournal.line("选嗓音：\(v.isEmpty ? "默认" : v)")
-            }
 
             Button("试听") {
                 Audition.shared.play(identifier: voiceID.isEmpty ? nil : voiceID)
             }
-            .buttonStyle(.bordered)
+            .buttonStyle(.borderedProminent)
             .disabled(isReading || isConverting)
         }
+    }
+
+    /// 当前嗓音在界面上怎么说。名单里没有（系统换掉了、或换了一台机）要说得出来，
+    /// 不能只显示一个空串让他以为没选。
+    private var currentVoiceLabel: String {
+        if voiceID.isEmpty { return "默认（第一个 zh-CN）" }
+        if let r = voiceRows.first(where: { $0.identifier == voiceID }) { return r.label }
+        return "存的这个本机没有 ⇒ 请用「默认」"
+    }
+
+    /// 清单页：一行一个嗓音，右边各带一个试听（比嗓音就是要来回切着听，不必每切一个先关页面）。
+    /// 点行=选定并收起；试听=当场外放一句，不跑链、不落盘。
+    @ViewBuilder
+    private var voiceListPage: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("本机中文语音 \(voiceRows.count) 个（\(rosterCountLine)）")
+                    .font(.headline)
+                Text("「试听」当场外放念一句，不跑链子；点整行就选定这个并收页面。"
+                     + "名单里没有性别标注的那些是系统自带的角色嗓（爷爷／奶奶／小子…），"
+                     + "音高往往和正经播报嗓差很多——低、温柔这类只能靠你耳朵在这页比。")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+
+                voiceLine(title: "默认（第一个 zh-CN）", id: "")
+                ForEach(voiceRows) { r in
+                    voiceLine(title: r.label, id: r.identifier)
+                }
+
+                Button("关闭") { pickSlot = nil }
+                    .buttonStyle(.bordered)
+            }
+            .padding()
+        }
+        .onDisappear { Audition.shared.stop() }
+    }
+
+    private var rosterCountLine: String {
+        let males = voiceRows.filter { $0.gender == "男" }.count
+        let females = voiceRows.filter { $0.gender == "女" }.count
+        return "男 \(males)／女 \(females)／未标 \(voiceRows.count - males - females)"
+    }
+
+    @ViewBuilder
+    private func voiceLine(title: String, id: String) -> some View {
+        HStack(spacing: 8) {
+            Button { chooseVoice(id) } label: {
+                HStack {
+                    Text(title)
+                        .font(.body)
+                    Spacer(minLength: 6)
+                    if voiceID == id {
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundColor(.accentColor)
+                    }
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.bordered)
+
+            Button("试听") {
+                Audition.shared.play(identifier: id.isEmpty ? nil : id)
+            }
+            .buttonStyle(.borderedProminent)
+        }
+    }
+
+    /// 选定：写内存状态 + 立刻落 UserDefaults（不靠 onChange），然后收起清单页。
+    private func chooseVoice(_ id: String) {
+        voiceID = id
+        UserDefaults.standard.set(id, forKey: "novelVoiceID")
+        VoiceJournal.line("选嗓音：\(id.isEmpty ? "默认" : id)")
+        pickSlot = nil
     }
 
     /// 文本来源：选了文件就显示那张卡——几十万字塞进 TextEditor 会把界面滚出卡顿，
