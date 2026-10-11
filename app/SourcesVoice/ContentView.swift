@@ -91,7 +91,7 @@ struct ContentView: View {
                     .buttonStyle(.bordered)
                     .disabled(refURL == nil || isMakingSample || isConverting || srcRec.isRecording || refRec.isRecording)
             }
-            Text("样本 = 音色向量 1 KB + 150 帧 prompt mel 47 KB，做一次反复用；参考音频要 ≥1.5 s（DiT 的 prompts 钉死 150 帧）。")
+            Text("样本 = 音色向量 1 KB + 150 帧 prompt mel 47 KB，做一次反复用。参考音频硬下限 1.5 s（DiT 的 prompts 钉死 150 帧），但 PC 实测像不像随样本长度单调涨：1.5 s→0.636、3 s→0.705、6 s→0.748、10.9 s→0.759（尺：同人 0.928／两人 0.089）⇒ 录 6~10 s 连续干净说话，别只录一两个字。")
                 .font(.caption)
                 .foregroundColor(.secondary)
             if !makeNote.isEmpty {
@@ -126,8 +126,9 @@ struct ContentView: View {
 
                         VStack(alignment: .leading, spacing: 2) {
                             Text(s.info.name)
-                            Text(String(format: "%@　%.1f s　%@",
-                                        s.info.created, s.info.seconds, s.id))
+                            Text(String(format: "%@　%.1f s%@　%@",
+                                        s.info.created, s.info.seconds,
+                                        s.info.seconds < 6.0 ? "（偏短）" : "", s.id))
                                 .font(.caption2)
                                 .foregroundColor(.secondary)
                         }
@@ -272,7 +273,13 @@ struct ContentView: View {
                     samples = SampleStore.list()
                     pickedID = s.id
                     isMakingSample = false
-                    makeNote = "已生成「\(s.info.name)」，已选中"
+                    if s.info.seconds < 6.0 {
+                        makeNote = String(format: "已生成「%@」，但参考只有 %.1f s（实测 6 s 才饱和）⇒ 大概率不够像，重录一段 6~10 s 的",
+                                          s.info.name, s.info.seconds)
+                        VoiceJournal.line("样本偏短 \(s.info.name) \(String(format: "%.1f", s.info.seconds)) s")
+                    } else {
+                        makeNote = "已生成「\(s.info.name)」，已选中"
+                    }
                     sampleName = ""
                 }
             } catch {

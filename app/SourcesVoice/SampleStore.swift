@@ -17,13 +17,18 @@ enum SampleStore {
         var seconds: Double
     }
 
-    struct Sample: Identifiable, Equatable {
+    struct Sample: Identifiable {
         var dir: URL
         var info: Info
         var id: String { dir.lastPathComponent }
     }
 
-    struct Stale: Error { var text: String }
+    /// 样本条目本身不对（缺文件、长度不对）。只 conform Error 的话界面只能拿到系统话术，
+    /// 看不出是哪条样本的哪个数不对，所以把 text 直接当描述递出去。
+    struct Stale: Error, LocalizedError {
+        var text: String
+        var errorDescription: String? { text }
+    }
 
     static let embCount = 256
     static let promptCount = ChainDriver.promptFrames * MelFrontEnd.nMels
@@ -118,7 +123,7 @@ enum SampleStore {
         for n in ["spk.f32", "prompts.f32"] {
             let p = dir.appendingPathComponent(n).path
             guard let sz = (try? fm.attributesOfItem(atPath: p))?[.size] as? NSNumber,
-                  sz.intValue == (n == "spk.f32" ? embCount : promptCount) * MemoryLayout<Float>.size
+                  Int(sz.intValue) == (n == "spk.f32" ? embCount : promptCount) * MemoryLayout<Float>.size
             else { return false }
         }
         return fm.fileExists(atPath: dir.appendingPathComponent("ref.wav").path)
@@ -142,10 +147,12 @@ enum SampleStore {
 
     private static func readFloats(_ url: URL) throws -> [Float] {
         let d = try Data(contentsOf: url)
-        let n = d.count / MemoryLayout<Float>.size
+        let wide = MemoryLayout<Float>.size
+        let n = d.count / wide
         guard n > 0 else { throw Stale(text: "\(url.lastPathComponent) 是空的") }
-        var a = [Float](repeating: 0, count: n)
-        d.copyBytes(to: &a, count: n)
-        return a
+        // bindMemory 要求长度整除元素宽度，截断的文件尾巴先切掉再绑
+        return d.withUnsafeBytes { raw in
+            Array(raw.prefix(n * wide).bindMemory(to: Float.self))
+        }
     }
 }
