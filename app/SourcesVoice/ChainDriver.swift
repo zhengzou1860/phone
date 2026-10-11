@@ -125,6 +125,13 @@ final class ChainDriver {
                            prompts: Array(pm.prefix(Self.promptFrames * MelFrontEnd.nMels)))
     }
 
+    /// source / reference 都是 16 kHz 单声道 [-1,1]。返回同口径的转换结果。
+    /// app 里没人走这条路（音色一律从样本库带进来），它是 CI 那条整链数值对拍闸门的唯一入口
+    /// ——`ci/voice_chain_gate.swift:243` 靠这一句一次钉住 ①②③④，删它 = 拆闸门（0.1/25 就这么红的）。
+    func convert(source: [Float], reference: [Float]) throws -> [Float] {
+        return try convert(source: source, sample: try makeSample(reference: reference))
+    }
+
     /// 吃样本的那条：跳过 ①，直接 ②③④。
     /// 一条长音频要按片调用它多次（见 `VoiceEngine.convPassSeconds`），所以音色条件 `SampleParts`
     /// 由调用方算一次带着走 —— ① 那 386 MB 的 sv 图不该每片重载一遍。
