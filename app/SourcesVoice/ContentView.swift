@@ -1,19 +1,30 @@
 import SwiftUI
 import AVFoundation
+import UniformTypeIdentifiers
 
 struct ContentView: View {
     @StateObject private var models = ModelManager()
-    @StateObject private var audio = AudioEngine()
+    @StateObject private var srcRec = AudioEngine()
+    @StateObject private var refRec = AudioEngine()
+    @StateObject private var player = PlayController()
     @State private var engine: VoiceEngine?
     @State private var isConverting = false
     @State private var convertStatus = ""
     @State private var outputURL: URL?
-    @State private var isPlaying = false
-    @State private var player: AVAudioPlayer?
     @State private var sendStatus = ""
     @State private var isSending = false
     @State private var feReport = ""
     @State private var isRunningFE = false
+
+    // 两个槽：源（要转换的那段）和参考（目标音色）。各自要么录一段、要么从「文件」里选一个。
+    @State private var sourceURL: URL?
+    @State private var refURL: URL?
+    @State private var pickingSource = false
+    @State private var pickingRef = false
+    @State private var pickNote = ""
+
+    /// public.audio 是个大类，wav/m4a/mp3/aiff 全在里面；列出来只是让「文件」里默认看得见它们。
+    private let pickTypes: [UTType] = [.audio, .wav, .mpeg4Audio, .mp3, .aiff]
 
     var body: some View {
         NavigationView {
@@ -21,7 +32,13 @@ struct ContentView: View {
                 VStack(alignment: .leading, spacing: 20) {
                     modelSection
                     if case .downloaded = models.state {
-                        recordSection
+                        audioSlot("① 源音频（要转换的那段）", rec: srcRec,
+                                  url: $sourceURL, picking: $pickingSource)
+                        audioSlot("② 参考音频（目标音色；不选就是自转换）", rec: refRec,
+                                  url: $refURL, picking: $pickingRef)
+                        if !pickNote.isEmpty {
+                            Text(pickNote).font(.caption).foregroundColor(.secondary)
+                        }
                         convertSection
                         if let url = outputURL {
                             playbackSection(url: url)
@@ -37,7 +54,242 @@ struct ContentView: View {
                 models.check()
             }
         }
+        .fileImporter(isPresented: $pickingSource, allowedContentTypes: pickTypes) { result in
+            sourceURL = adopt(result)
+        }
+        .fileImporter(isPresented: $pickingRef, allowedContentTypes: pickTypes) { result in
+            refURL = adopt(result)
+        }
     }
+
+    // MARK: - 两个音频槽
+
+    @ViewBuilder
+    private func audioSlot(_ title: String, rec: AudioEngine,
+                           url: Binding<URL?>, picking: Binding<Bool>) -> some View {
+        let anyRecording = srcRec.isRecording || refRec.isRecording
+        VStack(alignment: .leading, spacing: 10) {
+            Text(title).font(.headline)
+            HStack(spacing: 12) {
+                Button(rec.isRecording ? "录制中…" : "录一段") {
+                    rec.startRecording()
+                }
+                .buttonStyle(.bordered)
+                .disabled(anyRecording || isConverting)
+
+                Button("停止") {
+                    rec.stopRecording()
+                    url.wrappedValue = rec.recordedURL
+                }
+                .buttonStyle(.bordered)
+                .disabled(!rec.isRecording)
+
+                Button("选文件") { picking.wrappedValue = true }
+                    .buttonStyle(.bordered)
+                    .disabled(isConverting)
+            }
+            if let u = url.wrappedValue {
+                Text("当前：" + u.lastPathComponent)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            } else {
+                Text("空的")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+        }
+    }
+
+    /// fileImporter 给的是安全作用域 URL，回调一返回就失效 ⇒ 当场拷进 Documents 再用。
+    /// 不拷的话就是手机上那一类「文件明明在，读的时候说不存在」。
+    private func adopt(_ result: Result<[URL], Error>) -> URL? {
+        switch result {
+        case .failure(let err):
+            pickNote = "选文件失败：" + err.localizedDescription
+            VoiceJournal.line("选文件失败：\(err.localizedDescription)")
+            return nil
+        case .success(let urls):
+            guard let src = urls.first else {
+                pickNote = "没选中文件"
+                return nil
+            }
+            let granted = src.startAccessingSecurityScopedResource()
+            defer { if granted { src.stopAccessingSecurityScopedResource() } }
+            let ext = src.pathExtension.isEmpty ? "wav" : src.pathExtension
+            let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+            let dest = docs.appendingPathComponent("pick_\(Int(Date().timeIntervalSince1970)).\(ext)")
+            do {
+                try? FileManager.default.removeItem(at: dest)
+                try FileManager.default.copyItem(at: src, to: dest)
+                let size = ((try? FileManager.default.attributesOfItem(atPath: dest.path))?[.size] as? NSNumber)?.int64Value ?? 0
+                pickNote = "已拷进 app：" + dest.lastPathComponent + "（\(size / 1024) KB）"
+                VoiceJournal.line("选文件 \(src.lastPathComponent) → \(dest.lastPathComponent) \(size / 1024) KB，授权=\(granted)")
+                return dest
+            } catch {
+                pickNote = "拷进来失败：" + error.localizedDescription
+                VoiceJournal.line("拷选中的文件失败：\(error.localizedDescription)")
+                return nil
+            }
+        }
+    }
+
+    // MARK: - 模型状态
+
+    @ViewBuilder
+    private var modelSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("模型状态")
+                .font(.headline)
+
+            switch models.state {
+            case .checking:
+                Text("检查中…")
+                    .foregroundColor(.secondary)
+            case .notDownloaded:
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("模型未下载（下载 581 MB，解压后占 726 MB）")
+                        .foregroundColor(.secondary)
+                    Button("下载模型") {
+                        models.download()
+                    }
+                    .buttonStyle(.borderedProminent)
+                }
+            case .downloading:
+                VStack(alignment: .leading, spacing: 8) {
+                    ProgressView(value: models.progress)
+                    Text(models.progressText)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+            case .downloaded:
+                HStack {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundColor(.green)
+                    Text(models.progressText)
+                }
+            case .failed(let msg):
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("失败: \(msg)")
+                        .foregroundColor(.red)
+                    Button("重试") {
+                        models.check()
+                    }
+                }
+            }
+        }
+    }
+
+    // MARK: - 转换
+
+    @ViewBuilder
+    private var convertSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("转换")
+                .font(.headline)
+
+            Button("开始转换") {
+                startConversion()
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(sourceURL == nil || isConverting || srcRec.isRecording || refRec.isRecording)
+
+            if sourceURL == nil {
+                Text("先在 ① 录一段或选一个音频文件")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            } else if refURL == nil {
+                Text("② 空的 ⇒ 这次是自转换（音色还是你自己的）")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+            if isConverting {
+                Text(convertStatus)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func playbackSection(url: URL) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("转换结果")
+                .font(.headline)
+
+            HStack(spacing: 15) {
+                Button {
+                    player.play(url: url)
+                } label: {
+                    Label(player.isPlaying ? "播放中" : "播放",
+                          systemImage: player.isPlaying ? "speaker.wave.2.fill" : "play.fill")
+                }
+                .buttonStyle(.bordered)
+                .disabled(player.isPlaying)
+
+                Button {
+                    player.stop()
+                } label: {
+                    Label("停止", systemImage: "stop.fill")
+                }
+                .buttonStyle(.bordered)
+                .disabled(!player.isPlaying)
+            }
+
+            if !player.status.isEmpty {
+                Text(player.status)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+            Text(url.lastPathComponent)
+                .font(.caption)
+                .foregroundColor(.secondary)
+        }
+    }
+
+    private func startConversion() {
+        guard let modelDir = models.modelDir,
+              let inputURL = sourceURL else { return }
+        // ② 没填就退回源自己 —— 和上一版行为一致，界面上也已经写了「这次是自转换」
+        let refInput = refURL ?? inputURL
+
+        isConverting = true
+        convertStatus = "加载模型…"
+        VoiceJournal.line("开始转换 源=\(inputURL.lastPathComponent) 参考=\(refInput.lastPathComponent)")
+
+        if engine == nil {
+            engine = VoiceEngine(modelDir: modelDir)
+        }
+
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+        let output = docs.appendingPathComponent("output_\(Int(Date().timeIntervalSince1970)).wav")
+
+        Task {
+            do {
+                convertStatus = "提取音色特征…"
+                try await engine?.convert(inputWav: inputURL,
+                                          refWav: refInput,
+                                          outputWav: output,
+                                          onStage: { text in
+                    // 推理线程回调 → 跳回主线程改文案（ContentView 是 struct，
+                    // @State 的 setter 是 nonmutating，闭包里捕获的副本写回同一块存储）。
+                    DispatchQueue.main.async { convertStatus = text }
+                })
+                await MainActor.run {
+                    outputURL = output
+                    isConverting = false
+                    convertStatus = "转换完成"
+                }
+            } catch {
+                await MainActor.run {
+                    isConverting = false
+                    convertStatus = "失败：\(error.localizedDescription)"
+                    VoiceJournal.line("转换失败：\(error.localizedDescription)")
+                }
+            }
+        }
+    }
+
+    // MARK: - 诊断
 
     @ViewBuilder
     private var debugSection: some View {
@@ -111,188 +363,5 @@ struct ContentView: View {
                 VoiceJournal.line("发到电脑：\(r)")
             }
         }
-    }
-
-    @ViewBuilder
-    private var modelSection: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text("模型状态")
-                .font(.headline)
-
-            switch models.state {
-            case .checking:
-                Text("检查中…")
-                    .foregroundColor(.secondary)
-            case .notDownloaded:
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("模型未下载（下载 581 MB，解压后占 726 MB）")
-                        .foregroundColor(.secondary)
-                    Button("下载模型") {
-                        models.download()
-                    }
-                    .buttonStyle(.borderedProminent)
-                }
-            case .downloading:
-                VStack(alignment: .leading, spacing: 8) {
-                    ProgressView(value: models.progress)
-                    Text(models.progressText)
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                }
-            case .downloaded:
-                HStack {
-                    Image(systemName: "checkmark.circle.fill")
-                        .foregroundColor(.green)
-                    Text(models.progressText)
-                }
-            case .failed(let msg):
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("失败: \(msg)")
-                        .foregroundColor(.red)
-                    Button("重试") {
-                        models.check()
-                    }
-                }
-            }
-        }
-    }
-
-    @ViewBuilder
-    private var recordSection: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text("录音")
-                .font(.headline)
-
-            HStack(spacing: 15) {
-                Button {
-                    audio.startRecording()
-                } label: {
-                    Label("录音", systemImage: "mic.fill")
-                }
-                .buttonStyle(.bordered)
-                .disabled(audio.isRecording || isConverting)
-
-                Button {
-                    audio.stopRecording()
-                } label: {
-                    Label("停止", systemImage: "stop.fill")
-                }
-                .buttonStyle(.bordered)
-                .disabled(!audio.isRecording)
-            }
-
-            if let url = audio.recordedURL {
-                Text("已录制: \(url.lastPathComponent)")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-            }
-        }
-    }
-
-    @ViewBuilder
-    private var convertSection: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text("转换")
-                .font(.headline)
-
-            Button("开始转换") {
-                startConversion()
-            }
-            .buttonStyle(.borderedProminent)
-            .disabled(audio.recordedURL == nil || isConverting)
-
-            if isConverting {
-                Text(convertStatus)
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-            }
-        }
-    }
-
-    @ViewBuilder
-    private func playbackSection(url: URL) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text("转换结果")
-                .font(.headline)
-
-            HStack(spacing: 15) {
-                Button {
-                    play(url: url)
-                } label: {
-                    Label(isPlaying ? "播放中" : "播放",
-                          systemImage: isPlaying ? "speaker.wave.2.fill" : "play.fill")
-                }
-                .buttonStyle(.bordered)
-                .disabled(isPlaying)
-
-                Button {
-                    stop()
-                } label: {
-                    Label("停止", systemImage: "stop.fill")
-                }
-                .buttonStyle(.bordered)
-                .disabled(!isPlaying)
-            }
-
-            Text(url.lastPathComponent)
-                .font(.caption)
-                .foregroundColor(.secondary)
-        }
-    }
-
-    private func startConversion() {
-        guard let modelDir = models.modelDir,
-              let inputURL = audio.recordedURL else { return }
-
-        isConverting = true
-        convertStatus = "加载模型…"
-
-        // 初始化引擎
-        if engine == nil {
-            engine = VoiceEngine(modelDir: modelDir)
-        }
-
-        // 输出文件路径
-        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
-        let output = docs.appendingPathComponent("output_\(Int(Date().timeIntervalSince1970)).wav")
-
-        Task {
-            do {
-                convertStatus = "提取音色特征…"
-                try await engine?.convert(inputWav: inputURL,
-                                          refWav: inputURL,  // 当前版本用同一段音频
-                                          outputWav: output,
-                                          onStage: { text in
-                    // 推理线程回调 → 跳回主线程改文案（ContentView 是 struct，
-                    // @State 的 setter 是 nonmutating，闭包里捕获的副本写回同一块存储）。
-                    DispatchQueue.main.async { convertStatus = text }
-                })
-                await MainActor.run {
-                    outputURL = output
-                    isConverting = false
-                    convertStatus = "转换完成"
-                }
-            } catch {
-                await MainActor.run {
-                    isConverting = false
-                    convertStatus = "失败：\(error.localizedDescription)"
-                }
-            }
-        }
-    }
-
-    private func play(url: URL) {
-        do {
-            player = try AVAudioPlayer(contentsOf: url)
-            player?.play()
-            isPlaying = true
-        } catch {
-            print("播放失败：\(error)")
-        }
-    }
-
-    private func stop() {
-        player?.stop()
-        isPlaying = false
     }
 }
