@@ -23,6 +23,8 @@ enum SystemTTS {
     struct Report {
         var sentences: Int = 0
         var buffers: Int = 0
+        /// `frameLength == 0` 的 buffer：不是错误，是这一句吐完的收尾信号。
+        var markers: Int = 0
         var skipped: Int = 0
         var nativeRate: Double = 0
         var nativeChannels: Int = 0
@@ -37,9 +39,9 @@ enum SystemTTS {
 
         /// 发回电脑的那一行探针读数。
         var line: String {
-            String(format: "TTS 探针 %d 句 / %d 个 buffer%@／原生 %.0f Hz %d 声道 %@ %@／首包 %.2f s／合成音频 %.2f s 用时 %.1f s（%.1f× 实时）／峰值 %.3f rms %.3f",
-                   sentences, buffers,
-                   skipped > 0 ? "（另有 \(skipped) 个不是 PCM）" : "",
+            String(format: "TTS 探针 %d 句 / %d 个 buffer（收尾 marker %d 个%@）／原生 %.0f Hz %d 声道 %@ %@／首包 %.2f s／合成音频 %.2f s 用时 %.1f s（%.1f× 实时）／峰值 %.3f rms %.3f",
+                   sentences, buffers, markers,
+                   skipped > 0 ? "、另有 \(skipped) 个不是 PCM" : "",
                    nativeRate, nativeChannels, nativeCommon,
                    nativeInterleaved ? "交错" : "非交错",
                    firstBuffer,
@@ -52,7 +54,8 @@ enum SystemTTS {
     /// 现场读数：当前音频会话。`write` 这条路若被会话状态挡住，这一行能看出来。
     static func sessionLine() -> String {
         let s = AVAudioSession.sharedInstance()
-        return "\(s.category)/\(s.mode)/\(Int(s.sampleRate))Hz"
+        func bare(_ v: String) -> String { v.replacingOccurrences(of: "AVAudioSession", with: "") }
+        return "\(bare(s.category.rawValue))/\(bare(s.mode.rawValue))/\(Int(s.sampleRate))Hz"
     }
 
     /// 这台机装了哪些中文语音。空表本身是有用读数（语音包没装或被 LiveContainer 挡住）。
@@ -103,15 +106,36 @@ enum SystemTTS {
 /// 按句吐数是为了让「读小说」那条管路能在攒够一片之后就进链子，不必把整章音频先摊在内存里。
 /// 计数器（`report`）跨句累加，最后那一行探针读数就取它。
 ///
-/// **0.1/19 那一版的等法是错的**：它按 `synth.isSpeaking` 排空，而 `isSpeaking` 对 `write` 这种
-/// 不落扬声器的离线生成不成立，于是循环一次都没转就退出，紧接着 `stopSpeaking(.immediate)`
-/// 把刚起步的生成掐死——手机报回来的「0 个 buffer」是这一手造成的假阴性，不能当 A0 的判据。
-/// 这一版按「回调来一次 signal 一次」等：拿到过 buffer 且连续 `idleClose` 秒没有新的来才算吐完，
-/// 一个都没来就等满 `hardCap`（按句长估）为止；等满了才抛错，抛之前再拿普通朗读对照一次。
+/// **0.1/20 手机上量到的**：`write` 的回调**确实异步吐 PCM**（首包 0.34–0.78 s，925 个有效 buffer），
+/// 普通朗读也正常（`didStart 1／didFinish 1`）⇒ A0 这一格是通的。那一版死在两处自己的判据上：
+/// - 静默收摊读的是**跨句累计**的 `report.buffers`：第二句一开局它就是真的，而 `lastArrival` 被我
+///   重置成 `distantPast`，于是第一次 0.2 s 超时当场满足「静默 0.6 s」，0.7 s 就退出，第二句一个样本都没等；
+/// - `stopSpeaking(.immediate)` **掐不掉已经在吐的离线生成**：第一句的尾巴还在往共享计数器里灌
+///   （那 296 次「回调进来」就是这么来的），反过来也说明第一句在静默窗那里被截了尾。
+/// 这一版：每句一个独立的 `Call`（身份比对，上一句迟到的尾巴直接丢弃、不污染新句）；收摊只看本句；
+/// `frameLength == 0` 的 buffer 当「这一句吐完了」的强信号（0.1/20 的日志里它就成对出现在句尾），
+/// 收到它之后再静默 `afterMarker` 秒就收；`idleClose` 只当兜底；成功路径上不再提前 stop。
 final class TTSPump: NSObject, AVSpeechSynthesizerDelegate {
 
-    /// 已经有过 buffer 之后，静默这么多秒就认为这一句吐完了（`BufferCallback` 没有结束标志位）。
-    private static let idleClose = 0.6
+    /// 本句已有数据、且一直没等到收尾 marker 时，静默这么多秒才算吐完（兜底）。
+    private static let idleClose = 0.9
+    /// 收到 `frameLength == 0` 的 marker 之后，再静默这么多秒就收摊。
+    /// 不敢取太小：万一它只是中途的一次冲刷，提前收摊会把这句的后半截全判成"迟到"丢掉。
+    private static let afterMarker = 0.5
+
+    /// 一句的私有状态。回调线程只认「我还是当前那句」才往里写。
+    private final class Call {
+        var got: [Float] = []
+        var arrivals = 0
+        var buffers = 0
+        var empties = 0
+        /// 见过 marker 且之前已有数据 ⇒ 这一句吐完了。
+        var ended = false
+        var lastArrival = Date.distantPast
+        var firstAt = -1.0
+        var nativeLine = ""
+        var err: String?
+    }
 
     private let synth = AVSpeechSynthesizer()
     private let voice: AVSpeechSynthesisVoice?
@@ -122,16 +146,16 @@ final class TTSPump: NSObject, AVSpeechSynthesizerDelegate {
     private var sumSq: Double = 0
     private var frames = 0
 
-    /// 回调线程 → 等待线程：来一个 buffer 就 +1 并 signal。
+    /// 回调线程 → 等待线程：来一个 buffer 就 signal 一次。
     private let arrived = DispatchSemaphore(value: 0)
-    private var arrivals = 0
-    private var lastArrival = Date.distantPast
+    /// 当前正在收的那一句；换句就整个换掉，旧句迟到的 buffer 因此在身份比对上落空。
+    private var current: Call?
+    /// 被丢弃的迟到 buffer 计数，只为报一次现象。
+    private var lateDropped = 0
     /// 只走普通 `speak()` 的对照探针用；代理回调来自另一条线程。
     private var spStart = 0
     private var spFinish = 0
     private var spCancel = 0
-    /// 不是 PCM 的 buffer 只报第一个的类名，够定性了。
-    private var skippedType = ""
 
     init(voice: AVSpeechSynthesisVoice?) {
         // 语音挂在 utterance 上就行：AVSpeechSynthesizer 自己没有 voice 这个属性（CI 编译器报的）。
@@ -140,41 +164,55 @@ final class TTSPump: NSObject, AVSpeechSynthesizerDelegate {
         synth.delegate = self
     }
 
-    /// 念一句。等满还是没有 buffer 就抛错（A0 的判据就是这一条）。
+    /// 念一句。等满硬上限仍一个样本都没有才抛错（A0 的判据；0.1/20 已经把它答成「通」了）。
     func speak(_ sentence: String) throws -> [Float] {
         let t0 = Date()
         report.sentences += 1
-        var got: [Float] = []
+        let c = Call()
+        bump { self.current = c }
         let utt = AVSpeechUtterance(string: sentence)
         utt.voice = voice
-        var err: String?
-        bump {
-            self.arrivals = 0
-            self.lastArrival = Date.distantPast
-        }
         synth.write(utt) { [weak self] buf in
             guard let self = self else { return }
             self.lock.lock()
-            self.arrivals += 1
-            self.lastArrival = Date()
-            self.lock.unlock()
-            self.arrived.signal()
-            self.lock.lock()
             defer { self.lock.unlock() }
-            guard let pcm = buf as? AVAudioPCMBuffer, pcm.frameLength > 0 else {
-                self.report.skipped += 1
-                if self.skippedType.isEmpty {
-                    self.skippedType = String(describing: type(of: buf))
-                    VoiceJournal.line("TTS 回调给的不是 PCM buffer：\(self.skippedType)")
+            // 上一句的尾巴迟到：丢掉。让它写进新句的计数会把「这一句到底吐完没有」彻底读乱。
+            guard self.current === c else {
+                self.lateDropped += 1
+                if self.lateDropped == 1 {
+                    VoiceJournal.line("TTS 有 buffer 迟到（上一句的尾巴，`stopSpeaking` 掐不掉离线生成）⇒ 已丢弃")
                 }
                 return
             }
+            c.arrivals += 1
+            c.lastArrival = Date()
+            self.arrived.signal()
+            guard let pcm = buf as? AVAudioPCMBuffer else {
+                c.err = "回调给的不是 AVAudioPCMBuffer 而是 \(String(describing: type(of: buf)))"
+                self.report.skipped += 1
+                return
+            }
+            if pcm.frameLength == 0 {
+                // 不是错误：这是这一句吐完的信号（0.1/20 的日志里它出现在句尾）。
+                c.empties += 1
+                if c.buffers > 0 { c.ended = true }
+                self.report.markers += 1
+                return
+            }
             let fmt = pcm.format
-            if self.report.buffers == 0 {
-                self.report.nativeRate = fmt.sampleRate
-                self.report.nativeChannels = Int(fmt.channelCount)
-                self.report.nativeCommon = String(describing: fmt.commonFormat)
-                self.report.nativeInterleaved = fmt.isInterleaved
+            if c.buffers == 0 {
+                c.firstAt = Date().timeIntervalSince(t0)
+                c.nativeLine = String(format: "%.0f Hz %d 声道 %@ %@", fmt.sampleRate, Int(fmt.channelCount),
+                                     String(describing: fmt.commonFormat), fmt.isInterleaved ? "交错" : "非交错")
+                VoiceJournal.line(String(format: "TTS 首包 %.2f s／原生 %@（句长 %d 字）",
+                                         c.firstAt, c.nativeLine, sentence.count))
+                if self.report.firstBuffer < 0 { self.report.firstBuffer = c.firstAt }
+                if self.report.buffers == 0 {
+                    self.report.nativeRate = fmt.sampleRate
+                    self.report.nativeChannels = Int(fmt.channelCount)
+                    self.report.nativeCommon = String(describing: fmt.commonFormat)
+                    self.report.nativeInterleaved = fmt.isInterleaved
+                }
             }
             let key = String(format: "%.0f/%d/%@/%d", fmt.sampleRate, Int(fmt.channelCount),
                             String(describing: fmt.commonFormat), fmt.isInterleaved ? 1 : 0)
@@ -183,59 +221,67 @@ final class TTSPump: NSObject, AVSpeechSynthesizerDelegate {
                 self.convInKey = key
             }
             guard let conv = self.converter else {
+                c.err = String(format: "转换器建不出来（%.0f Hz %d 声道）", fmt.sampleRate, Int(fmt.channelCount))
                 self.report.skipped += 1
-                VoiceJournal.line(String(format: "TTS buffer 转不成 16k：转换器建不出来（%.0f Hz %d 声道）",
-                                         fmt.sampleRate, Int(fmt.channelCount)))
                 return
             }
             do {
-                got.append(contentsOf: try Self.floats(from: pcm, via: conv))
+                c.got.append(contentsOf: try Self.floats(from: pcm, via: conv))
+                c.buffers += 1
                 self.report.buffers += 1
             } catch {
+                c.err = error.localizedDescription
                 self.report.skipped += 1
-                err = error.localizedDescription
             }
         }
-        // 结束的两种判据：吐过东西且静默够久；或等满硬上限。
-        // `report`/`lastArrival` 是回调线程在锁里写的，这边读也必须走同一把锁。
+        // 收摊：只看本句。有数据 +（见过 marker 就再静默 afterMarker，否则静默 idleClose）。
         let est = max(1.0, Double(sentence.count) / 4.1)
-        let hardCap = 20.0 + est * 4
-        var waited = Date().timeIntervalSince(t0)
-        while waited < hardCap {
-            let r = arrived.wait(timeout: .now() + 0.2)
+        let hardCap = 20.0 + est * 6
+        var waited = 0.0
+        var closedClean = false
+        while true {
+            _ = arrived.wait(timeout: .now() + 0.2)
             let now = Date()
             waited = now.timeIntervalSince(t0)
-            if r == .success {
-                if report.firstBuffer < 0 {
-                    report.firstBuffer = waited
-                    VoiceJournal.line(String(format: "TTS 首包 %.2f s（句长 %d 字）", waited, sentence.count))
-                }
-            } else {
-                let s = bumpRead { (self.report.buffers, self.lastArrival) }
-                if s.0 > 0, now.timeIntervalSince(s.1) >= Self.idleClose { break }
+            let s = bumpRead { (c.buffers, c.ended, c.lastArrival) }
+            if s.0 > 0, now.timeIntervalSince(s.2) >= (s.1 ? Self.afterMarker : Self.idleClose) {
+                closedClean = true
+                break
             }
+            if waited >= hardCap { break }
         }
+        let snap = bumpRead { (c.arrivals, c.buffers, c.empties, c.got.count, c.err) }
+        bump { self.current = nil }
         finish()
-        if let err = err {
+        if let err = snap.4 {
             VoiceJournal.line("TTS buffer 搬不进 16k：\(err)")
         }
-        if got.isEmpty {
-            let snap = bumpRead { (self.arrivals, self.report.buffers, self.report.skipped, self.skippedType) }
+        if snap.3 == 0 {
             let diag = probeSpeaking(sentence)
-            throw SystemTTS.fail(String(format: "第 %d 句 write 等满 %.1f s：回调进来 %d 次／其中 PCM %d 个／被跳过 %d 个（%@）；对照普通朗读：%@",
-                                         report.sentences, waited, snap.0, snap.1, snap.2,
-                                         snap.3.isEmpty ? "-" : "首个非 PCM 是 \(snap.3)", diag))
+            throw SystemTTS.fail(String(format: "第 %d 句（%d 字）等满 %.1f s 仍 0 样本：回调进来 %d 次／有效 PCM %d 个／空 marker %d 个／干净收摊=%@；对照普通朗读：%@",
+                                         report.sentences, sentence.count, waited, snap.0, snap.1, snap.2,
+                                         closedClean ? "是" : "否", diag))
         }
-        for v in got {
-            let a = abs(v)
-            if a > report.peak { report.peak = a }
-            sumSq += Double(v) * Double(v)
+        if !closedClean {
+            VoiceJournal.line(String(format: "第 %d 句没等到收尾 marker，按静默窗收摊（%.1f s／%d 个 buffer／%d 样本）",
+                                     report.sentences, waited, snap.1, snap.3))
         }
-        frames += got.count
-        report.rms = Float(sqrt(sumSq / Double(max(frames, 1))))
-        report.wall += Date().timeIntervalSince(t0)
-        report.seconds += Double(got.count) / SystemTTS.sampleRate
-        return got
+        // 统计和取值都在锁里做一次：`c.got` 是回调线程在锁里往上长的，锁外读它（含 return 那份拷贝）
+        // 会和刚好已进身份比对、还持着锁的在途回调撞上。
+        var samples: [Float] = []
+        bump {
+            samples = c.got
+            for v in samples {
+                let a = abs(v)
+                if a > report.peak { report.peak = a }
+                sumSq += Double(v) * Double(v)
+            }
+            frames += samples.count
+            report.rms = Float(sqrt(sumSq / Double(max(frames, 1))))
+            report.wall += Date().timeIntervalSince(t0)
+            report.seconds += Double(samples.count) / SystemTTS.sampleRate
+        }
+        return samples
     }
 
     /// 对照探针：普通 `speak()`（走扬声器那条）起不起得来。
@@ -321,7 +367,10 @@ final class TTSPump: NSObject, AVSpeechSynthesizerDelegate {
         var error: NSError?
         let status = conv.convert(to: dst, error: &error) { _, outStatus in
             if fed {
-                outStatus.pointee = .endOfStream
+                // 不是 endOfStream：`write` 的回调是一串小块，每块都宣告流结束就等于
+                // 每个边界把重采样器的历史冲一次、周期性啃掉尾巴。宣告"暂时没料"，
+                // 让它把现在能产的产出来、状态留给下一个 buffer（同一个 converter 实例跨 buffer 复用）。
+                outStatus.pointee = .noDataNow
                 return nil
             }
             outStatus.pointee = .haveData
