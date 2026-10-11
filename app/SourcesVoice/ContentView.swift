@@ -1,5 +1,6 @@
 import SwiftUI
 import AVFoundation
+import UIKit
 import UniformTypeIdentifiers
 
 /// 哪个槽在选文件。共用一个呈现，源槽和参考槽不再各挂一个 fileImporter。
@@ -42,6 +43,13 @@ struct ContentView: View {
     @State private var semitones: Double = 0
     @State private var showShare = false
 
+    // 读小说：文本 → 系统 TTS → 现有样本那条链（②③④）。音色仍然来自上面选中的样本。
+    @State private var novelText = ""
+    @State private var isReading = false
+    @State private var readStatus = ""
+    @State private var readNote = ""
+    @State private var rawTTSURL: URL?
+
     var body: some View {
         NavigationView {
             ScrollView {
@@ -57,6 +65,7 @@ struct ContentView: View {
                             Text(pickNote).font(.caption).foregroundColor(.secondary)
                         }
                         convertSection
+                        novelSection
                         if let url = outputURL {
                             playbackSection(url: url)
                         }
@@ -65,7 +74,7 @@ struct ContentView: View {
                 }
                 .padding()
             }
-            .navigationTitle("声音克隆")
+            .navigationTitle("声音克隆 \(appVersion())")
             .onAppear {
                 VoiceJournal.line("ContentView.onAppear")
                 samples = SampleStore.list()
@@ -415,6 +424,145 @@ struct ContentView: View {
 
     private var canConvert: Bool {
         sourceURL != nil && !srcRec.isRecording && !refRec.isRecording
+    }
+
+    // MARK: - 读小说（文本 → 系统 TTS → 现有样本链）
+
+    @ViewBuilder
+    private var novelSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("读小说（文本 → 系统朗读 → 上面那个样本的音色）").font(.headline)
+
+            TextEditor(text: $novelText)
+                .font(.body)
+                .frame(height: 170)
+                .padding(6)
+                .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.gray.opacity(0.35)))
+                .disabled(isReading)
+
+            HStack(spacing: 12) {
+                Button("粘贴") {
+                    let s = UIPasteboard.general.string ?? ""
+                    if s.isEmpty {
+                        readNote = "剪贴板里没有文字"
+                    } else {
+                        novelText = s
+                        readNote = "粘进来 \(s.count) 字"
+                        VoiceJournal.line("粘进文本 \(s.count) 字")
+                    }
+                }
+                .buttonStyle(.bordered)
+                .disabled(isReading)
+
+                Button("清空") { novelText = ""; readNote = ""; VoiceJournal.line("清空朗读文本") }
+                    .buttonStyle(.bordered)
+                    .disabled(isReading || novelText.isEmpty)
+
+                Button(isReading ? "读着…" : "读给我听") { startReading() }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(isReading || novelText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                              || isConverting || srcRec.isRecording || refRec.isRecording)
+                Spacer()
+                Text("\(novelText.count) 字")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+
+            Text("音色就用在「样本清单」里点中的那个样本（现在：\(pickedSampleNote)）；没点样本就用 ② 那段参考。0 MB 新模型，走的是手机自带的中文语音。实测：系统念中文 ≈4.1 字/秒，链子 ≈2.7× 实时 ⇒ 6000 字一章约 25 分钟音频、转换约 5 分钟。原声和转换后的都落盘，下面能对着听。上限 30 分钟音频（两段波形要同时在内存里），超了会一行话告诉你，不闪退。")
+                .font(.caption)
+                .foregroundColor(.secondary)
+
+            if isReading || !readStatus.isEmpty {
+                Text(readStatus)
+                    .font(.caption)
+                    .foregroundColor(isReading ? .secondary : .accentColor)
+                    .textSelection(.enabled)
+            }
+            if !readNote.isEmpty {
+                Text(readNote).font(.caption).foregroundColor(.orange)
+            }
+
+            if let raw = rawTTSURL {
+                HStack(spacing: 12) {
+                    Button {
+                        player.play(url: raw)
+                    } label: {
+                        Label(player.isPlaying ? "播放中" : "播系统原声",
+                              systemImage: player.isPlaying ? "speaker.wave.2.fill" : "play.fill")
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(player.isPlaying)
+                    Text(raw.lastPathComponent)
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
+            }
+        }
+    }
+
+    private var pickedSampleNote: String {
+        if let p = samples.first(where: { $0.id == pickedID }) { return "样本「\(p.info.name)」" }
+        if refURL != nil { return "② 那段参考" }
+        return "还没选"
+    }
+
+    private func startReading() {
+        guard let modelDir = models.modelDir else { return }
+        let text = novelText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return }
+        let picked = samples.first { $0.id == pickedID }
+        guard picked != nil || refURL != nil else {
+            readNote = "先在「样本清单」点一个样本（或让 ② 有段参考音频）——文本这条路没有自转换"
+            VoiceJournal.line("点「读给我听」但没选样本/参考")
+            return
+        }
+        isReading = true
+        readStatus = "分句、合成中…"
+        readNote = ""
+        outputURL = nil
+        rawTTSURL = nil
+        VoiceJournal.line(String(format: "点「读给我听」%d 字 音色=%@ 音高 %+.0f 半音",
+                                 text.count, picked != nil ? "样本「\(picked!.info.name)」" : "现场参考",
+                                 semitones))
+        if engine == nil { engine = VoiceEngine(modelDir: modelDir) }
+        let eng = engine!
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+        let stamp = Int(Date().timeIntervalSince1970)
+        let output = docs.appendingPathComponent("novel_\(stamp).wav")
+        let raw = docs.appendingPathComponent("tts_raw_\(stamp).wav")
+        let t0 = Date()
+
+        Task {
+            do {
+                let r = try await eng.readNovel(text: text,
+                                               sample: picked,
+                                               refWav: picked != nil ? nil : refURL,
+                                               outputWav: output,
+                                               rawTTSWav: raw,
+                                               pitchCents: semitones * 100.0,
+                                               onStage: { txt in
+                    DispatchQueue.main.async { readStatus = txt }
+                })
+                let wall = Date().timeIntervalSince(t0)
+                await MainActor.run {
+                    outputURL = output
+                    rawTTSURL = raw
+                    isReading = false
+                    readStatus = r.tts.line
+                    readNote = String(format: "读完：%d 句合成 %.0f s → %d 片转换出 %.0f s，整趟墙钟 %.0f s（合成占 %.0f s）",
+                                      r.tts.sentences, r.tts.seconds, r.passes, r.convertedSeconds,
+                                      wall, r.tts.wall)
+                    VoiceJournal.line("读小说界面收尾：\(readNote)")
+                }
+            } catch {
+                await MainActor.run {
+                    isReading = false
+                    readStatus = "失败：\(error.localizedDescription)"
+                    readNote = "没读成，原因在上面那一行。"
+                    VoiceJournal.line("读小说失败：\(error.localizedDescription)")
+                }
+            }
+        }
     }
 
     @ViewBuilder
