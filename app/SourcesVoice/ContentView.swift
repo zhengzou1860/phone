@@ -56,7 +56,7 @@ struct ContentView: View {
     @State private var novelFileURL: URL?
     @State private var novelFileText = ""
     @State private var novelFileEnc = ""
-    /// 选中的嗓音。空 = 没选过，交给 `SystemTTS.pickVoice` 的老判据（第一个 zh-CN）。
+    /// 选中的嗓音。空 = 没选过，交给 `SystemTTS.pickVoice` 的排名（普通话 → 质量档高 → 男声）。
     /// 存在 UserDefaults 里：重开 app 不用重挑，也不必每章都试听一遍。
     @State private var voiceID = UserDefaults.standard.string(forKey: "novelVoiceID") ?? ""
     @State private var voiceRows: [SystemTTS.VoiceRow] = []
@@ -743,7 +743,7 @@ struct ContentView: View {
     /// 当前嗓音在界面上怎么说。名单里没有（系统换掉了、或换了一台机）要说得出来，
     /// 不能只显示一个空串让他以为没选。
     private var currentVoiceLabel: String {
-        if voiceID.isEmpty { return "默认（第一个 zh-CN）" }
+        if voiceID.isEmpty { return "默认（本机最高档的普通话嗓子）" }
         if let r = voiceRows.first(where: { $0.identifier == voiceID }) { return r.label }
         return "存的这个本机没有 ⇒ 请用「默认」"
     }
@@ -762,7 +762,7 @@ struct ContentView: View {
                     .font(.caption)
                     .foregroundColor(.secondary)
 
-                voiceLine(title: "默认（第一个 zh-CN）", id: "")
+                voiceLine(title: "默认（本机最高档的普通话嗓子）", id: "")
                 ForEach(voiceRows) { r in
                     voiceLine(title: r.label, id: r.identifier)
                 }

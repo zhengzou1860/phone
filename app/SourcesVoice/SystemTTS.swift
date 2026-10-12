@@ -140,12 +140,13 @@ enum SystemTTS {
         }
         let zh = chineseVoices()
         func rank(_ v: AVSpeechSynthesisVoice) -> (Int, Int, Int) {
+            // 用前缀不用全等：真机 identifier 里有 `com.apple.voice.enhanced.zh-CN-u-sd-cnln.Dongmei`
+            // 这种带变体后缀的，`== "zh-CN"` 会把一个普通话嗓子错分到最低一层。
             let lang: Int
-            switch v.language {
-            case "zh-CN": lang = 0
-            case "zh-TW", "zh-Hans", "zh-Hant": lang = 1
-            default: lang = 2                      // zh-HK 等粤语嗓子排最后
-            }
+            if v.language.hasPrefix("zh-CN") { lang = 0 }
+            else if v.language.hasPrefix("zh-TW") || v.language.hasPrefix("zh-Hans")
+                    || v.language.hasPrefix("zh-Hant") { lang = 1 }
+            else { lang = 2 }                      // zh-HK 等粤语嗓子排最后
             let quality = 3 - min(max(Int(v.quality.rawValue), 0), 3)   // 3 最优→0
             let gender = v.gender == .male ? 0 : 1
             return (lang, quality, gender)
