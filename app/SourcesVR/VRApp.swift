@@ -214,7 +214,8 @@ final class VRJob: ObservableObject {
             log.append("源片副本不在临时目录，不动它：\(url.path)")
             return
         }
-        let mb = Double((try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0) / 1_048_576
+        let bytes = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
+        let mb = Double(bytes) / 1_048_576
         if (try? FileManager.default.removeItem(at: url)) != nil {
             VRJournal.line("清副本 删掉源片副本 \(url.lastPathComponent) \(String(format: "%.1f", mb)) MB")
         } else {
@@ -308,10 +309,10 @@ final class VRJob: ObservableObject {
         let fm = FileManager.default
         var staleN = 0, staleMb = 0.0
         for one in (try? fm.contentsOfDirectory(at: fm.temporaryDirectory,
-                    includingPropertiesForKeys: [.fileSizeKey], options: [.skipsHiddenKeys])) ?? []
+                    includingPropertiesForKeys: [.fileSizeKey], options: [])) ?? []
             where one.lastPathComponent.hasPrefix("vr3d_") && one.path != url.path {
-            let sz = Double((try? one.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0) / 1_048_576
-            if (try? fm.removeItem(at: one)) != nil { staleN += 1; staleMb += sz }
+            let sz = (try? one.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
+            if (try? fm.removeItem(at: one)) != nil { staleN += 1; staleMb += Double(sz) / 1_048_576 }
         }
         if staleN > 0 {
             log.append("选片 顺带删掉上几轮留下的 \(staleN) 个源片副本，释放 \(String(format: "%.1f", staleMb)) MB")
