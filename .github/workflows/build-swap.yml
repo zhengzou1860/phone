@@ -29,16 +29,26 @@ jobs:
       - name: show toolchain
         run: sw_vers && xcodebuild -version && xcodebuild -showsdks | grep -i ios
 
+      # 必须钉 3.11：runner 默认的 python3 落在 onnx2coreml 的 Requires-Python >=3.11,<3.14 之外，
+      # 第 1 轮 pip 直接回 "Could not find a version that satisfies the requirement onnx2coreml"，
+      # 后面三张图的 convert 全是 rc=127（命令根本没装上）。
+      - name: 装 python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
       - name: 装 python 3.11 + 转换器
         run: |
           set +e
           ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=6{print "::error::" p substr($0,1,230)}'; }
           rec() { tee -a /tmp/model.log; }
           rm -f /tmp/model.log
+          echo "PY 版本=$(python3 -V 2>&1)" | rec
           python3 -m venv /tmp/m2c >/dev/null 2>&1
           /tmp/m2c/bin/pip install --quiet --no-cache-dir onnx2coreml coremltools onnx onnxruntime numpy >/tmp/pip.log 2>&1
           echo "PIP-VERDICT onnx2coreml=$(/tmp/m2c/bin/pip show onnx2coreml 2>/dev/null | awk '/^Version/{print $2}') coremltools=$(/tmp/m2c/bin/python -c 'import coremltools as ct;print(ct.__version__)' 2>&1 | tail -1) ort=$(/tmp/m2c/bin/pip show onnxruntime 2>/dev/null | awk '/^Version/{print $2}')" | rec | ann "PIP "
-          tail -3 /tmp/pip.log | rec | ann "PIP-TAIL "
+          echo "PIP-VERDICT 可执行=$([ -x /tmp/m2c/bin/onnx2coreml ] && echo 在 || echo 不在)" | rec | ann "PIP "
+          tail -6 /tmp/pip.log | rec | ann "PIP-TAIL "
           # 判决必须落成文件：annotation 我这边匿名读不到，宁可多发一份 model.log。
           echo "M-VERDICT 转换器就绪" | rec
           exit 0
@@ -202,7 +212,7 @@ jobs:
           ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=6{print "::error::" p substr($0,1,230)}'; }
           cat /tmp/model.log /tmp/build.log > ./build.log 2>/dev/null || cp /tmp/build.log ./build.log
           # 转换器的完整日志从 /tmp 搬进来再挂：少一个文件就整条 gh 命令报错、结果一个都发不出去
-          for f in cv_unet cv_arc cv_build; do
+          for f in cv_unet cv_arc cv_build pip; do
             [ -s "/tmp/$f.log" ] && cp "/tmp/$f.log" "./$f.log"
           done
           files="swap.ipa build.log"
