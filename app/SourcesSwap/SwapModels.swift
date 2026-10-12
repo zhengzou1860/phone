@@ -456,6 +456,60 @@ final class SwapRunner {
         return (out.count, ms, "权重装失败：\(bad.joined(separator: "｜"))")
     }
 
+    /// 把内存里那 18 个权重连形状一起摊成 [Float]，交身份库存盘。形状必须跟着存：
+    /// 下次装回来要按它核对，光有名字对不上位置就是错的，而错的权重出的画面照样"像个人"。
+    func weightDump() -> [(name: String, dims: [Int], data: [Float])] {
+        guard hasWeights else { return [] }
+        var out: [(name: String, dims: [Int], data: [Float])] = []
+        for n in contract.weightNames {
+            guard let a = weightFeed[n]?.multiArrayValue, let f = SwapRunner.flatten(a) else { return [] }
+            out.append((n, a.shape.map { $0.intValue }, f))
+        }
+        return out
+    }
+
+    /// 从存档装回 18 个权重。逐条按 unet 自己声明的形状和类型核对，凑不齐就整份不收、hasWeights 留假：
+    /// 名字表错一位出的画面照样"像个人"，只有身份会串——那种错必须当场挡下来。
+    func useWeights(_ tensors: [(name: String, dims: [Int], data: [Float])]) -> (count: Int, note: String) {
+        weightFeed = [:]
+        hasWeights = false
+        let md = unet.modelDescription
+        var out: [String: MLFeatureValue] = [:]
+        var bad: [String] = []
+        for t in tensors {
+            guard contract.weightNames.contains(t.name) else { bad.append("\(t.name) 不在名字表里"); continue }
+            guard let d = md.inputDescriptionsByName[t.name], let c = d.multiArrayConstraint else {
+                bad.append("\(t.name) 网里没有这个入参"); continue
+            }
+            let want = c.shape.map { $0.intValue }
+            guard want == t.dims else { bad.append("\(t.name) 要 \(want) 存档 \(t.dims)"); continue }
+            let total = want.reduce(1, *)
+            guard t.data.count == total else { bad.append("\(t.name) 要 \(total) 个数，存档 \(t.data.count)"); continue }
+            guard let arr = try? MLMultiArray(shape: want.map { NSNumber(value: $0) }, dataType: c.dataType)
+            else { bad.append("\(t.name) 建不出 MLMultiArray \(want)"); continue }
+            switch c.dataType {
+            case .float32:
+                let p = arr.dataPointer.assumingMemoryBound(to: Float32.self)
+                for i in 0 ..< total { p[i] = t.data[i] }
+            case .float16:
+                let p = arr.dataPointer.assumingMemoryBound(to: Float16.self)
+                for i in 0 ..< total { p[i] = Float16(t.data[i]) }
+            case .float64:
+                let p = arr.dataPointer.assumingMemoryBound(to: Double.self)
+                for i in 0 ..< total { p[i] = Double(t.data[i]) }
+            default:
+                bad.append("\(t.name) 入参类型 \(c.dataType.rawValue) 不会填"); continue
+            }
+            out[t.name] = MLFeatureValue(multiArray: arr)
+        }
+        guard bad.isEmpty, out.count == contract.weightNames.count else {
+            return (out.count, "存档的权重没收：\(bad.joined(separator: "｜"))")
+        }
+        weightFeed = out
+        hasWeights = true
+        return (out.count, "18 个权重从存档装上，形状逐条对过")
+    }
+
     /// ③ 逐帧：224 的 0~1 planar RGB ＋ 那 18 个权重 → 换出的脸 + mask。
     /// PC 56 ms/帧；上一版上机实测这张网 CPU 12.00 ms/帧。
     /// `out` 是图自己混好的 gen·mask + (1−mask)·att（mask 最大只到 0.79，所以它天生半透明）；

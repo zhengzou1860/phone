@@ -36,6 +36,16 @@ struct SwapContentView: View {
     @State private var logTail = ""
     @State private var outURL: URL?
 
+    @State private var idents: [SwapIdents.Item] = []
+    @State private var chosenIdent: String = ""      // 已存的人：非空就跳过身份证＋身份包那两步
+    @State private var identNote = ""
+    @State private var renaming = false
+    @State private var renameId = ""
+    @State private var renameText = ""
+    @State private var deleting = false
+    @State private var delId = ""
+    @State private var delName = ""
+
     @State private var benchText = ""
     @State private var benchRunning = false
     @State private var runs = 30
@@ -62,12 +72,53 @@ struct SwapContentView: View {
                     Divider()
 
                     VStack(alignment: .leading, spacing: 6) {
+                        Text("已存的人（选他就不必再挑照片）").font(.headline)
+                        Text("一人一份 18 个身份权重＋512 维身份证；点名字选中，跑片时跳过身份证＋身份包那两步。")
+                            .font(.caption2)
+                        if idents.isEmpty {
+                            Text("（列表空着。①选一张源脸照片跑一次，跑的时候自动存进来）").font(.caption)
+                        }
+                        ForEach(idents, id: \.id) { it in
+                            HStack(spacing: 6) {
+                                Button((chosenIdent == it.id ? "◉ " : "○ ") + it.name) { pickIdent(it) }
+                                    .buttonStyle(.borderless)
+                                    .disabled(running)
+                                Text(String(format: "%.2f MB", Double(it.bytes) / 1_048_576))
+                                    .font(.caption2)
+                                Spacer(minLength: 4)
+                                Button("改名") { startRename(it) }
+                                    .buttonStyle(.borderless)
+                                    .disabled(running)
+                                Button("删") { startDelete(it) }
+                                    .buttonStyle(.borderless)
+                                    .disabled(running)
+                            }
+                            .font(.caption)
+                        }
+                        if !identNote.isEmpty { Text(identNote).font(.caption).textSelection(.enabled) }
+                    }
+                    .alert("改名", isPresented: $renaming) {
+                        TextField("名字", text: $renameText)
+                        Button("存") { commitRename() }
+                        Button("取消", role: .cancel) { renameId = "" }
+                    }
+                    .alert("删掉「\(delName)」？", isPresented: $deleting) {
+                        Button("删", role: .destructive) { commitDelete() }
+                        Button("留着", role: .cancel) { delId = "" }
+                    } message: {
+                        Text("删了就只能重挑那张照片再算一次身份。")
+                    }
+
+                    Divider()
+
+                    VStack(alignment: .leading, spacing: 6) {
                         Text("整片换脸").font(.headline)
                         Button(faceURL == nil ? "① 选一张源脸照片" : "① 源脸：\(faceURL!.lastPathComponent)（点它换一张）") {
                             picking = "face"
                         }
                         .buttonStyle(.bordered)
                         .disabled(running)
+                        Text(sourceLine).font(.caption)
                         Button(videoURL == nil ? "② 选一条要换脸的视频" : "② 视频：\(videoURL!.lastPathComponent)（点它换一条）") {
                             picking = "video"
                         }
@@ -94,7 +145,7 @@ struct SwapContentView: View {
                             startSwap()
                         }
                         .buttonStyle(.borderedProminent)
-                        .disabled(running || faceURL == nil || videoURL == nil)
+                        .disabled(running || !hasSource || videoURL == nil)
 
                         // 我点的这个按钮下面就是真实流水：送达→执行→到第几帧→结果
                         Text(running ? "跑着，下面每 1 s 刷一次："
@@ -145,6 +196,11 @@ struct SwapContentView: View {
                         跑完自己存相册、成功才删沙盒那份。
                         界面上每 sampleEvery=30 帧复测一次身份余弦（PC 参照：换后<->源 0.81~0.90）——\
                         这一版质量不许降，所以三张网都是 fp32，码率按尺寸给到 6 Mbps 以上。
+                        这一版多了「已存的人」：一张照片的身份（18 个权重＋512 维身份证）落进 Documents/swap_idents，\
+                        以后点名字直接选他，跳过身份证＋身份包那两步（上机实测这两步 70.61 + 18.27 ms），能改名、能删，删掉就把那份字节还回磁盘。
+                        遮罩透明度分母从 0.60 改成 0.40：0.60 那版你报「那层透明更明显了」，\
+                        本机在你这条原片上量到贴层实度只 92.5%、缝上亮度台阶 L+3.4（六臂里最差）；0.40 量到 97.1%／L+2.3，\
+                        盖脸框 97.1%→97.9%，换脸力度不丢（像素差 10.9→11.2、↔他本人 0.045→0.039）。
                         """)
                             .font(.caption)
                             .textSelection(.enabled)
@@ -156,6 +212,7 @@ struct SwapContentView: View {
             .navigationTitle("换脸出片")
             .onAppear {
                 facts = SwapFacts.lines()
+                idents = SwapIdents.list()
                 logTail = SwapJournal.tail(30)
             }
             .onReceive(pulse) { _ in
@@ -172,6 +229,10 @@ struct SwapContentView: View {
                         if FileManager.default.fileExists(atPath: u.path) { try? FileManager.default.removeItem(at: u) }
                         faceImg = img
                         faceURL = img == nil ? nil : u
+                        if img != nil {
+                            chosenIdent = ""
+                            identNote = "这一趟用刚选的这张照片的身份（跑完自动存进「已存的人」）"
+                        }
                         SwapJournal.line("选了源脸 \(u.lastPathComponent)｜"
                             + (img == nil ? "这张照片读不进来，重选" : "已读进内存，tmp 副本当场还掉"))
                     } else {
@@ -197,8 +258,17 @@ struct SwapContentView: View {
     }
 
     private func startSwap() {
-        guard let img = faceImg, let v = videoURL else {
-            result = "源脸照片没在手上了（重新选一张）"
+        let person: SwapClip.Person
+        if !chosenIdent.isEmpty {
+            person = .saved(chosenIdent)
+        } else if let img = faceImg {
+            person = .photo(img)
+        } else {
+            result = "源身份没在手上了：在「已存的人」里点一个，或者①重选一张源脸照片"
+            return
+        }
+        guard let v = videoURL else {
+            result = "②还没选要换脸的视频"
             return
         }
         running = true
@@ -207,12 +277,12 @@ struct SwapContentView: View {
         logTail = SwapJournal.tail(30)
         let units = Self.units[unitIdx].1
         let longEdge = Self.longs[longIdx]
-        SwapJournal.line("开始整片换脸 units=\(Self.units[unitIdx].0) 长边=\(longEdge) 源=\(faceURL?.lastPathComponent ?? "-") 片=\(v.lastPathComponent)")
+        SwapJournal.line("开始整片换脸 units=\(Self.units[unitIdx].0) 长边=\(longEdge) 源=\(sourceTag) 片=\(v.lastPathComponent)")
         var args = SwapClip.Args()
         args.units = units
         args.longEdge = longEdge
         Task.detached {
-            let r = SwapClip.run(source: img, video: v, args: args) { line in
+            let r = SwapClip.run(person: person, video: v, args: args) { line in
                 SwapJournal.line(line)
             }
             // 视频那份拷贝是输入，跑完就该还掉：手机存储不许留残料（源脸那份选定时就还了）
@@ -226,9 +296,64 @@ struct SwapContentView: View {
                 result = r.note
                 running = false
                 facts = SwapFacts.lines()
+                idents = SwapIdents.list()
                 logTail = SwapJournal.tail(30)
             }
         }
+    }
+
+    // MARK: - 已存的人
+
+    /// 这一趟的源身份是谁：界面贴在 ① 下面，日志里同一句话进流水。
+    private var sourceLine: String {
+        if !chosenIdent.isEmpty { return "源身份：已存的人「\(SwapIdents.displayName(chosenIdent))」，跑的时候跳过身份证＋身份包" }
+        if faceImg != nil { return "源身份：刚选的这张照片，要跑身份证＋身份包那两步" }
+        return "源身份：还没定——在「已存的人」里点一个，或①选一张源脸照片"
+    }
+
+    private var hasSource: Bool { !chosenIdent.isEmpty || faceImg != nil }
+
+    private var sourceTag: String {
+        chosenIdent.isEmpty ? (faceURL?.lastPathComponent ?? "-") : "已存「\(SwapIdents.displayName(chosenIdent))」"
+    }
+
+    private func pickIdent(_ it: SwapIdents.Item) {
+        chosenIdent = it.id
+        faceImg = nil
+        faceURL = nil
+        identNote = "选中「\(it.name)」：这一趟不用照片，身份直接从盘上装"
+        SwapJournal.line(identNote)
+    }
+
+    private func startRename(_ it: SwapIdents.Item) {
+        renameId = it.id
+        renameText = it.name
+        renaming = true
+    }
+
+    private func commitRename() {
+        renaming = false
+        guard !renameId.isEmpty else { return }
+        identNote = SwapIdents.rename(id: renameId, to: renameText)
+        SwapJournal.line("改名：\(identNote)")
+        renameId = ""
+        idents = SwapIdents.list()
+    }
+
+    private func startDelete(_ it: SwapIdents.Item) {
+        delId = it.id
+        delName = it.name
+        deleting = true
+    }
+
+    private func commitDelete() {
+        deleting = false
+        guard !delId.isEmpty else { return }
+        identNote = SwapIdents.remove(id: delId)
+        SwapJournal.line("删已存的人：\(identNote)")
+        if chosenIdent == delId { chosenIdent = "" }
+        delId = ""
+        idents = SwapIdents.list()
     }
 
     private func runBench() {

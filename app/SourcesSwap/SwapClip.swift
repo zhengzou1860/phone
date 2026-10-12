@@ -167,7 +167,7 @@ final class SwapSource {
     }
 }
 
-/// 整片真换脸：源静帧算一次身份 → 逐帧 检测→对齐→逐帧网→回贴 → 编码器写新片。
+/// 整片真换脸：源身份（新照片跑一次那两步、已存的人从盘上直接装）→ 逐帧 检测→对齐→逐帧网→回贴 → 编码器写新片。
 /// 每一步的单价、身份余弦、足迹水位全部进流水；跑完存相册，成功才删沙盒那份。
 enum SwapClip {
     struct Args {
@@ -176,12 +176,19 @@ enum SwapClip {
         var minFacePx: Double = 40
         var sampleEvery: Int = 30
         var footprintStopMB: Int = 900
-        /// 五官加深倍数、遮罩透明度分母：两个数都取自本机对这条原片的 A/B（tools/ship_check.py 的 B 臂），不是拍的
+        /// 五官加深倍数、遮罩透明度分母：两个数都取自本机对这条原片的六臂 A/B（tools/soft_menu.py），不是拍的。
+        /// 0.60 那一版他跑出来报「那层透明更明显了」：量到贴层实度只有 92.5%、缝上亮度台阶最差（L+3.4）。
         var gamma: Float = 1.6
-        var maskSoft: Float = 0.60
+        var maskSoft: Float = 0.40
     }
 
-    static func run(source: UIImage, video: URL, args: Args, onLine: (String) -> Void) -> (out: URL?, note: String) {
+    /// 源身份的两条来路：新挑的照片（要跑"每人一次"那两步）或列表里已存的人（直接从盘上装）。
+    enum Person {
+        case photo(UIImage)
+        case saved(String)
+    }
+
+    static func run(person: Person, video: URL, args: Args, onLine: (String) -> Void) -> (out: URL?, note: String) {
         var rep: [String] = []
         func say(_ s: String) { rep.append(s); onLine(s) }
         func fail(_ s: String) -> (out: URL?, note: String) {
@@ -193,49 +200,71 @@ enum SwapClip {
         let got = SwapRunner.load(units: args.units, onLine: onLine)
         guard let runner = got.runner else { return fail("装网失败：\n" + got.note) }
 
-        // —— 2. 源身份：每人一次的那两步，这一版第一次在机上量出钱来 ——
-        let up = SwapVision.uprightImage(source)
-        guard let cg = up.cg else { return fail("源脸静帧取不出：\(up.note)") }
-        let req = VNDetectFaceLandmarksRequest()
-        let (sObs, sErr) = SwapVision.faces(cg, req)
-        if !sErr.isEmpty { say("源脸检测：\(sErr)") }
-        guard let sl = SwapVision.largest(sObs, w: cg.width, h: cg.height) else {
-            return fail("源脸检测：这张图里没检到脸（\(up.note)）")
+        // —— 2. 源身份：已存的人只读盘装权重，新照片才跑下面那两步 ——
+        var srcEmb: [Float] = []
+        switch person {
+        case .saved(let pid):
+            guard let one = SwapIdents.load(id: pid) else {
+                return fail("已存的人「\(SwapIdents.displayName(pid))」的存档读不出来"
+                    + "（不是这一版写的、或字节缺了），重选一张源脸照片")
+            }
+            let l0 = DispatchTime.now().uptimeNanoseconds
+            let put = runner.useWeights(one.weights)
+            let lMs = Double(DispatchTime.now().uptimeNanoseconds - l0) / 1_000_000
+            guard put.count == 18, !one.emb.isEmpty else {
+                return fail("已存的人「\(one.name)」接不上：\(put.note)")
+            }
+            say("用已存的人「\(one.name)」：读盘＋装权重 \(SwapUtil.ms(lMs))｜\(put.note)"
+                + "｜身份证 512 维随包带回来，每 30 帧复测那把尺子照旧"
+                + "｜跳过 ①②（上机实测这两步 70.61 + 18.27 ms）｜足迹 \(SwapFacts.footprintMB()) MB")
+            srcEmb = one.emb
+        case .photo(let source):
+            // —— 2a. 每人一次的那两步，这一版第一次在机上量出钱来 ——
+            let up = SwapVision.uprightImage(source)
+            guard let cg = up.cg else { return fail("源脸静帧取不出：\(up.note)") }
+            let req = VNDetectFaceLandmarksRequest()
+            let (sObs, sErr) = SwapVision.faces(cg, req)
+            if !sErr.isEmpty { say("源脸检测：\(sErr)") }
+            guard let sl = SwapVision.largest(sObs, w: cg.width, h: cg.height) else {
+                return fail("源脸检测：这张图里没检到脸（\(up.note)）")
+            }
+            say("源脸：" + SwapVision.settleOrigin(face: sObs[sl.index]) + "｜短边 \(String(format: "%.0f", sl.shortSide)) px")
+            guard let srcAlign = SwapVision.align(face: sObs[sl.index], w: cg.width, h: cg.height) else {
+                return fail("源脸对齐失败：5 点映不进模板")
+            }
+            say("源脸对齐 点位=\(srcAlign.src)｜残差 \(String(format: "%.1f", srcAlign.resid224))（224 内）"
+                + "＝\(String(format: "%.2f", srcAlign.residPx)) px｜det \(String(format: "%.3f", srcAlign.det))"
+                + "｜缩放比 \(String(format: "%.2f", srcAlign.ratio))")
+            let sPb = SwapTech.pixelBuffer(from: cg)
+            guard let sbuf = sPb.pb else { return fail("源静帧 \(sPb.note)") }
+            var crop224 = [Float](repeating: 0, count: 3 * SwapGeo.size * SwapGeo.size)
+            let warpsrc = SwapTech.withPixels(sbuf) { base, bpr -> Bool in
+                SwapGeo.warpToCrop(UnsafeRawPointer(base), bytesPerRow: bpr, w: cg.width, h: cg.height,
+                                   fwd: srcAlign.fwd, side: SwapGeo.size, out: &crop224)
+                return true
+            }
+            guard warpsrc == true else { return fail("源脸裁不出 224") }
+            var src112 = [Float](repeating: 0, count: 3 * 112 * 112)
+            SwapGeo.resizePlanar(crop224, from: SwapGeo.size, to: 112, into: &src112)
+            let id0 = DispatchTime.now().uptimeNanoseconds
+            let ident = runner.identity(crop112_01: src112)
+            let idMs = Double(DispatchTime.now().uptimeNanoseconds - id0) / 1_000_000
+            guard !ident.emb.isEmpty else {
+                return fail("① 身份证失败：\(ident.note)（PC 参照：这一步 1109~1318 ms）")
+            }
+            say("① 身份证 \(SwapUtil.ms(idMs))（纯网 \(SwapUtil.ms(ident.ms))，\(ident.note)）"
+                + "｜模长 \(String(format: "%.1f", ident.rawNorm))｜足迹 \(SwapFacts.footprintMB()) MB"
+                + "｜PC 参照 1109~1318 ms、同一步模长 2.84~3.72（逐维 ±0.5 上下；口径错了形状照样合法、只有模长露馅）")
+            let w0 = DispatchTime.now().uptimeNanoseconds
+            let mk = runner.makeWeights(emb: ident.emb, feat: ident.feat)
+            let wMs = Double(DispatchTime.now().uptimeNanoseconds - w0) / 1_000_000
+            guard mk.count == 18 else { return fail("② 身份包失败：\(mk.note)") }
+            say("② 身份包 \(SwapUtil.ms(wMs))（纯网 \(SwapUtil.ms(mk.ms))）｜\(mk.note)"
+                + "｜足迹 \(SwapFacts.footprintMB()) MB｜PC 参照 27~50 ms")
+            srcEmb = ident.emb
+            let sv = SwapIdents.save(emb: ident.emb, weights: runner.weightDump(), taken: SwapIdents.list())
+            say("③ 身份存档：\(sv.note)｜足迹 \(SwapFacts.footprintMB()) MB")
         }
-        say("源脸：" + SwapVision.settleOrigin(face: sObs[sl.index]) + "｜短边 \(String(format: "%.0f", sl.shortSide)) px")
-        guard let srcAlign = SwapVision.align(face: sObs[sl.index], w: cg.width, h: cg.height) else {
-            return fail("源脸对齐失败：5 点映不进模板")
-        }
-        say("源脸对齐 点位=\(srcAlign.src)｜残差 \(String(format: "%.1f", srcAlign.resid224))（224 内）"
-            + "＝\(String(format: "%.2f", srcAlign.residPx)) px｜det \(String(format: "%.3f", srcAlign.det))"
-            + "｜缩放比 \(String(format: "%.2f", srcAlign.ratio))")
-        let sPb = SwapTech.pixelBuffer(from: cg)
-        guard let sbuf = sPb.pb else { return fail("源静帧 \(sPb.note)") }
-        var crop224 = [Float](repeating: 0, count: 3 * SwapGeo.size * SwapGeo.size)
-        let warpsrc = SwapTech.withPixels(sbuf) { base, bpr -> Bool in
-            SwapGeo.warpToCrop(UnsafeRawPointer(base), bytesPerRow: bpr, w: cg.width, h: cg.height,
-                               fwd: srcAlign.fwd, side: SwapGeo.size, out: &crop224)
-            return true
-        }
-        guard warpsrc == true else { return fail("源脸裁不出 224") }
-        var src112 = [Float](repeating: 0, count: 3 * 112 * 112)
-        SwapGeo.resizePlanar(crop224, from: SwapGeo.size, to: 112, into: &src112)
-        let id0 = DispatchTime.now().uptimeNanoseconds
-        let ident = runner.identity(crop112_01: src112)
-        let idMs = Double(DispatchTime.now().uptimeNanoseconds - id0) / 1_000_000
-        guard !ident.emb.isEmpty else {
-            return fail("① 身份证失败：\(ident.note)（PC 参照：这一步 1109~1318 ms）")
-        }
-        say("① 身份证 \(SwapUtil.ms(idMs))（纯网 \(SwapUtil.ms(ident.ms))，\(ident.note)）"
-            + "｜模长 \(String(format: "%.1f", ident.rawNorm))｜足迹 \(SwapFacts.footprintMB()) MB"
-            + "｜PC 参照 1109~1318 ms、同一步模长 2.84~3.72（逐维 ±0.5 上下；口径错了形状照样合法、只有模长露馅）")
-        let w0 = DispatchTime.now().uptimeNanoseconds
-        let mk = runner.makeWeights(emb: ident.emb, feat: ident.feat)
-        let wMs = Double(DispatchTime.now().uptimeNanoseconds - w0) / 1_000_000
-        guard mk.count == 18 else { return fail("② 身份包失败：\(mk.note)") }
-        say("② 身份包 \(SwapUtil.ms(wMs))（纯网 \(SwapUtil.ms(mk.ms))）｜\(mk.note)"
-            + "｜足迹 \(SwapFacts.footprintMB()) MB｜PC 参照 27~50 ms")
-        let srcEmb = ident.emb
 
         // —— 3. 片子 ——
         guard let src = SwapSource(url: video, longEdge: args.longEdge, onLine: onLine) else {
