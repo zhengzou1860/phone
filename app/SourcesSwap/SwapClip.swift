@@ -346,7 +346,7 @@ enum SwapClip {
         var appendMs: [Double] = [], decodeMs: [Double] = [], sampleMs: [Double] = [], resids: [Double] = []
         var resids224: [Double] = [], facePx: [Double] = []
         var cosList: [String] = []
-        var made = 0, swapped = 0, noFace = 0, smallFace = 0, fitFail = 0, mirror = 0, netFail = 0
+        var made = 0, swapped = 0, noFace = 0, smallFace = 0, fitFail = 0, mirror = 0, netFail = 0, poolMiss = 0
         var probeLeft = 6                       // 「没脸」帧只挑前 6 帧做二次检测对照
         var pointSrc = "—"
         var why = ""
@@ -364,7 +364,14 @@ enum SwapClip {
             guard let ai = aIn, let ao = aOut, aNote.isEmpty else { return }
             while writer.status == .writing {
                 if aFedTo != .invalid && CMTimeCompare(aFedTo, pts) >= 0 { return }
-                guard let s = ao.copyNextSampleBuffer() else { aNote = "音轨先到末尾"; return }
+                guard let s = ao.copyNextSampleBuffer() else {
+                    if writer.status == .writing && reader.status == .reading {
+                        aNote = "音轨已到末尾（读到 \(aOK) 块）"
+                    } else {
+                        aNote = "音轨停止：writer \(writerName(writer.status))｜reader \(readerName(reader.status))｜读到 \(aOK) 块"
+                    }
+                    return
+                }
                 let sPTS = CMSampleBufferGetPresentationTimeStamp(s)
                 if aFedTo == .invalid {
                     let off = CMTimeGetSeconds(CMTimeSubtract(sPTS, basePTS == .invalid ? .zero : basePTS))
@@ -375,7 +382,10 @@ enum SwapClip {
                 var spins = 0
                 while !ai.isReadyForMoreMediaData {
                     spins += 1
-                    if spins > 600 { aNote = "音轨队列 3 秒不收"; return }
+                    if spins > 12_000 { aNote = "音轨队列 60 秒不收"; return }
+                    if spins % 400 == 0 {
+                        say("  音频队列不收，已等 \(String(format: "%.1f", Double(spins) * 0.005)) s")
+                    }
                     Thread.sleep(forTimeInterval: 0.005)
                 }
                 if ai.append(s) {
@@ -415,7 +425,10 @@ enum SwapClip {
 
                 var mine: CVPixelBuffer?
                 if let pool = adaptor.pixelBufferPool { mine = SwapTech.poolBuffer(pool) }
-                if mine == nil { mine = SwapTech.pixelBuffer(src.outW, src.outH).pb }
+                if mine == nil {
+                    mine = SwapTech.pixelBuffer(src.outW, src.outH).pb
+                    poolMiss += 1
+                }
                 guard let dst = mine else { ended = "拿不出成片缓冲"; return }
                 guard SwapTech.copyRows(from: pb, to: dst) else { ended = "拷帧失败"; return }
                 decodeMs.append(Double(DispatchTime.now().uptimeNanoseconds - td0) / 1_000_000)
@@ -512,7 +525,11 @@ enum SwapClip {
                 var spins = 0
                 while !vIn.isReadyForMoreMediaData {
                     spins += 1
-                    if spins > 600 { ended = "编码器队列 3 秒不收"; return }
+                    // 上一版 3 秒就收兵：418 帧的片子走到 397 帧被编码器一次打嗝截掉，成片比素材短 0.7 秒
+                    if spins > 12_000 { ended = "编码器队列 60 秒不收（第 \(made) 帧）"; return }
+                    if spins % 400 == 0 {
+                        say("  编码器不收第 \(made) 帧，已等 \(String(format: "%.1f", Double(spins) * 0.005)) s")
+                    }
                     Thread.sleep(forTimeInterval: 0.005)
                 }
                 var tries = 0
@@ -572,7 +589,9 @@ enum SwapClip {
         let madeSec = Double(made) / max(src.fps, 1)
         let perFrame = avg(decodeMs) + avg(detectMs) + avg(alignMs) + avg(netMs) + avg(pasteMs) + avg(appendMs)
         say("换完 \(made) 帧（预估 \(estFrames)，编码器头/尾 \(SwapUtil.ms(tailMs))）"
-            + "｜成片 \(String(format: "%.1f", Double(size) / 1_048_576)) MB｜\(why.isEmpty ? "跑到末尾" : why)")
+            + "｜成片 \(String(format: "%.1f", Double(size) / 1_048_576)) MB"
+            + "｜缓冲 池子给 \(made - poolMiss)／自造 \(poolMiss)"
+            + "｜\(why.isEmpty ? "跑到末尾" : why)")
         say("单价 解码 \(SwapUtil.stat(decodeMs))｜检测 \(SwapUtil.stat(detectMs))｜对齐 \(SwapUtil.stat(alignMs))")
         say("      逐帧网 \(SwapUtil.stat(netMs))｜回贴 \(SwapUtil.stat(pasteMs))｜提交 \(SwapUtil.stat(appendMs))")
         say("      \(runner.statsLine())")
