@@ -17,11 +17,6 @@ enum SwapTech {
         return d
     }
 
-    static func fourCC(_ c: OSType) -> String {
-        let bytes = [Int((c >> 24) & 0xFF), Int((c >> 16) & 0xFF), Int((c >> 8) & 0xFF), Int(c & 0xFF)]
-        return bytes.map { Character(UnicodeScalar($0)) }.reduce(into: "") { $0.append($1) }
-    }
-
     /// 长边不超过 cap，宽高取偶数（h264 要偶数尺寸）。cap 用不上就原样取偶。
     static func fitEven(_ w: Int, _ h: Int, longEdge cap: Int) -> (w: Int, h: Int) {
         let long = max(w, h)
@@ -61,8 +56,8 @@ enum SwapTech {
         guard w == CVPixelBufferGetWidth(dst), h == CVPixelBufferGetHeight(dst) else { return false }
         if CVPixelBufferLockBaseAddress(src, .readOnly) != kCVReturnSuccess { return false }
         defer { CVPixelBufferUnlockBaseAddress(src, .readOnly) }
-        if CVPixelBufferLockBaseAddress(dst, .readWrite) != kCVReturnSuccess { return false }
-        defer { CVPixelBufferUnlockBaseAddress(dst, .readWrite) }
+        if CVPixelBufferLockBaseAddress(dst, []) != kCVReturnSuccess { return false }
+        defer { CVPixelBufferUnlockBaseAddress(dst, []) }
         guard let sb = CVPixelBufferGetBaseAddress(src), let db = CVPixelBufferGetBaseAddress(dst) else { return false }
         let sr = CVPixelBufferGetBytesPerRow(src), dr = CVPixelBufferGetBytesPerRow(dst)
         let n = min(sr, dr)
@@ -75,8 +70,8 @@ enum SwapTech {
     /// 读写一块缓冲的像素。锁不开或拿不到基址就返回 nil（调用方必须把这一帧当失败处理，不许静默跳过）。
     /// 模型预测期间不握着锁：取像素和回贴各自锁一次。
     static func withPixels<T>(_ pb: CVPixelBuffer, _ body: (UnsafeMutableRawPointer, Int) -> T) -> T? {
-        guard CVPixelBufferLockBaseAddress(pb, .readWrite) == kCVReturnSuccess else { return nil }
-        defer { CVPixelBufferUnlockBaseAddress(pb, .readWrite) }
+        guard CVPixelBufferLockBaseAddress(pb, []) == kCVReturnSuccess else { return nil }
+        defer { CVPixelBufferUnlockBaseAddress(pb, []) }
         guard let base = CVPixelBufferGetBaseAddress(pb) else { return nil }
         return body(base, CVPixelBufferGetBytesPerRow(pb))
     }
@@ -86,10 +81,10 @@ enum SwapTech {
         let w = cg.width, h = cg.height
         let made = pixelBuffer(w, h)
         guard let pb = made.pb else { return (nil, made.note) }
-        guard CVPixelBufferLockBaseAddress(pb, .readWrite) == kCVReturnSuccess else {
+        guard CVPixelBufferLockBaseAddress(pb, []) == kCVReturnSuccess else {
             return (nil, "静帧缓冲锁不上")
         }
-        defer { CVPixelBufferUnlockBaseAddress(pb, .readWrite) }
+        defer { CVPixelBufferUnlockBaseAddress(pb, []) }
         guard let base = CVPixelBufferGetBaseAddress(pb) else { return (nil, "静帧缓冲没有基址") }
         let cs = cg.colorSpace ?? CGColorSpaceCreateDeviceRGB()
         guard let ctx = CGContext(data: base, width: w, height: h, bitsPerComponent: 8,
@@ -305,13 +300,13 @@ enum SwapClip {
         if let at = src.asset.tracks(withMediaType: .audio).first {
             let ai = AVAssetWriterInput(mediaType: .audio, outputSettings: nil)
             ai.expectsMediaDataInRealTime = false
-            ai.sourceFormatHint = at.format.formatDescription
+            // 没设 sourceFormatHint：Swift 里它是只读属性，只能靠 append 的第一块 sample 自带格式
             if let ao = try? AVAssetReaderTrackOutput(track: at, outputSettings: nil), writer.canAdd(ai) {
                 writer.add(ai)
                 reader.add(ao)
                 aIn = ai
                 aOut = ao
-                say("音频 原样搬运（不解码）：子类型 \(SwapTech.fourCC(at.format.formatDescription.mediaSubType.rawValue))")
+                say("音频 原样搬运（不解码不重编，没给格式提示→靠 sample 自带）")
             } else {
                 say("音频 建不出透传或 canAdd 为假 → 成片没声音")
             }

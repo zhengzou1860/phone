@@ -47,7 +47,7 @@ enum SwapNets {
         for n in md.inputDescriptionsByName.keys.sorted() {
             guard let d = md.inputDescriptionsByName[n] else { continue }
             if d.type == .multiArray, let c = d.multiArrayConstraint {
-                ins.append("\(n)=\(c.shape.map { $0.intValue }.joined(separator: "x"))/\(dtypeName(c.dataType))")
+                ins.append("\(n)=\(c.shape.map { String($0.intValue) }.joined(separator: "x"))/\(dtypeName(c.dataType))")
             } else if d.type == .image, let ic = d.imageConstraint {
                 ins.append("\(n)=image\(ic.pixelsWide)x\(ic.pixelsHigh)")
             } else {
@@ -58,7 +58,7 @@ enum SwapNets {
         for n in md.outputDescriptionsByName.keys.sorted() {
             guard let d = md.outputDescriptionsByName[n], d.type == .multiArray,
                   let c = d.multiArrayConstraint else { continue }
-            outs.append("\(n)=\(c.shape.map { $0.intValue }.joined(separator: "x"))")
+            outs.append("\(n)=\(c.shape.map { String($0.intValue) }.joined(separator: "x"))")
         }
         return "入[\(ins.joined(separator: " "))] 出[\(outs.joined(separator: " "))]"
     }
@@ -69,7 +69,6 @@ enum SwapNets {
         case .float32: return "f32"
         case .float64: return "f64"
         case .int32: return "i32"
-        case .int64: return "i64"
         @unknown default: return "?\(t.rawValue)"
         }
     }
