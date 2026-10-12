@@ -299,7 +299,8 @@ enum SwapClip {
         var aOut: AVAssetReaderTrackOutput?
         if let at = src.asset.tracks(withMediaType: .audio).first {
             let fds = at.formatDescriptions
-            let hint = fds.first as? CMFormatDescription
+            // 空数组才没提示；非空时这个元素本身就是 CMFormatDescription（SDK 里 `as?` 到 CF 类型是 error：恒成立）
+            let hint: CMFormatDescription? = fds.isEmpty ? nil : (fds[0] as! CMFormatDescription)
             var sub = "-"
             if let h = hint {
                 let t = CMFormatDescriptionGetMediaSubType(h)
@@ -312,7 +313,7 @@ enum SwapClip {
             let ao = try? AVAssetReaderTrackOutput(track: at, outputSettings: nil)
             // 三种失败分开报：上一版挤成一句「建不出透传或 canAdd 为假」，死在哪一环看不出来
             if hint == nil {
-                say("音频 这条音轨的 formatDescriptions 有 \(fds.count) 条，第一条桥不成 CMFormatDescription → 没提示可给")
+                say("音频 这条音轨的 formatDescriptions 是空的（\(fds.count) 条）→ 没提示可给")
             }
             if ao == nil {
                 say("音频 reader 的透传输出建不出来 → 成片没声音")
@@ -343,6 +344,7 @@ enum SwapClip {
 
         var detectMs: [Double] = [], alignMs: [Double] = [], netMs: [Double] = [], pasteMs: [Double] = []
         var appendMs: [Double] = [], decodeMs: [Double] = [], sampleMs: [Double] = [], resids: [Double] = []
+        var resids224: [Double] = [], facePx: [Double] = []
         var cosList: [String] = []
         var made = 0, swapped = 0, noFace = 0, smallFace = 0, fitFail = 0, mirror = 0, netFail = 0
         var probeLeft = 6                       // 「没脸」帧只挑前 6 帧做二次检测对照
@@ -401,6 +403,8 @@ enum SwapClip {
                         } else {
                             let t2 = DispatchTime.now().uptimeNanoseconds
                             resids.append(al.residPx)
+                            resids224.append(al.resid224)
+                            facePx.append(l.shortSide)
                             alignMs.append(Double(DispatchTime.now().uptimeNanoseconds - t2) / 1_000_000)
                             let took = SwapTech.withPixels(dst) { base, bpr -> Bool in
                                 SwapGeo.warpToCrop(UnsafeRawPointer(base), bytesPerRow: bpr, w: w, h: h,
@@ -452,16 +456,16 @@ enum SwapClip {
                     }
                 } else {
                     noFace += 1
-                    // 当场对照：默认档 0 张脸的，换 .accurate＋revision3 再检一遍同一帧。
+                    // 当场对照：默认档 0 张脸的，换老一版检测器（revision1）再检同一帧。
+                    // 这个 SDK 的 face 请求已经没有 accuracy 旋钮了，能换口径的只有 revision。
                     // 分不清「漏检」还是「这帧真没脸」时，整片跑完也判不了，只能这样钉死。
                     if probeLeft > 0 {
                         probeLeft -= 1
                         let req2 = VNDetectFaceLandmarksRequest()
-                        req2.accuracy = .accurate
-                        req2.revision = VNDetectFaceLandmarksRequestRevision3
+                        req2.revision = VNDetectFaceLandmarksRequestRevision1
                         let (o2, e2) = SwapVision.faces(dst, req2)
                         let s2 = SwapVision.largest(o2, w: w, h: h)
-                        say("  没脸对照 第 \(made) 帧：默认档 \(obs.count) 张｜.accurate+rev3 \(o2.count) 张"
+                        say("  没脸对照 第 \(made) 帧：默认档 \(obs.count) 张｜rev1 老检测器 \(o2.count) 张"
                             + (s2 == nil ? "" : "｜最大短边 \(String(format: "%.0f", s2!.shortSide)) px")
                             + (e2.isEmpty ? "" : "｜\(e2)"))
                     }
@@ -550,8 +554,12 @@ enum SwapClip {
             + "｜身份复测每次 \(SwapUtil.stat(sampleMs))")
         say("换上人 \(swapped) 帧｜没脸 \(noFace)｜太小 \(smallFace)｜拟合没过 \(fitFail)｜镜像 \(mirror)｜网失败 \(netFail)｜点位 \(pointSrc)")
         if !resids.isEmpty {
-            say("对齐残差 中位 \(String(format: "%.2f", median(resids))) px／最大 \(String(format: "%.2f", resids.max() ?? 0)) px"
-                + "（PC 那张容忍表：±2~4 px 之内才不掉分）")
+            say("对齐残差 中位 \(String(format: "%.2f", median(resids)))／最大 \(String(format: "%.2f", resids.max() ?? 0)) px（原图像素口径）"
+                + "｜折进 224 方块 中位 \(String(format: "%.2f", median(resids224)))／最大 \(String(format: "%.2f", resids224.max() ?? 0)) px")
+            say("      注：原图像素那个数会随脸在片里的大小成比例放大，跨片子只能看 224 那一列；PC 那张 ±2~4 px 容忍表是在 141 px 的脸上量的")
+            let fm = median(facePx), fmax = facePx.max() ?? 0
+            say("      脸短边 中位 \(String(format: "%.0f", fm))／p90 \(String(format: "%.0f", pct(facePx, 0.9)))／最大 \(String(format: "%.0f", fmax)) px"
+                + "｜224 补丁撑到最大脸＝\(String(format: "%.2f", fmax / 224.0))×（>1＝把 224 的结果放大贴，糊边成一层膜）")
         }
         say("足迹 \(mem0)→\(SwapFacts.footprintMB()) MB，本次峰值 \(memMax) MB")
         if !cosList.isEmpty {
@@ -575,5 +583,11 @@ enum SwapClip {
         guard !v.isEmpty else { return -1 }
         let s = v.sorted()
         return s[s.count / 2]
+    }
+    private static func pct(_ v: [Double], _ q: Double) -> Double {
+        guard !v.isEmpty else { return 0 }
+        let s = v.sorted()
+        let i = min(s.count - 1, max(0, Int((Double(s.count - 1) * min(1, max(0, q))).rounded())))
+        return s[i]
     }
 }
