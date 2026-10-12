@@ -90,8 +90,6 @@ final class SwapRunner {
         let buildFeatIn: String
         let attName: String
         let unetOutImage: String
-        /// 没混过的全脸生成 gen（CI 那一步按结构从 out = gen·mask + (1−mask)·att_img 里挂出来的第三个出参）
-        let unetOutGen: String
         let unetOutMask: String
         let weightNames: [String]
         let weightSources: [String]
@@ -221,16 +219,6 @@ final class SwapRunner {
             err.append("逐帧网找不到换出的脸（实际出 \(names(unet, false))）")
             return (nil, err.joined(separator: "；"))
         }
-        // 第三个出参 gen 与上面那个"换出的脸"形状逐条相同，光靠形状分不出谁是谁 ⇒ 先按名认，认不到就取"同形状但不是它"的那个
-        let uod = unet.modelDescription.outputDescriptionsByName
-        var gn: String? = nil
-        for n in (["mfs_gen_face"] + names(unet, false)) where n != gi {
-            if let d = uod[n], matches(d, rank: 4, channels: 3, total: 3 * 224 * 224) { gn = n; break }
-        }
-        guard let gg = gn else {
-            err.append("逐帧网找不到没混过的 gen（实际出 \(names(unet, false))）⇒ 补丁口径没法算，拒绝出片")
-            return (nil, err.joined(separator: "；"))
-        }
         guard let mi = find(unet, inputs: false, rank: 4, channels: 1, total: 224 * 224,
                             prefers: ["save_infer_model_scale_1_tmp_0"]) else {
             err.append("逐帧网找不到 mask（实际出 \(names(unet, false))）")
@@ -249,10 +237,10 @@ final class SwapRunner {
         }
         let c = Contract(arcInput: ai, arcEmbOut: ae, arcFeatOut: af,
                          buildEmbIn: be, buildFeatIn: bf, attName: at,
-                         unetOutImage: gi, unetOutGen: gg, unetOutMask: mi,
+                         unetOutImage: gi, unetOutMask: mi,
                          weightNames: SwapNets.weightMap.map { $0.unet },
                          weightSources: SwapNets.weightMap.map { $0.build })
-        return (c, "全对上｜arc 入 \(ai) 出 \(ae)+\(af)｜build 入 \(be)+\(bf)｜unet 入 \(at)+18 出 \(gi)+\(gg)+\(mi)")
+        return (c, "全对上｜arc 入 \(ai) 出 \(ae)+\(af)｜build 入 \(be)+\(bf)｜unet 入 \(at)+18 出 \(gi)+\(mi)")
     }
 
     /// image 型输入的等价判定：CoreML 把 [1,C,H,W] 折成一张 w×h 的图，面积×通道对得上就算它
@@ -512,32 +500,28 @@ final class SwapRunner {
 
     /// ③ 逐帧：224 的 0~1 planar RGB ＋ 那 18 个权重 → 换出的脸 + mask。
     /// PC 56 ms/帧；上一版上机实测这张网 CPU 12.00 ms/帧。
-    /// `out` 是图自己混好的 gen·mask + (1−mask)·att（mask 最大只到 0.79，所以它天生半透明）；
-    /// `raw` 是没混过的全脸生成 gen——"五官加深"要从这一份取料，不能拿 out 反复混。
-    func frame(att224_01: [Float]) -> (out: [Float], raw: [Float], mask: [Float], ms: Double, note: String) {
-        guard hasWeights else { return ([], [], [], 0, "还没算身份") }
+    func frame(att224_01: [Float]) -> (out: [Float], mask: [Float], ms: Double, note: String) {
+        guard hasWeights else { return ([], [], 0, "还没算身份") }
         let (v, how) = feature(unet, name: contract.attName, planar01: att224_01, mean: nil, std: nil)
-        guard let av = v else { return ([], [], [], 0, "逐帧网喂不进：\(how)") }
+        guard let av = v else { return ([], [], 0, "逐帧网喂不进：\(how)") }
         var dict = weightFeed
         dict[contract.attName] = av
         guard let provider = try? MLDictionaryFeatureProvider(dictionary: dict) else {
-            return ([], [], [], 0, "逐帧输入字典装不起来（\(dict.count) 个键）")
+            return ([], [], 0, "逐帧输入字典装不起来（\(dict.count) 个键）")
         }
         let t0 = DispatchTime.now().uptimeNanoseconds
         guard let res = try? unet.prediction(from: provider) else {
             frameMs.append(Double(DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000)
-            return ([], [], [], 0, "逐帧 predict 抛错（\(how)）")
+            return ([], [], 0, "逐帧 predict 抛错（\(how)）")
         }
         let ms = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000
         frameMs.append(ms)
         guard let gArr = res.featureValue(for: contract.unetOutImage)?.multiArrayValue,
-              let rArr = res.featureValue(for: contract.unetOutGen)?.multiArrayValue,
               let mArr = res.featureValue(for: contract.unetOutMask)?.multiArrayValue,
-              let g = SwapRunner.flatten(gArr), let rw = SwapRunner.flatten(rArr),
-              let m = SwapRunner.flatten(mArr) else {
-            return ([], [], [], ms, "逐帧输出取不出来（\(contract.unetOutImage)/\(contract.unetOutGen)/\(contract.unetOutMask)）")
+              let g = SwapRunner.flatten(gArr), let m = SwapRunner.flatten(mArr) else {
+            return ([], [], ms, "逐帧输出取不出来（\(contract.unetOutImage)/\(contract.unetOutMask)）")
         }
-        return (g, rw, m, ms, "")
+        return (g, m, ms, "")
     }
 
     func statsLine() -> String {
