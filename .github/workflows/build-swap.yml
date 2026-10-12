@@ -1,0 +1,263 @@
+name: build-swap-ipa
+
+# 第五条线（手机本地换脸）自己的分支、自己的发布位，不碰别人的 channel。
+# 剪辑那份 build.yml 是 "push 到 main 就触发"且没有 paths 过滤 ⇒ 任何东西都不往 main 推。
+# 要重跑：gh 没登录就 git commit --allow-empty && git push origin swap
+on:
+  push:
+    branches: [swap]
+    paths:
+      - 'app/SourcesSwap/**'
+      - 'app/project-swap.yml'
+      - '.github/workflows/build-swap.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: swap
+  cancel-in-progress: true
+
+jobs:
+  swap:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: show toolchain
+        run: sw_vers && xcodebuild -version && xcodebuild -showsdks | grep -i ios
+
+      - name: 装 python 3.11 + 转换器
+        run: |
+          set +e
+          ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=6{print "::error::" p substr($0,1,230)}'; }
+          rec() { tee -a /tmp/model.log; }
+          rm -f /tmp/model.log
+          python3 -m venv /tmp/m2c >/dev/null 2>&1
+          /tmp/m2c/bin/pip install --quiet --no-cache-dir onnx2coreml coremltools onnx onnxruntime numpy >/tmp/pip.log 2>&1
+          echo "PIP-VERDICT onnx2coreml=$(/tmp/m2c/bin/pip show onnx2coreml 2>/dev/null | awk '/^Version/{print $2}') coremltools=$(/tmp/m2c/bin/python -c 'import coremltools as ct;print(ct.__version__)' 2>&1 | tail -1) ort=$(/tmp/m2c/bin/pip show onnxruntime 2>/dev/null | awk '/^Version/{print $2}')" | rec | ann "PIP "
+          tail -3 /tmp/pip.log | rec | ann "PIP-TAIL "
+          # 判决必须落成文件：annotation 我这边匿名读不到，宁可多发一份 model.log。
+          echo "M-VERDICT 转换器就绪" | rec
+          exit 0
+
+      # 四张 onnx 只在这台机器上下载，不进 git（公开仓库 + 295 MB 权重）。
+      # 下不到也照样出包：app 的环境行会写"包里没有模型"，那才是判据。
+      - name: 拉 MobileFaceSwap 的 onnx
+        run: |
+          set +e
+          ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=6{print "::error::" p substr($0,1,230)}'; }
+          rec() { tee -a /tmp/model.log; }
+          REPO=ZZZHHHHW/mobilefaceswap
+          # 必须下在工程看不见的目录里：project-swap.yml 的 sources 就是 SourcesSwap，
+          # 模型一旦落进 SourcesSwap，xcodegen 就把 mlpackage 当编译输入交给 coremlc generate，
+          # VR3D 第 5 轮正是这么死在 build 阶段（A valid manifest does not exist）。
+          DST=app/SwapModel
+          rm -rf "$DST" && mkdir -p "$DST/out"
+          want="MobileFaceSwapUNetRuntime.onnx BuildFaceSwap.onnx arcface.onnx"
+          ok=0; bad=0
+          for F in $want; do
+            for U in https://huggingface.co https://hf-mirror.com; do
+              code=$(curl -sS -L --retry 3 --retry-all-errors --max-time 900 \
+                     -o "$DST/$F.part" -w '%{http_code}' "$U/$REPO/resolve/main/$F?download=true" 2>/tmp/curl.err)
+              sz=$(wc -c < "$DST/$F.part" 2>/dev/null | tr -d ' ')
+              if [ "$code" = "200" ] && [ "${sz:-0}" -gt 100000 ]; then
+                mv -f "$DST/$F.part" "$DST/$F"
+                echo "M-OK $F code=$code bytes=$sz host=$U" | rec
+                ok=$((ok+1)); break
+              fi
+              echo "M-TRY $F code=${code:-?} bytes=${sz:-0} host=$U err=$(head -c 160 /tmp/curl.err 2>/dev/null)" | rec
+            done
+            [ -s "$DST/$F" ] || { bad=$((bad+1)); echo "M-FAIL 两个源都没拿下 $F" | rec; }
+          done
+          echo "M-VERDICT 下载 $ok 成 / $bad 败｜$(ls -l "$DST"/*.onnx 2>/dev/null | awk '{print $9"="$5}' | tr '\n' ' ')" | rec | ann "M-VERDICT "
+          exit 0
+
+      # 一张一条 step：annotation 每步只有约 10 条额度，三张挤在一起会把判定行挤掉
+      - name: 转 逐帧网（决定单价的那张）
+        run: |
+          set +e
+          ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=6{print "::error::" p substr($0,1,230)}'; }
+          rec() { tee -a /tmp/model.log; }
+          IN=app/SwapModel/MobileFaceSwapUNetRuntime.onnx
+          OUT=app/SwapModel/out/mfs_unet.mlpackage
+          rm -rf "$OUT"
+          if [ ! -s "$IN" ]; then echo "CV-VERDICT unet 没下到，跳过" | rec | ann "CV "; exit 0; fi
+          /tmp/m2c/bin/onnx2coreml convert "$IN" -o "$OUT" --format mlpackage --verify >/tmp/cv_unet.log 2>&1
+          rc=$?
+          echo "CV-VERDICT unet rc=$rc 大小=$(du -sk "$OUT" 2>/dev/null | awk '{print $1"KB"}') 文件=$(find "$OUT" -type f 2>/dev/null | wc -l | tr -d ' ') 权重=$(wc -c < "$OUT/Data/com.apple.CoreML/weights/weight.bin" 2>/dev/null | tr -d ' ')B" | rec | ann "CV "
+          grep -iE "mismatch|maximum absolute|mean absolute|verify|error|not support|unsupported" /tmp/cv_unet.log | head -5 | rec | ann "CV-V "
+          exit 0
+
+      - name: 转 arcface（每人一次的身份证）
+        run: |
+          set +e
+          ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=6{print "::error::" p substr($0,1,230)}'; }
+          rec() { tee -a /tmp/model.log; }
+          IN=app/SwapModel/arcface.onnx
+          OUT=app/SwapModel/out/arcface.mlpackage
+          rm -rf "$OUT"
+          if [ ! -s "$IN" ]; then echo "CV-VERDICT arcface 没下到，跳过" | rec | ann "CV "; exit 0; fi
+          /tmp/m2c/bin/onnx2coreml convert "$IN" -o "$OUT" --format mlpackage --verify >/tmp/cv_arc.log 2>&1
+          rc=$?
+          echo "CV-VERDICT arcface rc=$rc 大小=$(du -sk "$OUT" 2>/dev/null | awk '{print $1"KB"}') 文件=$(find "$OUT" -type f 2>/dev/null | wc -l | tr -d ' ') 权重=$(wc -c < "$OUT/Data/com.apple.CoreML/weights/weight.bin" 2>/dev/null | tr -d ' ')B" | rec | ann "CV "
+          grep -iE "mismatch|maximum absolute|mean absolute|verify|error|not support|unsupported" /tmp/cv_arc.log | head -5 | rec | ann "CV-V "
+          exit 0
+
+      - name: 转 权重生成网（每人一次的身份包）
+        run: |
+          set +e
+          ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=6{print "::error::" p substr($0,1,230)}'; }
+          rec() { tee -a /tmp/model.log; }
+          IN=app/SwapModel/BuildFaceSwap.onnx
+          OUT=app/SwapModel/out/build_swap.mlpackage
+          rm -rf "$OUT"
+          if [ ! -s "$IN" ]; then echo "CV-VERDICT build 没下到，跳过" | rec | ann "CV "; exit 0; fi
+          /tmp/m2c/bin/onnx2coreml convert "$IN" -o "$OUT" --format mlpackage --verify >/tmp/cv_build.log 2>&1
+          rc=$?
+          echo "CV-VERDICT build rc=$rc 大小=$(du -sk "$OUT" 2>/dev/null | awk '{print $1"KB"}') 文件=$(find "$OUT" -type f 2>/dev/null | wc -l | tr -d ' ') 权重=$(wc -c < "$OUT/Data/com.apple.CoreML/weights/weight.bin" 2>/dev/null | tr -d ' ')B" | rec | ann "CV "
+          grep -iE "mismatch|maximum absolute|mean absolute|verify|error|not support|unsupported" /tmp/cv_build.log | head -5 | rec | ann "CV-V "
+          # 三张的总判定单独一条：这是这一轮最想知道的事
+          { echo "CONV-SUM 逐帧网=$([ -d app/SwapModel/out/mfs_unet.mlpackage ] && echo 成 || echo 败)｜arcface=$([ -d app/SwapModel/out/arcface.mlpackage ] && echo 成 || echo 败)｜权重生成=$([ -d app/SwapModel/out/build_swap.mlpackage ] && echo 成 || echo 败)";
+            echo "CONV-SUM SwapModel 目录=$(du -sk app/SwapModel 2>/dev/null | awk '{print $1"KB"}')"; } | rec | ann "CONV-SUM "
+          exit 0
+
+      - name: install xcodegen
+        run: |
+          set -euo pipefail
+          curl -sL -o /tmp/xg.zip https://github.com/yonaskolb/XcodeGen/releases/download/2.46.0/xcodegen.zip
+          rm -rf /tmp/xg && unzip -q /tmp/xg.zip -d /tmp/xg
+          sudo /tmp/xg/xcodegen/install.sh
+          xcodegen --version
+
+      - name: generate project
+        working-directory: app
+        run: xcodegen --spec project-swap.yml
+
+      - name: build
+        working-directory: app
+        run: |
+          set -euo pipefail
+          rm -rf build
+          xcodebuild -project SwapBench.xcodeproj -scheme SwapBench \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY= EXPANDED_CODE_SIGN_IDENTITY= \
+            build 2>&1 | tee /tmp/build.log
+
+      # 模型不当成工程文件交给 coremlc：直接拷进 .app，让"这张网 A13 认不认"由设备本人口述
+      # （app 里 SwapBench.locate() 找到 mlpackage 自己调 compileModel 并把耗时报出来）。
+      - name: package ipa
+        working-directory: app
+        run: |
+          set -euo pipefail
+          rec() { tee -a /tmp/model.log; }
+          APP=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' | head -1)
+          test -n "$APP"
+          echo "built app: $APP" >> /tmp/build.log
+          file "$APP/SwapBench" | tee -a /tmp/build.log
+          PKG=SwapModel/out/mfs_unet.mlpackage
+          MAN="$PKG/Manifest.json"
+          if [ -d "$PKG" ]; then
+            echo "P-FILES $(find "$PKG" -type f | wc -l | tr -d ' ') 个文件｜Manifest=$([ -s "$MAN" ] && echo "在 $(wc -c < "$MAN" | tr -d ' ')B" || echo 缺/空)｜体积=$(du -sk "$PKG" | awk '{print $1"KB"}')" | rec
+          fi
+          if [ -s "$MAN" ]; then
+            rm -rf "$APP/mfs_unet.mlpackage"
+            cp -R "$PKG" "$APP"/
+            echo "P-VERDICT 逐帧网已原样拷进包 $APP/mfs_unet.mlpackage（等手机上 compileModel）" | rec
+          else
+            echo "P-VERDICT 逐帧网没转出来或没 Manifest，这一版包里没模型" | rec
+          fi
+          # arcface 太大（199 MB 级）这一版不装包，只留个"编得开吗"的现场答案
+          rm -rf Payload swap.ipa
+          mkdir Payload
+          cp -R "$APP" Payload/
+          ditto -c -k --keepParent Payload swap.ipa
+          ls -la swap.ipa | tee -a /tmp/build.log
+
+      - name: bundle check
+        if: always()
+        working-directory: app
+        run: |
+          set +e
+          ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=5{print "::error::" p substr($0,1,230)}'; }
+          APP=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' 2>/dev/null | head -1)
+          { echo "app=$APP"
+            echo "mlpackage=$([ -d "$APP/mfs_unet.mlpackage" ] && echo 在 || echo 不在) 大小=$(du -sk "$APP/mfs_unet.mlpackage" 2>/dev/null | awk '{print $1"KB"}')"
+            echo "mlmodelc=$(find "$APP" -maxdepth 1 -name '*.mlmodelc' 2>/dev/null | head -1)"
+            echo "整个 app=$(du -sk "$APP" 2>/dev/null | awk '{print $1"KB"}')"
+            echo "swap.ipa=$(wc -c < swap.ipa 2>/dev/null | tr -d ' ') 字节"; } | tee -a /tmp/model.log | ann "B-VERDICT "
+          exit 0
+
+      - name: publish release
+        working-directory: app
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set +e
+          ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=6{print "::error::" p substr($0,1,230)}'; }
+          cat /tmp/model.log /tmp/build.log > ./build.log 2>/dev/null || cp /tmp/build.log ./build.log
+          # 转换器的完整日志从 /tmp 搬进来再挂：少一个文件就整条 gh 命令报错、结果一个都发不出去
+          for f in cv_unet cv_arc cv_build; do
+            [ -s "/tmp/$f.log" ] && cp "/tmp/$f.log" "./$f.log"
+          done
+          files="swap.ipa build.log"
+          for f in cv_unet.log cv_arc.log cv_build.log; do
+            [ -s "$f" ] && files="$files $f"
+          done
+          echo "待发文件 [$files]" | ann "REL "
+          gh release delete channel-swap --cleanup-tag -y >/dev/null 2>&1 || true
+          gh release create channel-swap $files \
+            --title "SwapBench build" \
+            --prerelease \
+            --notes "CI artifact for commit $GITHUB_SHA" 2>&1 | ann "REL "
+          echo "url=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/channel-swap/swap.ipa" | ann "REL "
+          # 闸门：带 token 的 gh 列 asset 名（证挂上去了）+ 匿名 HEAD 真下载地址（证手机上不登录也拉得到）
+          hit=0
+          for i in 1 2 3; do
+            names=$(gh release view channel-swap --json assets --jq '.assets[].name' 2>&1 | tr '\n' ' ')
+            anon=$(curl -sIL -o /dev/null -w '%{http_code}' --max-time 90 \
+              "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/channel-swap/swap.ipa" 2>/dev/null)
+            echo "第 $i 次：gh 列到 [$names]｜匿名 HEAD=$anon" | ann "REL-GATE "
+            case "$names" in
+              *swap.ipa*) [ "$anon" = 200 ] && { hit=1; break; } ;;
+            esac
+            sleep 10
+          done
+          [ "$hit" = 1 ] || echo "::error::REL-GATE 三次都没同时满足「gh 列到 swap.ipa」+「匿名 HEAD 回 200」⇒ 这一版确实没发出去"
+          if [ "$hit" = 1 ]; then exit 0; else exit 1; fi
+
+      - name: report compile errors
+        if: failure()
+        working-directory: app
+        run: |
+          set +e
+          ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=8{print "::error::" p substr($0,1,230)}'; }
+          cat /tmp/model.log /tmp/build.log > ./build.log 2>/dev/null || cp /tmp/build.log ./build.log 2>/dev/null || echo "no build log at all" > ./build.log
+          grep -nE "error:|fatal error:" ./build.log | ann "ERR "
+          exit 0
+
+      - name: report failure log
+        if: failure()
+        working-directory: app
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set +e
+          ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=6{print "::error::" p substr($0,1,230)}'; }
+          cat /tmp/model.log /tmp/build.log > ./build.log 2>/dev/null || cp /tmp/build.log ./build.log 2>/dev/null || echo "no build log at all" > ./build.log
+          files="build.log"
+          for f in cv_unet cv_arc cv_build pip; do
+            [ -s "/tmp/$f.log" ] && { cp "/tmp/$f.log" "./$f.log"; files="$files $f.log"; }
+          done
+          echo "待发文件 [$files]" | ann "GH-FAIL "
+          gh release delete channel-swap-fail --cleanup-tag -y >/dev/null 2>&1 || true
+          gh release create channel-swap-fail $files \
+            --title "SwapBench CI failed log" \
+            --prerelease \
+            --notes "no ipa this round" 2>&1 | ann "GH-FAIL "
+          exit 0

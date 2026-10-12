@@ -1,0 +1,48 @@
+name: SwapBench
+options:
+  createIntermediateGroups: true
+  deploymentTarget:
+    iOS: "18.0"
+settings:
+  base:
+    CODE_SIGNING_ALLOWED: "NO"
+    CODE_SIGNING_REQUIRED: "NO"
+    CODE_SIGN_IDENTITY: ""
+    IPHONEOS_DEPLOYMENT_TARGET: "18.0"
+targets:
+  SwapBench:
+    type: application
+    platform: iOS
+    # 只吃自己的目录。换脸网不在这里出现：由 CI 在装包阶段直接拷进 .app，
+    # 免得"xcodegen 怎么对待 mlpackage、coremlc 编不编"两件事混进上机判定。
+    # app 里 SwapBench.locate() 找到 mlpackage 后自己调 compileModel，
+    # "A13 的编译器认不认这张网"由设备本人口述。
+    sources:
+      - SourcesSwap
+    info:
+      path: Info-Swap.plist
+      properties:
+        CFBundleDisplayName: 换脸自检
+        CFBundleName: SwapBench
+        CFBundleExecutable: SwapBench
+        CFBundleIdentifier: com.qoder.swapbench
+        CFBundlePackageType: APPL
+        CFBundleShortVersionString: "0.1"
+        CFBundleVersion: "1"
+        CFBundleInfoDictionaryVersion: "6.0"
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
+        LSRequiresIPhoneOS: true
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.qoder.swapbench
+        PRODUCT_NAME: SwapBench
+        TARGETED_DEVICE_FAMILY: "1"
+        ARCHS: arm64
+        SWIFT_VERSION: "5.0"
+        SWIFT_STRICT_CONCURRENCY: minimal
+        ENABLE_BITCODE: "NO"
+        GENERATE_INFOPLIST_FILE: "NO"
