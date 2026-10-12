@@ -122,7 +122,9 @@ jobs:
               pn = prod.get(x)
               if pn is not None and pn.op_type == 'Mul' and msk[0] in list(pn.input):
                   cands.append((pn, [i for i in pn.input if i != msk[0]]))
-          print('G 含 mask 的那支=%s｜另一入参=%s' % ([(c[0].name, c[1]) for c in cands]))
+          who = [c[0].name + '(' + c[0].op_type + ')' for c in cands]
+          other = [','.join(c[1]) for c in cands]
+          print('G 含 mask 入参的那支 Mul：%s｜另一入参候选=%s' % (who, other))
           assert len(cands) == 1 and len(cands[0][1]) == 1, 'G-FAIL 补丁支认不出来'
           gt = cands[0][1][0]
           GN = 'mfs_gen_face'
@@ -141,7 +143,13 @@ jobs:
                 % (gt, nd.op_type, GN, [o.name for o in onnx.load(dst_p).graph.output]))
           PY
           /tmp/m2c/bin/python /tmp/patch_gen.py "$IN" "$GEN" 2>&1 | rec | ann "G "
-          echo "G-VERDICT 打完补丁 $(wc -c < "$GEN" 2>/dev/null | tr -d ' ') 字节（原 $(wc -c < "$IN" | tr -d ' ')）" | rec | ann "G "
+          GSZ=$(wc -c < "$GEN" 2>/dev/null | tr -d ' ')
+          if [ "${GSZ:-0}" -gt 100000 ]; then
+            echo "G-VERDICT 成 补丁版 $GSZ 字节（原 $(wc -c < "$IN" | tr -d ' ')）" | rec | ann "G "
+          else
+            echo "G-VERDICT 败 补丁版=${GSZ:-空} 字节 ⇒ 下面逐帧网必跳，这一版没有逐帧网、装了也不能出片" | rec | ann "G "
+            echo "::error::G-FAIL 逐帧网补丁没成（补丁版 ${GSZ:-空} 字节），这一版包里没有逐帧网"
+          fi
           exit 0
 
       # 一张一条 step：annotation 每步只有约 10 条额度，三张挤在一起会把判定行挤掉
