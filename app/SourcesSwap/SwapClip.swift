@@ -176,6 +176,9 @@ enum SwapClip {
         var minFacePx: Double = 40
         var sampleEvery: Int = 30
         var footprintStopMB: Int = 900
+        /// 五官加深倍数、遮罩透明度分母：两个数都取自本机对这条原片的 A/B（tools/ship_check.py 的 B 臂），不是拍的
+        var gamma: Float = 1.6
+        var maskSoft: Float = 0.60
     }
 
     static func run(source: UIImage, video: URL, args: Args, onLine: (String) -> Void) -> (out: URL?, note: String) {
@@ -245,7 +248,7 @@ enum SwapClip {
         say("磁盘闸门 这条要 \(String(format: "%.0f", need / 1_048_576)) MB（码率 \(String(format: "%.1f", Double(bitrate) / 1e6)) Mbps）"
             + "｜可用 \(String(format: "%.1f", free / 1_073_741_824)) GB")
         if need > free { return fail("可用空间不够，不出片：素材 \(String(format: "%.0f", src.duration)) s") }
-        say("补丁口径 遮罩往外长 16 px（224 内，这条原片上≈58 px）｜高频回填 1.0×（σ=0.8 细带，只毛孔级、不带回他自己的纹路）")
+        say("补丁口径 五官加深 γ=\(args.gamma)（A=clip(mask·γ)，取没混过的 gen）｜遮罩透明度 mask/\(args.maskSoft) 渐变（脸中央不再 100% 实）＋往外长 16 px（224 内，这条原片上≈58 px）＋抹 σ=3.5｜高频回填 1.0×（σ=0.8 细带，只毛孔级、不带回他自己的纹路）")
 
         let fm = FileManager.default
         let dir = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
@@ -461,22 +464,22 @@ enum SwapClip {
                                                    fwd: al.fwd, side: side, out: &att)
                                 return true
                             }
-                            var r: (gen: [Float], mask: [Float], ms: Double, note: String) =
-                                (gen: [], mask: [], ms: 0.0, note: "裁不出 224")
+                            var r: (out: [Float], raw: [Float], mask: [Float], ms: Double, note: String) =
+                                (out: [], raw: [], mask: [], ms: 0.0, note: "裁不出 224")
                             if took == true { r = runner.frame(att224_01: att) }
-                            if r.gen.count != 3 * side * side || r.mask.count != side * side {
+                            if r.out.count != 3 * side * side || r.raw.count != 3 * side * side || r.mask.count != side * side {
                                 // 网没回话：这一帧原样交出去，绝不许丢帧（丢了成片就比素材短）
                                 netFail += 1
                                 if netFail <= 3 { say("第 \(made) 帧网没回话：\(r.note)→这帧原样交") }
                             } else {
                                 netMs.append(r.ms)
-                                gen = r.gen
+                                gen = r.out
                                 rawMask = r.mask
                                 let t3 = DispatchTime.now().uptimeNanoseconds
-                                // 两格都取自 PC 上他这条原片整片均匀抽 24 帧（tools/orig_menu2.py），不是拍的
+                                // 三个数都取自本机对这条原片的 A/B（tools/ship_check.py、tools/tail_const.py），不是拍的
+                                SwapGeo.deepenFeatures(&gen, r.raw, att, rawMask, gamma: args.gamma)
                                 SwapGeo.restoreDetail(&gen, att, lam: 1.0, sigma: 0.8)
-                                SwapGeo.preprocessMask(rawMask, &m2)
-                                SwapGeo.growMask(&m2, px: 16)
+                                SwapGeo.softMask(rawMask, &m2, soft: args.maskSoft, grow: 16)
                                 let pasted = SwapTech.withPixels(dst) { base, bpr -> Bool in
                                     SwapGeo.pasteBack(base, bytesPerRow: bpr, w: w, h: h,
                                                       gen: gen, mask: m2, fwd: al.fwd, back: al.back)

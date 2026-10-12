@@ -160,6 +160,37 @@ enum SwapGeo {
         for i in 0..<m.count { m2[i] = m[i] * m1[i] }
     }
 
+    /// 五官加深：补丁 = A·gen + (1−A)·att，A = clip(mask·γ, 0, 1)。
+    /// 官方那颗 mask 最大只到 0.79，所以图自己混出来的 out 天生是"源脸 6 成 + 他本人 4 成"——
+    /// 他判的「换脸不明显／那层透明感」就是这一条。γ=1 必须逐像素等于 out（本机 tools/tail_const.py 量到差 0.00 灰阶），
+    /// 这一条同时是"我对图尾的读法对不对"的控制组。γ=1.6 实测（tools/ship_check.py，抽 10 帧）：
+    /// 脸的变化量 像素差 7.7→10.9，↔源 0.785→0.733（纯 gen 本身没混合后的 out 像源，这一格是代价，写在界面上）。
+    static func deepenFeatures(_ patch: inout [Float], _ raw: [Float], _ att: [Float], _ mask: [Float], gamma: Float) {
+        let plane = size * size
+        for p in 0..<3 {
+            let o = p * plane
+            for i in 0..<plane {
+                let a = min(1.0, max(0.0, mask[i] * gamma))
+                let v = a * raw[o + i] + (1 - a) * att[o + i]
+                patch[o + i] = v < 0 ? 0 : (v > 1 ? 1 : v)
+            }
+        }
+    }
+
+    /// 可调透明度的遮罩：alpha = clip(mask/soft, 0, 1) → 往外长 grow px → 抹 σ=3.5。
+    /// 取代 preprocessMask 那一刀（>0.001 归 1 ⇒ 脸中央 100% 实，根本没有透明度可谈）。
+    /// soft=0.60 实测：贴层实度 98.6%→92.5%（额头腮帮这些没生成内容的皮透回原片），
+    /// 盖脸框 97.3%→97.1% 不动，缝上亮度台阶 L+2.0→+3.4 仍远好于没外长那版。
+    /// 反向的对照也量过：拿阈值把低 mask 那圈直接切掉（t=0.45）缝台阶冲到 L+16.9，那条已否。
+    static func softMask(_ inMask: [Float], _ m2: inout [Float], soft: Float, grow: Int) {
+        let plane = size * size
+        var a = [Float](repeating: 0, count: plane)
+        for i in 0..<plane { a[i] = min(1.0, max(0.0, inMask[i] / soft)) }
+        growMask(&a, px: grow)
+        let f = gaussPlane(a, sigma: 3.5)
+        for i in 0..<plane { m2[i] = f[i] }
+    }
+
     /// 最终遮罩整体往外长 px 像素（圆盘核，同 cv2.dilate(MORPH_ELLIPSE, 2·px+1)）。
     /// 整片均匀抽 24 帧实测：盖脸框 81.1%→97.1%，缝上的亮度台阶 L+21.9→+2.6，身份余弦 0.776→0.787。
     /// 缝平了，"动脸时遮罩抖"那件事也就没有可见载体了——抖的就是这条缝。
@@ -198,13 +229,10 @@ enum SwapGeo {
         }
     }
 
-    /// 把这张真脸自己的高频按 lam 倍加回补丁：补丁糊是糊在 224 要撑到 807 px 上。
-    /// 带宽是关键——σ=2 那份连着额头纹、法令纹、眼窝一起回来，等于把他本人的结构盖回补丁上，
-    /// 他一眼判「完全没遮住」（那版成片身份余弦中位 0.673，上一版没回填是 0.700）。
-    /// 改 σ=0.8 只取毛孔级细带后（整片均匀抽 24 帧）：能量比 0.244→0.429，身份余弦 0.787→0.784 不动。
-    static func restoreDetail(_ gen: inout [Float], _ att: [Float], lam: Float, sigma: Double = 0.8) {
+    /// 单张 224×224 的分离高斯模糊：核宽 2·round(3σ)+1，越界反射同 cv2 的 BORDER_REFLECT_101。
+    private static func gaussPlane(_ a: [Float], sigma: Double) -> [Float] {
         let s = size, plane = s * s
-        let kr = Int((sigma * 3).rounded())          // cv2.GaussianBlur(0,0,σ) 的核宽＝2·round(3σ)+1
+        let kr = Int((sigma * 3).rounded())
         let k = 2 * kr + 1
         var kw = [Float](repeating: 0, count: k)
         var sum: Float = 0
@@ -213,25 +241,35 @@ enum SwapGeo {
             kw[i] = Float(exp(-0.5 * x * x)); sum += kw[i]
         }
         for i in 0..<k { kw[i] /= sum }
-        func refl(_ i: Int) -> Int { i < 0 ? -i : (i >= s ? 2 * s - 2 - i : i) }   // BORDER_REFLECT_101，同 cv2
+        func refl(_ i: Int) -> Int { i < 0 ? -i : (i >= s ? 2 * s - 2 - i : i) }
         var tmp = [Float](repeating: 0, count: plane)
-        var blr = [Float](repeating: 0, count: plane)
+        var out = [Float](repeating: 0, count: plane)
+        for y in 0..<s {
+            for x in 0..<s {
+                var v: Float = 0
+                for i in 0..<k { v += kw[i] * a[refl(y - kr + i) * s + x] }
+                tmp[y * s + x] = v
+            }
+        }
+        for y in 0..<s {
+            for x in 0..<s {
+                var v: Float = 0
+                for i in 0..<k { v += kw[i] * tmp[y * s + refl(x - kr + i)] }
+                out[y * s + x] = v
+            }
+        }
+        return out
+    }
+
+    /// 把这张真脸自己的高频按 lam 倍加回补丁：补丁糊是糊在 224 要撑到 807 px 上。
+    /// 带宽是关键——σ=2 那份连着额头纹、法令纹、眼窝一起回来，等于把他本人的结构盖回补丁上，
+    /// 他一眼判「完全没遮住」（那版成片身份余弦中位 0.673，上一版没回填是 0.700）。
+    /// 改 σ=0.8 只取毛孔级细带后（整片均匀抽 24 帧）：能量比 0.244→0.429，身份余弦 0.787→0.784 不动。
+    static func restoreDetail(_ gen: inout [Float], _ att: [Float], lam: Float, sigma: Double = 0.8) {
+        let s = size, plane = s * s
         for p in 0..<3 {
             let o = p * plane
-            for y in 0..<s {
-                for x in 0..<s {
-                    var v: Float = 0
-                    for i in 0..<k { v += kw[i] * att[o + refl(y - kr + i) * s + x] }
-                    tmp[y * s + x] = v
-                }
-            }
-            for y in 0..<s {
-                for x in 0..<s {
-                    var v: Float = 0
-                    for i in 0..<k { v += kw[i] * tmp[y * s + refl(x - kr + i)] }
-                    blr[y * s + x] = v
-                }
-            }
+            let blr = gaussPlane(Array(att[o..<(o + plane)]), sigma: sigma)
             for i in 0..<plane {
                 let v = gen[o + i] + lam * (att[o + i] - blr[i])
                 gen[o + i] = v < 0 ? 0 : (v > 1 ? 1 : v)

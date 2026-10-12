@@ -86,6 +86,64 @@ jobs:
           echo "M-VERDICT 下载 $ok 成 / $bad 败｜$(ls -l "$DST"/*.onnx 2>/dev/null | awk '{print $9"="$5}' | tr '\n' ' ')" | rec | ann "M-VERDICT "
           exit 0
 
+      # 官方这张图只导出 out 与 mask，而尾巴是 out = gen·mask + (1−mask)·att_img，mask 最大只到 0.79
+      # ⇒ 我们拿到的补丁天生是"源脸 6 成 + 他本人 4 成"（他判的「换脸不明显／那层透明感」就是这一条，
+      #   本机 tools/tail_const.py 逐像素验过这条式子，最大差 0.00 灰阶）。
+      # 这一步按结构把没混过的 gen 挂成第三个出参 mfs_gen_face：不写死张量名，
+      # 从「图像出参的生产 Add」倒着走——两个入参里，含 mask 出参名的那支 Mul 的另一入参就是 gen。
+      # 本机同逻辑验通：tools/patch_gen_output.py（判定 gen=Mul.3，onnx.checker 过，ort 能加载三出参）。
+      - name: 给逐帧网补第三个出参 gen
+        run: |
+          set +e
+          ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=6{print "::error::" p substr($0,1,230)}'; }
+          rec() { tee -a /tmp/model.log; }
+          IN=app/SwapModel/MobileFaceSwapUNetRuntime.onnx
+          GEN=app/SwapModel/unet_with_gen.onnx
+          if [ ! -s "$IN" ]; then echo "G-VERDICT 逐帧网没下到，跳过" | rec | ann "G "; exit 0; fi
+          cat > /tmp/patch_gen.py <<'PY'
+          import sys, onnx
+          from onnx import ValueInfoProto
+          src_p, dst_p = sys.argv[1], sys.argv[2]
+          m = onnx.load(src_p)
+          names = [x.name for x in m.graph.output]
+          prod = {}
+          for nd in m.graph.node:
+              for y in nd.output:
+                  prod[y] = nd
+          img = [x for x in names if x.endswith('scale_0.tmp_0')]
+          msk = [x for x in names if x.endswith('scale_1.tmp_0')]
+          print('G 原出参 %s｜图像=%s｜mask=%s' % (names, img, msk))
+          assert len(img) == 1 and len(msk) == 1, 'G-FAIL 出参名不像预期'
+          head = prod[img[0]]
+          print('G 图像出参的生产节点 %s(%s) 入参=%s' % (head.name, head.op_type, list(head.input)))
+          assert head.op_type == 'Add', 'G-FAIL 尾巴不是 Add，结构规则要重看'
+          cands = []
+          for x in head.input:
+              pn = prod.get(x)
+              if pn is not None and pn.op_type == 'Mul' and msk[0] in list(pn.input):
+                  cands.append((pn, [i for i in pn.input if i != msk[0]]))
+          print('G 含 mask 的那支=%s｜另一入参=%s' % ([(c[0].name, c[1]) for c in cands]))
+          assert len(cands) == 1 and len(cands[0][1]) == 1, 'G-FAIL 补丁支认不出来'
+          gt = cands[0][1][0]
+          GN = 'mfs_gen_face'
+          so = [x for x in m.graph.output if x.name == img[0]][0]
+          nv = ValueInfoProto(); nv.name = GN; nv.type.CopyFrom(so.type)
+          m.graph.output.append(nv)
+          nd = prod[gt]
+          nd.output[list(nd.output).index(gt)] = GN
+          for x in m.graph.node:
+              for i, y in enumerate(x.input):
+                  if y == gt:
+                      x.input[i] = GN
+          onnx.checker.check_model(m)
+          onnx.save(m, dst_p)
+          print('G-VERDICT gen=%s(生产者 %s) 已挂成 %s｜新出参 %s'
+                % (gt, nd.op_type, GN, [o.name for o in onnx.load(dst_p).graph.output]))
+          PY
+          /tmp/m2c/bin/python /tmp/patch_gen.py "$IN" "$GEN" 2>&1 | rec | ann "G "
+          echo "G-VERDICT 打完补丁 $(wc -c < "$GEN" 2>/dev/null | tr -d ' ') 字节（原 $(wc -c < "$IN" | tr -d ' ')）" | rec | ann "G "
+          exit 0
+
       # 一张一条 step：annotation 每步只有约 10 条额度，三张挤在一起会把判定行挤掉
       # onnx2coreml 的 --precision 默认是 fp16 ⇒ 第 2 轮三张全按 fp16 编的：
       # arcface 的 512 维嵌入 max_abs=0.034（等于把人脸挪了个位置），逐帧网直接 verify 出 nan。
@@ -96,10 +154,10 @@ jobs:
           set +e
           ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=6{print "::error::" p substr($0,1,230)}'; }
           rec() { tee -a /tmp/model.log; }
-          IN=app/SwapModel/MobileFaceSwapUNetRuntime.onnx
+          IN=app/SwapModel/unet_with_gen.onnx
           OUT=app/SwapModel/out/mfs_unet.mlpackage
           rm -rf "$OUT" app/SwapModel/out/mfs_unet_fp16.mlpackage
-          if [ ! -s "$IN" ]; then echo "CV-VERDICT unet 没下到，跳过" | rec | ann "CV "; exit 0; fi
+          if [ ! -s "$IN" ]; then echo "CV-VERDICT unet 补丁版不在（上一步没成或原图没下到），跳过" | rec | ann "CV "; exit 0; fi
           /tmp/m2c/bin/onnx2coreml convert "$IN" -o "$OUT" --format mlpackage --precision fp32 --verify >/tmp/cv_unet.log 2>&1
           rc=$?
           echo "CV-VERDICT unet(fp32) rc=$rc 大小=$(du -sk "$OUT" 2>/dev/null | awk '{print $1"KB"}') 文件=$(find "$OUT" -type f 2>/dev/null | wc -l | tr -d ' ') 权重=$(wc -c < "$OUT/Data/com.apple.CoreML/weights/weight.bin" 2>/dev/null | tr -d ' ')B" | rec | ann "CV "
