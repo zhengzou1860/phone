@@ -397,7 +397,7 @@ enum SwapClip {
         var aDone = false
         // 音频往前喂的顶＝画面这条轨的长度（不是容器长度：容器常带一段比画面长的音轨尾巴，
         // 喂过它成片就变成结尾有声音没画面）
-        let vDur = CMTimeGetSeconds(src.track.duration)
+        let vDur = CMTimeGetSeconds(src.track.timeRange.duration)
         let picLen = vDur > 0.1 ? vDur : src.duration
         let audioCeil = CMTimeMakeWithSeconds(max(0.0, picLen - 0.05), preferredTimescale: 600)
         func pumpAudio(until pts: CMTime) {
@@ -568,8 +568,9 @@ enum SwapClip {
                 if !did && made < 3 { say("第 \(made) 帧没换上脸（这帧 \(obs.count) 张脸，检到最大短边 \(String(format: "%.0f", SwapVision.largest(obs, w: w, h: h)?.shortSide ?? 0)) px）") }
 
                 let t5 = DispatchTime.now().uptimeNanoseconds
-                // 音频往前喂 2 秒，但不越过素材末尾：越过去成片就会比画面长出一截
-                let ahead = CMTimeMinimum(CMTimeAdd(rel, CMTime(value: 2, timescale: 1)), audioCeil)
+                // 音频往前喂 2 秒，但不越过画面轨的末尾：越过去成片就会比画面长出一截
+                var ahead = CMTimeAdd(rel, CMTime(value: 2, timescale: 1))
+                if CMTimeCompare(ahead, audioCeil) > 0 { ahead = audioCeil }
                 pumpAudio(until: ahead)
                 var spins = 0
                 while !vIn.isReadyForMoreMediaData {
