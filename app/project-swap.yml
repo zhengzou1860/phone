@@ -22,14 +22,16 @@ targets:
     info:
       path: Info-Swap.plist
       properties:
-        CFBundleDisplayName: 换脸自检
+        CFBundleDisplayName: 换脸出片
         CFBundleName: SwapBench
         CFBundleExecutable: SwapBench
         CFBundleIdentifier: com.qoder.swapbench
         CFBundlePackageType: APPL
-        CFBundleShortVersionString: "0.1"
-        CFBundleVersion: "1"
+        CFBundleShortVersionString: "0.2"
+        CFBundleVersion: "2"
         CFBundleInfoDictionaryVersion: "6.0"
+        NSPhotoLibraryAddUsageDescription: "要把换好脸的片段存回相册"
+        NSPhotoLibraryUsageDescription: "要选一张源脸照片和一条要换脸的视频"
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
         LSRequiresIPhoneOS: true

@@ -1,0 +1,555 @@
+import AVFoundation
+import CoreMedia
+import CoreML
+import CoreVideo
+import Foundation
+import Photos
+import UIKit
+import Vision
+
+/// 像素缓冲和编码器那边的小工具，写法照 VR3D 那条线已经上机跑通的抄。
+enum SwapTech {
+
+    /// 容器写的旋转角（0/90/180/270）
+    static func deg(_ t: CGAffineTransform) -> Int {
+        var d = Int((atan2(t.b, t.a) * 180 / .pi).rounded())
+        if d < 0 { d += 360 }
+        return d
+    }
+
+    static func fourCC(_ c: OSType) -> String {
+        let bytes = [Int((c >> 24) & 0xFF), Int((c >> 16) & 0xFF), Int((c >> 8) & 0xFF), Int(c & 0xFF)]
+        return bytes.map { Character(UnicodeScalar($0)) }.reduce(into: "") { $0.append($1) }
+    }
+
+    /// 长边不超过 cap，宽高取偶数（h264 要偶数尺寸）。cap 用不上就原样取偶。
+    static func fitEven(_ w: Int, _ h: Int, longEdge cap: Int) -> (w: Int, h: Int) {
+        let long = max(w, h)
+        var ow = w, oh = h
+        if cap > 0, long > cap {
+            let s = Double(cap) / Double(long)
+            ow = Int((Double(w) * s).rounded())
+            oh = Int((Double(h) * s).rounded())
+        }
+        return (max(16, ow & ~1), max(16, oh & ~1))
+    }
+
+    static func pixelBuffer(_ w: Int, _ h: Int) -> (pb: CVPixelBuffer?, note: String) {
+        let attrs: [String: Any] = [
+            kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any],
+            kCVPixelBufferBytesPerRowAlignmentKey as String: w * 4,
+        ]
+        var pb: CVPixelBuffer?
+        let r = CVPixelBufferCreate(kCFAllocatorDefault, w, h, kCVPixelFormatType_32BGRA,
+                                    attrs as CFDictionary, &pb)
+        guard r == kCVReturnSuccess, let out = pb else {
+            return (nil, "建 \(w)x\(h) BGRA 缓冲失败 CVReturn=\(r)")
+        }
+        return (out, "")
+    }
+
+    /// 从 adaptor 的池里要一块。池没了就返回 nil，调用方退回每帧新造。
+    static func poolBuffer(_ pool: CVPixelBufferPool) -> CVPixelBuffer? {
+        var pb: CVPixelBuffer?
+        guard CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &pb) == kCVReturnSuccess else { return nil }
+        return pb
+    }
+
+    /// 逐行拷像素（两张的 bytesPerRow 不一定相同，不能一次 memcpy 到底）
+    static func copyRows(from src: CVPixelBuffer, to dst: CVPixelBuffer) -> Bool {
+        let w = CVPixelBufferGetWidth(src), h = CVPixelBufferGetHeight(src)
+        guard w == CVPixelBufferGetWidth(dst), h == CVPixelBufferGetHeight(dst) else { return false }
+        if CVPixelBufferLockBaseAddress(src, .readOnly) != kCVReturnSuccess { return false }
+        defer { CVPixelBufferUnlockBaseAddress(src, .readOnly) }
+        if CVPixelBufferLockBaseAddress(dst, .readWrite) != kCVReturnSuccess { return false }
+        defer { CVPixelBufferUnlockBaseAddress(dst, .readWrite) }
+        guard let sb = CVPixelBufferGetBaseAddress(src), let db = CVPixelBufferGetBaseAddress(dst) else { return false }
+        let sr = CVPixelBufferGetBytesPerRow(src), dr = CVPixelBufferGetBytesPerRow(dst)
+        let n = min(sr, dr)
+        for y in 0..<h {
+            memcpy(db.advanced(by: y * dr), sb.advanced(by: y * sr), n)
+        }
+        return true
+    }
+
+    /// 读写一块缓冲的像素。锁不开或拿不到基址就返回 nil（调用方必须把这一帧当失败处理，不许静默跳过）。
+    /// 模型预测期间不握着锁：取像素和回贴各自锁一次。
+    static func withPixels<T>(_ pb: CVPixelBuffer, _ body: (UnsafeMutableRawPointer, Int) -> T) -> T? {
+        guard CVPixelBufferLockBaseAddress(pb, .readWrite) == kCVReturnSuccess else { return nil }
+        defer { CVPixelBufferUnlockBaseAddress(pb, .readWrite) }
+        guard let base = CVPixelBufferGetBaseAddress(pb) else { return nil }
+        return body(base, CVPixelBufferGetBytesPerRow(pb))
+    }
+
+    /// 把 CGImage 画进一块 BGRA 缓冲：静帧和取样器只认缓冲这一种形状
+    static func pixelBuffer(from cg: CGImage) -> (pb: CVPixelBuffer?, note: String) {
+        let w = cg.width, h = cg.height
+        let made = pixelBuffer(w, h)
+        guard let pb = made.pb else { return (nil, made.note) }
+        guard CVPixelBufferLockBaseAddress(pb, .readWrite) == kCVReturnSuccess else {
+            return (nil, "静帧缓冲锁不上")
+        }
+        defer { CVPixelBufferUnlockBaseAddress(pb, .readWrite) }
+        guard let base = CVPixelBufferGetBaseAddress(pb) else { return (nil, "静帧缓冲没有基址") }
+        let cs = cg.colorSpace ?? CGColorSpaceCreateDeviceRGB()
+        guard let ctx = CGContext(data: base, width: w, height: h, bitsPerComponent: 8,
+                                  bytesPerRow: CVPixelBufferGetBytesPerRow(pb), space: cs,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
+                                    | CGBitmapInfo.byteOrder32Little.rawValue) else {
+            return (nil, "静帧建不出画到缓冲的上下文")
+        }
+        ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
+        return (pb, "")
+    }
+
+    /// 存进相册。成功返回「已存到相册」，失败带回错误文本。
+    static func toPhotos(_ file: URL) -> String {
+        let sem = DispatchSemaphore(value: 0)
+        var result = "没发起"
+        PHPhotoLibrary.shared().performChanges({
+            PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: file)
+        }) { ok, error in
+            result = ok ? "已存到相册" : "存相册失败: \(error?.localizedDescription ?? "-")"
+            sem.signal()
+        }
+        sem.wait()
+        return result
+    }
+}
+
+/// 一条片子：摆正后的尺寸、时长、帧率，以及"直出来就是摆正的帧"的那份 videoComposition。
+/// 走 composition 这条路是 VR3D 上机验过的（一分钟素材跑通），好处是 app 里根本不存在朝向这件事。
+final class SwapSource {
+    let asset: AVURLAsset
+    let track: AVAssetTrack
+    let vc: AVMutableVideoComposition
+    let upW: Int
+    let upH: Int
+    let outW: Int
+    let outH: Int
+    let deg: Int
+    let duration: Double
+    let fps: Double
+
+    init?(url: URL, longEdge: Int, onLine: (String) -> Void) {
+        asset = AVURLAsset(url: url)
+        guard let t = asset.tracks(withMediaType: .video).first else {
+            onLine("源 没有视频轨 \(url.lastPathComponent)")
+            return nil
+        }
+        track = t
+        let tf = t.preferredTransform
+        let nat = t.naturalSize
+        let cs = [CGPoint(x: 0, y: 0), CGPoint(x: nat.width, y: 0),
+                  CGPoint(x: 0, y: nat.height), CGPoint(x: nat.width, y: nat.height)]
+            .map { $0.applying(tf) }
+        deg = SwapTech.deg(tf)
+        upW = max(2, Int((cs.map { $0.x }.max()! - cs.map { $0.x }.min()!).rounded()))
+        upH = max(2, Int((cs.map { $0.y }.max()! - cs.map { $0.y }.min()!).rounded()))
+        let fit = SwapTech.fitEven(upW, upH, longEdge: longEdge)
+        outW = fit.w
+        outH = fit.h
+        duration = CMTimeGetSeconds(asset.duration)
+        fps = Double(t.nominalFrameRate) > 1 ? Double(t.nominalFrameRate) : 30.0
+        let v = AVMutableVideoComposition()
+        let li = AVMutableVideoCompositionLayerInstruction(assetTrack: t)
+        // 源的摆正变换之后再接一层缩放，直出「摆正且已经是进链尺寸」的帧
+        let sc = CGAffineTransform(scaleX: CGFloat(outW) / CGFloat(upW), y: CGFloat(outH) / CGFloat(upH))
+        li.setTransform(tf.concatenating(sc), at: .zero)
+        let ti = AVMutableVideoCompositionInstruction()
+        ti.timeRange = CMTimeRange(start: .zero, duration: asset.duration)
+        ti.layerInstructions = [li]
+        v.instructions = [ti]
+        v.renderSize = CGSize(width: outW, height: outH)
+        v.frameDuration = CMTime(value: 1, timescale: 600)
+        vc = v
+        onLine("源 \(url.lastPathComponent) 存 \(Int(nat.width))x\(Int(nat.height)) 容器转 \(deg)° → 摆正 \(upW)x\(upH)"
+             + "｜进链 \(outW)x\(outH)（长边上限 \(longEdge)）｜\(String(format: "%.1f", duration)) s @ \(String(format: "%.1f", fps)) fps")
+        guard duration > 0.1 else {
+            onLine("源 时长读不出来 \(duration)")
+            return nil
+        }
+    }
+}
+
+/// 整片真换脸：源静帧算一次身份 → 逐帧 检测→对齐→逐帧网→回贴 → 编码器写新片。
+/// 每一步的单价、身份余弦、足迹水位全部进流水；跑完存相册，成功才删沙盒那份。
+enum SwapClip {
+    struct Args {
+        var units: MLComputeUnits = .cpuOnly
+        var longEdge: Int = 1920
+        var minFacePx: Double = 40
+        var sampleEvery: Int = 30
+        var footprintStopMB: Int = 900
+    }
+
+    static func run(source: UIImage, video: URL, args: Args, onLine: (String) -> Void) -> (out: URL?, note: String) {
+        var rep: [String] = []
+        func say(_ s: String) { rep.append(s); onLine(s) }
+        func fail(_ s: String) -> (out: URL?, note: String) {
+            say(s)
+            return (nil, rep.joined(separator: "\n"))
+        }
+
+        // —— 1. 三张网 ——
+        let got = SwapRunner.load(units: args.units, onLine: onLine)
+        guard let runner = got.runner else { return fail("装网失败：\n" + got.note) }
+
+        // —— 2. 源身份：每人一次的那两步，这一版第一次在机上量出钱来 ——
+        let up = SwapVision.uprightImage(source)
+        guard let cg = up.cg else { return fail("源脸静帧取不出：\(up.note)") }
+        let req = VNDetectFaceLandmarksRequest()
+        let (sObs, sErr) = SwapVision.faces(cg, req)
+        if !sErr.isEmpty { say("源脸检测：\(sErr)") }
+        guard let sl = SwapVision.largest(sObs, w: cg.width, h: cg.height) else {
+            return fail("源脸检测：这张图里没检到脸（\(up.note)）")
+        }
+        say("源脸：" + SwapVision.settleOrigin(face: sObs[sl.index]) + "｜短边 \(String(format: "%.0f", sl.shortSide)) px")
+        guard let srcAlign = SwapVision.align(face: sObs[sl.index], w: cg.width, h: cg.height) else {
+            return fail("源脸对齐失败：5 点映不进模板")
+        }
+        say("源脸对齐 点位=\(srcAlign.src)｜残差 \(String(format: "%.1f", srcAlign.resid224))（224 内）"
+            + "＝\(String(format: "%.2f", srcAlign.residPx)) px｜det \(String(format: "%.3f", srcAlign.det))"
+            + "｜缩放比 \(String(format: "%.2f", srcAlign.ratio))")
+        let sPb = SwapTech.pixelBuffer(from: cg)
+        guard let sbuf = sPb.pb else { return fail("源静帧 \(sPb.note)") }
+        var crop224 = [Float](repeating: 0, count: 3 * SwapGeo.size * SwapGeo.size)
+        let warpsrc = SwapTech.withPixels(sbuf) { base, bpr -> Bool in
+            SwapGeo.warpToCrop(UnsafeRawPointer(base), bytesPerRow: bpr, w: cg.width, h: cg.height,
+                               fwd: srcAlign.fwd, side: SwapGeo.size, out: &crop224)
+            return true
+        }
+        guard warpsrc == true else { return fail("源脸裁不出 224") }
+        var src112 = [Float](repeating: 0, count: 3 * 112 * 112)
+        SwapGeo.resizePlanar(crop224, from: SwapGeo.size, to: 112, into: &src112)
+        let id0 = DispatchTime.now().uptimeNanoseconds
+        let ident = runner.identity(crop112_01: src112)
+        let idMs = Double(DispatchTime.now().uptimeNanoseconds - id0) / 1_000_000
+        guard !ident.emb.isEmpty else {
+            return fail("① 身份证失败：\(ident.note)（PC 参照：这一步 1109~1318 ms）")
+        }
+        say("① 身份证 \(SwapUtil.ms(idMs))（纯网 \(SwapUtil.ms(ident.ms))，\(ident.note)）"
+            + "｜模长 \(String(format: "%.1f", ident.rawNorm))｜足迹 \(SwapFacts.footprintMB()) MB"
+            + "｜PC 参照 1109~1318 ms、同一步模长 2.84~3.72（逐维 ±0.5 上下；口径错了形状照样合法、只有模长露馅）")
+        let w0 = DispatchTime.now().uptimeNanoseconds
+        let mk = runner.makeWeights(emb: ident.emb, feat: ident.feat)
+        let wMs = Double(DispatchTime.now().uptimeNanoseconds - w0) / 1_000_000
+        guard mk.count == 18 else { return fail("② 身份包失败：\(mk.note)") }
+        say("② 身份包 \(SwapUtil.ms(wMs))（纯网 \(SwapUtil.ms(mk.ms))）｜\(mk.note)"
+            + "｜足迹 \(SwapFacts.footprintMB()) MB｜PC 参照 27~50 ms")
+        let srcEmb = ident.emb
+
+        // —— 3. 片子 ——
+        guard let src = SwapSource(url: video, longEdge: args.longEdge, onLine: onLine) else {
+            return fail("这条片子读不出（见上面几行）")
+        }
+        let estFrames = max(1, Int((src.duration * src.fps).rounded()))
+        let bitrate = max(6_000_000, Int(Double(src.outW * src.outH * 6) * 1.5))
+        let need = Double(bitrate) / 8.0 * src.duration * 1.2 + 200_000_000
+        let free = (Double(SwapFacts.diskFreeGB()) ?? 0) * 1_073_741_824
+        say("磁盘闸门 这条要 \(String(format: "%.0f", need / 1_048_576)) MB（码率 \(String(format: "%.1f", Double(bitrate) / 1e6)) Mbps）"
+            + "｜可用 \(String(format: "%.1f", free / 1_073_741_824)) GB")
+        if need > free { return fail("可用空间不够，不出片：素材 \(String(format: "%.0f", src.duration)) s") }
+
+        let fm = FileManager.default
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+        // 上一轮留下的半成品和旧选片先清掉：手机侧不许留残料
+        var reclaimed = 0
+        for one in (try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.fileSizeKey], options: [])) ?? [] {
+            guard one.lastPathComponent.hasPrefix("swap_") else { continue }
+            guard one.path != video.path else { continue }   // 本次要用的这条输入不能当残留删
+            let sz = (try? one.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
+            if (try? fm.removeItem(at: one)) != nil { reclaimed += sz }
+        }
+        if reclaimed > 0 { say("先清掉上轮残留的半成品 \(String(format: "%.1f", Double(reclaimed) / 1_048_576)) MB") }
+        let dfmt = DateFormatter()
+        dfmt.dateFormat = "yyyyMMdd-HHmmss"
+        let out = dir.appendingPathComponent("swap_\(dfmt.string(from: Date())).mp4")
+        try? fm.removeItem(at: out)
+
+        guard let reader = try? AVAssetReader(asset: src.asset) else { return fail("AVAssetReader 建不起来") }
+        let vOut = AVAssetReaderVideoCompositionOutput(
+            videoTracks: [src.track],
+            videoSettings: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA])
+        vOut.videoComposition = src.vc
+        reader.add(vOut)
+
+        guard let writer = try? AVAssetWriter(outputURL: out, fileType: .mp4) else { return fail("AVAssetWriter 建不起来") }
+        let settings: [String: Any] = [
+            AVVideoCodecKey: AVVideoCodecType.h264,
+            AVVideoWidthKey: src.outW,
+            AVVideoHeightKey: src.outH,
+            AVVideoCompressionPropertiesKey: [
+                AVVideoAverageBitRateKey: bitrate,
+                AVVideoMaxKeyFrameIntervalKey: Int(src.fps * 2),
+                AVVideoExpectedSourceFrameRateKey: Int(src.fps),
+            ],
+        ]
+        let vIn = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
+        vIn.expectsMediaDataInRealTime = false
+        let attrs: [String: Any] = [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+            kCVPixelBufferWidthKey as String: src.outW,
+            kCVPixelBufferHeightKey as String: src.outH,
+            kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any],
+        ]
+        let adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: vIn, sourcePixelBufferAttributes: attrs)
+        guard writer.canAdd(vIn) else {
+            return fail("canAdd 为假：这套 outputSettings 本机不支持（\(src.outW)x\(src.outH) h264）")
+        }
+        writer.add(vIn)
+
+        // 音频：原样搬过去（不解码不重编）。这一段整条是尽力而为，挂了也不许拖累画面。
+        var aIn: AVAssetWriterInput?
+        var aOut: AVAssetReaderTrackOutput?
+        if let at = src.asset.tracks(withMediaType: .audio).first {
+            let ai = AVAssetWriterInput(mediaType: .audio, outputSettings: nil)
+            ai.expectsMediaDataInRealTime = false
+            ai.sourceFormatHint = at.format.formatDescription
+            if let ao = try? AVAssetReaderTrackOutput(track: at, outputSettings: nil), writer.canAdd(ai) {
+                writer.add(ai)
+                reader.add(ao)
+                aIn = ai
+                aOut = ao
+                say("音频 原样搬运（不解码）：子类型 \(SwapTech.fourCC(at.format.formatDescription.mediaSubType.rawValue))")
+            } else {
+                say("音频 建不出透传或 canAdd 为假 → 成片没声音")
+            }
+        } else {
+            say("音频 这条片子没有音轨")
+        }
+
+        do { try writer.startWriting() } catch {
+            reader.cancelReading()
+            return fail("startWriting 抛错: \(error)")
+        }
+        writer.startSession(atSourceTime: .zero)
+        // 不显式开读，copyNextSampleBuffer 第一下就回 nil ⇒ 看起来"跑完了"其实 0 帧
+        guard reader.startReading() else {
+            writer.cancelWriting()
+            try? fm.removeItem(at: out)
+            return fail("reader startReading 失败：\(reader.error?.localizedDescription ?? "-")")
+        }
+
+        var detectMs: [Double] = [], alignMs: [Double] = [], netMs: [Double] = [], pasteMs: [Double] = []
+        var appendMs: [Double] = [], decodeMs: [Double] = [], sampleMs: [Double] = [], resids: [Double] = []
+        var cosList: [String] = []
+        var made = 0, swapped = 0, noFace = 0, smallFace = 0, fitFail = 0, mirror = 0, netFail = 0
+        var pointSrc = "—"
+        var why = ""
+        var basePTS: CMTime = .invalid
+        let mem0 = SwapFacts.footprintMB()
+        var memMax = mem0
+        let wall0 = DispatchTime.now().uptimeNanoseconds
+
+        // 整片复用同几块数组：几千帧每帧新造 0.6 MB 是给分配器添垃圾
+        let side = SwapGeo.size
+        var att = [Float](repeating: 0, count: 3 * side * side)
+        var gen = [Float](repeating: 0, count: 3 * side * side)
+        var rawMask = [Float](repeating: 0, count: side * side)
+        var m2 = [Float](repeating: 0, count: side * side)
+        var f112 = [Float](repeating: 0, count: 3 * 112 * 112)
+
+        while why.isEmpty {
+            var ended = ""
+            autoreleasepool {
+                let td0 = DispatchTime.now().uptimeNanoseconds
+                guard let sb = vOut.copyNextSampleBuffer() else { ended = "片源到末尾"; return }
+                defer { CMSampleBufferInvalidate(sb) }
+                guard reader.status == .reading else {
+                    ended = "reader 状态 \(reader.status.rawValue): \(reader.error?.localizedDescription ?? "-")"; return
+                }
+                guard let pb = CMSampleBufferGetImageBuffer(sb) else { ended = "sample 里没有像素缓冲"; return }
+                let pts = CMSampleBufferGetPresentationTimeStamp(sb)
+                if basePTS == .invalid { basePTS = pts }
+                let rel = CMTimeSubtract(pts, basePTS)
+
+                var mine: CVPixelBuffer?
+                if let pool = adaptor.pixelBufferPool { mine = SwapTech.poolBuffer(pool) }
+                if mine == nil { mine = SwapTech.pixelBuffer(src.outW, src.outH).pb }
+                guard let dst = mine else { ended = "拿不出成片缓冲"; return }
+                guard SwapTech.copyRows(from: pb, to: dst) else { ended = "拷帧失败"; return }
+                decodeMs.append(Double(DispatchTime.now().uptimeNanoseconds - td0) / 1_000_000)
+
+                let w = CVPixelBufferGetWidth(dst), h = CVPixelBufferGetHeight(dst)
+                let t1 = DispatchTime.now().uptimeNanoseconds
+                let (obs, derr) = SwapVision.faces(dst, req)
+                if !derr.isEmpty { say("检测抛错：\(derr)") }
+                detectMs.append(Double(DispatchTime.now().uptimeNanoseconds - t1) / 1_000_000)
+
+                var did = false
+                if let l = SwapVision.largest(obs, w: w, h: h) {
+                    if l.shortSide < args.minFacePx {
+                        smallFace += 1
+                    } else if let al = SwapVision.align(face: obs[l.index], w: w, h: h) {
+                        pointSrc = al.src
+                        if al.det < 0 {
+                            // 5 点映成镜像＝点位被排反了，这张脸换出来是一张翻面的脸，宁可这帧不动
+                            mirror += 1
+                            if mirror <= 3 { say("第 \(made) 帧对齐映成镜像（det \(String(format: "%.3f", al.det))）→ 这帧不换") }
+                        } else {
+                            let t2 = DispatchTime.now().uptimeNanoseconds
+                            resids.append(al.residPx)
+                            alignMs.append(Double(DispatchTime.now().uptimeNanoseconds - t2) / 1_000_000)
+                            let took = SwapTech.withPixels(dst) { base, bpr -> Bool in
+                                SwapGeo.warpToCrop(UnsafeRawPointer(base), bytesPerRow: bpr, w: w, h: h,
+                                                   fwd: al.fwd, side: side, out: &att)
+                                return true
+                            }
+                            var r: (gen: [Float], mask: [Float], ms: Double, note: String) =
+                                (gen: [], mask: [], ms: 0.0, note: "裁不出 224")
+                            if took == true { r = runner.frame(att224_01: att) }
+                            if r.gen.count != 3 * side * side || r.mask.count != side * side {
+                                // 网没回话：这一帧原样交出去，绝不许丢帧（丢了成片就比素材短）
+                                netFail += 1
+                                if netFail <= 3 { say("第 \(made) 帧网没回话：\(r.note)→这帧原样交") }
+                            } else {
+                                netMs.append(r.ms)
+                                gen = r.gen
+                                rawMask = r.mask
+                                let t3 = DispatchTime.now().uptimeNanoseconds
+                                SwapGeo.preprocessMask(rawMask, &m2)
+                                let pasted = SwapTech.withPixels(dst) { base, bpr -> Bool in
+                                    SwapGeo.pasteBack(base, bytesPerRow: bpr, w: w, h: h,
+                                                      gen: gen, mask: m2, fwd: al.fwd, back: al.back)
+                                    return true
+                                }
+                                pasteMs.append(Double(DispatchTime.now().uptimeNanoseconds - t3) / 1_000_000)
+                                did = pasted == true
+                                if !did { netFail += 1 }
+
+                                // 每 sampleEvery 帧复测一次"换完这张脸还剩多少源的身份"
+                                if did, made % max(1, args.sampleEvery) == 0 {
+                                    let t4 = DispatchTime.now().uptimeNanoseconds
+                                    SwapGeo.resizePlanar(gen, from: side, to: 112, into: &f112)
+                                    let after = runner.identity(crop112_01: f112)
+                                    var g112 = [Float](repeating: 0, count: 3 * 112 * 112)
+                                    SwapGeo.resizePlanar(att, from: side, to: 112, into: &g112)
+                                    let before = runner.identity(crop112_01: g112).emb
+                                    sampleMs.append(Double(DispatchTime.now().uptimeNanoseconds - t4) / 1_000_000)
+                                    let cSrc = SwapMath.cosine(after.emb, srcEmb)
+                                    let cTgt = before.isEmpty ? -9 : SwapMath.cosine(before, srcEmb)
+                                    cosList.append("第 \(made) 帧 换后<->源 \(String(format: "%.3f", cSrc))"
+                                        + (cTgt < -8 ? "" : "｜换前<->源 \(String(format: "%.3f", cTgt))")
+                                        + (after.emb.isEmpty ? "（尺子没回话：\(after.note)）" : ""))
+                                    say("  身份 " + cosList.last!)
+                                }
+                            }
+                        }
+                    } else {
+                        fitFail += 1
+                    }
+                } else {
+                    noFace += 1
+                }
+                if !did && made < 3 { say("第 \(made) 帧没换上脸（这帧 \(obs.count) 张脸，检到最大短边 \(String(format: "%.0f", SwapVision.largest(obs, w: w, h: h)?.shortSide ?? 0)) px）") }
+
+                let t5 = DispatchTime.now().uptimeNanoseconds
+                var spins = 0
+                while !vIn.isReadyForMoreMediaData {
+                    spins += 1
+                    if spins > 600 { ended = "编码器队列 3 秒不收"; return }
+                    Thread.sleep(forTimeInterval: 0.005)
+                }
+                var tries = 0
+                while !adaptor.append(dst, withPresentationTime: rel) {
+                    tries += 1
+                    if writer.status == .failed {
+                        ended = "append 失败，writer failed: \(writer.error?.localizedDescription ?? "-")"; return
+                    }
+                    if tries > 400 { ended = "append 连续失败 400 轮"; return }
+                    Thread.sleep(forTimeInterval: 0.005)
+                }
+                appendMs.append(Double(DispatchTime.now().uptimeNanoseconds - t5) / 1_000_000)
+                if did { swapped += 1 }
+                made += 1
+                let now = SwapFacts.footprintMB()
+                if now > memMax { memMax = now }
+                if now > args.footprintStopMB { ended = "足迹 \(now) MB 超收兵线 \(args.footprintStopMB) MB"; return }
+                if made % 60 == 0 {
+                    let el = Double(DispatchTime.now().uptimeNanoseconds - wall0) / 1_000_000_000
+                    let per = el / Double(max(1, made))
+                    say("换到第 \(made)/\(estFrames) 帧｜已用 \(String(format: "%.1f", el)) s"
+                        + "｜约还需 \(String(format: "%.1f", per * Double(max(0, estFrames - made)))) s｜足迹 \(now) MB")
+                }
+            }
+            if !ended.isEmpty { why = ended }
+        }
+
+        // 音频整段透传：画面这条已经走完，失败只报不追
+        if let ai = aIn, let ao = aOut {
+            var ok = 0, bad = 0
+            var aBase: CMTime = .invalid
+            while let s = ao.copyNextSampleBuffer() {
+                defer { CMSampleBufferInvalidate(s) }
+                if aBase == .invalid {
+                    aBase = CMSampleBufferGetPresentationTimeStamp(s)
+                    let off = CMTimeGetSeconds(CMTimeSubtract(aBase, basePTS == .invalid ? .zero : basePTS))
+                    say("音频 起点比画面晚 \(String(format: "%.0f", off * 1000)) ms"
+                        + (abs(off) < 0.02 ? "（都从 0 起，原样搬）" : "（这一版不移位，成片口型可能偏）"))
+                }
+                var spins = 0
+                while !ai.isReadyForMoreMediaData {
+                    spins += 1
+                    if spins > 600 { break }
+                    Thread.sleep(forTimeInterval: 0.005)
+                }
+                if ai.append(s) { ok += 1 } else { bad += 1 }
+                if bad > 20 { break }
+            }
+            say("音频 \(ok) 块原样搬过去（失败 \(bad) 块）")
+            ai.markAsFinished()
+        }
+
+        vIn.markAsFinished()
+        if reader.status == .reading { reader.cancelReading() }
+        let tail0 = DispatchTime.now().uptimeNanoseconds
+        let sem = DispatchSemaphore(value: 0)
+        writer.finishWriting { sem.signal() }
+        sem.wait()
+        let tailMs = Double(DispatchTime.now().uptimeNanoseconds - tail0) / 1_000_000
+        guard writer.status == .completed else {
+            return fail("writer 没收尾 status=\(writer.status.rawValue): \(writer.error?.localizedDescription ?? "-")")
+        }
+        let attrsOfOut = try? fm.attributesOfItem(atPath: out.path)
+        let size = (attrsOfOut?[.size] as? NSNumber)?.int64Value ?? 0
+        let wall = Double(DispatchTime.now().uptimeNanoseconds - wall0) / 1_000_000_000
+        let madeSec = Double(made) / max(src.fps, 1)
+        let perFrame = avg(decodeMs) + avg(detectMs) + avg(alignMs) + avg(netMs) + avg(pasteMs) + avg(appendMs)
+        say("换完 \(made) 帧（预估 \(estFrames)，编码器头/尾 \(SwapUtil.ms(tailMs))）"
+            + "｜成片 \(String(format: "%.1f", Double(size) / 1_048_576)) MB｜\(why.isEmpty ? "跑到末尾" : why)")
+        say("单价 解码 \(SwapUtil.stat(decodeMs))｜检测 \(SwapUtil.stat(detectMs))｜对齐 \(SwapUtil.stat(alignMs))")
+        say("      逐帧网 \(SwapUtil.stat(netMs))｜回贴 \(SwapUtil.stat(pasteMs))｜提交 \(SwapUtil.stat(appendMs))")
+        say("      \(runner.statsLine())")
+        say("总耗时 \(String(format: "%.1f", wall)) s（素材实到 \(String(format: "%.1f", madeSec)) s）"
+            + "＝\(String(format: "%.2f", wall / max(madeSec, 0.01)))× 实时｜每帧合计 \(String(format: "%.1f", perFrame)) ms"
+            + "｜身份复测每次 \(SwapUtil.stat(sampleMs))")
+        say("换上人 \(swapped) 帧｜没脸 \(noFace)｜太小 \(smallFace)｜拟合没过 \(fitFail)｜镜像 \(mirror)｜网失败 \(netFail)｜点位 \(pointSrc)")
+        if !resids.isEmpty {
+            say("对齐残差 中位 \(String(format: "%.2f", median(resids))) px／最大 \(String(format: "%.2f", resids.max() ?? 0)) px"
+                + "（PC 那张容忍表：±2~4 px 之内才不掉分）")
+        }
+        say("足迹 \(mem0)→\(SwapFacts.footprintMB()) MB，本次峰值 \(memMax) MB")
+        if !cosList.isEmpty {
+            say("身份复测 \(cosList.count) 次（PC 参照：换后<->源 0.81~0.90，换前<->源 ≈0.1~0.3）")
+            for c in cosList.suffix(12) { say("  " + c) }
+        }
+
+        let saved = SwapTech.toPhotos(out)
+        say("存相册 " + saved)
+        if saved.hasPrefix("已存") {
+            try? fm.removeItem(at: out)
+            say("沙盒那份已删（\(out.lastPathComponent)）")
+            return (nil, rep.joined(separator: "\n"))
+        }
+        say("本地还留着 \(out.path)")
+        return (out, rep.joined(separator: "\n"))
+    }
+
+    private static func avg(_ v: [Double]) -> Double { v.isEmpty ? 0 : v.reduce(0, +) / Double(v.count) }
+    private static func median(_ v: [Double]) -> Double {
+        guard !v.isEmpty else { return -1 }
+        let s = v.sorted()
+        return s[s.count / 2]
+    }
+}

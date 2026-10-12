@@ -22,22 +22,29 @@ enum SwapFacts {
         ]
     }
 
-    /// 只认包里有哪个文件。绝不在主线程调 compileModel——那可能现场编几分钟。
+    /// 三张网逐个报。只认包里有哪个文件，绝不在主线程调 compileModel——那可能现场编几分钟。
     /// CI 是把 mlpackage 当普通目录拷进 .app 的，所以除了 Bundle.url 还要直接按路径摸。
     static func modelNote() -> String {
-        let fm = FileManager.default
-        func has(_ ext: String) -> Bool {
-            if Bundle.main.url(forResource: SwapBench.resource, withExtension: ext) != nil { return true }
-            for base in [Bundle.main.bundleURL, Bundle.main.resourceURL].compactMap({ $0 }) {
-                var isDir: ObjCBool = false
-                if fm.fileExists(atPath: base.appendingPathComponent("\(SwapBench.resource).\(ext)").path,
-                                isDirectory: &isDir), isDir.boolValue { return true }
-            }
-            return false
+        let names = [SwapNets.arcResource, SwapNets.buildResource, SwapNets.unetResource]
+        var parts: [String] = []
+        for res in names {
+            if Bundle.main.url(forResource: res, withExtension: "mlmodelc") != nil { parts.append("\(res)✓编") }
+            else if hasDir("\(res).mlpackage") { parts.append("\(res)✓待编") }
+            else { parts.append("\(res)✗") }
         }
-        if has("mlmodelc") { return "\(SwapBench.resource).mlmodelc 在包里" }
-        if has("mlpackage") { return "\(SwapBench.resource).mlpackage 在包里（点自检才现场编译）" }
-        return "包里没有换脸网：CI 那轮没把 mlpackage 拷进包"
+        let miss = parts.filter { $0.contains("✗") }.count
+        return parts.joined(separator: " ") + (miss == 0 ? "｜三张齐，能出片" : "｜缺 \(miss) 张：CI 那轮没拷全，出不了片")
+    }
+
+    private static func hasDir(_ name: String) -> Bool {
+        let fm = FileManager.default
+        for base in [Bundle.main.bundleURL, Bundle.main.resourceURL].compactMap({ $0 }) {
+            var isDir: ObjCBool = false
+            if fm.fileExists(atPath: base.appendingPathComponent(name).path, isDirectory: &isDir), isDir.boolValue {
+                return true
+            }
+        }
+        return false
     }
 
     static func diskFreeGB() -> String {

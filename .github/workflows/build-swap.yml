@@ -170,7 +170,8 @@ jobs:
             build 2>&1 | tee /tmp/build.log
 
       # 模型不当成工程文件交给 coremlc：直接拷进 .app，让"这张网 A13 认不认"由设备本人口述
-      # （app 里 SwapBench.locate() 找到 mlpackage 自己调 compileModel 并把耗时报出来）。
+      # （app 里 SwapNets.locate() 找到 mlpackage 自己调 compileModel 并把耗时报出来）。
+      # 这一版三张全装：出片要身份证 + 身份包 + 逐帧三张齐，缺一张就只能自检不能出片。
       - name: package ipa
         working-directory: app
         run: |
@@ -180,19 +181,24 @@ jobs:
           test -n "$APP"
           echo "built app: $APP" >> /tmp/build.log
           file "$APP/SwapBench" | tee -a /tmp/build.log
-          PKG=SwapModel/out/mfs_unet.mlpackage
-          MAN="$PKG/Manifest.json"
-          if [ -d "$PKG" ]; then
-            echo "P-FILES $(find "$PKG" -type f | wc -l | tr -d ' ') 个文件｜Manifest=$([ -s "$MAN" ] && echo "在 $(wc -c < "$MAN" | tr -d ' ')B" || echo 缺/空)｜体积=$(du -sk "$PKG" | awk '{print $1"KB"}')" | rec
-          fi
-          if [ -s "$MAN" ]; then
-            rm -rf "$APP/mfs_unet.mlpackage"
-            cp -R "$PKG" "$APP"/
-            echo "P-VERDICT 逐帧网已原样拷进包 $APP/mfs_unet.mlpackage（等手机上 compileModel）" | rec
-          else
-            echo "P-VERDICT 逐帧网没转出来或没 Manifest，这一版包里没模型" | rec
-          fi
-          # arcface 太大（199 MB 级）这一版不装包，只留个"编得开吗"的现场答案
+          have=0; miss=""
+          for N in mfs_unet arcface build_swap; do
+            PKG="SwapModel/out/$N.mlpackage"
+            MAN="$PKG/Manifest.json"
+            if [ -d "$PKG" ]; then
+              echo "P-FILES $N $(find "$PKG" -type f | wc -l | tr -d ' ') 个文件｜Manifest=$([ -s "$MAN" ] && echo "在 $(wc -c < "$MAN" | tr -d ' ')B" || echo 缺/空)｜体积=$(du -sk "$PKG" | awk '{print $1"KB"}')" | rec
+            fi
+            if [ -s "$MAN" ]; then
+              rm -rf "$APP/$N.mlpackage"
+              cp -R "$PKG" "$APP"/
+              echo "P-VERDICT $N 已原样拷进包（等手机上 compileModel）" | rec
+              have=$((have+1))
+            else
+              miss="$miss $N"
+              echo "P-VERDICT $N 没转出来或 Manifest 空 → 不装包（空 mlpackage 进 .app 会让装机炸「A valid manifest does not exist」）" | rec
+            fi
+          done
+          echo "P-VERDICT 装进去 $have/3 张$([ -n "$miss" ] && echo "｜缺$miss ⇒ 这一版只能自检不能出片")" | rec
           rm -rf Payload swap.ipa
           mkdir Payload
           cp -R "$APP" Payload/
@@ -207,8 +213,10 @@ jobs:
           ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=5{print "::error::" p substr($0,1,230)}'; }
           APP=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' 2>/dev/null | head -1)
           { echo "app=$APP"
-            echo "mlpackage=$([ -d "$APP/mfs_unet.mlpackage" ] && echo 在 || echo 不在) 大小=$(du -sk "$APP/mfs_unet.mlpackage" 2>/dev/null | awk '{print $1"KB"}')"
-            echo "mlmodelc=$(find "$APP" -maxdepth 1 -name '*.mlmodelc' 2>/dev/null | head -1)"
+            for N in mfs_unet arcface build_swap; do
+              echo "包内 $N=$([ -d "$APP/$N.mlpackage" ] && echo 在 || echo 不在) 大小=$(du -sk "$APP/$N.mlpackage" 2>/dev/null | awk '{print $1"KB"}')"
+            done
+            echo "mlmodelc=$(find "$APP" -maxdepth 1 -name '*.mlmodelc' 2>/dev/null | tr '\n' ' ')"
             echo "整个 app=$(du -sk "$APP" 2>/dev/null | awk '{print $1"KB"}')"
             echo "swap.ipa=$(wc -c < swap.ipa 2>/dev/null | tr -d ' ') 字节"; } | tee -a /tmp/model.log | ann "B-VERDICT "
           exit 0
