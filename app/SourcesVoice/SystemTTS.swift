@@ -126,7 +126,11 @@ enum SystemTTS {
         }
     }
 
-    /// 优先用户选中的 identifier，其次 zh-CN，再次任何 zh，都没有就 nil（交给系统默认语音）。
+    /// 没手动选时的兜底判据。他要的是「最平和低沉」那一档 ⇒ 三层依次是：
+    /// ① 普通话（`zh-CN`）—— 简体小说交给粤语嗓子会串调，这一层不许让步；
+    /// ② 合成质量高档（最优 > 增强 > 标准 > 未标）—— 电音几乎全在低档那批里；
+    /// ③ 男声在前（低沉）。真机上落到谁，下面那行日志会写出来。
+    /// 手动选中的 identifier 仍然优先，这条只管他没选过的时候。
     static func pickVoice(identifier: String? = nil) -> AVSpeechSynthesisVoice? {
         if let id = identifier, !id.isEmpty {
             // 这个 init 在有/无 Optional 两种 SDK 声明里都能编：接成可选就两头都不赌。
@@ -135,7 +139,33 @@ enum SystemTTS {
             VoiceJournal.line("存的语音 \(id) 在这台机上取不回来（可能被系统换掉了）⇒ 退回默认选法")
         }
         let zh = chineseVoices()
-        return zh.first { $0.language == "zh-CN" } ?? zh.first
+        func rank(_ v: AVSpeechSynthesisVoice) -> (Int, Int, Int) {
+            let lang: Int
+            switch v.language {
+            case "zh-CN": lang = 0
+            case "zh-TW", "zh-Hans", "zh-Hant": lang = 1
+            default: lang = 2                      // zh-HK 等粤语嗓子排最后
+            }
+            let quality = 3 - min(max(Int(v.quality.rawValue), 0), 3)   // 3 最优→0
+            let gender = v.gender == .male ? 0 : 1
+            return (lang, quality, gender)
+        }
+        // 最后一层用 identifier 收尾：`sorted` 不保证稳定，比到 identifier 就是全序 ⇒ 每次一样。
+        guard let best = zh.sorted(by: { a, b in
+            let ra = rank(a), rb = rank(b)
+            if ra.0 != rb.0 { return ra.0 < rb.0 }
+            if ra.1 != rb.1 { return ra.1 < rb.1 }
+            if ra.2 != rb.2 { return ra.2 < rb.2 }
+            return a.identifier < b.identifier
+        }).first else { return nil }
+        let g: String
+        switch best.gender {
+        case .male: g = "男"
+        case .female: g = "女"
+        @unknown default: g = "未标"
+        }
+        VoiceJournal.line("默认嗓音 → \(best.name)（\(best.language)／\(g)／质量档 \(best.quality.rawValue)）\(best.identifier)")
+        return best
     }
 
     /// 中文句读切句：`。！？；…` 和换行是硬边界；`，、：` 只在已攒够 24 字时才算边界；
