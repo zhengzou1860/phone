@@ -5,6 +5,15 @@ import UIKit
 
 @main
 struct SwapApp: App {
+    init() {
+        // AVFoundation 抛的是 Objective-C 异常，Swift 的 do/catch 抓不住，进程当场就没了，
+        // 盘上只剩半截日志。这个钩子是唯一能在断气前把死因写进 swap_log.txt 的地方。
+        NSSetUncaughtExceptionHandler { ex in
+            SwapJournal.line("未捕获异常 \(ex.name.rawValue)｜\(ex.reason ?? "-")")
+            for f in ex.callStackSymbols.prefix(8) { SwapJournal.line("  栈 \(f)") }
+        }
+    }
+
     var body: some Scene {
         WindowGroup {
             SwapContentView()

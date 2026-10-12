@@ -355,6 +355,42 @@ enum SwapClip {
         var memMax = mem0
         let wall0 = DispatchTime.now().uptimeNanoseconds
 
+        // 音频跟画面在同一趟里交替喂，绝不等到整条画面跑完才开始搬音轨：
+        // 挂着一条音轨输入却一块不喂，编码队列中途就不收画面了（第 9 轮 418 帧只走到 30 帧，随后闪退）。
+        // 交出去给 writer 的块一律不许 CMSampleBufferInvalidate——append 只是入队，取数据在另一条线程上。
+        var aOK = 0, aBad = 0, aNote = ""
+        var aFedTo: CMTime = .invalid
+        func pumpAudio(until pts: CMTime) {
+            guard let ai = aIn, let ao = aOut, aNote.isEmpty else { return }
+            while writer.status == .writing {
+                if aFedTo != .invalid && CMTimeCompare(aFedTo, pts) >= 0 { return }
+                guard let s = ao.copyNextSampleBuffer() else { aNote = "音轨先到末尾"; return }
+                let sPTS = CMSampleBufferGetPresentationTimeStamp(s)
+                if aFedTo == .invalid {
+                    let off = CMTimeGetSeconds(CMTimeSubtract(sPTS, basePTS == .invalid ? .zero : basePTS))
+                    say("音频 起点比画面晚 \(String(format: "%.0f", off * 1000)) ms"
+                        + (abs(off) < 0.02 ? "（都从 0 起，原样搬）" : "（这一版不移位，成片口型可能偏）"))
+                }
+                aFedTo = sPTS
+                var spins = 0
+                while !ai.isReadyForMoreMediaData {
+                    spins += 1
+                    if spins > 600 { aNote = "音轨队列 3 秒不收"; return }
+                    Thread.sleep(forTimeInterval: 0.005)
+                }
+                if ai.append(s) {
+                    aOK += 1
+                    if aOK == 1 { say("音频 头一块进去了（\(String(format: "%.0f", CMTimeGetSeconds(sPTS) * 1000)) ms 处）") }
+                } else {
+                    aBad = 1
+                    aNote = "第 \(aOK + 1) 块 append 被拒｜writer \(writerName(writer.status))"
+                        + " \(writer.error?.localizedDescription ?? "-")"
+                    return
+                }
+            }
+            if writer.status != .writing { aNote = "writer 已不是 writing（\(writerName(writer.status))）" }
+        }
+
         // 整片复用同几块数组：几千帧每帧新造 0.6 MB 是给分配器添垃圾
         let side = SwapGeo.size
         var att = [Float](repeating: 0, count: 3 * side * side)
@@ -489,43 +525,33 @@ enum SwapClip {
                     Thread.sleep(forTimeInterval: 0.005)
                 }
                 appendMs.append(Double(DispatchTime.now().uptimeNanoseconds - t5) / 1_000_000)
+                pumpAudio(until: rel)
                 if did { swapped += 1 }
                 made += 1
                 let now = SwapFacts.footprintMB()
                 if now > memMax { memMax = now }
-                if now > args.footprintStopMB { ended = "足迹 \(now) MB 超收兵线 \(args.footprintStopMB) MB"; return }
+                if now > args.footprintStopMB {
+                    ended = "足迹 \(now) MB 超收兵线 \(args.footprintStopMB) MB"; return
+                }
                 if made % 60 == 0 {
                     let el = Double(DispatchTime.now().uptimeNanoseconds - wall0) / 1_000_000_000
                     let per = el / Double(max(1, made))
                     say("换到第 \(made)/\(estFrames) 帧｜已用 \(String(format: "%.1f", el)) s"
-                        + "｜约还需 \(String(format: "%.1f", per * Double(max(0, estFrames - made)))) s｜足迹 \(now) MB")
+                        + "｜约还需 \(String(format: "%.1f", per * Double(max(0, estFrames - made)))) s｜足迹 \(now) MB"
+                        + "｜音频 \(aOK) 块")
                 }
             }
             if !ended.isEmpty { why = ended }
         }
+        // 画面这条走到哪一步、reader/writer 各是什么状态、因何停：音频那块紧接着要搬，死因得先落在盘上
+        say("画面这条结束 读到 \(made)/\(estFrames) 帧｜\(why.isEmpty ? "自然到末尾" : "因：\(why)")
+            + "｜reader \(readerName(reader.status)) \(reader.error?.localizedDescription ?? "-")"
+            + "｜writer \(writerName(writer.status)) \(writer.error?.localizedDescription ?? "-")")
 
-        // 音频整段透传：画面这条已经走完，失败只报不追
-        if let ai = aIn, let ao = aOut {
-            var ok = 0, bad = 0
-            var aBase: CMTime = .invalid
-            while let s = ao.copyNextSampleBuffer() {
-                defer { CMSampleBufferInvalidate(s) }
-                if aBase == .invalid {
-                    aBase = CMSampleBufferGetPresentationTimeStamp(s)
-                    let off = CMTimeGetSeconds(CMTimeSubtract(aBase, basePTS == .invalid ? .zero : basePTS))
-                    say("音频 起点比画面晚 \(String(format: "%.0f", off * 1000)) ms"
-                        + (abs(off) < 0.02 ? "（都从 0 起，原样搬）" : "（这一版不移位，成片口型可能偏）"))
-                }
-                var spins = 0
-                while !ai.isReadyForMoreMediaData {
-                    spins += 1
-                    if spins > 600 { break }
-                    Thread.sleep(forTimeInterval: 0.005)
-                }
-                if ai.append(s) { ok += 1 } else { bad += 1 }
-                if bad > 20 { break }
-            }
-            say("音频 \(ok) 块原样搬过去（失败 \(bad) 块）")
+        // 音频收尾：搬运本身已在画面循环里逐帧做完（pumpAudio），这里只关闸并报账
+        if let ai = aIn {
+            if aNote.isEmpty { aNote = "跟到画面末尾" }
+            say("音频 \(aOK) 块原样搬过去（拒 \(aBad) 块）｜\(aNote)")
             ai.markAsFinished()
         }
 
@@ -589,5 +615,26 @@ enum SwapClip {
         let s = v.sorted()
         let i = min(s.count - 1, max(0, Int((Double(s.count - 1) * min(1, max(0, q))).rounded())))
         return s[i]
+    }
+}
+
+private func writerName(_ s: AVAssetWriter.Status) -> String {
+    switch s {
+    case .writing: return "writing"
+    case .completed: return "completed"
+    case .failed: return "failed"
+    case .cancelled: return "cancelled"
+    default: return "unknown(\(s.rawValue))"
+    }
+}
+
+private func readerName(_ s: AVAssetReader.Status) -> String {
+    switch s {
+    case .reading: return "reading"
+    case .completed: return "completed"
+    case .failed: return "failed"
+    case .cancelled: return "cancelled"
+    case .paused: return "paused"
+    default: return "unknown(\(s.rawValue))"
     }
 }
