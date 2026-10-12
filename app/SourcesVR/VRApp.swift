@@ -267,9 +267,9 @@ final class VRJob: ObservableObject {
         // 只认 vr3d_ 前缀：别 app 落在同一个容器里的文件一律不碰
         var items: [URL] = []
         let fm = FileManager.default
-        for dir in [fm.temporaryDirectory,
-                    fm.urls(for: .documentDirectory, in: .userDomainMask).first] {
-            guard let dir = dir else { continue }
+        var dirs = [fm.temporaryDirectory]
+        dirs += fm.urls(for: .documentDirectory, in: .userDomainMask)
+        for dir in dirs {
             items += ((try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.fileSizeKey], options: [])) ?? [])
                 .filter { $0.lastPathComponent.hasPrefix("vr3d_") }
         }

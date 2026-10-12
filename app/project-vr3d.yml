@@ -28,7 +28,7 @@ targets:
         CFBundleIdentifier: com.qoder.vr3d
         CFBundlePackageType: APPL
         CFBundleShortVersionString: "0.16"
-        CFBundleVersion: "6"
+        CFBundleVersion: "7"
         CFBundleInfoDictionaryVersion: "6.0"
         NSPhotoLibraryAddUsageDescription: "要把合成的 3D(SBS) 片段存回相册"
         NSPhotoLibraryUsageDescription: "要选一条普通视频来转 3D"
