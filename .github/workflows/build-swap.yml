@@ -86,6 +86,10 @@ jobs:
           exit 0
 
       # 一张一条 step：annotation 每步只有约 10 条额度，三张挤在一起会把判定行挤掉
+      # onnx2coreml 的 --precision 默认是 fp16 ⇒ 第 2 轮三张全按 fp16 编的：
+      # arcface 的 512 维嵌入 max_abs=0.034（等于把人脸挪了个位置），逐帧网直接 verify 出 nan。
+      # 参照端（onnxruntime）在同样喂全 U[0,1) 随机权重时输出是干净的（本机 tools/mfs_nan_probe.py 已测），
+      # 所以那个 nan 是 fp16 中间值溢出，不是图转坏了。这一轮起全部 --precision fp32。
       - name: 转 逐帧网（决定单价的那张）
         run: |
           set +e
@@ -93,12 +97,16 @@ jobs:
           rec() { tee -a /tmp/model.log; }
           IN=app/SwapModel/MobileFaceSwapUNetRuntime.onnx
           OUT=app/SwapModel/out/mfs_unet.mlpackage
-          rm -rf "$OUT"
+          rm -rf "$OUT" app/SwapModel/out/mfs_unet_fp16.mlpackage
           if [ ! -s "$IN" ]; then echo "CV-VERDICT unet 没下到，跳过" | rec | ann "CV "; exit 0; fi
-          /tmp/m2c/bin/onnx2coreml convert "$IN" -o "$OUT" --format mlpackage --verify >/tmp/cv_unet.log 2>&1
+          /tmp/m2c/bin/onnx2coreml convert "$IN" -o "$OUT" --format mlpackage --precision fp32 --verify >/tmp/cv_unet.log 2>&1
           rc=$?
-          echo "CV-VERDICT unet rc=$rc 大小=$(du -sk "$OUT" 2>/dev/null | awk '{print $1"KB"}') 文件=$(find "$OUT" -type f 2>/dev/null | wc -l | tr -d ' ') 权重=$(wc -c < "$OUT/Data/com.apple.CoreML/weights/weight.bin" 2>/dev/null | tr -d ' ')B" | rec | ann "CV "
-          grep -iE "mismatch|maximum absolute|mean absolute|verify|error|not support|unsupported" /tmp/cv_unet.log | head -5 | rec | ann "CV-V "
+          echo "CV-VERDICT unet(fp32) rc=$rc 大小=$(du -sk "$OUT" 2>/dev/null | awk '{print $1"KB"}') 文件=$(find "$OUT" -type f 2>/dev/null | wc -l | tr -d ' ') 权重=$(wc -c < "$OUT/Data/com.apple.CoreML/weights/weight.bin" 2>/dev/null | tr -d ' ')B" | rec | ann "CV "
+          # 同一张图再按 fp16 编一遍只为留分账证据：不装包，别拿它出片
+          /tmp/m2c/bin/onnx2coreml convert "$IN" -o app/SwapModel/out/mfs_unet_fp16.mlpackage \
+            --format mlpackage --precision fp16 --verify >/tmp/cv_unet_fp16.log 2>&1
+          echo "CV-VERDICT unet(fp16 对照) rc=$? 大小=$(du -sk app/SwapModel/out/mfs_unet_fp16.mlpackage 2>/dev/null | awk '{print $1"KB"}')" | rec | ann "CV "
+          grep -iE "mismatch|max_abs|psnr|verify|error|not support|unsupported|renamed" /tmp/cv_unet.log /tmp/cv_unet_fp16.log | head -8 | rec | ann "CV-V "
           exit 0
 
       - name: 转 arcface（每人一次的身份证）
@@ -110,10 +118,12 @@ jobs:
           OUT=app/SwapModel/out/arcface.mlpackage
           rm -rf "$OUT"
           if [ ! -s "$IN" ]; then echo "CV-VERDICT arcface 没下到，跳过" | rec | ann "CV "; exit 0; fi
-          /tmp/m2c/bin/onnx2coreml convert "$IN" -o "$OUT" --format mlpackage --verify >/tmp/cv_arc.log 2>&1
+          # 必须显式 --precision fp32：默认 fp16 时第 2 轮量到 512 维嵌入 max_abs=3.445e-02，
+          # 那就是把这张脸挪到了另一个人脸上，属于降价，不许。
+          /tmp/m2c/bin/onnx2coreml convert "$IN" -o "$OUT" --format mlpackage --precision fp32 --verify >/tmp/cv_arc.log 2>&1
           rc=$?
-          echo "CV-VERDICT arcface rc=$rc 大小=$(du -sk "$OUT" 2>/dev/null | awk '{print $1"KB"}') 文件=$(find "$OUT" -type f 2>/dev/null | wc -l | tr -d ' ') 权重=$(wc -c < "$OUT/Data/com.apple.CoreML/weights/weight.bin" 2>/dev/null | tr -d ' ')B" | rec | ann "CV "
-          grep -iE "mismatch|maximum absolute|mean absolute|verify|error|not support|unsupported" /tmp/cv_arc.log | head -5 | rec | ann "CV-V "
+          echo "CV-VERDICT arcface(fp32) rc=$rc 大小=$(du -sk "$OUT" 2>/dev/null | awk '{print $1"KB"}') 文件=$(find "$OUT" -type f 2>/dev/null | wc -l | tr -d ' ') 权重=$(wc -c < "$OUT/Data/com.apple.CoreML/weights/weight.bin" 2>/dev/null | tr -d ' ')B" | rec | ann "CV "
+          grep -iE "mismatch|max_abs|psnr|error|not support|unsupported" /tmp/cv_arc.log | head -6 | rec | ann "CV-V "
           exit 0
 
       - name: 转 权重生成网（每人一次的身份包）
@@ -125,10 +135,10 @@ jobs:
           OUT=app/SwapModel/out/build_swap.mlpackage
           rm -rf "$OUT"
           if [ ! -s "$IN" ]; then echo "CV-VERDICT build 没下到，跳过" | rec | ann "CV "; exit 0; fi
-          /tmp/m2c/bin/onnx2coreml convert "$IN" -o "$OUT" --format mlpackage --verify >/tmp/cv_build.log 2>&1
+          /tmp/m2c/bin/onnx2coreml convert "$IN" -o "$OUT" --format mlpackage --precision fp32 --verify >/tmp/cv_build.log 2>&1
           rc=$?
-          echo "CV-VERDICT build rc=$rc 大小=$(du -sk "$OUT" 2>/dev/null | awk '{print $1"KB"}') 文件=$(find "$OUT" -type f 2>/dev/null | wc -l | tr -d ' ') 权重=$(wc -c < "$OUT/Data/com.apple.CoreML/weights/weight.bin" 2>/dev/null | tr -d ' ')B" | rec | ann "CV "
-          grep -iE "mismatch|maximum absolute|mean absolute|verify|error|not support|unsupported" /tmp/cv_build.log | head -5 | rec | ann "CV-V "
+          echo "CV-VERDICT build(fp32) rc=$rc 大小=$(du -sk "$OUT" 2>/dev/null | awk '{print $1"KB"}') 文件=$(find "$OUT" -type f 2>/dev/null | wc -l | tr -d ' ') 权重=$(wc -c < "$OUT/Data/com.apple.CoreML/weights/weight.bin" 2>/dev/null | tr -d ' ')B" | rec | ann "CV "
+          grep -iE "mismatch|max_abs|psnr|error|not support|unsupported" /tmp/cv_build.log | head -6 | rec | ann "CV-V "
           # 三张的总判定单独一条：这是这一轮最想知道的事
           { echo "CONV-SUM 逐帧网=$([ -d app/SwapModel/out/mfs_unet.mlpackage ] && echo 成 || echo 败)｜arcface=$([ -d app/SwapModel/out/arcface.mlpackage ] && echo 成 || echo 败)｜权重生成=$([ -d app/SwapModel/out/build_swap.mlpackage ] && echo 成 || echo 败)";
             echo "CONV-SUM SwapModel 目录=$(du -sk app/SwapModel 2>/dev/null | awk '{print $1"KB"}')"; } | rec | ann "CONV-SUM "
