@@ -298,17 +298,32 @@ enum SwapClip {
         var aIn: AVAssetWriterInput?
         var aOut: AVAssetReaderTrackOutput?
         if let at = src.asset.tracks(withMediaType: .audio).first {
-            let ai = AVAssetWriterInput(mediaType: .audio, outputSettings: nil)
+            let fds = at.formatDescriptions
+            let hint = fds.first as? CMFormatDescription
+            var sub = "-"
+            if let h = hint {
+                let t = CMFormatDescriptionGetMediaSubType(h)
+                let bs = [UInt8((t >> 24) & 0xFF), UInt8((t >> 16) & 0xFF), UInt8((t >> 8) & 0xFF), UInt8(t & 0xFF)]
+                    .filter { $0 >= 32 && $0 < 127 }
+                sub = String(decoding: bs, as: UTF8.self)
+            }
+            let ai = AVAssetWriterInput(mediaType: .audio, outputSettings: nil, sourceFormatHint: hint)
             ai.expectsMediaDataInRealTime = false
-            // 没设 sourceFormatHint：Swift 里它是只读属性，只能靠 append 的第一块 sample 自带格式
-            if let ao = try? AVAssetReaderTrackOutput(track: at, outputSettings: nil), writer.canAdd(ai) {
+            let ao = try? AVAssetReaderTrackOutput(track: at, outputSettings: nil)
+            // 三种失败分开报：上一版挤成一句「建不出透传或 canAdd 为假」，死在哪一环看不出来
+            if hint == nil {
+                say("音频 这条音轨的 formatDescriptions 有 \(fds.count) 条，第一条桥不成 CMFormatDescription → 没提示可给")
+            }
+            if ao == nil {
+                say("音频 reader 的透传输出建不出来 → 成片没声音")
+            } else if !writer.canAdd(ai) {
+                say("音频 canAdd 为假（子类型 \(sub)）→ 成片没声音")
+            } else if let a = ao {
                 writer.add(ai)
-                reader.add(ao)
+                reader.add(a)
                 aIn = ai
-                aOut = ao
-                say("音频 原样搬运（不解码不重编，没给格式提示→靠 sample 自带）")
-            } else {
-                say("音频 建不出透传或 canAdd 为假 → 成片没声音")
+                aOut = a
+                say("音频 原样搬运（不解码不重编）：子类型 \(sub)｜提示取自音轨自己的 formatDescriptions")
             }
         } else {
             say("音频 这条片子没有音轨")
@@ -330,6 +345,7 @@ enum SwapClip {
         var appendMs: [Double] = [], decodeMs: [Double] = [], sampleMs: [Double] = [], resids: [Double] = []
         var cosList: [String] = []
         var made = 0, swapped = 0, noFace = 0, smallFace = 0, fitFail = 0, mirror = 0, netFail = 0
+        var probeLeft = 6                       // 「没脸」帧只挑前 6 帧做二次检测对照
         var pointSrc = "—"
         var why = ""
         var basePTS: CMTime = .invalid
@@ -436,6 +452,19 @@ enum SwapClip {
                     }
                 } else {
                     noFace += 1
+                    // 当场对照：默认档 0 张脸的，换 .accurate＋revision3 再检一遍同一帧。
+                    // 分不清「漏检」还是「这帧真没脸」时，整片跑完也判不了，只能这样钉死。
+                    if probeLeft > 0 {
+                        probeLeft -= 1
+                        let req2 = VNDetectFaceLandmarksRequest()
+                        req2.accuracy = .accurate
+                        req2.revision = VNDetectFaceLandmarksRequestRevision3
+                        let (o2, e2) = SwapVision.faces(dst, req2)
+                        let s2 = SwapVision.largest(o2, w: w, h: h)
+                        say("  没脸对照 第 \(made) 帧：默认档 \(obs.count) 张｜.accurate+rev3 \(o2.count) 张"
+                            + (s2 == nil ? "" : "｜最大短边 \(String(format: "%.0f", s2!.shortSide)) px")
+                            + (e2.isEmpty ? "" : "｜\(e2)"))
+                    }
                 }
                 if !did && made < 3 { say("第 \(made) 帧没换上脸（这帧 \(obs.count) 张脸，检到最大短边 \(String(format: "%.0f", SwapVision.largest(obs, w: w, h: h)?.shortSide ?? 0)) px）") }
 

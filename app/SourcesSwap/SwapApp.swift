@@ -17,6 +17,7 @@ struct SwapApp: App {
 struct SwapContentView: View {
     @State private var facts: [String] = []
     @State private var faceURL: URL?
+    @State private var faceImg: UIImage?          // 选定时就读进来：tmp 副本当场还掉，重跑不必重选
     @State private var videoURL: URL?
     @State private var picking: String = ""          // "face" / "video"：谁的选片器开着
     @State private var running = false
@@ -157,8 +158,13 @@ struct SwapContentView: View {
                 SwapPickerHost(kind: .image) { url, err in
                     picking = ""
                     if let u = url {
-                        faceURL = u
-                        SwapJournal.line("选了源脸 \(u.lastPathComponent)")
+                        // 当场读进内存再还掉 tmp 那份：一不留残料，二不让开跑时的清扫把正在用的输入吃掉
+                        let img = UIImage(contentsOfFile: u.path)
+                        if FileManager.default.fileExists(atPath: u.path) { try? FileManager.default.removeItem(at: u) }
+                        faceImg = img
+                        faceURL = img == nil ? nil : u
+                        SwapJournal.line("选了源脸 \(u.lastPathComponent)｜"
+                            + (img == nil ? "这张照片读不进来，重选" : "已读进内存，tmp 副本当场还掉"))
                     } else {
                         SwapJournal.line("选源脸没成：\(err ?? "-")")
                         result = "选源脸没成：\(err ?? "-")"
@@ -182,8 +188,8 @@ struct SwapContentView: View {
     }
 
     private func startSwap() {
-        guard let f = faceURL, let v = videoURL, let img = UIImage(contentsOfFile: f.path) else {
-            result = "源脸照片读不进来（重新选一张）"
+        guard let img = faceImg, let v = videoURL else {
+            result = "源脸照片没在手上了（重新选一张）"
             return
         }
         running = true
@@ -192,7 +198,7 @@ struct SwapContentView: View {
         logTail = SwapJournal.tail(30)
         let units = Self.units[unitIdx].1
         let longEdge = Self.longs[longIdx]
-        SwapJournal.line("开始整片换脸 units=\(Self.units[unitIdx].0) 长边=\(longEdge) 源=\(f.lastPathComponent) 片=\(v.lastPathComponent)")
+        SwapJournal.line("开始整片换脸 units=\(Self.units[unitIdx].0) 长边=\(longEdge) 源=\(faceURL?.lastPathComponent ?? "-") 片=\(v.lastPathComponent)")
         var args = SwapClip.Args()
         args.units = units
         args.longEdge = longEdge
@@ -200,9 +206,11 @@ struct SwapContentView: View {
             let r = SwapClip.run(source: img, video: v, args: args) { line in
                 SwapJournal.line(line)
             }
-            // 选片时拷进 tmp 的那两份是输入，跑完就该还掉：手机存储不许留残料
-            for u in [f, v] {
-                if (try? FileManager.default.removeItem(at: u)) == nil { SwapJournal.line("输入副本没删掉 \(u.lastPathComponent)") }
+            // 视频那份拷贝是输入，跑完就该还掉：手机存储不许留残料（源脸那份选定时就还了）
+            if !FileManager.default.fileExists(atPath: v.path) {
+                SwapJournal.line("视频副本早没了 \(v.lastPathComponent)")
+            } else if (try? FileManager.default.removeItem(at: v)) == nil {
+                SwapJournal.line("视频副本没删掉 \(v.lastPathComponent)")
             }
             DispatchQueue.main.async {
                 outURL = r.out

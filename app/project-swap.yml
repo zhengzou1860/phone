@@ -27,8 +27,8 @@ targets:
         CFBundleExecutable: SwapBench
         CFBundleIdentifier: com.qoder.swapbench
         CFBundlePackageType: APPL
-        CFBundleShortVersionString: "0.2"
-        CFBundleVersion: "2"
+        CFBundleShortVersionString: "0.3"
+        CFBundleVersion: "3"
         CFBundleInfoDictionaryVersion: "6.0"
         NSPhotoLibraryAddUsageDescription: "要把换好脸的片段存回相册"
         NSPhotoLibraryUsageDescription: "要选一张源脸照片和一条要换脸的视频"
