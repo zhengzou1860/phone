@@ -194,7 +194,7 @@ final class VRJob: ObservableObject {
         }
     }
 
-    func finish(_ report: String) {
+    func finish(_ report: String, pickCopy: URL? = nil) {
         ticker?.invalidate()
         ticker = nil
         fullRunning = false
@@ -203,6 +203,24 @@ final class VRJob: ObservableObject {
         busy = false
         status = ""
         VRJournal.line("界面 " + report.replacingOccurrences(of: "\n", with: " ／ "))
+        dropPickCopy(pickCopy)
+    }
+
+    /// 源片副本一跑完就删。它进 app 自己的 tmp 只为了躲开「回调一返回系统就回收」，
+    /// 留着就是你 10-12 在 LC 的 Data/Application/*/tmp 里看到的那些 vr3d_*.mov。
+    func dropPickCopy(_ url: URL?) {
+        guard let url = url else { return }
+        guard url.path.hasPrefix(FileManager.default.temporaryDirectory.path + "/") else {
+            log.append("源片副本不在临时目录，不动它：\(url.path)")
+            return
+        }
+        let mb = Double((try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0) / 1_048_576
+        if (try? FileManager.default.removeItem(at: url)) != nil {
+            VRJournal.line("清副本 删掉源片副本 \(url.lastPathComponent) \(String(format: "%.1f", mb)) MB")
+        } else {
+            log.append("源片副本没删掉：\(url.path)")
+            VRJournal.line("清副本 没删掉 \(url.path)")
+        }
     }
 
     func startCheck() {
@@ -237,7 +255,7 @@ final class VRJob: ObservableObject {
         Task.detached { [weak self] in
             let r = VRPilot.run(url: url, frames: n, bpct: b, eyeLong: eye,
                                 zps: [0.15, 0.50, 0.85], outFps: 5.0, units: u, rot: rot)
-            await MainActor.run { self?.finish(r) }
+            await MainActor.run { self?.finish(r, pickCopy: url) }
         }
     }
 
@@ -263,7 +281,7 @@ final class VRJob: ObservableObject {
         }
         Task.detached { [weak self] in
             let r = VRFull.run(url: url, bpct: b, eyeLong: eye, zps: zps, smooth: 0.4, units: u, rot: rot)
-            await MainActor.run { self?.finish(r) }
+            await MainActor.run { self?.finish(r, pickCopy: url) }
         }
     }
 
@@ -285,6 +303,19 @@ final class VRJob: ObservableObject {
         if busy || VRFull.isBusy() {
             log.append("已经有一条在跑，这条选片不算（进度：\(status)）。要换片先按「停止」。")
             return
+        }
+        // 上一次跑一半闪退/直接退出的，finish 永远等不到 ⇒ 这里补删。只认自己那份前缀，别的不碰
+        let fm = FileManager.default
+        var staleN = 0, staleMb = 0.0
+        for one in (try? fm.contentsOfDirectory(at: fm.temporaryDirectory,
+                    includingPropertiesForKeys: [.fileSizeKey], options: [.skipsHiddenKeys])) ?? []
+            where one.lastPathComponent.hasPrefix("vr3d_") && one.path != url.path {
+            let sz = Double((try? one.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0) / 1_048_576
+            if (try? fm.removeItem(at: one)) != nil { staleN += 1; staleMb += sz }
+        }
+        if staleN > 0 {
+            log.append("选片 顺带删掉上几轮留下的 \(staleN) 个源片副本，释放 \(String(format: "%.1f", staleMb)) MB")
+            VRJournal.line("选片 补删上几轮副本 \(staleN) 个 \(String(format: "%.1f", staleMb)) MB")
         }
         if fullMode { startFull(url) } else { startPilot(url) }
     }
