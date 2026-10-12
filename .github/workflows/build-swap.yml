@@ -239,27 +239,37 @@ jobs:
             [ -s "$f" ] && files="$files $f"
           done
           echo "待发文件 [$files]" | ann "REL "
-          # 不删了重发：删这一下下载位就出现空窗，而且 --cleanup-tag 删不掉 tag 时会留下
-          # 「有 tag 没发布」的半截状态（99ffb71 那轮 CI 成功、包也发了，事后匿名读回 404，tag 却还在）。
-          # 改成发布位常驻，只原地覆盖同名 asset ⇒ 他随时点这个链接都拿得到一个完整版本。
+          # 不删了重发：删这一下下载位就出现空窗（99ffb71 那轮 CI 成功、包也造出来了，事后匿名读回 404）。
           gh release view channel-swap >/dev/null 2>&1 || gh release create channel-swap \
-            --title "SwapBench build" --prerelease --notes "CI artifact (占位，等 asset 上传)" 2>&1 | ann "REL "
+            --title "SwapBench build" --prerelease --notes "CI artifact（占位，等 asset 上传）" 2>&1 | ann "REL "
+          # 关键顺序：建 release 时一个文件都不带 ⇒ 建完就是已发布状态。
+          # gh release create 带文件时是先建草稿、传完才发布，中途没走完就永久卡在草稿里
+          # （99ffb71 就是这样：事件里 swap.ipa=272620931 三张网全在，但 draft=true，匿名 HEAD 回 404）。
+          # 所以 asset 一律用 upload --clobber 传进这条已发布的 release。
           gh release upload channel-swap $files --clobber 2>&1 | ann "REL "
-          gh release edit channel-swap --notes "CI artifact for commit $GITHUB_SHA" >/dev/null 2>&1
+          gh release edit channel-swap --draft=false --prerelease >/dev/null 2>&1
+          RID=$(gh release view channel-swap --json id --jq .id 2>/dev/null)
+          curl -sS -X PATCH \
+            -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/$RID" \
+            -d '{"draft":false,"prerelease":true,"tag_name":"channel-swap","name":"SwapBench build","body":"CI artifact for commit '"$GITHUB_SHA"'"}' \
+            >/tmp/rel_patch.json 2>&1
+          echo "R-PATCH id=$RID 回包=$(head -c 120 /tmp/rel_patch.json | tr -d '\n')" | ann "REL "
           echo "url=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/channel-swap/swap.ipa" | ann "REL "
-          # 闸门：带 token 的 gh 列 asset 名（证挂上去了）+ 匿名 HEAD 真下载地址（证手机上不登录也拉得到）
+          # 闸门三条同时满足才算数：isDraft=false（草稿手机拉不到）＋列到 swap.ipa 及其字节数＋匿名 HEAD 回 200
           hit=0
           for i in 1 2 3; do
+            draft=$(gh release view channel-swap --json isDraft --jq .isDraft 2>&1)
             names=$(gh release view channel-swap --json assets --jq '.assets[] | .name + "=" + (.size|tostring)' 2>&1 | tr '\n' ' ')
             anon=$(curl -sIL -o /dev/null -w '%{http_code}' --max-time 90 \
               "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/channel-swap/swap.ipa" 2>/dev/null)
-            echo "第 $i 次：gh 列到 [$names]｜匿名 HEAD=$anon" | ann "REL-GATE "
-            case "$names" in
-              *swap.ipa*) [ "$anon" = 200 ] && { hit=1; break; } ;;
-            esac
+            echo "第 $i 次：isDraft=$draft｜匿名 HEAD=$anon｜ [$names]" | ann "REL-GATE "
+            if [ "$draft" = "false" ] && [ "$anon" = 200 ]; then
+              case "$names" in *swap.ipa*) hit=1; break ;; esac
+            fi
             sleep 10
           done
-          [ "$hit" = 1 ] || echo "::error::REL-GATE 三次都没同时满足「gh 列到 swap.ipa」+「匿名 HEAD 回 200」⇒ 这一版确实没发出去"
+          [ "$hit" = 1 ] || echo "::error::REL-GATE 三次都没同时满足「isDraft=false」+「列到 swap.ipa」+「匿名 HEAD 回 200」⇒ 这一版手机上拿不到"
           if [ "$hit" = 1 ]; then exit 0; else exit 1; fi
 
       - name: report compile errors
