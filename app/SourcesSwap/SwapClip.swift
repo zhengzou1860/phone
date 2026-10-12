@@ -282,7 +282,7 @@ enum SwapClip {
         var reclaimed = 0
         for one in (try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.fileSizeKey], options: [])) ?? [] {
             guard one.lastPathComponent.hasPrefix("swap_") else { continue }
-            guard one.path != video.path else { continue }   // 本次要用的这条输入不能当残留删
+            guard one.lastPathComponent != video.lastPathComponent else { continue }   // 本次要用的这条输入不能当残留删
             let sz = (try? one.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
             if (try? fm.removeItem(at: one)) != nil { reclaimed += sz }
         }
@@ -388,18 +388,32 @@ enum SwapClip {
         // 音频跟画面在同一趟里交替喂，绝不等到整条画面跑完才开始搬音轨：
         // 挂着一条音轨输入却一块不喂，编码队列中途就不收画面了（第 9 轮 418 帧只走到 30 帧，随后闪退）。
         // 交出去给 writer 的块一律不许 CMSampleBufferInvalidate——append 只是入队，取数据在另一条线程上。
+        // 10-13 对上机四条片子的账：画面全停在「编码器队列 15 秒不收」，停止点＝最后喂进去那块音频的起点。
+        // muxer 是按时间交错的，音轨 frontier 落到画面后头就不收画面了，
+        // 而老写法只在 append 成功之后才喂音频——画面不收、音频不喂，两边互等死锁。
+        // 所以这一版：① 喂到画面前面 2 秒（见调用处）② 音频队列满了不当场干等，下一帧再来 ③ 音轨先到末尾就立刻关闸。
         var aOK = 0, aBad = 0, aNote = ""
         var aFedTo: CMTime = .invalid
+        var aDone = false
+        // 音频往前喂的顶＝画面这条轨的长度（不是容器长度：容器常带一段比画面长的音轨尾巴，
+        // 喂过它成片就变成结尾有声音没画面）
+        let vDur = CMTimeGetSeconds(src.track.duration)
+        let picLen = vDur > 0.1 ? vDur : src.duration
+        let audioCeil = CMTimeMakeWithSeconds(max(0.0, picLen - 0.05), preferredTimescale: 600)
         func pumpAudio(until pts: CMTime) {
-            guard let ai = aIn, let ao = aOut, aNote.isEmpty else { return }
+            guard let ai = aIn, let ao = aOut, aNote.isEmpty, !aDone else { return }
             while writer.status == .writing {
                 if aFedTo != .invalid && CMTimeCompare(aFedTo, pts) >= 0 { return }
+                if !ai.isReadyForMoreMediaData { return }
                 guard let s = ao.copyNextSampleBuffer() else {
                     if writer.status == .writing && reader.status == .reading {
                         aNote = "音轨已到末尾（读到 \(aOK) 块）"
                     } else {
                         aNote = "音轨停止：writer \(writerName(writer.status))｜reader \(readerName(reader.status))｜读到 \(aOK) 块"
                     }
+                    // 音轨比画面短：当场关音频那条闸，不然 muxer 一直等音轨，画面最后那截永远写不进去
+                    ai.markAsFinished()
+                    aDone = true
                     return
                 }
                 let sPTS = CMSampleBufferGetPresentationTimeStamp(s)
@@ -409,15 +423,6 @@ enum SwapClip {
                         + (abs(off) < 0.02 ? "（都从 0 起，原样搬）" : "（这一版不移位，成片口型可能偏）"))
                 }
                 aFedTo = sPTS
-                var spins = 0
-                while !ai.isReadyForMoreMediaData {
-                    spins += 1
-                    if spins > 12_000 { aNote = "音轨队列 60 秒不收"; return }
-                    if spins % 400 == 0 {
-                        say("  音频队列不收，已等 \(String(format: "%.1f", Double(spins) * 0.005)) s")
-                    }
-                    Thread.sleep(forTimeInterval: 0.005)
-                }
                 if ai.append(s) {
                     aOK += 1
                     if aOK == 1 { say("音频 头一块进去了（\(String(format: "%.0f", CMTimeGetSeconds(sPTS) * 1000)) ms 处）") }
@@ -468,6 +473,17 @@ enum SwapClip {
                 let (obs, derr) = SwapVision.faces(dst, req)
                 if !derr.isEmpty { say("检测抛错：\(derr)") }
                 detectMs.append(Double(DispatchTime.now().uptimeNanoseconds - t1) / 1_000_000)
+
+                // y 口径没定过就当场判：直接选「已存的人」这一路没有源脸照片，
+                // 拿默认值当结论会把整片 5 点映成镜像（上机实测 397 帧全被挡、换上人 0 帧）。
+                if SwapVision.yTopLeftOrigin == nil {
+                    for i in obs.indices {
+                        if let line = SwapVision.settleOriginStrict(face: obs[i]) {
+                            say("y 原点靠第 \(made) 帧这一帧判出来（这一趟没有源脸照片可判）：" + line)
+                            break
+                        }
+                    }
+                }
 
                 var did = false
                 if let l = SwapVision.largest(obs, w: w, h: h) {
@@ -552,18 +568,25 @@ enum SwapClip {
                 if !did && made < 3 { say("第 \(made) 帧没换上脸（这帧 \(obs.count) 张脸，检到最大短边 \(String(format: "%.0f", SwapVision.largest(obs, w: w, h: h)?.shortSide ?? 0)) px）") }
 
                 let t5 = DispatchTime.now().uptimeNanoseconds
+                // 音频往前喂 2 秒，但不越过素材末尾：越过去成片就会比画面长出一截
+                let ahead = CMTimeMinimum(CMTimeAdd(rel, CMTime(value: 2, timescale: 1)), audioCeil)
+                pumpAudio(until: ahead)
                 var spins = 0
                 while !vIn.isReadyForMoreMediaData {
                     spins += 1
                     // 0.5 上机证伪了我上一轮的归因：闸放宽到 60 秒，编码器在第 397 帧照样连着 60 秒不收
                     // （源 418 帧的 PTS 逐帧 1/30 严格单调，不是时间戳的事）。是真停，不是打嗝，等 60 秒纯白等。
                     if spins > 3_000 {
-                        ended = "编码器队列 15 秒不收（第 \(made) 帧，PTS \(String(format: "%.3f", CMTimeGetSeconds(rel))) s）"
+                        let fed = aFedTo == .invalid ? "-" : String(format: "%.3f", CMTimeGetSeconds(aFedTo))
+                        let an = aNote.isEmpty ? "" : "｜\(aNote)"
+                        ended = "编码器队列 15 秒不收（第 \(made) 帧，PTS \(String(format: "%.3f", CMTimeGetSeconds(rel))) s"
+                            + "｜音频喂到 \(fed) s、\(aOK) 块\(an)）"
                         return
                     }
                     if spins % 400 == 0 {
                         say("  编码器不收第 \(made) 帧，已等 \(String(format: "%.1f", Double(spins) * 0.005)) s")
                     }
+                    pumpAudio(until: ahead)   // 卡住的这一会儿正是该往前喂音频的时候
                     Thread.sleep(forTimeInterval: 0.005)
                 }
                 var tries = 0
@@ -576,7 +599,6 @@ enum SwapClip {
                     Thread.sleep(forTimeInterval: 0.005)
                 }
                 appendMs.append(Double(DispatchTime.now().uptimeNanoseconds - t5) / 1_000_000)
-                pumpAudio(until: rel)
                 if did { swapped += 1 }
                 made += 1
                 let now = SwapFacts.footprintMB()
@@ -600,11 +622,16 @@ enum SwapClip {
             + "｜reader \(readerName(reader.status)) \(reader.error?.localizedDescription ?? "-")"
             + "｜writer \(writerName(writer.status)) \(writer.error?.localizedDescription ?? "-")")
 
-        // 音频收尾：搬运本身已在画面循环里逐帧做完（pumpAudio），这里只关闸并报账
+        // 音频收尾：搬运已在画面循环里做完（pumpAudio 往前喂 2 秒），这里只补尾巴、关闸、报账
         if let ai = aIn {
-            if aNote.isEmpty { aNote = "跟到画面末尾" }
-            say("音频 \(aOK) 块原样搬过去（拒 \(aBad) 块）｜\(aNote)")
-            ai.markAsFinished()
+            if !aDone {
+                pumpAudio(until: audioCeil)
+                if aNote.isEmpty { aNote = "跟到画面末尾" }
+            }
+            let fed = aFedTo == .invalid ? "-" : String(format: "%.2f", CMTimeGetSeconds(aFedTo))
+            say("音频 \(aOK) 块原样搬过去（拒 \(aBad) 块）｜\(aNote)"
+                + "｜最后一块起点 \(fed) s／画面 \(String(format: "%.2f", picLen)) s")
+            if !aDone { ai.markAsFinished() }
         }
 
         vIn.markAsFinished()

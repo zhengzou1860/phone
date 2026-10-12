@@ -84,14 +84,12 @@ enum SwapVision {
         return CGPoint(x: n.x * CGFloat(w), y: (1 - n.y) * CGFloat(h))
     }
 
-    /// 把 y 原点自己判出来并缓存。判据不需要任何 API 假设：喂进来的帧是摆正的，
-    /// 所以眼睛必须在鼻尖上面、鼻尖必须在嘴角上面（y 向下＝数值更小）。
-    /// 两种口径各摆一遍，谁满足这条谁赢；两边同判时才退回文档口径（左上原点）。
-    @discardableResult
-    static func settleOrigin(face f: VNFaceObservation) -> String {
+    /// 两种口径各摆一遍看谁满足「眼在鼻上、鼻在嘴上」；两边同判时返回的 ok 两位相等＝这一帧定不了论。
+    private static func originVerdict(_ f: VNFaceObservation)
+        -> (ok: [Bool], desc: [String], raw: String, box: String)? {
         guard let p = parts(f),
               let ml = p.lips.min(by: { $0.x < $1.x }), let mr = p.lips.max(by: { $0.x < $1.x })
-        else { return "y 原点没判（五官点缺失）" }
+        else { return nil }
         let set = p.eyes + [p.nose, ml, mr]
         var ok: [Bool] = []
         var desc: [String] = []
@@ -101,14 +99,31 @@ enum SwapVision {
             ok.append(good)
             desc.append("y\(tl ? "不翻" : "翻")\(good ? "√" : "×")")
         }
-        let how: String
-        if ok[0] != ok[1] { yTopLeftOrigin = ok[0]; how = "判出" }
-        else if yTopLeftOrigin == nil { yTopLeftOrigin = true; how = "两边同判→按文档(左上)" }
-        else { how = "两边同判→沿用" }
         let raw = set.map { String(format: "%.2f/%.2f", $0.x, $0.y) }.joined(separator: " ")
         let b = f.boundingBox
         let box = String(format: "框 %.2f/%.2f %.2fx%.2f", b.minX, b.minY, b.width, b.height)
-        return "y 原点 \(desc.joined(separator: "｜"))→「\(topLeft ? "不翻" : "翻")」(\(how))｜\(box)｜5点 \(raw)"
+        return (ok, desc, raw, box)
+    }
+
+    /// 把 y 原点自己判出来并缓存。判据不需要任何 API 假设：喂进来的帧是摆正的，
+    /// 所以眼睛必须在鼻尖上面、鼻尖必须在嘴角上面（y 向下＝数值更小）。
+    /// 两种口径各摆一遍，谁满足这条谁赢；两边同判时才退回文档口径（左上原点）。
+    @discardableResult
+    static func settleOrigin(face f: VNFaceObservation) -> String {
+        guard let v = originVerdict(f) else { return "y 原点没判（五官点缺失）" }
+        let how: String
+        if v.ok[0] != v.ok[1] { yTopLeftOrigin = v.ok[0]; how = "判出" }
+        else if yTopLeftOrigin == nil { yTopLeftOrigin = true; how = "两边同判→按文档(左上)" }
+        else { how = "两边同判→沿用" }
+        return "y 原点 \(v.desc.joined(separator: "｜"))→「\(topLeft ? "不翻" : "翻")」(\(how))｜\(v.box)｜5点 \(v.raw)"
+    }
+
+    /// 只认「两种口径只有一个满足」这一种定论，定不了返回 nil 让下一帧再判。
+    /// 出片循环里补判用的就是这一把：那条路上没有源脸照片，默认值当结论就会整片映成镜像。
+    static func settleOriginStrict(face f: VNFaceObservation) -> String? {
+        guard let v = originVerdict(f), v.ok[0] != v.ok[1] else { return nil }
+        yTopLeftOrigin = v.ok[0]
+        return "y 原点 \(v.desc.joined(separator: "｜"))→「\(topLeft ? "不翻" : "翻")」(判出)｜\(v.box)｜5点 \(v.raw)"
     }
 
     /// 一张脸要送进对齐的那 5 个像素点。左右槽位按 x 排在摆正后的空间里挑，

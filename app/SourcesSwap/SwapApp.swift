@@ -272,6 +272,14 @@ struct SwapContentView: View {
             result = "②还没选要换脸的视频"
             return
         }
+        // 上一趟跑完已经把那份拷贝还掉了，按钮下面留着的 URL 指向一个没了的文件：
+        // 直接再点开始只会在几秒后报「源 没有视频轨」（上机实测三次，全是他重按那一下）
+        if !FileManager.default.fileExists(atPath: v.path) {
+            videoURL = nil
+            result = "②那份视频副本上一趟已经还掉了，重新点②选一条"
+            SwapJournal.line("开始被挡：\(v.lastPathComponent) 这份副本不在了，要重新选")
+            return
+        }
         running = true
         result = ""
         outURL = nil
@@ -296,6 +304,7 @@ struct SwapContentView: View {
                 outURL = r.out
                 result = r.note
                 running = false
+                videoURL = nil
                 facts = SwapFacts.lines()
                 idents = SwapIdents.list()
                 logTail = SwapJournal.tail(30)
