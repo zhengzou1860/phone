@@ -121,6 +121,22 @@ struct VRMainView: View {
                 .font(.footnote)
                 .disabled(job.busy)
 
+                HStack(spacing: 10) {
+                    Button(job.cleanArmed
+                           ? "确认删除 \(job.cleanTargets.count) 个（\(String(format: "%.1f", job.cleanMB)) MB）"
+                           : "删除历史视频") { job.tapClean() }
+                    if job.cleanArmed {
+                        Button("取消") { job.cancelClean() }
+                    }
+                }
+                .buttonStyle(.bordered)
+                .font(.footnote)
+                .disabled(job.busy)
+
+                Text("清的是 app 自己目录里的历史文件：临时目录的源片副本、Documents 的深度缓存和没存进相册的成片。相册里的原片和已入库成品不受影响")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundColor(.secondary)
+
                 if job.busy {
                     Text(job.status)
                         .font(.footnote)
@@ -177,6 +193,10 @@ final class VRJob: ObservableObject {
     @Published var fullZps = 1
     @Published var fullRunning = false
     @Published var stopPressed = false
+    /// 「删除历史视频」的第一击只列清单、置 armed；第二击才真删
+    @Published var cleanArmed = false
+    @Published var cleanTargets: [URL] = []
+    @Published var cleanMB = 0.0
     private var ticker: Timer?
 
     init() {
@@ -222,6 +242,58 @@ final class VRJob: ObservableObject {
             log.append("源片副本没删掉：\(url.path)")
             VRJournal.line("清副本 没删掉 \(url.path)")
         }
+    }
+
+    func tapClean() {
+        if busy || VRFull.isBusy() {
+            log.append("有一条在跑，历史先不动（跑完会自动清它自己那份）。进度：\(status)")
+            return
+        }
+        if cleanArmed {
+            var n = 0, fail = 0, mb = 0.0
+            for one in cleanTargets {
+                let sz = Double((try? one.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0) / 1_048_576
+                if (try? FileManager.default.removeItem(at: one)) != nil { n += 1; mb += sz } else { fail += 1 }
+            }
+            cleanArmed = false
+            cleanTargets = []
+            cleanMB = 0
+            let msg = "删除历史 删掉 \(n) 个，释放 \(String(format: "%.1f", mb)) MB"
+                + (fail > 0 ? "，\(fail) 个没删掉" : "")
+            log.append(msg)
+            VRJournal.line(msg)
+            return
+        }
+        // 只认 vr3d_ 前缀：别 app 落在同一个容器里的文件一律不碰
+        var items: [URL] = []
+        let fm = FileManager.default
+        for dir in [fm.temporaryDirectory,
+                    fm.urls(for: .documentDirectory, in: .userDomainMask).first] {
+            guard let dir = dir else { continue }
+            items += ((try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.fileSizeKey], options: [])) ?? [])
+                .filter { $0.lastPathComponent.hasPrefix("vr3d_") }
+        }
+        cleanTargets = items
+        cleanMB = items.reduce(0.0) {
+            $0 + Double((try? $1.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0) / 1_048_576
+        }
+        guard !items.isEmpty else {
+            cleanArmed = false
+            log.append("删除历史 没找到可删的（源片副本、深度缓存、成片都是空的）")
+            VRJournal.line("删除历史 没找到可删的")
+            return
+        }
+        cleanArmed = true
+        let names = items.prefix(6).map { $0.lastPathComponent }.joined(separator: "、")
+            + (items.count > 6 ? " 等 \(items.count) 个" : "")
+        log.append("删除历史 找到 \(items.count) 个，共 \(String(format: "%.1f", cleanMB)) MB：\(names)\n再点一次「确认删除」才真删")
+        VRJournal.line("删除历史 预备 \(items.count) 个 \(String(format: "%.1f", cleanMB)) MB")
+    }
+
+    func cancelClean() {
+        cleanArmed = false
+        cleanTargets = []
+        cleanMB = 0
     }
 
     func startCheck() {
