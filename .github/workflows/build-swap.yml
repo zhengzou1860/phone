@@ -2,7 +2,8 @@ name: build-swap-ipa
 
 # 第五条线（手机本地换脸）自己的分支、自己的发布位，不碰别人的 channel。
 # 剪辑那份 build.yml 是 "push 到 main 就触发"且没有 paths 过滤 ⇒ 任何东西都不往 main 推。
-# 要重跑：gh 没登录就 git commit --allow-empty && git push origin swap
+# 要重跑：本机 gh 没登录，走 git push。空提交不算——上面有 paths 过滤，一个文件都没改就不匹配，push 了也不触发；
+# 要么改动那三个路径里的任一个（在本文件加一行注释也算），要么在仓库页上手动 workflow_dispatch。
 on:
   push:
     branches: [swap]
@@ -238,16 +239,18 @@ jobs:
             [ -s "$f" ] && files="$files $f"
           done
           echo "待发文件 [$files]" | ann "REL "
-          gh release delete channel-swap --cleanup-tag -y >/dev/null 2>&1 || true
-          gh release create channel-swap $files \
-            --title "SwapBench build" \
-            --prerelease \
-            --notes "CI artifact for commit $GITHUB_SHA" 2>&1 | ann "REL "
+          # 不删了重发：删这一下下载位就出现空窗，而且 --cleanup-tag 删不掉 tag 时会留下
+          # 「有 tag 没发布」的半截状态（99ffb71 那轮 CI 成功、包也发了，事后匿名读回 404，tag 却还在）。
+          # 改成发布位常驻，只原地覆盖同名 asset ⇒ 他随时点这个链接都拿得到一个完整版本。
+          gh release view channel-swap >/dev/null 2>&1 || gh release create channel-swap \
+            --title "SwapBench build" --prerelease --notes "CI artifact (占位，等 asset 上传)" 2>&1 | ann "REL "
+          gh release upload channel-swap $files --clobber 2>&1 | ann "REL "
+          gh release edit channel-swap --notes "CI artifact for commit $GITHUB_SHA" >/dev/null 2>&1
           echo "url=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/channel-swap/swap.ipa" | ann "REL "
           # 闸门：带 token 的 gh 列 asset 名（证挂上去了）+ 匿名 HEAD 真下载地址（证手机上不登录也拉得到）
           hit=0
           for i in 1 2 3; do
-            names=$(gh release view channel-swap --json assets --jq '.assets[].name' 2>&1 | tr '\n' ' ')
+            names=$(gh release view channel-swap --json assets --jq '.assets[] | .name + "=" + (.size|tostring)' 2>&1 | tr '\n' ' ')
             anon=$(curl -sIL -o /dev/null -w '%{http_code}' --max-time 90 \
               "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/channel-swap/swap.ipa" 2>/dev/null)
             echo "第 $i 次：gh 列到 [$names]｜匿名 HEAD=$anon" | ann "REL-GATE "
