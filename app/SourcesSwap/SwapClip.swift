@@ -544,7 +544,8 @@ enum SwapClip {
             if !ended.isEmpty { why = ended }
         }
         // 画面这条走到哪一步、reader/writer 各是什么状态、因何停：音频那块紧接着要搬，死因得先落在盘上
-        say("画面这条结束 读到 \(made)/\(estFrames) 帧｜\(why.isEmpty ? "自然到末尾" : "因：\(why)")
+        let stopWhy = why.isEmpty ? "自然到末尾" : "因：\(why)"
+        say("画面这条结束 读到 \(made)/\(estFrames) 帧｜\(stopWhy)"
             + "｜reader \(readerName(reader.status)) \(reader.error?.localizedDescription ?? "-")"
             + "｜writer \(writerName(writer.status)) \(writer.error?.localizedDescription ?? "-")")
 
