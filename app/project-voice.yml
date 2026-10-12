@@ -36,12 +36,11 @@ targets:
         CFBundleIdentifier: com.qoder.voice
         CFBundlePackageType: APPL
         CFBundleShortVersionString: "0.1"
-        CFBundleVersion: "28"
+        CFBundleVersion: "29"
         CFBundleInfoDictionaryVersion: "6.0"
         # 「导出到手机」的第二条路：开了这两个开关后 Documents 整个出现在「文件」app 里，
         # 录的音、样本、输出 wav 可以就地看和播，不必每条都点一次分享面板。
-        # 代价（10-12 他提的）：同一个「文件」app 也把残留全暴露出来，他的判词是「这样很不安全」⇒
-        # ContentView 的「历史文件」页负责逐条/整类/一键删；撤这两个开关能连根挡住，但那条便利路径一起没（他没令撤）。
+        # 代价就是同一个「文件」app 也把残留翻得到（他 10-12 提的）⇒ ContentView 的「历史文件」页负责删。
         # LiveContainer 里这两个键由宿主怎么透传没实测过，所以分享面板那条仍留着。
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true

@@ -322,27 +322,11 @@ struct ContentView: View {
             pickNote = "已拷进 app：" + dest.lastPathComponent + "（\(size / 1024) KB）" + probe
             history = FileHistory.scan()
             VoiceJournal.line("选文件 \(src.lastPathComponent) → \(dest.lastPathComponent) \(size / 1024) KB，\(probe)")
-            dropTempOriginal(ifUnderTemp: src)
             return dest
         } catch {
             pickNote = "拷进来失败：" + error.localizedDescription
             VoiceJournal.line("拷选中的文件失败：\(error.localizedDescription)")
             return nil
-        }
-    }
-
-    /// 「选文件」的原件在临时目录里，界面上用的是刚拷进 Documents 的那份 ⇒ 原件当场清掉。
-    /// 不清就是每条素材在手机上存两份（88 MB 的 wav ＝ 176 MB），而临时目录那一份谁都不会来清
-    /// （iOS 只清它自己管的容器，LiveContainer 这层嵌套的不管）。
-    /// 只删确实落在我们自己 temporaryDirectory 下面的，别的来源一概不碰。
-    private func dropTempOriginal(ifUnderTemp src: URL) {
-        let root = FileManager.default.temporaryDirectory.path
-        guard src.path.hasPrefix(root + "/") else { return }
-        do {
-            try FileManager.default.removeItem(at: src)
-            VoiceJournal.line("临时目录原件已清 \(String(src.path.dropFirst(root.count + 1)))")
-        } catch {
-            VoiceJournal.line("临时目录原件清理失败 \(src.lastPathComponent)：\(error.localizedDescription)")
         }
     }
 
@@ -439,7 +423,7 @@ struct ContentView: View {
                                      : "查看并清空（\(history.count) 个 / \(FileHistory.human(FileHistory.total(history)))）")
             }
             .buttonStyle(.bordered)
-            Text("「选文件」拷进来的、录的、系统原声、转换成品都留在 app 的 Documents 里；「选文件」那份原件另有一份躺在临时目录里，那条路 iOS 不会替我们清 ⇒ 播完不会自动删，别人拿手机翻「文件」app 就看到。这页两处的都逐条删、整类删、一键清空。模型目录（581 MB）、voice_log.txt、样本清单不在这页里，也删不到。")
+            Text("「选文件」拷进来的、录的、系统原声、转换成品都一直留在 app 目录里，播完不会自动删 ⇒ 「文件」app 里直接翻得到。这页逐条删、整类删、一键清空。模型目录（581 MB）、voice_log.txt、样本清单不在这页里，也删不到。")
                 .font(.caption)
                 .foregroundColor(.secondary)
         }
@@ -502,14 +486,6 @@ struct ContentView: View {
                     Spacer(minLength: 6)
                     Button("删本类") { deleteFiles(rows, what: "已删这一类「\(k.rawValue)」") }
                         .buttonStyle(.bordered)
-                        .disabled(k == .temp && isDownloadingModels)
-                }
-                if k == .temp {
-                    Text(isDownloadingModels
-                         ? "模型正在下载 ⇒ 这一类先别动（半截下载文件也在临时目录里），下完再清。"
-                         : "「选文件」给的原件就堆在这儿。iOS 只清它自己管的那个容器，LiveContainer 这层嵌套容器它不管 ⇒ 选一条留一条，谁都不会自动清掉。")
-                        .font(.caption2)
-                        .foregroundColor(isDownloadingModels ? .red : .secondary)
                 }
                 ForEach(rows) { it in
                     historyLine(it)
@@ -523,30 +499,21 @@ struct ContentView: View {
     private func historyLine(_ it: FileHistory.Item) -> some View {
         HStack(spacing: 8) {
             VStack(alignment: .leading, spacing: 2) {
-                Text(it.label).font(.caption)
+                Text(it.name).font(.caption)
                 Text(FileHistory.human(it.bytes) + (currentPaths.contains(it.id) ? "　这一格正在用" : ""))
                     .font(.caption2)
                     .foregroundColor(currentPaths.contains(it.id) ? .accentColor : .secondary)
             }
             Spacer(minLength: 6)
-            Button("删") { deleteFiles([it], what: "已删 \(it.label)") }
+            Button("删") { deleteFiles([it], what: "已删 \(it.name)") }
                 .buttonStyle(.bordered)
-                .disabled(it.kind == .temp && isDownloadingModels)
         }
     }
 
-    /// 模型正在下（581 MB 那条 background session）⇒ 半截下载文件就在这个 app 的临时目录里，
-    /// 这一趟不许清 tmp，否则下完解压要重头再来。
-    private var isDownloadingModels: Bool {
-        if case .downloading = models.state { return true }
-        return false
-    }
-
-    /// 界面上现在指着哪些文件（删掉时要一起清引用，清单里也要标出来）。
-    /// `novelFileURL` 是临时目录里那份 txt —— 读小说是就地读它，不拷进 Documents，所以它也算「在用」。
+    /// 界面上四个槽现在指着哪些文件（删掉时要一起清引用，清单里也要标出来）。
     private var currentPaths: Set<String> {
         var s = Set<String>()
-        for u in [sourceURL, refURL, outputURL, rawTTSURL, novelFileURL] {
+        for u in [sourceURL, refURL, outputURL, rawTTSURL] {
             if let u = u { s.insert(u.path) }
         }
         return s
@@ -581,11 +548,6 @@ struct ContentView: View {
         if let u = refURL, paths.contains(u.path) { refURL = nil }
         if let u = outputURL, paths.contains(u.path) { outputURL = nil }
         if let u = rawTTSURL, paths.contains(u.path) { rawTTSURL = nil }
-        if let u = novelFileURL, paths.contains(u.path) {
-            novelFileURL = nil
-            novelFileText = ""
-            readNote = "选中的那个文本文件被删了 ⇒ 退回手打/粘贴"
-        }
     }
 
     // MARK: - 模型状态
