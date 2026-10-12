@@ -77,10 +77,9 @@ enum SwapIdents {
     }
 
     static func displayName(_ id: String) -> String {
-        guard let u = sidecar(id),
-              let s = try? String(contentsOf: u, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !s.isEmpty else { return id }
-        return s
+        guard let u = sidecar(id), let raw = try? String(contentsOf: u, encoding: .utf8) else { return id }
+        let s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return s.isEmpty ? id : s
     }
 
     /// 存一份。同 hash 已在列表里就不重写作废（他可能连选同一张照片），只报回那一格。

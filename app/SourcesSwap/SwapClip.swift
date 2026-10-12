@@ -201,6 +201,7 @@ enum SwapClip {
         guard let runner = got.runner else { return fail("装网失败：\n" + got.note) }
 
         // —— 2. 源身份：已存的人只读盘装权重，新照片才跑下面那两步 ——
+        let req = VNDetectFaceLandmarksRequest()
         var srcEmb: [Float] = []
         switch person {
         case .saved(let pid):
@@ -222,7 +223,6 @@ enum SwapClip {
             // —— 2a. 每人一次的那两步，这一版第一次在机上量出钱来 ——
             let up = SwapVision.uprightImage(source)
             guard let cg = up.cg else { return fail("源脸静帧取不出：\(up.note)") }
-            let req = VNDetectFaceLandmarksRequest()
             let (sObs, sErr) = SwapVision.faces(cg, req)
             if !sErr.isEmpty { say("源脸检测：\(sErr)") }
             guard let sl = SwapVision.largest(sObs, w: cg.width, h: cg.height) else {
