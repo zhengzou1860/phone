@@ -619,23 +619,27 @@ enum SwapClip {
     }
 }
 
+// 状态词按 rawValue 翻：这些枚举在本 SDK 里不保证每个成员都有 Swift 名字（第 11 轮就死在
+// AVAssetReader.Status 没有 .paused 上）。AVAssetWriterStatus / AVAssetReaderStatus 的编号是 Objective-C 定死的。
 private func writerName(_ s: AVAssetWriter.Status) -> String {
-    switch s {
-    case .writing: return "writing"
-    case .completed: return "completed"
-    case .failed: return "failed"
-    case .cancelled: return "cancelled"
-    default: return "unknown(\(s.rawValue))"
+    switch s.rawValue {
+    case 0: return "unknown"
+    case 1: return "writing"
+    case 2: return "completed"
+    case 3: return "failed"
+    case 4: return "cancelled"
+    default: return "其他(\(s.rawValue))"
     }
 }
 
 private func readerName(_ s: AVAssetReader.Status) -> String {
-    switch s {
-    case .reading: return "reading"
-    case .completed: return "completed"
-    case .failed: return "failed"
-    case .cancelled: return "cancelled"
-    case .paused: return "paused"
-    default: return "unknown(\(s.rawValue))"
+    switch s.rawValue {
+    case 0: return "unknown"
+    case 1: return "reading"
+    case 2: return "completed"
+    case 3: return "paused"
+    case 4: return "failed"
+    case 5: return "cancelled"
+    default: return "其他(\(s.rawValue))"
     }
 }
