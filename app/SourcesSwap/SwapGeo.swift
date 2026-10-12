@@ -161,8 +161,8 @@ enum SwapGeo {
     }
 
     /// 最终遮罩整体往外长 px 像素（圆盘核，同 cv2.dilate(MORPH_ELLIPSE, 2·px+1)）。
-    /// 他原片 24 帧实测：盖脸框 82.0%→97.8%，缝上的亮度台阶 L+18.1→−1.5，身份余弦 0.755→0.782。
-    /// 缝不见了，"动脸时遮罩抖"那件事也就没有可见载体了——抖的是这条缝。
+    /// 整片均匀抽 24 帧实测：盖脸框 81.1%→97.1%，缝上的亮度台阶 L+21.9→+2.6，身份余弦 0.776→0.787。
+    /// 缝平了，"动脸时遮罩抖"那件事也就没有可见载体了——抖的就是这条缝。
     static func growMask(_ m: inout [Float], px: Int) {
         let s = size
         guard px > 0 else { return }
@@ -198,10 +198,11 @@ enum SwapGeo {
         }
     }
 
-    /// 把这张真脸自己的高频（毛孔/胡茬/纹路）按 lam 倍加回补丁：补丁糊是糊在 224 要撑到 740 px 上。
-    /// 同那 24 帧：能量比（补丁高频 ÷ 它周围该有的高频）0.247→0.481，身份余弦 0.782→0.677；
-    /// lam=2.0 能到 0.745 但脸开始显粗，0.5 只到 0.357 等于没做。
-    static func restoreDetail(_ gen: inout [Float], _ att: [Float], lam: Float, sigma: Double = 2.0) {
+    /// 把这张真脸自己的高频按 lam 倍加回补丁：补丁糊是糊在 224 要撑到 807 px 上。
+    /// 带宽是关键——σ=2 那份连着额头纹、法令纹、眼窝一起回来，等于把他本人的结构盖回补丁上，
+    /// 他一眼判「完全没遮住」（那版成片身份余弦中位 0.673，上一版没回填是 0.700）。
+    /// 改 σ=0.8 只取毛孔级细带后（整片均匀抽 24 帧）：能量比 0.244→0.429，身份余弦 0.787→0.784 不动。
+    static func restoreDetail(_ gen: inout [Float], _ att: [Float], lam: Float, sigma: Double = 0.8) {
         let s = size, plane = s * s
         let kr = Int((sigma * 3).rounded())          // cv2.GaussianBlur(0,0,σ) 的核宽＝2·round(3σ)+1
         let k = 2 * kr + 1

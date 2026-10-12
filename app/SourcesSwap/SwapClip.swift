@@ -245,7 +245,7 @@ enum SwapClip {
         say("磁盘闸门 这条要 \(String(format: "%.0f", need / 1_048_576)) MB（码率 \(String(format: "%.1f", Double(bitrate) / 1e6)) Mbps）"
             + "｜可用 \(String(format: "%.1f", free / 1_073_741_824)) GB")
         if need > free { return fail("可用空间不够，不出片：素材 \(String(format: "%.0f", src.duration)) s") }
-        say("补丁口径 遮罩往外长 16 px（224 内，这条原片上≈53 px）｜高频回填 1.0×（σ=2，取自这张脸自己）")
+        say("补丁口径 遮罩往外长 16 px（224 内，这条原片上≈58 px）｜高频回填 1.0×（σ=0.8 细带，只毛孔级、不带回他自己的纹路）")
 
         let fm = FileManager.default
         let dir = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
@@ -473,8 +473,8 @@ enum SwapClip {
                                 gen = r.gen
                                 rawMask = r.mask
                                 let t3 = DispatchTime.now().uptimeNanoseconds
-                                // 两个数都取自 PC 上他这条原片 24 帧（tools/orig_menu.py），不是拍的
-                                SwapGeo.restoreDetail(&gen, att, lam: 1.0)
+                                // 两格都取自 PC 上他这条原片整片均匀抽 24 帧（tools/orig_menu2.py），不是拍的
+                                SwapGeo.restoreDetail(&gen, att, lam: 1.0, sigma: 0.8)
                                 SwapGeo.preprocessMask(rawMask, &m2)
                                 SwapGeo.growMask(&m2, px: 16)
                                 let pasted = SwapTech.withPixels(dst) { base, bpr -> Bool in
@@ -529,8 +529,12 @@ enum SwapClip {
                 var spins = 0
                 while !vIn.isReadyForMoreMediaData {
                     spins += 1
-                    // 上一版 3 秒就收兵：418 帧的片子走到 397 帧被编码器一次打嗝截掉，成片比素材短 0.7 秒
-                    if spins > 12_000 { ended = "编码器队列 60 秒不收（第 \(made) 帧）"; return }
+                    // 0.5 上机证伪了我上一轮的归因：闸放宽到 60 秒，编码器在第 397 帧照样连着 60 秒不收
+                    // （源 418 帧的 PTS 逐帧 1/30 严格单调，不是时间戳的事）。是真停，不是打嗝，等 60 秒纯白等。
+                    if spins > 3_000 {
+                        ended = "编码器队列 15 秒不收（第 \(made) 帧，PTS \(String(format: "%.3f", CMTimeGetSeconds(rel))) s）"
+                        return
+                    }
                     if spins % 400 == 0 {
                         say("  编码器不收第 \(made) 帧，已等 \(String(format: "%.1f", Double(spins) * 0.005)) s")
                     }
