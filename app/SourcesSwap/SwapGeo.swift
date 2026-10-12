@@ -160,6 +160,84 @@ enum SwapGeo {
         for i in 0..<m.count { m2[i] = m[i] * m1[i] }
     }
 
+    /// 最终遮罩整体往外长 px 像素（圆盘核，同 cv2.dilate(MORPH_ELLIPSE, 2·px+1)）。
+    /// 他原片 24 帧实测：盖脸框 82.0%→97.8%，缝上的亮度台阶 L+18.1→−1.5，身份余弦 0.755→0.782。
+    /// 缝不见了，"动脸时遮罩抖"那件事也就没有可见载体了——抖的是这条缝。
+    static func growMask(_ m: inout [Float], px: Int) {
+        let s = size
+        guard px > 0 else { return }
+        var out = [Float](repeating: 0, count: s * s)
+        var row = [Float](repeating: 0, count: s)
+        var dq = [Int](repeating: 0, count: s)
+        for dy in (-px)...px {
+            let w = Int((Double(px * px - dy * dy).squareRoot()).rounded(.down))
+            let sy0 = max(0, dy), sy1 = min(s - 1, s - 1 + dy)
+            for sy in sy0...sy1 {
+                slidingMaxRow(m, sy, w, &row, &dq)
+                let y = (sy - dy) * s
+                for x in 0..<s where row[x] > out[y + x] { out[y + x] = row[x] }
+            }
+        }
+        for i in 0..<(s * s) where out[i] > m[i] { m[i] = out[i] }
+    }
+
+    /// 一维滑窗最大，窗口 2w+1，越界那半边不参与（= 形态学默认边界取 -inf 的效果）。单调队列，整行 O(s)。
+    private static func slidingMaxRow(_ a: [Float], _ r0: Int, _ w: Int, _ dst: inout [Float], _ dq: inout [Int]) {
+        let s = size
+        var head = 0, tail = 0, pushed = 0
+        for x in 0..<s {
+            let lo = max(0, x - w), hi = min(s - 1, x + w)
+            while pushed <= hi {
+                let v = a[r0 * s + pushed]
+                while tail > head && a[r0 * s + dq[tail - 1]] <= v { tail -= 1 }
+                dq[tail] = pushed; tail += 1
+                pushed += 1
+            }
+            while tail > head && dq[head] < lo { head += 1 }
+            dst[x] = a[r0 * s + dq[head]]
+        }
+    }
+
+    /// 把这张真脸自己的高频（毛孔/胡茬/纹路）按 lam 倍加回补丁：补丁糊是糊在 224 要撑到 740 px 上。
+    /// 同那 24 帧：能量比（补丁高频 ÷ 它周围该有的高频）0.247→0.481，身份余弦 0.782→0.677；
+    /// lam=2.0 能到 0.745 但脸开始显粗，0.5 只到 0.357 等于没做。
+    static func restoreDetail(_ gen: inout [Float], _ att: [Float], lam: Float, sigma: Double = 2.0) {
+        let s = size, plane = s * s
+        let kr = Int((sigma * 3).rounded())          // cv2.GaussianBlur(0,0,σ) 的核宽＝2·round(3σ)+1
+        let k = 2 * kr + 1
+        var kw = [Float](repeating: 0, count: k)
+        var sum: Float = 0
+        for i in 0..<k {
+            let x = Double(i - kr) / sigma
+            kw[i] = Float(exp(-0.5 * x * x)); sum += kw[i]
+        }
+        for i in 0..<k { kw[i] /= sum }
+        func refl(_ i: Int) -> Int { i < 0 ? -i : (i >= s ? 2 * s - 2 - i : i) }   // BORDER_REFLECT_101，同 cv2
+        var tmp = [Float](repeating: 0, count: plane)
+        var blr = [Float](repeating: 0, count: plane)
+        for p in 0..<3 {
+            let o = p * plane
+            for y in 0..<s {
+                for x in 0..<s {
+                    var v: Float = 0
+                    for i in 0..<k { v += kw[i] * att[o + refl(y - kr + i) * s + x] }
+                    tmp[y * s + x] = v
+                }
+            }
+            for y in 0..<s {
+                for x in 0..<s {
+                    var v: Float = 0
+                    for i in 0..<k { v += kw[i] * tmp[y * s + refl(x - kr + i)] }
+                    blr[y * s + x] = v
+                }
+            }
+            for i in 0..<plane {
+                let v = gen[o + i] + lam * (att[o + i] - blr[i])
+                gen[o + i] = v < 0 ? 0 : (v > 1 ? 1 : v)
+            }
+        }
+    }
+
     /// 矩形核膨胀：可分离（先行后列）；越界按 OpenCV 形态学默认边界＝不参与（比 -inf/ +inf 弱）
     private static func boxMax(_ a: [Float], _ s: Int, _ k: Int) -> [Float] {
         let r = k / 2

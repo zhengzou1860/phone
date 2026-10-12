@@ -245,6 +245,7 @@ enum SwapClip {
         say("磁盘闸门 这条要 \(String(format: "%.0f", need / 1_048_576)) MB（码率 \(String(format: "%.1f", Double(bitrate) / 1e6)) Mbps）"
             + "｜可用 \(String(format: "%.1f", free / 1_073_741_824)) GB")
         if need > free { return fail("可用空间不够，不出片：素材 \(String(format: "%.0f", src.duration)) s") }
+        say("补丁口径 遮罩往外长 16 px（224 内，这条原片上≈53 px）｜高频回填 1.0×（σ=2，取自这张脸自己）")
 
         let fm = FileManager.default
         let dir = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
@@ -472,7 +473,10 @@ enum SwapClip {
                                 gen = r.gen
                                 rawMask = r.mask
                                 let t3 = DispatchTime.now().uptimeNanoseconds
+                                // 两个数都取自 PC 上他这条原片 24 帧（tools/orig_menu.py），不是拍的
+                                SwapGeo.restoreDetail(&gen, att, lam: 1.0)
                                 SwapGeo.preprocessMask(rawMask, &m2)
+                                SwapGeo.growMask(&m2, px: 16)
                                 let pasted = SwapTech.withPixels(dst) { base, bpr -> Bool in
                                     SwapGeo.pasteBack(base, bytesPerRow: bpr, w: w, h: h,
                                                       gen: gen, mask: m2, fwd: al.fwd, back: al.back)
