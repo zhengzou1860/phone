@@ -87,8 +87,10 @@ final class PlayController: NSObject, ObservableObject {
                 sum += Double(v) * Double(v)
             }
             let rms = (sum / Double(max(s.count, 1))).squareRoot()
-            VoiceJournal.line(String(format: "输出实测 样本 %d / 峰值 %.4f / rms %.5f%@",
-                                     s.count, peak, rms,
+            // 文件名必须在这一行里：他一次跑会连着播「系统原声」和「转换成品」两个文件，
+            // 只留三个数就成了两行没有主人的读数，正是要分的时候分不出来。
+            VoiceJournal.line(String(format: "输出实测 %@ 样本 %d / 峰值 %.4f / rms %.5f%@",
+                                     url.lastPathComponent, s.count, peak, rms,
                                      rms < 0.001 ? " ⇒ 这条基本是静音" : ""))
         }
     }
