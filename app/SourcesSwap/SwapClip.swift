@@ -371,7 +371,8 @@ enum SwapClip {
                 reader.add(a)
                 aIn = ai
                 aOut = a
-                say("音频 原样搬运（不解码不重编）：子类型 \(sub)｜提示取自音轨自己的 formatDescriptions")
+                say("音频 原样搬运（不解码不重编）：子类型 \(sub)｜提示取自音轨自己的 formatDescriptions"
+                    + "｜往前喂的顶＝画面末尾再多 0.4 s｜前沿自己记秒数（某块时戳回读无效也不停下，照块长往前累加）")
             }
         } else {
             say("音频 这条片子没有音轨")
@@ -414,18 +415,24 @@ enum SwapClip {
         // 而老写法只在 append 成功之后才喂音频——画面不收、音频不喂，两边互等死锁。
         // 所以这一版：① 喂到画面前面 2 秒（见调用处）② 音频队列满了不当场干等，下一帧再来 ③ 音轨先到末尾就立刻关闸。
         var aOK = 0, aBad = 0, aNote = ""
-        var aFedTo: CMTime = .zero
+        // 音频前沿自己记秒数，不信时戳回读：这条轨上有块的 PTS 读出来是无效的，
+        // 而 CMTimeCompare 摊上无效值恒回 0 ⇒ 旧写法把「比不出大小」判成「早就喂够了」，
+        // 从此不再向 reader 取下一块，画面就停在最后一块有效音频的起点上（0.16 上机：一条停在第 36 帧，
+        // 两条长片尾巴少 63/79/109 帧，四处日志印的都是「音频喂到 nan s」）。
+        var aFedSec: Double = 0
         var aHaveFed = false
         var aDone = false
-        // 音频往前喂的顶＝画面这条轨的长度（不是容器长度：容器常带一段比画面长的音轨尾巴，
-        // 喂过它成片就变成结尾有声音没画面）
+        // 音频往前喂的顶＝画面这条轨的末尾再多 0.4 秒：顶要是收在画面末尾之前，
+        // 最后那几帧（PTS＝画面末尾−1/帧率）就压着音频一头，muxer 不收，成片尾巴缺帧。
+        // 不是容器长度：容器常带一段比画面长的音轨尾巴，喂满它成片就变成结尾有声音没画面。
         let vDur = CMTimeGetSeconds(src.track.timeRange.duration)
         let picLen = vDur > 0.1 ? vDur : src.duration
-        let audioCeil = CMTimeMakeWithSeconds(max(0.0, picLen - 0.05), preferredTimescale: 600)
+        let audioCeil = CMTimeMakeWithSeconds(max(0.0, picLen + 0.4), preferredTimescale: 600)
         func pumpAudio(until pts: CMTime) {
             guard let ai = aIn, let ao = aOut, aNote.isEmpty, !aDone else { return }
+            let ptsSec = CMTimeGetSeconds(pts)
             while writer.status == .writing {
-                if aHaveFed && CMTimeCompare(aFedTo, pts) >= 0 { return }
+                if aHaveFed && aFedSec >= ptsSec { return }
                 if !ai.isReadyForMoreMediaData { return }
                 guard let s = ao.copyNextSampleBuffer() else {
                     if writer.status == .writing && reader.status == .reading {
@@ -439,10 +446,13 @@ enum SwapClip {
                     return
                 }
                 let sPTS = CMSampleBufferGetPresentationTimeStamp(s)
-                let aStart = String(format: "%.0f", CMTimeGetSeconds(sPTS) * 1000)
+                let sec = CMTimeGetSeconds(sPTS)
+                let dur = CMTimeGetSeconds(CMSampleBufferGetDuration(s))
+                let step = dur.isFinite && dur > 0 ? dur : 0
+                if sec.isFinite { aFedSec = max(aFedSec, sec + step) } else { aFedSec += step }
+                let aStart = String(format: "%.0f", (sec.isFinite ? sec : 0) * 1000)
                 let vStart = String(format: "%.0f", CMTimeGetSeconds(basePTS) * 1000)
                 let isFirst = !aHaveFed
-                aFedTo = sPTS
                 aHaveFed = true
                 if ai.append(s) {
                     aOK += 1
@@ -616,7 +626,7 @@ enum SwapClip {
                     // 0.5 上机证伪了我上一轮的归因：闸放宽到 60 秒，编码器在第 397 帧照样连着 60 秒不收
                     // （源 418 帧的 PTS 逐帧 1/30 严格单调，不是时间戳的事）。是真停，不是打嗝，等 60 秒纯白等。
                     if spins > 3_000 {
-                        let fed = aHaveFed ? String(format: "%.3f", CMTimeGetSeconds(aFedTo)) : "-"
+                        let fed = aHaveFed ? String(format: "%.3f", aFedSec) : "-"
                         let an = aNote.isEmpty ? "" : "｜\(aNote)"
                         ended = "编码器队列 15 秒不收（第 \(made) 帧，PTS \(String(format: "%.3f", CMTimeGetSeconds(rel))) s"
                             + "｜音频喂到 \(fed) s、\(aOK) 块\(an)）"
@@ -676,9 +686,9 @@ enum SwapClip {
                 pumpAudio(until: audioCeil)
                 if aNote.isEmpty { aNote = "跟到画面末尾" }
             }
-            let fed = aHaveFed ? String(format: "%.2f", CMTimeGetSeconds(aFedTo)) : "-"
+            let fed = aHaveFed ? String(format: "%.2f", aFedSec) : "-"
             say("音频 \(aOK) 块原样搬过去（拒 \(aBad) 块）｜\(aNote)"
-                + "｜最后一块起点 \(fed) s／画面 \(String(format: "%.2f", picLen)) s")
+                + "｜音频前沿 \(fed) s／画面 \(String(format: "%.2f", picLen)) s")
             if !aDone { ai.markAsFinished() }
         }
 
