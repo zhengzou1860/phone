@@ -324,14 +324,16 @@ enum VideoClip {
                             + "｜两条轨都不移位，起点不同成片口型就偏")
                     }
                 } else {
+                    let sub = CMSampleBufferGetFormatDescription(s).map { fourcc($0) } ?? "-"
+                    let fed = String(format: "%.3f", CMTimeGetSeconds(sPTS))
                     let rj = "第 \(aOK + 1) 块音频 append 被拒｜writer \(writerName(writer.status)) \(errText(writer.error))"
-                    aNote = "\(rj)｜这条输入 \(errText(ain.error))"
+                    aNote = "\(rj)｜这块音频 \(sub)／起点 \(fed) s｜这条输入还收 \(ain.isReadyForMoreMediaData)"
                     return
                 }
             }
             if writer.status.rawValue != 1 {
                 let st = "writer 已不是 writing（\(writerName(writer.status))）\(errText(writer.error))"
-                aNote = "\(st)｜音轨这条输入 \(errText(ain.error))"
+                aNote = "\(st)｜音轨 reader \(readerName(wReader.status)) \(errText(wReader.error))"
             }
         }
 
@@ -376,7 +378,10 @@ enum VideoClip {
                 // 透传：块原样交出去，时间戳一个数都不改（改了成片就和原片口型对不上）。
                 // 也不能 CMSampleBufferInvalidate——append 只是入队，取数据在另一条线程上。
                 if !vin.append(sb) {
-                    why = "第 \(frames) 块画面 append 被拒｜\(errText(writer.error))｜画面这条输入 \(errText(vin.error))"
+                    let sub = CMSampleBufferGetFormatDescription(sb).map { fourcc($0) } ?? "-"
+                    let at = String(format: "%.3f", CMTimeGetSeconds(pts))
+                    let st = "第 \(frames) 块画面 append 被拒｜\(errText(writer.error))"
+                    why = "\(st)｜这块画面 \(sub)／PTS \(at) s｜这条输入还收 \(vin.isReadyForMoreMediaData)"
                     return
                 }
                 frames += 1
@@ -401,8 +406,10 @@ enum VideoClip {
             try? fm.removeItem(at: out)
             let head = "成片没收尾［\(cfg.name)］：writer \(writerName(writer.status)) \(errText(writer.error))"
             let cnt = "画面 \(frames) 块／音频 \(aOK) 块"
-            let inps = "画面那条 \(errText(vin.error))｜音轨那条 \(errText(ain.error))"
-            throw ChainError.input("\(head)｜\(cnt)｜\(inps)｜\(why)")
+            let inps = "画面那条还收 \(vin.isReadyForMoreMediaData)｜音轨那条还收 \(ain.isReadyForMoreMediaData)"
+            let rds = "画面 reader \(readerName(reader.status)) \(errText(reader.error))"
+                + "｜音轨 reader \(readerName(wReader.status)) \(errText(wReader.error))"
+            throw ChainError.input("\(head)｜\(cnt)｜\(inps)｜\(rds)｜\(why)")
         }
         // 中途停（队列不收／append 被拒）时 finishWriting 也能 completed，但那份文件画面短了一截 ⇒ 不算成功
         if why != "片源到末尾" {
