@@ -148,7 +148,7 @@ enum SwapGeo {
 
     /// 官方 preprocess_mask：>0.001 归 1 → 11×11 膨胀 → 11×11 腐蚀×2 → 7×7 模糊 → 乘 10 px 内收衰减
     /// 只这一处偏离官方：下边不再内收（下巴下半截就是被那一刀切掉的），左右和上边照旧。
-    /// 下边缘的剖面挪到 pasteBack 里按行现算（chinProfile），因为只有现算才能伸出补丁外几行。
+    /// 下边缘的剖面不在这里乘，由 featherMask 折进 236 行那张再整张糊一次（伸出补丁那几行只有现算才有）。
     static func preprocessMask(_ inMask: [Float], _ m2: inout [Float]) {
         let s = size
         var m = inMask
@@ -210,20 +210,20 @@ enum SwapGeo {
     }
 
     /// cv2.blur(k×k) ＝ 均值滤波，边界 BORDER_REFLECT_101（不复制边缘、不补 0）
+    private static func refl101(_ i: Int, _ n: Int) -> Int {
+        if i >= 0 && i < n { return i }
+        if i < 0 { return -i }              // REFLECT_101: -1 → 1
+        return 2 * n - 2 - i
+    }
+
     private static func boxBlur(_ a: [Float], _ s: Int, _ k: Int) -> [Float] {
         let r = k / 2
-        func refl(_ i: Int, _ n: Int) -> Int {
-            if i >= 0 && i < n { return i }
-            if i < 0 { return -i }              // REFLECT_101: -1 → 1
-            if i >= n { return 2 * n - 2 - i }
-            return i
-        }
         var t = [Float](repeating: 0, count: a.count)
         let inv = 1.0 / Float(k)
         for y in 0..<s {
             for x in 0..<s {
                 var v: Float = 0
-                for d in (-r)...r { v += a[y * s + refl(x + d, s)] }
+                for d in (-r)...r { v += a[y * s + refl101(x + d, s)] }
                 t[y * s + x] = v * inv
             }
         }
@@ -231,7 +231,7 @@ enum SwapGeo {
         for x in 0..<s {
             for y in 0..<s {
                 var v: Float = 0
-                for d in (-r)...r { v += t[refl(y + d, s) * s + x] }
+                for d in (-r)...r { v += t[refl101(y + d, s) * s + x] }
                 o[y * s + x] = v * inv
             }
         }
@@ -269,6 +269,61 @@ enum SwapGeo {
         return Float(1 - t * t * (3 - 2 * t))
     }
 
+    // MARK: - 遮罩在 224 这一层糊一次（他 10-13 点名的那一格：八臂里的 G「G更自然」）
+    //
+    // 本机八臂的数：遮罩边上的亮度台阶 7.81→6.02、轮廓粗糙 4.3→4.0 px、↔源 0.794→0.784、能量比 0.226→0.240。
+    // 同一档羽化若在整幅那一层糊（B 臂），台阶只到 6.79 而本机合成段要 2.3 倍的钱 ⇒ 糊在 224 里，
+    // 两条路的 alpha 逐像素差 均值 2.43／最大 26.59（0~255 刻度）。
+    static let featherSigma = 4.0
+    static var maskRows: Int { Int(chinRamp1) + 1 }        // 236 行＝补丁 224 行＋伸出那 12 行
+
+    /// 224 那张遮罩 → 236×224 的成品 alpha：下巴剖面先折进来（伸出那几行拿末行接下去），
+    /// 再整张高斯摊开一次。贴回时取样就直接落在这张上，不再按行现算剖面。
+    /// out 的长度必须是 maskRows*size，调用方按帧复用这一格缓冲。
+    static func featherMask(_ m2: [Float], _ out: inout [Float]) {
+        let s = size
+        var m = [Float](repeating: 0, count: maskRows * s)
+        for y in 0..<maskRows {
+            let sy = min(y, s - 1)
+            let pf = chinProfile(Double(y))
+            for x in 0..<s { m[y * s + x] = m2[sy * s + x] * pf }
+        }
+        out = gaussBlur(m, s, maskRows, featherSigma)
+    }
+
+    /// cv2 由 σ 现算核长：float 输入取 round(σ·4·2+1) 再凑奇数（σ=4 ⇒ 33 抽），归一化到和为 1
+    private static func gaussKernel(_ sigma: Double) -> [Float] {
+        var n = Int((sigma * 8.0 + 1.0).rounded())
+        if n % 2 == 0 { n += 1 }
+        let r = n / 2
+        var w = [Double](repeating: 0, count: n)
+        for i in 0..<n { let x = Double(i - r); w[i] = exp(-0.5 * (x / sigma) * (x / sigma)) }
+        let sum = w.reduce(0, +)
+        return w.map { Float($0 / sum) }
+    }
+
+    /// 可分离高斯，边界 BORDER_REFLECT_101；核对称 ⇒ 两半合成一次加法一次乘法
+    private static func gaussBlur(_ a: [Float], _ w: Int, _ h: Int, _ sigma: Double) -> [Float] {
+        let k = gaussKernel(sigma), r = k.count / 2
+        var t = [Float](repeating: 0, count: a.count)
+        for y in 0..<h {
+            for x in 0..<w {
+                var v = a[y * w + x] * k[r]
+                for i in 1...r { v += (a[y * w + refl101(x - i, w)] + a[y * w + refl101(x + i, w)]) * k[r + i] }
+                t[y * w + x] = v
+            }
+        }
+        var o = [Float](repeating: 0, count: a.count)
+        for x in 0..<w {
+            for y in 0..<h {
+                var v = t[y * w + x] * k[r]
+                for i in 1...r { v += (t[refl101(y - i, h) * w + x] + t[refl101(y + i, h) * w + x]) * k[r + i] }
+                o[y * w + x] = v
+            }
+        }
+        return o
+    }
+
     /// 官方 dealign 的框内版：整幅像素 (gx,gy) 用正向 M（整幅→模板）去 224 结果和 mask 里取样，
     /// 再按 mask 就地混进 BGRA。clip 到 0~255 同 cv2 存盘那一步。
     static func pasteBack(_ base: UnsafeMutableRawPointer, bytesPerRow: Int, w: Int, h: Int,
@@ -291,7 +346,8 @@ enum SwapGeo {
                 let fy = fwd.d * u + fwd.e * v + fwd.f
                 guard fx >= 0, fy >= 0, fx <= Double(size - 1), fy <= chinRamp1 else { continue }
                 let sy = min(fy, Double(size - 1))     // 补丁底下这几行：拿最后一行接下去
-                let mk = bilinearFloat(mask, size, size, fx, sy) * chinProfile(fy)
+                // alpha 落在 featherMask 那张 236×224 上（剖面和羽化都在里面了），不再按行现算
+                let mk = bilinearFloat(mask, size, mask.count / size, fx, fy)
                 if mk <= 0 { continue }
                 let x0 = Int(fx), y0 = Int(sy)
                 let dx = Float(fx - Double(x0)), dy = Float(sy - Double(y0))

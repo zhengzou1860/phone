@@ -289,6 +289,7 @@ enum SwapClip {
             + "｜可用 \(String(format: "%.1f", free / 1_073_741_824)) GB")
         if need > free { return fail("可用空间不够，不出片：素材 \(String(format: "%.0f", src.duration)) s") }
         say("补丁口径 遮罩＝官方 preprocess_mask 那一刀（>0.001 归 1→11 膨胀→11 腐蚀×2→7×7 模糊→10 px 内收衰减），"
+            + "下边不再内收，下巴剖面折进遮罩后整张在 224 里高斯糊一次（σ=4，本机八臂的 G 那一格）｜"
             + "补丁＝逐帧网自己混好的 out｜这一版补丁加一档美白＝Lab 里 L×1.06+4.31、a×0.90、b×0.92（＝beauty_ab 第 1 列，本机逐像素对拍最大 5 灰阶）｜"
             + "五官加深 γ、高频回填、可调透明度遮罩三样这一版都不在（退回第一版的贴法）")
 
@@ -389,7 +390,7 @@ enum SwapClip {
         }
 
         var detectMs: [Double] = [], alignMs: [Double] = [], netMs: [Double] = [], pasteMs: [Double] = []
-        var beautyMs: [Double] = []
+        var beautyMs: [Double] = [], maskMs: [Double] = []
         var appendMs: [Double] = [], decodeMs: [Double] = [], sampleMs: [Double] = [], resids: [Double] = []
         var resids224: [Double] = [], facePx: [Double] = []
         var cosList: [String] = []
@@ -466,6 +467,7 @@ enum SwapClip {
         var gen = [Float](repeating: 0, count: 3 * side * side)
         var rawMask = [Float](repeating: 0, count: side * side)
         var m2 = [Float](repeating: 0, count: side * side)
+        var alpha = [Float](repeating: 0, count: SwapGeo.maskRows * side)
         var f112 = [Float](repeating: 0, count: 3 * 112 * 112)
 
         while why.isEmpty {
@@ -546,12 +548,15 @@ enum SwapClip {
                                 beautyMs.append(Double(DispatchTime.now().uptimeNanoseconds - tb) / 1_000_000)
                                 let t3 = DispatchTime.now().uptimeNanoseconds
                                 SwapGeo.preprocessMask(rawMask, &m2)
+                                SwapGeo.featherMask(m2, &alpha)
+                                let tm = DispatchTime.now().uptimeNanoseconds
                                 let pasted = SwapTech.withPixels(dst) { base, bpr -> Bool in
                                     SwapGeo.pasteBack(base, bytesPerRow: bpr, w: w, h: h,
-                                                      gen: gen, mask: m2, fwd: al.fwd, back: al.back)
+                                                      gen: gen, mask: alpha, fwd: al.fwd, back: al.back)
                                     return true
                                 }
-                                pasteMs.append(Double(DispatchTime.now().uptimeNanoseconds - t3) / 1_000_000)
+                                maskMs.append(Double(tm - t3) / 1_000_000)
+                                pasteMs.append(Double(DispatchTime.now().uptimeNanoseconds - tm) / 1_000_000)
                                 did = pasted == true
                                 if !did { netFail += 1 }
 
@@ -691,13 +696,13 @@ enum SwapClip {
         let size = (attrsOfOut?[.size] as? NSNumber)?.int64Value ?? 0
         let wall = Double(DispatchTime.now().uptimeNanoseconds - wall0) / 1_000_000_000
         let madeSec = Double(made) / max(src.fps, 1)
-        let perFrame = avg(decodeMs) + avg(detectMs) + avg(alignMs) + avg(netMs) + avg(beautyMs) + avg(pasteMs) + avg(appendMs)
+        let perFrame = avg(decodeMs) + avg(detectMs) + avg(alignMs) + avg(netMs) + avg(beautyMs) + avg(maskMs) + avg(pasteMs) + avg(appendMs)
         say("换完 \(made) 帧（编码器头/尾 \(SwapUtil.ms(tailMs))）"
             + "｜成片 \(String(format: "%.1f", Double(size) / 1_048_576)) MB"
             + "｜缓冲 池子给 \(made - poolMiss)／自造 \(poolMiss)"
             + "｜\(why.isEmpty ? "跑到末尾" : why)")
         say("单价 解码 \(SwapUtil.stat(decodeMs))｜检测 \(SwapUtil.stat(detectMs))｜对齐 \(SwapUtil.stat(alignMs))")
-        say("      逐帧网 \(SwapUtil.stat(netMs))｜美白 \(SwapUtil.stat(beautyMs))｜回贴 \(SwapUtil.stat(pasteMs))｜提交 \(SwapUtil.stat(appendMs))")
+        say("      逐帧网 \(SwapUtil.stat(netMs))｜美白 \(SwapUtil.stat(beautyMs))｜羽化 \(SwapUtil.stat(maskMs))｜回贴 \(SwapUtil.stat(pasteMs))｜提交 \(SwapUtil.stat(appendMs))")
         say("      \(runner.statsLine())")
         say("总耗时 \(String(format: "%.1f", wall)) s（素材实到 \(String(format: "%.1f", madeSec)) s）"
             + "＝\(String(format: "%.2f", wall / max(madeSec, 0.01)))× 实时｜每帧合计 \(String(format: "%.1f", perFrame)) ms"
