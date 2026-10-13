@@ -212,11 +212,18 @@ enum SwapClip {
             guard put.count == 18, !one.emb.isEmpty else {
                 return fail("已存的人「\(one.name)」接不上：\(put.note)")
             }
-            var en = 0.0
-            for x in one.emb { en += Double(x) * Double(x) }
+            let eNorm = SwapIdents.norm(one.emb)
+            let wNorm = SwapIdents.weightsNorm(one.weights)
+            // 存进去的身份证是 L2 归一化过的⇒模长本该≈1；掉到 0.5 以下只有"这份包里的数是空的"这一种解释。
+            // 空包出的画面跟没换一样（他这次看到的"还是原视频的脸"），这种趟不许再往下跑。
+            guard eNorm > 0.5, wNorm > 1e-6 else {
+                return fail("已存的人「\(one.name)」这份包里的数是空的（身份证模长 \(String(format: "%.4f", eNorm))"
+                    + "／权重合起来模长 \(String(format: "%.3f", wNorm))）——不出片，重选一张源脸照片")
+            }
             say("用已存的人「\(one.name)」：读盘＋装权重 \(SwapUtil.ms(lMs))｜\(put.note)"
-                + "｜身份证从盘上带回来 \(one.emb.count) 维／模长 \(String(format: "%.3f", en.squareRoot()))"
+                + "｜身份证从盘上带回来 \(one.emb.count) 维／模长 \(String(format: "%.4f", eNorm))"
                 + "｜跳过 ①②（上机实测这两步 70.61 + 18.27 ms）｜足迹 \(SwapFacts.footprintMB()) MB")
+            say("  读档自检 \(SwapIdents.probe(id: pid))")
             srcEmb = one.emb
         case .photo(let source):
             // —— 2a. 每人一次的那两步，这一版第一次在机上量出钱来 ——
@@ -261,8 +268,13 @@ enum SwapClip {
             say("② 身份包 \(SwapUtil.ms(wMs))（纯网 \(SwapUtil.ms(mk.ms))）｜\(mk.note)"
                 + "｜足迹 \(SwapFacts.footprintMB()) MB｜PC 参照 27~50 ms")
             srcEmb = ident.emb
-            let sv = SwapIdents.save(emb: ident.emb, weights: runner.weightDump(), taken: SwapIdents.list())
+            let dump = runner.weightDump()
+            let sv = SwapIdents.save(emb: ident.emb, weights: dump, taken: SwapIdents.list())
             say("③ 身份存档：\(sv.note)｜足迹 \(SwapFacts.footprintMB()) MB")
+            if !sv.id.isEmpty {
+                say("  存档自检 盘上：\(SwapIdents.probe(id: sv.id))")
+                say("  存档自检 \(SwapIdents.codecSelfTest(emb: ident.emb, weights: dump))")
+            }
         }
 
         // —— 3. 片子 ——

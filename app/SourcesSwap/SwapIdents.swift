@@ -148,6 +148,50 @@ enum SwapIdents {
         return Pack(name: displayName(id), emb: emb, weights: ws)
     }
 
+    static func norm(_ v: [Float]) -> Double {
+        var s = 0.0
+        for x in v { s += Double(x) * Double(x) }
+        return s.squareRoot()
+    }
+
+    /// 18 个权重合起来的模长（逐张量累加，不新拼一个 41 万个数的大数组）。
+    static func weightsNorm(_ ws: [(name: String, dims: [Int], data: [Float])]) -> Double {
+        var s = 0.0
+        for t in ws { for x in t.data { s += Double(x) * Double(x) } }
+        return s.squareRoot()
+    }
+
+    /// 盘上那份包原样读一遍，只报四个数：文件字节数、身份证头 4 个字节（盘上的、不是解出来的）、
+    /// 身份证模长、18 个权重合起来的模长。
+    /// 「用已存的人还是出原视频的脸」有两种成因——写下去就是空、或读的时候丢空——画面上分不出来，这四个数分得出。
+    static func probe(id: String) -> String {
+        guard let u = pak(id), let data = try? Data(contentsOf: u) else {
+            return "文件 \(id).pak 读不到字节"
+        }
+        let head = data.count >= 16
+            ? data[12 ..< 16].map { String(format: "%02x", $0) }.joined(separator: " ")
+            : "不到 16 字节"
+        guard let (emb, ws) = decode(data) else {
+            return "文件 \(data.count) 字节｜身份证头 4 字节 \(head)｜整份解不出"
+        }
+        let cnt = ws.reduce(0) { $0 + $1.data.count }
+        return "文件 \(data.count) 字节｜身份证头 4 字节(盘上原样) \(head)"
+            + "｜身份证 \(emb.count) 维／模长 \(String(format: "%.4f", norm(emb)))"
+            + "｜权重 \(ws.count) 个／\(cnt) 数／合起来模长 \(String(format: "%.3f", weightsNorm(ws)))"
+    }
+
+    /// 不碰磁盘，只把这份数据走一遍 encode→decode（内存里往返）。跟 probe 成对看：
+    /// 内存往返是空的⇒字节格式这一头错；内存往返正常而盘上是空的⇒写那一步（或那个文件）错。
+    static func codecSelfTest(emb: [Float],
+                              weights: [(name: String, dims: [Int], data: [Float])]) -> String {
+        guard let (e2, w2) = decode(encode(emb: emb, weights: weights)) else {
+            return "内存往返解不出"
+        }
+        return "内存往返 身份证 \(e2.count) 维／模长 \(String(format: "%.4f", norm(e2)))"
+            + "｜权重 \(w2.count) 个／合起来模长 \(String(format: "%.3f", weightsNorm(w2)))"
+            + "（写进去前：模长 \(String(format: "%.4f", norm(emb)))／\(String(format: "%.3f", weightsNorm(weights)))）"
+    }
+
     static func rename(id: String, to raw: String) -> String {
         let t = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !t.isEmpty else { return "名字是空的，没改" }
