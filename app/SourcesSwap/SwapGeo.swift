@@ -256,10 +256,12 @@ enum SwapGeo {
     // 所以剖面伸出补丁 chinExt 行，伸出那几行拿补丁最后一行接下去。
     // 试过镜像接（把倒数几行翻下来）：脖子上会多出一道弧形的下巴鬼影，比复制更难看，已弃。
     static let chinRamp0 = 214.0                    // 这一行以上 alpha 照旧满
-    static let chinExt = 24.0                       // 伸出补丁几行
+    static let chinExt = 12.0                       // 伸出补丁几行
+    // 0.14 这里是 24 行（肉眼边界到 230 行），他装上后判「现在的都有点过了，可以收点了」⇒ 收成 12：
+    // 边界回到 224 行，尾巴正好在巴尖（233）那一格收住。
     static var chinRamp1: Double { Double(size - 1) + chinExt }   // 到这一行掉到 0
 
-    /// smoothstep 1→0：补丁边框那一行（223）上还有 0.82，内外连续，所以边框不露直线
+    /// smoothstep 1→0：补丁边框那一行（223）上还有 0.61，内外连续，所以边框不露直线
     private static func chinProfile(_ fy: Double) -> Float {
         if fy <= chinRamp0 { return 1 }
         let t = (fy - chinRamp0) / (chinRamp1 - chinRamp0)
