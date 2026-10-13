@@ -100,7 +100,8 @@ enum SwapIdents {
         return (b.0, b.1)
     }
 
-    /// 存一份。同 hash 已在列表里就不重写作废（他可能连选同一张照片），只报回那一格。
+    /// 存一份。同 hash 已在列表里、且那一格读回来还有数，就不重写作废（他可能连选同一张照片），只报回那一格；
+    /// 那一格读回来是空的（0.8~0.12 写的包全是这样）就地重写那一格、名字不动。
     static func save(emb: [Float], weights: [(name: String, dims: [Int], data: [Float])],
                      taken: [Item]) -> (id: String, name: String, isNew: Bool, bytes: Int, note: String) {
         guard !emb.isEmpty, !weights.isEmpty else {
@@ -111,28 +112,61 @@ enum SwapIdents {
             return ("", "", false, 0, "建不出存档目录（Documents/swap_idents）")
         }
         if let one = taken.first(where: { $0.id == id }) {
-            return (id, one.name, false, one.bytes, "「\(one.name)」早就在列表里了（同一张照片，没重存）")
+            if isUsable(id: id) {
+                return (id, one.name, false, one.bytes, "「\(one.name)」早就在列表里了（同一张照片，没重存）")
+            }
+            // 0.8~0.12 写下去的每一份都是坏的（float 第四个字节恒写 0）。
+            // 照原样认"已存过"会让空包闸门永远拦死，所以这一格重写、名字不动。
+            return write(emb: emb, weights: weights, id: id, pak: u, sidecar: s, name: one.name,
+                         noteTail: "原来那份「\(one.name)」里的数是空的（那一版把每个 float 的第四个字节写成 0），"
+                             + "这一版重写好了，名字没变")
         }
         // 上一版只认"字节完全一样"，所以他换一张照片就跑出一格新的；这一版按身份证余弦认人
         let near = nearest(emb, skip: id)
         if let m = near, m.cos >= sameFaceCos {
             let c = String(format: "%.3f", m.cos)
             let g = String(format: "%.2f", sameFaceCos)
-            return (m.item.id, m.item.name, false, m.item.bytes,
-                    "跟库里「\(m.item.name)」是一张脸（身份证余弦 \(c)，闸门 \(g)），没重存")
+            if isUsable(id: m.item.id) {
+                return (m.item.id, m.item.name, false, m.item.bytes,
+                        "跟库里「\(m.item.name)」是一张脸（身份证余弦 \(c)，闸门 \(g)），没重存")
+            }
+            guard let pu = pak(m.item.id), let ps = sidecar(m.item.id) else {
+                return (m.item.id, m.item.name, false, 0, "库里「\(m.item.name)」是空包，而那一格的文件路径拿不到，重写不了")
+            }
+            // 同一张脸而那一格是空包：重写那一格，不另开一格
+            return write(emb: emb, weights: weights, id: m.item.id, pak: pu, sidecar: ps, name: m.item.name,
+                         noteTail: "库里「\(m.item.name)」那张是空包（身份证余弦 \(c)，闸门 \(g)），"
+                             + "已用这次的身份重写那一格，名字没变")
         }
         let name = nextName(taken)
+        let g = String(format: "%.2f", sameFaceCos)
+        let nearTxt = near == nil ? "库里没有别人可比"
+            : "库里最近的「\(near!.item.name)」余弦 \(String(format: "%.3f", near!.cos))（没到 \(g)，算另一个人）"
+        return write(emb: emb, weights: weights, id: id, pak: u, sidecar: s, name: name,
+                     noteTail: "存成「\(name)」，下次直接选他、不必再挑照片｜\(nearTxt)")
+    }
+
+    /// 那一格能不能用：读回来比一次模长。空包在画面上是"出原视频的脸"，只有这两个数认得出。
+    /// 阈值与出片线那道闸门同一个（身份证 >0.5、权重合起来 >1e-6）。
+    static func isUsable(id: String) -> Bool {
+        guard let one = load(id: id) else { return false }
+        return norm(one.emb) > 0.5 && weightsNorm(one.weights) > 1e-6
+    }
+
+    /// 落盘那一刀：编码 → 写包 → 写名字。`noteTail` 说清这一格为什么被写（新建／重写空包）。
+    private static func write(emb: [Float],
+                              weights: [(name: String, dims: [Int], data: [Float])],
+                              id: String, pak u: URL, sidecar s: URL, name: String,
+                              noteTail: String)
+        -> (id: String, name: String, isNew: Bool, bytes: Int, note: String) {
         let data = encode(emb: emb, weights: weights)
         do { try data.write(to: u) } catch {
             return (id, name, false, 0, "存不下：写 \(u.lastPathComponent) 失败 \(error)（磁盘可用 \(SwapFacts.diskFreeGB()) GB）")
         }
         try? name.write(to: s, atomically: true, encoding: .utf8)
         let bytes = (try? u.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? data.count
-        let g = String(format: "%.2f", sameFaceCos)
-        let nearTxt = near == nil ? "库里没有别人可比"
-            : "库里最近的「\(near!.item.name)」余弦 \(String(format: "%.3f", near!.cos))（没到 \(g)，算另一个人）"
         return (id, name, true, bytes,
-                "存成「\(name)」\(String(format: "%.2f", Double(bytes) / 1_048_576)) MB，下次直接选他、不必再挑照片｜\(nearTxt)")
+                "\(noteTail)｜\(String(format: "%.2f", Double(bytes) / 1_048_576)) MB")
     }
 
     private static func nextName(_ taken: [Item]) -> String {
@@ -280,7 +314,10 @@ enum SwapIdents {
             d.append(UInt8(b & 0xFF)); b >>= 8
             d.append(UInt8(b & 0xFF)); b >>= 8
             d.append(UInt8(b & 0xFF)); b >>= 8
-            d.append(UInt8(b >> 24))
+            d.append(UInt8(b & 0xFF))   // 上面已经移了三次：这里必须取剩下的那一字节。
+                                        // 写成 b >> 24 就是把已经移空的值再移 24 位⇒永远是 0，
+                                        // 每个 float 的符号＋指数都被抹掉，读回来是 ≈5e-39 的碎数
+                                        // （CI run 38352921097 逐位对账抓到的就是这一笔）。
         }
     }
 }
