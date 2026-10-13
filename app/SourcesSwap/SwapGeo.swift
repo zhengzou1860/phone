@@ -147,6 +147,8 @@ enum SwapGeo {
     // MARK: - 反向：size×size 的结果 + mask 贴回整幅（只在脸的外接框里做）
 
     /// 官方 preprocess_mask：>0.001 归 1 → 11×11 膨胀 → 11×11 腐蚀×2 → 7×7 模糊 → 乘 10 px 内收衰减
+    /// 只这一处偏离官方：下边不再内收（下巴下半截就是被那一刀切掉的），左右和上边照旧。
+    /// 下边缘的剖面挪到 pasteBack 里按行现算（chinProfile），因为只有现算才能伸出补丁外几行。
     static func preprocessMask(_ inMask: [Float], _ m2: inout [Float]) {
         let s = size
         var m = inMask
@@ -155,7 +157,7 @@ enum SwapGeo {
         m = boxMin(m, s, 11); m = boxMin(m, s, 11)   // iterations=2
         m = boxBlur(m, s, 7)
         var m1 = [Float](repeating: 0, count: s * s)
-        for y in 10..<(s - 10) { for x in 10..<(s - 10) { m1[y * s + x] = 1.0 } }
+        for y in 10..<s { for x in 10..<(s - 10) { m1[y * s + x] = 1.0 } }
         m1 = boxBlur(m1, s, 11)
         for i in 0..<m.count { m2[i] = m[i] * m1[i] }
     }
@@ -237,9 +239,10 @@ enum SwapGeo {
     }
 
     /// 224 方块（含中心）按 back = M⁻¹（模板→整幅）映回原图后的外接矩形 ＝ mfs_dealign.py 的 face_roi
-    static func faceRoi(back: Affine) -> (x0: Double, y0: Double, x1: Double, y1: Double) {
+    /// yMax 可以超过 223：下巴剖面伸出补丁那几行也得落在框里，否则循环根本走不到那儿。
+    static func faceRoi(back: Affine, yMax: Double) -> (x0: Double, y0: Double, x1: Double, y1: Double) {
         let s = Double(size)
-        let pts = [(0.0, 0.0), (s - 1, 0.0), (0.0, s - 1), (s - 1, s - 1), (s / 2, s / 2)]
+        let pts = [(0.0, 0.0), (s - 1, 0.0), (0.0, yMax), (s - 1, yMax), (s / 2, s / 2)]
         var xs: [Double] = [], ys: [Double] = []
         for (u, v) in pts {
             xs.append(back.a * u + back.b * v + back.c)
@@ -248,12 +251,28 @@ enum SwapGeo {
         return (xs.min() ?? 0, ys.min() ?? 0, xs.max() ?? 0, ys.max() ?? 0)
     }
 
+    // 下巴往下：补丁只有 0~223 行，而本机量下来下巴尖（检测框下沿）映到第 233 行（P10 230／P90 242）
+    // ——巴尖压根不在补丁里，光挪遮罩内收量最多盖到 218 行。
+    // 所以剖面伸出补丁 chinExt 行，伸出那几行拿补丁最后一行接下去。
+    // 试过镜像接（把倒数几行翻下来）：脖子上会多出一道弧形的下巴鬼影，比复制更难看，已弃。
+    static let chinRamp0 = 214.0                    // 这一行以上 alpha 照旧满
+    static let chinExt = 24.0                       // 伸出补丁几行
+    static var chinRamp1: Double { Double(size - 1) + chinExt }   // 到这一行掉到 0
+
+    /// smoothstep 1→0：补丁边框那一行（223）上还有 0.82，内外连续，所以边框不露直线
+    private static func chinProfile(_ fy: Double) -> Float {
+        if fy <= chinRamp0 { return 1 }
+        let t = (fy - chinRamp0) / (chinRamp1 - chinRamp0)
+        if t >= 1 { return 0 }
+        return Float(1 - t * t * (3 - 2 * t))
+    }
+
     /// 官方 dealign 的框内版：整幅像素 (gx,gy) 用正向 M（整幅→模板）去 224 结果和 mask 里取样，
     /// 再按 mask 就地混进 BGRA。clip 到 0~255 同 cv2 存盘那一步。
     static func pasteBack(_ base: UnsafeMutableRawPointer, bytesPerRow: Int, w: Int, h: Int,
                           gen: [Float], mask: [Float], fwd: Affine, back: Affine,
                           padRatio: Double = 0.06) {
-        let roi = faceRoi(back: back)
+        let roi = faceRoi(back: back, yMax: chinRamp1)
         let rw = roi.x1 - roi.x0, rh = roi.y1 - roi.y0
         let xi0 = max(0, Int(floor(roi.x0 - rw * padRatio)))
         let yi0 = max(0, Int(floor(roi.y0 - rh * padRatio)))
@@ -268,11 +287,12 @@ enum SwapGeo {
                 let u = Double(gx), v = Double(gy)
                 let fx = fwd.a * u + fwd.b * v + fwd.c
                 let fy = fwd.d * u + fwd.e * v + fwd.f
-                guard fx >= 0, fy >= 0, fx <= Double(size - 1), fy <= Double(size - 1) else { continue }
-                let mk = bilinearFloat(mask, size, size, fx, fy)
+                guard fx >= 0, fy >= 0, fx <= Double(size - 1), fy <= chinRamp1 else { continue }
+                let sy = min(fy, Double(size - 1))     // 补丁底下这几行：拿最后一行接下去
+                let mk = bilinearFloat(mask, size, size, fx, sy) * chinProfile(fy)
                 if mk <= 0 { continue }
-                let x0 = Int(fx), y0 = Int(fy)
-                let dx = Float(fx - Double(x0)), dy = Float(fy - Double(y0))
+                let x0 = Int(fx), y0 = Int(sy)
+                let dx = Float(fx - Double(x0)), dy = Float(sy - Double(y0))
                 let x1 = min(x0 + 1, size - 1), y1 = min(y0 + 1, size - 1)
                 let o = gy * rowPix * 4 + gx * 4
                 for (ci, planeIdx) in [(2, 0), (1, 1), (0, 2)] {   // BGRA 内存序：B←planar R 反着写
