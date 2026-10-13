@@ -300,27 +300,55 @@ final class VoiceEngine {
             var rate = 1.0
             let want = source.count
             let skew = want > 0 ? (Double(outSamples) - Double(want)) / Double(want) : 0
+            var stretched: [Float]? = nil
             if abs(skew) > 0.0005 {
                 rate = 1.0 + skew
                 onStage(String(format: "对齐：链子输出比源长 %.2f%% ⇒ 整条按 %.5f 拉伸", skew * 100, rate))
-                let stretched = PostProcessor.timeStretch(try AudioProcessor.loadWAV16K(chainWav), rate: rate)
-                fitSecs = Double(stretched.count) / AudioProcessor.sampleRate
-                fitWav = outDir.appendingPathComponent(base + "_fit.wav")
-                let w2 = try AudioProcessor.WAVWriter(url: fitWav)
-                // 一片一片喂进去：峰值守卫是**每片**一次的，整条一次 append 等于又变回全局长峰压小整章
-                let hop = Int(VoiceEngine.convPassSeconds * AudioProcessor.sampleRate)
-                var p = 0
-                while p < stretched.count {
-                    try w2.append(Array(stretched[p..<min(p + hop, stretched.count)]))
-                    p += hop
-                }
-                try w2.finish()
+                let s = PostProcessor.timeStretch(try AudioProcessor.loadWAV16K(chainWav), rate: rate)
+                stretched = s
+                fitSecs = Double(s.count) / AudioProcessor.sampleRate
                 VoiceJournal.line(String(format: "对齐完成：%.2f s → %.2f s（源 %.2f s，倍率 %.5f，残差 %.3f s）",
                                          convSecs, fitSecs, Double(want) / AudioProcessor.sampleRate,
                                          rate, fitSecs - Double(want) / AudioProcessor.sampleRate))
             } else {
                 VoiceJournal.line(String(format: "对齐跳过：链子输出与源只差 %.4f%%（阈值 0.05%%）⇒ 直接用 %@",
                                          skew * 100, chainWav.lastPathComponent))
+            }
+
+            // 结尾补静音，把这条音频垫到画面末尾之后：muxer 那条规矩是画面样本不许越过最后喂进去那块音频
+            //（0.1/33 实测 584 s 那条画面搬到 581.800 s 就不收了——解出来的音轨本来比画面短 3.07 s，
+            //   而拉伸是按音轨长度对齐的，补的那一截本来就没人说）。只往尾巴加零，已对齐的一段一个样本不动。
+            let picEnd = info.videoStart + info.videoSecs
+            let padSecs = max(0.0, picEnd + 0.6 - fitSecs)
+            if padSecs > 0.05 {
+                fitWav = outDir.appendingPathComponent(base + "_fit.wav")
+                let w2 = try AudioProcessor.WAVWriter(url: fitWav)
+                // 一片一片喂进去：峰值守卫是**每片**一次的，整条一次 append 等于又变回全局长峰压小整章
+                let hop = Int(VoiceEngine.convPassSeconds * AudioProcessor.sampleRate)
+                let body: [Float]
+                if let s = stretched {
+                    body = s
+                } else {
+                    body = try AudioProcessor.loadWAV16K(chainWav)
+                }
+                var p = 0
+                while p < body.count {
+                    try w2.append(Array(body[p..<min(p + hop, body.count)]))
+                    p += hop
+                }
+                var left = Int(padSecs * AudioProcessor.sampleRate)
+                while left > 0 {
+                    let n = min(left, Int(AudioProcessor.sampleRate))
+                    try w2.append([Float](repeating: 0, count: n))
+                    left -= n
+                }
+                try w2.finish()
+                VoiceJournal.line(String(format: "结尾补静音 %.2f s：画面到 %.2f s／对齐那条到 %.2f s ⇒ 交给回写的 %@ %.2f s",
+                                         padSecs, picEnd, fitSecs, fitWav.lastPathComponent,
+                                         fitSecs + padSecs))
+            } else {
+                VoiceJournal.line(String(format: "结尾不用补：对齐那条 %.2f s 已盖住画面末尾 %.2f s",
+                                         fitSecs, picEnd))
             }
 
             onStage("回写画面（一个像素都不动，只换声音）…")

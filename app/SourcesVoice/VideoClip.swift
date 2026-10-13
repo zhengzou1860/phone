@@ -288,17 +288,25 @@ enum VideoClip {
         var aNote = ""
         var aDone = false
         var aHaveFed = false
-        var aFedTo = CMTime.zero
+        /// 已经喂进去的音频前沿（秒）。不拿 CMTime 比：音轨末尾那块的真机上回读是无效时戳
+        ///（0.1/33 那句「音频喂到 nan s、292 块」），而 `CMTimeCompare` 碰上无效时戳恒回 0 ⇒
+        /// 「音频已喂够」被误判，泵从此不再向 reader 取下一块，画面冻在 581.800 s、音轨永远到不了末尾。
+        /// 走秒数、且无效时戳经 `secs` 折成 0 ⇒ 判据只会偏保守（多喂一点），不会把泵卡死。
+        var aFedSec = 0.0
         var firstV = "-"
         var firstA = "-"
-        // 音频往前喂的顶＝画面这条轨的长度（不是容器长度：容器常带一段比画面长的音轨尾巴，
-        // 喂过它成片就变成结尾有声音没画面）
-        let audioCeil = CMTimeMakeWithSeconds(max(0.0, picSecs - 0.05), preferredTimescale: 600)
+        // 音频往前喂的顶＝画面这条轨在源时间轴上的**末尾**（起点 + 轨长，不是只算轨长：
+        // 0.1/33 那条 584 s 的画面起点 133 ms、末块 PTS 583.94 s，只按轨长减 0.05 就成了 583.82，
+        // 顶反而比画面短一截 ⇒ 最后一块画面没人垫着，又回到「编码器不收」那句）。
+        // 往后多留 0.4 s：成片最多比画面多一小段静音尾巴，换来音频全程在画面前头。
+        let audioCeil = CMTimeMakeWithSeconds(max(0.0, secs(vt.timeRange.start) + picSecs + 0.4),
+                                              preferredTimescale: 600)
 
         func pumpAudio(until pts: CMTime) {
             guard aNote.isEmpty, !aDone else { return }
+            let untilSec = secs(pts)
             while writer.status.rawValue == 1 {     // 1 = writing
-                if aHaveFed && CMTimeCompare(aFedTo, pts) >= 0 { return }
+                if aHaveFed && aFedSec >= untilSec { return }
                 if !ain.isReadyForMoreMediaData { return }
                 guard let s = aOut.copyNextSampleBuffer() else {
                     if writer.status.rawValue == 1 && wReader.status.rawValue == 1 {
@@ -313,9 +321,9 @@ enum VideoClip {
                 }
                 let sPTS = CMSampleBufferGetPresentationTimeStamp(s)
                 if !aHaveFed {
-                    firstA = String(format: "%.0f", CMTimeGetSeconds(sPTS) * 1000)
+                    firstA = String(format: "%.0f", secs(sPTS) * 1000)
                 }
-                aFedTo = sPTS
+                aFedSec = secs(sPTS)
                 aHaveFed = true
                 if ain.append(s) {
                     aOK += 1
@@ -349,7 +357,7 @@ enum VideoClip {
                 if frames == 0 {
                     firstV = String(format: "%.0f", CMTimeGetSeconds(pts) * 1000)
                 }
-                // 音频往前喂 2 秒，但不越过画面轨的末尾：越过去成片就会比画面长出一截
+                // 音频往前喂 2 秒，封顶在 audioCeil（画面末尾 + 0.4 s）：全程垫在画面前头，尾巴只多 0.4 s
                 var ahead = CMTimeAdd(pts, CMTime(value: 2, timescale: 1))
                 if CMTimeCompare(ahead, audioCeil) > 0 { ahead = audioCeil }
                 pumpAudio(until: ahead)
@@ -357,10 +365,10 @@ enum VideoClip {
                 while !vin.isReadyForMoreMediaData {
                     spins += 1
                     if spins > 3_000 {
-                        let fed = aHaveFed ? String(format: "%.3f", CMTimeGetSeconds(aFedTo)) : "-"
+                        let fed = aHaveFed ? String(format: "%.3f", aFedSec) : "-"
                         let an = aNote.isEmpty ? "" : "｜\(aNote)"
-                        why = "编码器队列 15 秒不收（第 \(frames) 块画面，PTS \(String(format: "%.3f", CMTimeGetSeconds(pts))) s"
-                            + "｜音频喂到 \(fed) s、\(aOK) 块\(an)）"
+                        let at = String(format: "%.3f", secs(pts))
+                        why = "编码器队列 15 秒不收（第 \(frames) 块画面，PTS \(at) s｜音频喂到 \(fed) s、\(aOK) 块\(an)）"
                         return
                     }
                     if spins % 400 == 0 {
