@@ -253,8 +253,11 @@ enum SwapGeo {
 
     // 下巴往下：补丁只有 0~223 行，而本机量下来下巴尖（检测框下沿）映到第 233 行（P10 230／P90 242）
     // ——巴尖压根不在补丁里，光挪遮罩内收量最多盖到 218 行。
-    // 所以剖面伸出补丁 chinExt 行，伸出那几行拿补丁最后一行接下去。
+    // 所以剖面伸出补丁 chinExt 行，伸出那几行接的是「这一帧对齐后的原片末行」（tail），不是补丁末行。
     // 试过镜像接（把倒数几行翻下来）：脖子上会多出一道弧形的下巴鬼影，比复制更难看，已弃。
+    // 也试过拿补丁末行接（0.17 及以前）：那一行是网画的下颌暗面，平铺在脖子上＝一道横着的黑缝。
+    // 本机 4 帧对拍（tools/ring_chin.py）：巴尖那道带暗弧 223→0 px，暗像素 4418→1322 px²，
+    // ↔源 0.775、能量比 0.240 一个没动（那 12 行本来就不带身份信息）。
     static let chinRamp0 = 214.0                    // 这一行以上 alpha 照旧满
     static let chinExt = 12.0                       // 伸出补丁几行
     // 0.14 这里是 24 行（肉眼边界到 230 行），他装上后判「现在的都有点过了，可以收点了」⇒ 收成 12：
@@ -326,8 +329,9 @@ enum SwapGeo {
 
     /// 官方 dealign 的框内版：整幅像素 (gx,gy) 用正向 M（整幅→模板）去 224 结果和 mask 里取样，
     /// 再按 mask 就地混进 BGRA。clip 到 0~255 同 cv2 存盘那一步。
+    /// tail ＝ 这一帧对齐后原片的末行（planar，长 3*size）：补丁底下伸出去的那 chinExt 行由它接手。
     static func pasteBack(_ base: UnsafeMutableRawPointer, bytesPerRow: Int, w: Int, h: Int,
-                          gen: [Float], mask: [Float], fwd: Affine, back: Affine,
+                          gen: [Float], tail: [Float], mask: [Float], fwd: Affine, back: Affine,
                           padRatio: Double = 0.06) {
         let roi = faceRoi(back: back, yMax: chinRamp1)
         let rw = roi.x1 - roi.x0, rh = roi.y1 - roi.y0
@@ -345,22 +349,25 @@ enum SwapGeo {
                 let fx = fwd.a * u + fwd.b * v + fwd.c
                 let fy = fwd.d * u + fwd.e * v + fwd.f
                 guard fx >= 0, fy >= 0, fx <= Double(size - 1), fy <= chinRamp1 else { continue }
-                let sy = min(fy, Double(size - 1))     // 补丁底下这几行：拿最后一行接下去
                 // alpha 落在 featherMask 那张 236×224 上（剖面和羽化都在里面了），不再按行现算
                 let mk = bilinearFloat(mask, size, mask.count / size, fx, fy)
                 if mk <= 0 { continue }
-                let x0 = Int(fx), y0 = Int(sy)
-                let dx = Float(fx - Double(x0)), dy = Float(sy - Double(y0))
-                let x1 = min(x0 + 1, size - 1), y1 = min(y0 + 1, size - 1)
+                let x0 = Int(fx), y0 = Int(fy)
+                let dx = Float(fx - Double(x0)), dy = Float(fy - Double(y0))
+                let x1 = min(x0 + 1, size - 1), y1 = min(y0 + 1, maskRows - 1)
                 let o = gy * rowPix * 4 + gx * 4
                 for (ci, planeIdx) in [(2, 0), (1, 1), (0, 2)] {   // BGRA 内存序：B←planar R 反着写
-                    let a00 = gen[planeIdx * plane + y0 * size + x0]
-                    let a10 = gen[planeIdx * plane + y0 * size + x1]
-                    let a01 = gen[planeIdx * plane + y1 * size + x0]
-                    let a11 = gen[planeIdx * plane + y1 * size + x1]
-                    let g = (a00 + (a10 - a00) * dx) + ((a01 + (a11 - a01) * dx) - (a00 + (a10 - a00) * dx)) * dy
+                    let g = planeIdx * plane, t = planeIdx * size
+                    // 补丁只到 223 行；224 往上（含 223↔224 那一格插值）落进 tail
+                    let a00 = y0 < size ? gen[g + y0 * size + x0] : tail[t + x0]
+                    let a10 = y0 < size ? gen[g + y0 * size + x1] : tail[t + x1]
+                    let a01 = y1 < size ? gen[g + y1 * size + x0] : tail[t + x0]
+                    let a11 = y1 < size ? gen[g + y1 * size + x1] : tail[t + x1]
+                    let v0 = a00 + (a10 - a00) * dx
+                    let v1 = a01 + (a11 - a01) * dx
+                    let g2 = v0 + (v1 - v0) * dy
                     let orig = Float(p[o + ci])
-                    let v2 = g * 255.0 * mk + orig * (1 - mk)
+                    let v2 = g2 * 255.0 * mk + orig * (1 - mk)
                     p[o + ci] = UInt8(max(0, min(255, v2 + 0.5)))
                 }
             }

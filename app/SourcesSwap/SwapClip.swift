@@ -291,6 +291,7 @@ enum SwapClip {
         say("补丁口径 遮罩＝官方 preprocess_mask 那一刀（>0.001 归 1→11 膨胀→11 腐蚀×2→7×7 模糊→10 px 内收衰减），"
             + "下边不再内收，下巴剖面折进遮罩后整张在 224 里高斯糊一次（σ=4，本机八臂的 G 那一格）｜"
             + "补丁＝逐帧网自己混好的 out｜这一版补丁加一档美白＝Lab 里 L×1.06+4.31、a×0.90、b×0.92（＝beauty_ab 第 1 列，本机逐像素对拍最大 5 灰阶）｜"
+            + "下巴伸出补丁那 12 行＝这一帧对齐后原片的末行（0.17 及以前是补丁自己的末行）｜"
             + "五官加深 γ、高频回填、可调透明度遮罩三样这一版都不在（退回第一版的贴法）")
 
         let fm = FileManager.default
@@ -478,6 +479,7 @@ enum SwapClip {
         var rawMask = [Float](repeating: 0, count: side * side)
         var m2 = [Float](repeating: 0, count: side * side)
         var alpha = [Float](repeating: 0, count: SwapGeo.maskRows * side)
+        var tail = [Float](repeating: 0, count: 3 * side)
         var f112 = [Float](repeating: 0, count: 3 * 112 * 112)
 
         while why.isEmpty {
@@ -560,9 +562,15 @@ enum SwapClip {
                                 SwapGeo.preprocessMask(rawMask, &m2)
                                 SwapGeo.featherMask(m2, &alpha)
                                 let tm = DispatchTime.now().uptimeNanoseconds
+                                // 补丁底下伸出那 12 行接的是原片末行：他自己脖子的颜色，未美白
+                                for pl in 0..<3 {
+                                    let b = pl * side * side + (side - 1) * side
+                                    for x in 0..<side { tail[pl * side + x] = att[b + x] }
+                                }
                                 let pasted = SwapTech.withPixels(dst) { base, bpr -> Bool in
                                     SwapGeo.pasteBack(base, bytesPerRow: bpr, w: w, h: h,
-                                                      gen: gen, mask: alpha, fwd: al.fwd, back: al.back)
+                                                      gen: gen, tail: tail, mask: alpha,
+                                                      fwd: al.fwd, back: al.back)
                                     return true
                                 }
                                 maskMs.append(Double(tm - t3) / 1_000_000)
