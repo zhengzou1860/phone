@@ -1,5 +1,6 @@
 import Foundation
 import AVFoundation
+import AudioToolbox      // kAudioFormatLinearPCM / kAudioFormatMPEG4AAC 定义在这一层，不写死就赌 AVFoundation 的传递可见性
 import CoreMedia
 
 /// 视频这条线的进和出：把音轨解成链子吃的 16 kHz 单声道 Float，再把换好声的 wav 塞回原来那条画面。
