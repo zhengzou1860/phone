@@ -277,9 +277,10 @@ enum VideoClip {
         guard writer.status.rawValue == 1 else {
             writer.cancelWriting()
             try? fm.removeItem(at: out)
-            throw ChainError.input("开读之后 writer 就不是 writing 了［\(cfg.name)］："
-                                   + "\(writerName(writer.status)) \(errText(writer.error))"
-                                   + "｜音轨那份 \(audioWav.lastPathComponent)")
+            let head = "开读之后 writer 就不是 writing 了［\(cfg.name)］："
+                + "\(writerName(writer.status)) \(errText(writer.error))"
+            let srcs = "音轨那份 \(audioWav.lastPathComponent)｜画面那份 \(video.lastPathComponent)"
+            throw ChainError.input("\(head)｜\(srcs)")
         }
 
         var frames = 0
@@ -323,14 +324,14 @@ enum VideoClip {
                             + "｜两条轨都不移位，起点不同成片口型就偏")
                     }
                 } else {
-                    aNote = "第 \(aOK + 1) 块音频 append 被拒｜writer \(writerName(writer.status))"
-                        + " \(errText(writer.error))｜这条输入 \(errText(ain.error))"
+                    let rj = "第 \(aOK + 1) 块音频 append 被拒｜writer \(writerName(writer.status)) \(errText(writer.error))"
+                    aNote = "\(rj)｜这条输入 \(errText(ain.error))"
                     return
                 }
             }
             if writer.status.rawValue != 1 {
-                aNote = "writer 已不是 writing（\(writerName(writer.status))）\(errText(writer.error))"
-                    + "｜音轨这条输入 \(errText(ain.error))"
+                let st = "writer 已不是 writing（\(writerName(writer.status))）\(errText(writer.error))"
+                aNote = "\(st)｜音轨这条输入 \(errText(ain.error))"
             }
         }
 
@@ -368,8 +369,8 @@ enum VideoClip {
                 }
                 if writer.status.rawValue != 1 {
                     let an = aNote.isEmpty ? "" : "｜\(aNote)"
-                    why = "writer 已经不是 writing（\(writerName(writer.status))）\(errText(writer.error))"
-                        + "｜搬到第 \(frames) 块画面、音频 \(aOK) 块\(an)"
+                    let st = "writer 已经不是 writing（\(writerName(writer.status))）\(errText(writer.error))"
+                    why = "\(st)｜搬到第 \(frames) 块画面、音频 \(aOK) 块\(an)"
                     return
                 }
                 // 透传：块原样交出去，时间戳一个数都不改（改了成片就和原片口型对不上）。
@@ -398,10 +399,10 @@ enum VideoClip {
         sem.wait()
         guard writer.status.rawValue == 2 else {      // 2 = completed
             try? fm.removeItem(at: out)
-            throw ChainError.input("成片没收尾［\(cfg.name)］：writer \(writerName(writer.status))"
-                                   + " \(errText(writer.error))｜画面 \(frames) 块／音频 \(aOK) 块"
-                                   + "｜画面那条 \(errText(vin.error))｜音轨那条 \(errText(ain.error))"
-                                   + "｜\(why)")
+            let head = "成片没收尾［\(cfg.name)］：writer \(writerName(writer.status)) \(errText(writer.error))"
+            let cnt = "画面 \(frames) 块／音频 \(aOK) 块"
+            let inps = "画面那条 \(errText(vin.error))｜音轨那条 \(errText(ain.error))"
+            throw ChainError.input("\(head)｜\(cnt)｜\(inps)｜\(why)")
         }
         // 中途停（队列不收／append 被拒）时 finishWriting 也能 completed，但那份文件画面短了一截 ⇒ 不算成功
         if why != "片源到末尾" {
@@ -453,4 +454,12 @@ private func readerName(_ s: AVAssetReader.Status) -> String {
     case 5: return "cancelled"
     default: return "其他(\(s.rawValue))"
     }
+}
+
+/// 把 error 打成「域#编号｜原话」。光有原话不够：AVFoundation 那句 "Cannot Encode Media"
+/// 背后是容器不收还是编码器起不来是两回事，只有 domain/code 分得开。
+private func errText(_ error: Error?) -> String {
+    guard let error = error else { return "无 error" }
+    let ns = error as NSError
+    return "\(ns.domain)#\(ns.code)｜\(ns.localizedDescription)"
 }
