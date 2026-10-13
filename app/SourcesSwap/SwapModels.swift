@@ -540,4 +540,21 @@ enum SwapMath {
         guard na > 1e-12, nb > 1e-12 else { return -9 }
         return dot / (na.squareRoot() * nb.squareRoot())
     }
+
+    /// -9 只有三种来路：某一边是空的／两边维度不一样／某一边是全零。
+    /// 上一版日志只印 -9.000，这三种在机上分不开，「已存的人」那条路的账就永远结不了。
+    static func whyNot(_ v: Double, _ a: [Float], _ b: [Float]) -> String {
+        guard v < -8 else { return "不是量不出" }
+        if a.isEmpty { return "这边没回话" }
+        if b.isEmpty { return "那边是空的" }
+        if a.count != b.count { return "维度 \(a.count) vs \(b.count)" }
+        var na = 0.0, nb = 0.0
+        for i in 0 ..< a.count {
+            na += Double(a[i]) * Double(a[i])
+            nb += Double(b[i]) * Double(b[i])
+        }
+        if na <= 1e-12 { return "这边全零（模长 0）" }
+        if nb <= 1e-12 { return "那边全零（模长 0）" }
+        return "两条都正常却没回数"
+    }
 }

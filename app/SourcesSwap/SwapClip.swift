@@ -189,6 +189,7 @@ enum SwapClip {
         func say(_ s: String) { rep.append(s); onLine(s) }
         func fail(_ s: String) -> (out: URL?, note: String) {
             say(s)
+            SwapJournal.digest(rep, failed: true)
             return (nil, rep.joined(separator: "\n"))
         }
 
@@ -211,8 +212,10 @@ enum SwapClip {
             guard put.count == 18, !one.emb.isEmpty else {
                 return fail("已存的人「\(one.name)」接不上：\(put.note)")
             }
+            var en = 0.0
+            for x in one.emb { en += Double(x) * Double(x) }
             say("用已存的人「\(one.name)」：读盘＋装权重 \(SwapUtil.ms(lMs))｜\(put.note)"
-                + "｜身份证 512 维随包带回来，每 30 帧复测那把尺子照旧"
+                + "｜身份证从盘上带回来 \(one.emb.count) 维／模长 \(String(format: "%.3f", en.squareRoot()))"
                 + "｜跳过 ①②（上机实测这两步 70.61 + 18.27 ms）｜足迹 \(SwapFacts.footprintMB()) MB")
             srcEmb = one.emb
         case .photo(let source):
@@ -274,7 +277,8 @@ enum SwapClip {
             + "｜可用 \(String(format: "%.1f", free / 1_073_741_824)) GB")
         if need > free { return fail("可用空间不够，不出片：素材 \(String(format: "%.0f", src.duration)) s") }
         say("补丁口径 遮罩＝官方 preprocess_mask 那一刀（>0.001 归 1→11 膨胀→11 腐蚀×2→7×7 模糊→10 px 内收衰减），"
-            + "补丁＝逐帧网自己混好的 out｜五官加深 γ、高频回填、可调透明度遮罩三样这一版都不在（退回第一版的贴法）")
+            + "补丁＝逐帧网自己混好的 out｜这一版补丁加一档美白＝Lab 里 L×1.06+4.31、a×0.90、b×0.92（＝beauty_ab 第 1 列，本机逐像素对拍最大 5 灰阶）｜"
+            + "五官加深 γ、高频回填、可调透明度遮罩三样这一版都不在（退回第一版的贴法）")
 
         let fm = FileManager.default
         let dir = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
@@ -373,6 +377,7 @@ enum SwapClip {
         }
 
         var detectMs: [Double] = [], alignMs: [Double] = [], netMs: [Double] = [], pasteMs: [Double] = []
+        var beautyMs: [Double] = []
         var appendMs: [Double] = [], decodeMs: [Double] = [], sampleMs: [Double] = [], resids: [Double] = []
         var resids224: [Double] = [], facePx: [Double] = []
         var cosList: [String] = []
@@ -380,7 +385,10 @@ enum SwapClip {
         var probeLeft = 6                       // 「没脸」帧只挑前 6 帧做二次检测对照
         var pointSrc = "—"
         var why = ""
-        var basePTS: CMTime = .invalid
+        // CMTime 的 == .invalid 在机上不可信：0.10 那趟 6019 帧里「音频 起点比画面晚」逐块重印，
+        // 印出来的还是那块自己的绝对时间＝那个判断一直为真。首块只认 Bool，不认 CMTime。
+        var basePTS: CMTime = .zero
+        var haveBase = false
         let mem0 = SwapFacts.footprintMB()
         var memMax = mem0
         let wall0 = DispatchTime.now().uptimeNanoseconds
@@ -393,7 +401,8 @@ enum SwapClip {
         // 而老写法只在 append 成功之后才喂音频——画面不收、音频不喂，两边互等死锁。
         // 所以这一版：① 喂到画面前面 2 秒（见调用处）② 音频队列满了不当场干等，下一帧再来 ③ 音轨先到末尾就立刻关闸。
         var aOK = 0, aBad = 0, aNote = ""
-        var aFedTo: CMTime = .invalid
+        var aFedTo: CMTime = .zero
+        var aHaveFed = false
         var aDone = false
         // 音频往前喂的顶＝画面这条轨的长度（不是容器长度：容器常带一段比画面长的音轨尾巴，
         // 喂过它成片就变成结尾有声音没画面）
@@ -403,7 +412,7 @@ enum SwapClip {
         func pumpAudio(until pts: CMTime) {
             guard let ai = aIn, let ao = aOut, aNote.isEmpty, !aDone else { return }
             while writer.status == .writing {
-                if aFedTo != .invalid && CMTimeCompare(aFedTo, pts) >= 0 { return }
+                if aHaveFed && CMTimeCompare(aFedTo, pts) >= 0 { return }
                 if !ai.isReadyForMoreMediaData { return }
                 guard let s = ao.copyNextSampleBuffer() else {
                     if writer.status == .writing && reader.status == .reading {
@@ -417,15 +426,18 @@ enum SwapClip {
                     return
                 }
                 let sPTS = CMSampleBufferGetPresentationTimeStamp(s)
-                if aFedTo == .invalid {
-                    let off = CMTimeGetSeconds(CMTimeSubtract(sPTS, basePTS == .invalid ? .zero : basePTS))
-                    say("音频 起点比画面晚 \(String(format: "%.0f", off * 1000)) ms"
-                        + (abs(off) < 0.02 ? "（都从 0 起，原样搬）" : "（这一版不移位，成片口型可能偏）"))
-                }
+                let aStart = String(format: "%.0f", CMTimeGetSeconds(sPTS) * 1000)
+                let vStart = String(format: "%.0f", CMTimeGetSeconds(basePTS) * 1000)
+                let isFirst = !aHaveFed
                 aFedTo = sPTS
+                aHaveFed = true
                 if ai.append(s) {
                     aOK += 1
-                    if aOK == 1 { say("音频 头一块进去了（\(String(format: "%.0f", CMTimeGetSeconds(sPTS) * 1000)) ms 处）") }
+                    if isFirst {
+                        say("音频 头一块进去了（\(aStart) ms 处）｜画面头一块起点 \(vStart) ms"
+                            + (haveBase ? "" : "（画面的数还没记上，这条别看）")
+                            + "｜这一版两条轨都不移位，起点不同成片口型就偏")
+                    }
                 } else {
                     aBad = 1
                     aNote = "第 \(aOK + 1) 块 append 被拒｜writer \(writerName(writer.status))"
@@ -455,7 +467,7 @@ enum SwapClip {
                 }
                 guard let pb = CMSampleBufferGetImageBuffer(sb) else { ended = "sample 里没有像素缓冲"; return }
                 let pts = CMSampleBufferGetPresentationTimeStamp(sb)
-                if basePTS == .invalid { basePTS = pts }
+                if !haveBase { basePTS = pts; haveBase = true }
                 let rel = CMTimeSubtract(pts, basePTS)
 
                 var mine: CVPixelBuffer?
@@ -517,6 +529,9 @@ enum SwapClip {
                                 netMs.append(r.ms)
                                 gen = r.out
                                 rawMask = r.mask
+                                let tb = DispatchTime.now().uptimeNanoseconds
+                                SwapGeo.whiten(&gen, side: side)
+                                beautyMs.append(Double(DispatchTime.now().uptimeNanoseconds - tb) / 1_000_000)
                                 let t3 = DispatchTime.now().uptimeNanoseconds
                                 SwapGeo.preprocessMask(rawMask, &m2)
                                 let pasted = SwapTech.withPixels(dst) { base, bpr -> Bool in
@@ -535,13 +550,19 @@ enum SwapClip {
                                     let after = runner.identity(crop112_01: f112)
                                     var g112 = [Float](repeating: 0, count: 3 * 112 * 112)
                                     SwapGeo.resizePlanar(att, from: side, to: 112, into: &g112)
-                                    let before = runner.identity(crop112_01: g112).emb
+                                    let before = runner.identity(crop112_01: g112)
                                     sampleMs.append(Double(DispatchTime.now().uptimeNanoseconds - t4) / 1_000_000)
+                                    // -9 不是「不像」，是这把尺没量成。上一版只印 -9.000、还把「换前」那栏悄悄吞了，
+                                    // 结果「已存的人」那条路整趟看不出死因。这一版量不成就把量不成的原因写出来。
                                     let cSrc = SwapMath.cosine(after.emb, srcEmb)
-                                    let cTgt = before.isEmpty ? -9 : SwapMath.cosine(before, srcEmb)
-                                    cosList.append("第 \(made) 帧 换后<->源 \(String(format: "%.3f", cSrc))"
-                                        + (cTgt < -8 ? "" : "｜换前<->源 \(String(format: "%.3f", cTgt))")
-                                        + (after.emb.isEmpty ? "（尺子没回话：\(after.note)）" : ""))
+                                    let cTgt = SwapMath.cosine(before.emb, srcEmb)
+                                    // 换后<->换前 不吃存档身份：专答「这张脸到底动没动」——
+                                    // 低＝动过，接近 1＝网基本原样交（或这人本来就和视频里的是同一个人）。
+                                    let cSelf = SwapMath.cosine(after.emb, before.emb)
+                                    let sSrc = cSrc < -8 ? "量不出（" + SwapMath.whyNot(cSrc, after.emb, srcEmb) + "）" : String(format: "%.3f", cSrc)
+                                    let sTgt = cTgt < -8 ? "量不出（" + SwapMath.whyNot(cTgt, before.emb, srcEmb) + "）" : String(format: "%.3f", cTgt)
+                                    let sSelf = cSelf < -8 ? "量不出（" + SwapMath.whyNot(cSelf, after.emb, before.emb) + "）" : String(format: "%.3f", cSelf)
+                                    cosList.append("第 \(made) 帧 换后<->源 \(sSrc)｜换前<->源 \(sTgt)｜换后<->换前 \(sSelf)")
                                     say("  身份 " + cosList.last!)
                                 }
                             }
@@ -578,7 +599,7 @@ enum SwapClip {
                     // 0.5 上机证伪了我上一轮的归因：闸放宽到 60 秒，编码器在第 397 帧照样连着 60 秒不收
                     // （源 418 帧的 PTS 逐帧 1/30 严格单调，不是时间戳的事）。是真停，不是打嗝，等 60 秒纯白等。
                     if spins > 3_000 {
-                        let fed = aFedTo == .invalid ? "-" : String(format: "%.3f", CMTimeGetSeconds(aFedTo))
+                        let fed = aHaveFed ? String(format: "%.3f", CMTimeGetSeconds(aFedTo)) : "-"
                         let an = aNote.isEmpty ? "" : "｜\(aNote)"
                         ended = "编码器队列 15 秒不收（第 \(made) 帧，PTS \(String(format: "%.3f", CMTimeGetSeconds(rel))) s"
                             + "｜音频喂到 \(fed) s、\(aOK) 块\(an)）"
@@ -622,6 +643,15 @@ enum SwapClip {
         say("画面这条结束 读到 \(made)/\(estFrames) 帧｜\(stopWhy)"
             + "｜reader \(readerName(reader.status)) \(reader.error?.localizedDescription ?? "-")"
             + "｜writer \(writerName(writer.status)) \(writer.error?.localizedDescription ?? "-")")
+        // 「预估」是我拿容器时长×帧率算的，容器常比画面轨长一截：少的那些帧从来就不在画面轨里。
+        // 上一版只印「读到 397/418」，读的人以为丢了 21 帧。
+        if estFrames > made {
+            let gap = estFrames - made
+            let gapS = String(format: "%.2f", Double(gap) / max(src.fps, 1))
+            let trackS = String(format: "%.2f", picLen)
+            let contS = String(format: "%.2f", src.duration)
+            say("      读到比预估少 \(gap) 帧（\(gapS) s）：画面轨 \(trackS) s／容器 \(contS) s，差的那截只有声音没有画面，不是丢帧")
+        }
 
         // 音频收尾：搬运已在画面循环里做完（pumpAudio 往前喂 2 秒），这里只补尾巴、关闸、报账
         if let ai = aIn {
@@ -629,7 +659,7 @@ enum SwapClip {
                 pumpAudio(until: audioCeil)
                 if aNote.isEmpty { aNote = "跟到画面末尾" }
             }
-            let fed = aFedTo == .invalid ? "-" : String(format: "%.2f", CMTimeGetSeconds(aFedTo))
+            let fed = aHaveFed ? String(format: "%.2f", CMTimeGetSeconds(aFedTo)) : "-"
             say("音频 \(aOK) 块原样搬过去（拒 \(aBad) 块）｜\(aNote)"
                 + "｜最后一块起点 \(fed) s／画面 \(String(format: "%.2f", picLen)) s")
             if !aDone { ai.markAsFinished() }
@@ -649,13 +679,13 @@ enum SwapClip {
         let size = (attrsOfOut?[.size] as? NSNumber)?.int64Value ?? 0
         let wall = Double(DispatchTime.now().uptimeNanoseconds - wall0) / 1_000_000_000
         let madeSec = Double(made) / max(src.fps, 1)
-        let perFrame = avg(decodeMs) + avg(detectMs) + avg(alignMs) + avg(netMs) + avg(pasteMs) + avg(appendMs)
-        say("换完 \(made) 帧（预估 \(estFrames)，编码器头/尾 \(SwapUtil.ms(tailMs))）"
+        let perFrame = avg(decodeMs) + avg(detectMs) + avg(alignMs) + avg(netMs) + avg(beautyMs) + avg(pasteMs) + avg(appendMs)
+        say("换完 \(made) 帧（编码器头/尾 \(SwapUtil.ms(tailMs))）"
             + "｜成片 \(String(format: "%.1f", Double(size) / 1_048_576)) MB"
             + "｜缓冲 池子给 \(made - poolMiss)／自造 \(poolMiss)"
             + "｜\(why.isEmpty ? "跑到末尾" : why)")
         say("单价 解码 \(SwapUtil.stat(decodeMs))｜检测 \(SwapUtil.stat(detectMs))｜对齐 \(SwapUtil.stat(alignMs))")
-        say("      逐帧网 \(SwapUtil.stat(netMs))｜回贴 \(SwapUtil.stat(pasteMs))｜提交 \(SwapUtil.stat(appendMs))")
+        say("      逐帧网 \(SwapUtil.stat(netMs))｜美白 \(SwapUtil.stat(beautyMs))｜回贴 \(SwapUtil.stat(pasteMs))｜提交 \(SwapUtil.stat(appendMs))")
         say("      \(runner.statsLine())")
         say("总耗时 \(String(format: "%.1f", wall)) s（素材实到 \(String(format: "%.1f", madeSec)) s）"
             + "＝\(String(format: "%.2f", wall / max(madeSec, 0.01)))× 实时｜每帧合计 \(String(format: "%.1f", perFrame)) ms"
@@ -672,6 +702,7 @@ enum SwapClip {
         say("足迹 \(mem0)→\(SwapFacts.footprintMB()) MB，本次峰值 \(memMax) MB")
         if !cosList.isEmpty {
             say("身份复测 \(cosList.count) 次（PC 参照：换后<->源 0.81~0.90，换前<->源 ≈0.1~0.3）")
+            say("      换后<->换前 那一列不吃存档身份，只答「这张脸动没动」：低＝动过，接近 1＝原样交或本来就是同一个人；这一列 PC 上我没量过")
             for c in cosList.suffix(12) { say("  " + c) }
         }
 
@@ -680,9 +711,11 @@ enum SwapClip {
         if saved.hasPrefix("已存") {
             try? fm.removeItem(at: out)
             say("沙盒那份已删（\(out.lastPathComponent)）")
+            SwapJournal.digest(rep)
             return (nil, rep.joined(separator: "\n"))
         }
         say("本地还留着 \(out.path)")
+        SwapJournal.digest(rep)
         return (out, rep.joined(separator: "\n"))
     }
 

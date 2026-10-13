@@ -5,8 +5,8 @@ import Foundation
 /// 身份证也要存：出片线每 30 帧拿它复测一次「换后 <-> 源」，只存权重的那份存档会让这把尺子当场失效。
 ///
 /// 落在 Documents/swap_idents/<hash12>.pak，显示名另放 <hash12>.name：改名只写那几十字节，不动 1 MB 级的包。
-/// hash 取身份证 512 个 float 原始字节的 SHA-256 前 12 位——它只是文件名和"同一张照片别存两遍"的依据，
-/// 不是"同一个人"的判定：同一个人再拍一张，网给的嵌入几乎相同而不逐位相同，hash 会变、会另开一格。
+/// hash 取身份证 512 个 float 原始字节的 SHA-256 前 12 位——它只是文件名，不是"同一个人"的判定：
+/// 同一个人再拍一张，网给的嵌入几乎相同而不逐位相同，hash 会变。认人靠 nearest() 那把余弦尺（见 sameFaceCos）。
 enum SwapIdents {
     struct Item {
         var id: String
@@ -82,6 +82,24 @@ enum SwapIdents {
         return s.isEmpty ? id : s
     }
 
+    /// 同一个人换一张照片也算「库里已有」：逐份读出身份证比余弦，够像就只报回那一格，绝不再开第二格。
+    /// 阈值 0.45 是我照这条线的实测定的——机上「同一个人」两头量到 0.72~0.86、「不同人」−0.1~0.2，
+    /// 0.45 落在这两条带子中间的空档里；每次存档都把最近那一格的余弦打进日志，数不对我照数调。
+    static let sameFaceCos: Double = 0.45
+
+    /// 库里跟这张脸最像的一格（`skip` 是这张照片自己的 hash，同一张照片重选时不算进来）。
+    static func nearest(_ emb: [Float], skip: String) -> (item: Item, cos: Double)? {
+        guard !emb.isEmpty else { return nil }
+        var best: (Item, Double)?
+        for it in list() where it.id != skip {
+            guard let one = load(id: it.id) else { continue }
+            let c = SwapMath.cosine(emb, one.emb)
+            if c > (best?.1 ?? -2) { best = (it, c) }
+        }
+        guard let b = best else { return nil }
+        return (b.0, b.1)
+    }
+
     /// 存一份。同 hash 已在列表里就不重写作废（他可能连选同一张照片），只报回那一格。
     static func save(emb: [Float], weights: [(name: String, dims: [Int], data: [Float])],
                      taken: [Item]) -> (id: String, name: String, isNew: Bool, bytes: Int, note: String) {
@@ -95,6 +113,14 @@ enum SwapIdents {
         if let one = taken.first(where: { $0.id == id }) {
             return (id, one.name, false, one.bytes, "「\(one.name)」早就在列表里了（同一张照片，没重存）")
         }
+        // 上一版只认"字节完全一样"，所以他换一张照片就跑出一格新的；这一版按身份证余弦认人
+        let near = nearest(emb, skip: id)
+        if let m = near, m.cos >= sameFaceCos {
+            let c = String(format: "%.3f", m.cos)
+            let g = String(format: "%.2f", sameFaceCos)
+            return (m.item.id, m.item.name, false, m.item.bytes,
+                    "跟库里「\(m.item.name)」是一张脸（身份证余弦 \(c)，闸门 \(g)），没重存")
+        }
         let name = nextName(taken)
         let data = encode(emb: emb, weights: weights)
         do { try data.write(to: u) } catch {
@@ -102,8 +128,11 @@ enum SwapIdents {
         }
         try? name.write(to: s, atomically: true, encoding: .utf8)
         let bytes = (try? u.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? data.count
+        let g = String(format: "%.2f", sameFaceCos)
+        let nearTxt = near == nil ? "库里没有别人可比"
+            : "库里最近的「\(near!.item.name)」余弦 \(String(format: "%.3f", near!.cos))（没到 \(g)，算另一个人）"
         return (id, name, true, bytes,
-                "存成「\(name)」\(String(format: "%.2f", Double(bytes) / 1_048_576)) MB，下次直接选他、不必再挑照片")
+                "存成「\(name)」\(String(format: "%.2f", Double(bytes) / 1_048_576)) MB，下次直接选他、不必再挑照片｜\(nearTxt)")
     }
 
     private static func nextName(_ taken: [Item]) -> String {

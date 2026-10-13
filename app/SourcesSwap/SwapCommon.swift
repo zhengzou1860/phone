@@ -122,6 +122,53 @@ enum SwapJournal {
         if lines.isEmpty { return "磁盘日志是空的（\(url?.path ?? "拿不到 documents 目录")）" }
         return lines.suffix(n).joined(separator: "\n")
     }
+
+    // MARK: - 每趟的判决（不滚动）
+
+    /// 流水只留最后 500 行：一条 6000 帧的片子自己就能把上一趟的死因冲干净（「已存的人」那趟就是这么没的）。
+    /// 这一份每趟收尾时单独写一次，只收判决那几行，「发到电脑」连它一起发。
+    static var runsUrl: URL? {
+        guard let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else { return nil }
+        return dir.appendingPathComponent("swap_runs.txt")
+    }
+
+    static func runs(_ n: Int) -> String {
+        guard let u = runsUrl, let raw = try? String(contentsOf: u, encoding: .utf8) else {
+            return "还没有跑过的记录（\(runsUrl?.path ?? "拿不到 documents 目录")）"
+        }
+        let lines = raw.split(separator: "\n").map(String.init)
+        if lines.isEmpty { return "跑过的记录是空的" }
+        return lines.suffix(n).joined(separator: "\n")
+    }
+
+    private static let digestHeads = [
+        "开始整片换脸", "源脸：", "源脸对齐", "用已存的人", "① 身份证", "② 身份包", "③ 身份存档", "接口对账",
+        "补丁口径", "磁盘闸门", "原样搬运", "y 原点", "画面这条结束", "读到比预估少", "头一块进去",
+        "块原样搬过去", "换上人 ", "总耗时", "脸短边", "本次峰值", "存相册", "沙盒那份已删", "本地还留着", "身份复测",
+    ]
+
+    /// 成功的趟挑结论行，失败的趟直接留最后 12 行（死因就写在最后）。
+    static func digest(_ rep: [String], failed: Bool = false) {
+        guard let u = runsUrl else { return }
+        var picked: [String]
+        if failed {
+            picked = Array(rep.suffix(12))
+        } else {
+            picked = rep.filter { l in digestHeads.contains(where: { l.contains($0) }) }
+            picked.append(contentsOf: rep.filter { $0.contains("换后<->源") }.suffix(3))
+            if picked.isEmpty { picked = Array(rep.suffix(12)) }
+        }
+        let f = DateFormatter()
+        f.dateFormat = "MM-dd HH:mm:ss"
+        var lines = ((try? String(contentsOf: u, encoding: .utf8)) ?? "")
+            .split(separator: "\n").map(String.init)
+        let tag = failed ? "死在" : "判决"
+        lines.append("—— \(f.string(from: Date())) 这趟 \(tag) ——")
+        lines.append(contentsOf: picked)
+        if lines.count > 4000 { lines.removeFirst(lines.count - 4000) }
+        guard let data = lines.joined(separator: "\n").appending("\n").data(using: .utf8) else { return }
+        try? data.write(to: u)
+    }
 }
 
 enum SwapUploader {

@@ -392,6 +392,7 @@ struct SwapContentView: View {
             + "\n\n—— 整片换脸 ——\n" + clip
             + "\n\n—— 逐帧网自检 ——\n" + bench
             + "\n\n—— 流水 ——\n" + SwapJournal.tail(200)
+            + "\n\n—— 每趟判决（不滚动，一条片子冲不掉）——\n" + SwapJournal.runs(160)
         Task.detached {
             let r = SwapUploader.send(text)
             SwapJournal.line("发到电脑：\(r)")

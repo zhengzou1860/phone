@@ -289,6 +289,40 @@ enum SwapGeo {
         }
     }
 
+    /// 他点名要的那一格＝tools/beauty_ab.py 第 1 列「美白」：只动补丁的明度与偏色，几何、遮罩、贴法一概不碰。
+    /// 本机没有 8 位 LAB 可走（补丁在手里是 planar RGB 0~1 float），所以 sRGB↔Lab(D65) 自己换算。
+    /// 加数 100*11/255 ＝ PC 那句「uint8 的 L 加 11」折到 0~100 口径；与那一列逐像素对拍最大 5 灰阶
+    /// （cv2 自己的浮点路径对同一参照是 4 灰阶），三把尺同档：见 tools/whiten_parity.py 的判决表。
+    /// 网回来的 float 可以越出 0~1（pow 负底会出 NaN），PC 那一列是先 clip 成 8 位再算的，这里同一刀。
+    static func whiten(_ gen: inout [Float], side: Int) {
+        let plane = side * side
+        let xr = 0.950456, yr = 1.0, zr = 1.089058        // cv2 Lab98 用的 D65 参考白
+        let eps = 0.008856, kap = 903.3
+        let ladd = 100.0 * 11.0 / 255.0
+        func lin(_ c: Double) -> Double { c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4) }
+        func enc(_ v: Double) -> Double { v <= 0.0031308 ? v * 12.92 : 1.055 * pow(v, 1.0 / 2.4) - 0.055 }
+        func f(_ t: Double) -> Double { t > eps ? cbrt(t) : (kap * t + 16.0) / 116.0 }
+        func h(_ t: Double) -> Double { let c = t * t * t; return c > eps ? c : (116.0 * t - 16.0) / kap }
+        for o in 0..<plane {
+            let r = lin(min(1.0, max(0.0, Double(gen[o]))))
+            let g = lin(min(1.0, max(0.0, Double(gen[plane + o]))))
+            let b = lin(min(1.0, max(0.0, Double(gen[2 * plane + o]))))
+            let fx = f((0.412453 * r + 0.357580 * g + 0.180423 * b) / xr)
+            let fy = f((0.212671 * r + 0.715160 * g + 0.072190 * b) / yr)
+            let fz = f((0.019334 * r + 0.119193 * g + 0.950532 * b) / zr)
+            let L = min(100.0, max(0.0, (116.0 * fy - 16.0) * 1.06 + ladd))
+            let aa = 500.0 * (fx - fy) * 0.90
+            let bb = 200.0 * (fy - fz) * 0.92
+            let ny = (L + 16.0) / 116.0
+            let X = h(ny + aa / 500.0) * xr
+            let Y = (L > kap * eps ? ny * ny * ny : L / kap) * yr
+            let Z = h(ny - bb / 200.0) * zr
+            gen[o] = Float(enc(min(1.0, max(0.0, 3.240481 * X - 1.537158 * Y - 0.498537 * Z))))
+            gen[plane + o] = Float(enc(min(1.0, max(0.0, -0.969254 * X + 1.875990 * Y + 0.041556 * Z))))
+            gen[2 * plane + o] = Float(enc(min(1.0, max(0.0, 0.055643 * X - 0.204026 * Y + 1.057311 * Z))))
+        }
+    }
+
     private static func bilinearFloat(_ a: [Float], _ w: Int, _ h: Int, _ fx: Double, _ fy: Double) -> Float {
         let x0 = min(max(0, Int(fx)), w - 1), y0 = min(max(0, Int(fy)), h - 1)
         let dx = Float(fx - Double(x0)), dy = Float(fy - Double(y0))
