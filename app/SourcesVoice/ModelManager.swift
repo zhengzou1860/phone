@@ -50,7 +50,7 @@ final class ModelManager: ObservableObject {
         VoiceJournal.line("check() dir=\(dir.path)")
         if fm.fileExists(atPath: probe.path), fm.fileExists(atPath: marker.path) {
             state = .downloaded(modelDir: dir)
-            progressText = "模型已就绪（\(ModelManifest.parseCount(dir)) 个文件已逐条校验）"
+            progressText = "模型已就绪 \(ModelManifest.version)（\(ModelManifest.parseCount(dir)) 个文件已逐条校验）"
             return
         }
         if fm.fileExists(atPath: zip.path) {
@@ -134,10 +134,10 @@ final class ModelManager: ObservableObject {
         try? Data(ModelManifest.version.utf8)
             .write(to: dir.appendingPathComponent(ModelManifest.marker))
         if let zip = zip { try? FileManager.default.removeItem(at: zip) }
-        VoiceJournal.line("模型校验通过（\(stage)），zip 已删")
+        VoiceJournal.line("模型校验通过 \(ModelManifest.version)（\(stage)），zip 已删")
         state = .downloaded(modelDir: dir)
         progress = 1.0
-        progressText = "模型就绪（\(ModelManifest.parseCount(dir)) 个文件已逐条校验）"
+        progressText = "模型就绪 \(ModelManifest.version)（\(ModelManifest.parseCount(dir)) 个文件已逐条校验）"
     }
 
     /// 把 singleton 的两个回调接到这个界面。新开和接手走同一份，别写两遍。

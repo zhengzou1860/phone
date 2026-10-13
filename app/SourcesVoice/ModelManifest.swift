@@ -5,7 +5,15 @@ import CryptoKit
 /// 存在的理由：手机上可能已经躺着上一版 616 MB 的死包（11/13 张图 ORT 连加载都过不了），
 /// 只看"有没有 dit_state_0.onnx"会把死包当就绪，白跑一次装机。逐条 sha256 才能把坏包挡在门外。
 enum ModelManifest {
-    static let version = "2026-10-11a"
+    /// 2026-10-14a = dit_state_1..6 换了 rope 精度：位置 × inv_freq 原来整段在 fp16 里算，
+    /// 而那个位置就是绝对 mel 帧号（inv_freq[0]=1.0、分母=1.0 ⇒ 最 Plane 的角度＝帧号本身）。
+    /// fp16 在 [2048,4096) 的 ulp 是 2、[4096,8192) 是 4、[8192,16384) 是 8 ⇒ 150 s 一片跑到
+    /// 帧号 ~15000 时相位误差最大 4 rad，一个片里 20 帧塌到几个不同位置 ⇒ 吐字糊而音高不糊
+    /// （音高走 spks/cond，不走注意力对齐）。RoPE 本该平移不变，所以任何随 offset 变化的
+    /// 输出都是纯数值误差。判据：`tools/rope_ab.py` 同内容同噪声只挪起点，旧包 mel 余弦
+    /// 1.0000→0.9660、3 kHz 上/下能量比 −12.32→−16.24 dB；补成 fp32 后 cos 1.000000。
+    /// 权重一个字节没动，只改 dtype 与 4 处节点 ⇒ 见 `tools/_rope_patch.py`。
+    static let version = "2026-10-14a"
 
     struct Item {
         let name: String

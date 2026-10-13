@@ -60,7 +60,8 @@ final class ChainDriver {
     /// 所以合法的最大 offset = 4995 ⇒ **1000 窗**，每窗推进 20 帧 ⇒ 20000 帧 fbank = 200 s。
     /// 本机在同一份待发布 fp16 图上扫出来：a_first/b_second/c_steady 三张全部
     /// offset 4995 过、4996 炸；手机上那条 `10 by 15` 正是 offset 5000（5010−5000=10 行）那一格。
-    /// ③ 的 rope 不受这个罪（offset 喂到 40000 照样过），所以这条上限只属于 ②。
+    /// ③ 的 rope 不吃这条墙（offset 喂到 40000 照样过），但别把它当无害：那份精度墙量的是 ②，
+    /// ③ 自己的墙在 fp16 的位数上（见 ModelManifest.version 的注）⇒ 这条上限只属于 ②。
     static let encMaxFbankFrames = 1000 * encStride
     static let vocosWindow = 173
     static let melHop = 160          // mel 帧 → 样本
