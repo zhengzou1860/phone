@@ -214,6 +214,39 @@ enum AudioProcessor {
         }
     }
 
+    /// 一阶差分的能量占比 `sqrt(Σ(x[n]−x[n−1])² / Σx[n]²)`。按 Parseval 它就是
+    /// `sqrt(mean(4·sin²(πf/2SR)))` —— 一个不用 FFT 的频谱重心代理，齿音和塞擦全算在这一格。
+    /// 「吐字不清」在这把尺上就是数字往下走。每 `windowSecs` 一格，逐格报出来才能看是不是**越往后越低**。
+    static func claritySeries(_ x: [Float], windowSecs: Double = 30.0) -> [String] {
+        let L = Int(windowSecs * sampleRate)
+        guard L > 64, x.count >= L else { return [] }
+        var out: [String] = []
+        var i = 0
+        while i + L <= x.count {
+            var se = 0.0, sd = 0.0
+            var prev = Double(x[i])
+            var k = i
+            while k < i + L {
+                let v = Double(x[k])
+                se += v * v
+                let d = v - prev
+                sd += d * d
+                prev = v
+                k += 1
+            }
+            out.append(se > 0 ? String(format: "%.3f", (sd / se).squareRoot()) : "—")
+            i += L
+        }
+        return out
+    }
+
+    /// 逐格数字拼成一格话，末尾补上「一共几格／不足一格的尾巴不算」，免得他把 4 格当成 4 片。
+    static func clarityText(_ x: [Float], windowSecs: Double = 30.0) -> String {
+        let s = claritySeries(x, windowSecs: windowSecs)
+        guard !s.isEmpty else { return "不足 \(Int(windowSecs)) s，没格" }
+        return s.joined(separator: " ") + "（每 \(Int(windowSecs)) s 一格，共 \(s.count) 格）"
+    }
+
     /// kaldi 那一侧的定标：训练时 fbank 吃的是乘过 1<<15 的整数域样本
     static func scaled(_ norm: [Float]) -> [Float] {
         norm.map { $0 * 32768.0 }

@@ -50,8 +50,19 @@ enum FileHistory {
     /// 名字里带的是秒级 epoch，位数固定 ⇒ 按名字排就是按时间排，和样本清单一样新的在前面。
     static func scan() -> [Item] {
         let fm = FileManager.default
-        guard let docs = fm.urls(for: .documentDirectory, in: .userDomainMask).first,
-              let names = try? fm.contentsOfDirectory(atPath: docs.path) else { return [] }
+        guard let docs = fm.urls(for: .documentDirectory, in: .userDomainMask).first else {
+            VoiceJournal.line("历史文件：拿不到 Documents 路径")
+            return []
+        }
+        let names: [String]
+        do {
+            names = try fm.contentsOfDirectory(atPath: docs.path)
+        } catch {
+            let ne = error as NSError
+            VoiceJournal.line("历史文件列目录失败：\(ne.domain)#\(ne.code)｜\(ne.localizedDescription)"
+                              + "｜目录 \(docs.path)")
+            return []
+        }
         var out: [Item] = []
         for n in names {
             guard let kind = Kind.kind(ofName: n) else { continue }
@@ -61,6 +72,9 @@ enum FileHistory {
             let sz = ((try? fm.attributesOfItem(atPath: url.path))?[.size] as? NSNumber)?.int64Value ?? 0
             out.append(Item(url: url, kind: kind, bytes: sz))
         }
+        // 「目录里一共几项」和「本 app 认领几项」必须分开报：上一版只报认领数，
+        // 于是「列目录列不到」和「文件名字对不上前缀」在这行日志里长得一模一样。
+        VoiceJournal.line("历史文件扫目录：\(names.count) 项／认领 \(out.count) 个")
         return out.sorted { $0.name > $1.name }
     }
 
@@ -82,7 +96,8 @@ enum FileHistory {
             VoiceJournal.line("历史文件已删（\(item.kind.rawValue)）\(item.name) \(human(item.bytes))")
             return true
         } catch {
-            VoiceJournal.line("历史文件删除失败 \(item.name)：\(error.localizedDescription)")
+            let ne = error as NSError
+            VoiceJournal.line("历史文件删除失败 \(item.name)：\(ne.domain)#\(ne.code)｜\(ne.localizedDescription)")
             return false
         }
     }

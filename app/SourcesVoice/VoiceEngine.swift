@@ -109,6 +109,10 @@ final class VoiceEngine {
             let shaped = PostProcessor.pitchShift(try driver.convert(source: chunk, sample: parts),
                                                   cents: pitchCents)
             try writer.append(shaped)
+            // 「后面吐字不清」这种指控要能分账：同一片的源和输出各量一遍逐格清晰度。
+            // 两条一起往下走＝素材/解音轨那一头，只有输出往下走＝链子这一头。
+            VoiceJournal.line("清晰度 第 \(passes) 片 源：" + AudioProcessor.clarityText(chunk))
+            VoiceJournal.line("清晰度 第 \(passes) 片 输出：" + AudioProcessor.clarityText(shaped))
             outSamples += shaped.count
             start = end
             onStage(String(format: "第 %d 片已落盘：累计 %.0f s（墙钟 %.0f s）",
@@ -204,19 +208,38 @@ final class VoiceEngine {
     }
 
     /// 开跑前把上一轮没清掉的中间 wav 收一遍（崩在半路时它们留在盘上，`video_` 前缀归本条线）。
+    ///
+    /// 这一趟无论扫到几个都要落一行：真机上这条删除从来没成过，「列目录就没列到」和
+    /// 「删到一半被拒」是两件不同的事，得在这一行里分得开。
     private static func sweepVideoTemps(dir: URL) -> Int64 {
         let fm = FileManager.default
-        var reclaimed: Int64 = 0
-        for one in (try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.fileSizeKey],
-                                                options: [])) ?? [] {
+        var all: [URL]
+        do {
+            all = try fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.fileSizeKey],
+                                             options: [])
+        } catch {
+            let ne = error as NSError
+            VoiceJournal.line("开跑前列目录失败：\(ne.domain)#\(ne.code)｜\(ne.localizedDescription)"
+                              + "｜目录 \(dir.path)")
+            return 0
+        }
+        var found = 0, gone = 0, reclaimed: Int64 = 0
+        for one in all {
             let n = one.lastPathComponent
             guard n.hasPrefix("video_"), n.hasSuffix("_chain.wav") || n.hasSuffix("_fit.wav") else { continue }
+            found += 1
             let sz = (try? one.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
-            if (try? fm.removeItem(at: one)) == nil { reclaimed += Int64(sz) }
+            do {
+                try fm.removeItem(at: one)
+                gone += 1
+                reclaimed += Int64(sz)
+            } catch {
+                let ne = error as NSError
+                VoiceJournal.line("上轮残留删不掉 \(n)：\(ne.domain)#\(ne.code)｜\(ne.localizedDescription)")
+            }
         }
-        if reclaimed > 0 {
-            VoiceJournal.line("先清掉上轮残留的对齐中间量 \(FileHistory.human(reclaimed))")
-        }
+        VoiceJournal.line("开跑前扫中间量：目录里 \(all.count) 项／认下 \(found) 个／删掉 \(gone) 个"
+                          + "／拿回 \(FileHistory.human(reclaimed))")
         return reclaimed
     }
 
@@ -306,6 +329,7 @@ final class VoiceEngine {
                 onStage(String(format: "对齐：链子输出比源长 %.2f%% ⇒ 整条按 %.5f 拉伸", skew * 100, rate))
                 let s = PostProcessor.timeStretch(try AudioProcessor.loadWAV16K(chainWav), rate: rate)
                 stretched = s
+                VoiceJournal.line("清晰度 对齐拉伸后：" + AudioProcessor.clarityText(s))
                 fitSecs = Double(s.count) / AudioProcessor.sampleRate
                 VoiceJournal.line(String(format: "对齐完成：%.2f s → %.2f s（源 %.2f s，倍率 %.5f，残差 %.3f s）",
                                          convSecs, fitSecs, Double(want) / AudioProcessor.sampleRate,
@@ -386,10 +410,14 @@ final class VoiceEngine {
             if fitWav.path != chainWav.path { temps.append(fitWav) }
             for t in temps {
                 let sz = (try? t.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
-                if (try? FileManager.default.removeItem(at: t)) == nil {
+                do {
+                    try FileManager.default.removeItem(at: t)
                     VoiceJournal.line("中间量已清 \(t.lastPathComponent) \(FileHistory.human(Int64(sz)))")
-                } else {
-                    VoiceJournal.line("中间量没删掉 \(t.lastPathComponent)（历史文件页还能删）")
+                } catch {
+                    let ne = error as NSError
+                    VoiceJournal.line("中间量没删掉 \(t.lastPathComponent) \(FileHistory.human(Int64(sz)))"
+                                      + "：\(ne.domain)#\(ne.code)｜\(ne.localizedDescription)"
+                                      + "｜路径 \(t.path)")
                 }
             }
 
