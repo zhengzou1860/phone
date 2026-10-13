@@ -4,8 +4,9 @@ import UIKit
 import UniformTypeIdentifiers
 
 /// 哪个槽在选文件。共用一个呈现，源槽和参考槽不再各挂一个 fileImporter。
-/// `text` 和 `video` 也走这一个呈现：一个选的是 .txt/.md，一个选的是视频，都不是音频，
-/// 但呈现器只管把文件拿进来，能不能用由我们自己验（见 `TextFile.load`、`VideoClip.probe`）。
+/// `text` 也走这一个呈现：它选的是 .txt/.md，不是音频，但呈现器只管把文件拿进来，
+/// 能不能用由我们自己验（见 `TextFile.load`）。
+/// `video` 独用一个：片源在相册里，走 `VideoAlbumPickerHost`，不进这个文件选择器。
 enum PickSlot: String, Identifiable {
     case source
     case ref
@@ -129,8 +130,8 @@ struct ContentView: View {
         }
     }
 
-    /// 一个呈现六种内容：`.voice` 是自己铺的嗓音清单、`.history` 是自己铺的历史文件清单，
-    /// 其余四个槽（①②／文本／视频）还是系统文件选择器。
+    /// 一个呈现六种内容：`.voice` 是自己铺的嗓音清单、`.history` 是自己铺的历史文件清单、
+    /// `.video` 是相册选片，剩下那三个槽（①②／文本）还是系统文件选择器。
     /// 分支写在带 `@ViewBuilder` 的函数里，不赌 `fullScreenCover` 那个闭包是不是 ViewBuilder。
     @ViewBuilder
     private func coverPage(_ slot: PickSlot) -> some View {
@@ -138,12 +139,19 @@ struct ContentView: View {
             voiceListPage
         } else if slot == .history {
             historyPage
+        } else if slot == .video {
+            VideoAlbumPickerHost(onPick: { url, original in
+                videoURL = adoptVideo(url, from: original)
+            }, onCancel: { msg in
+                pickNote = "没选成：" + msg
+                VoiceJournal.line("相册选视频取消／失败（\(msg)）")
+            }, onDismiss: {
+                pickSlot = nil
+            })
         } else {
             DocumentPickerHost(onPick: { url in
                 if slot == .text {
                     loadNovelFile(url)
-                } else if slot == .video {
-                    videoURL = copyInVideo(url)
                 } else {
                     let got = copyIn(url)
                     if slot == .source { sourceURL = got } else { refURL = got }
@@ -359,29 +367,22 @@ struct ContentView: View {
                       Double(frames) / fmt.sampleRate)
     }
 
-    /// 视频的固化副本。和音频一样必须先拷进 Documents：asCopy 给的临时区随时会被清，
-    /// 而这条线要把同一个文件读两遍（解音轨一遍、回写画面一遍），中间隔着几分钟的链子。
-    /// 拷完就地读一次文件头（只读头、不解码，几百毫秒），选错了东西当场就知道，不用等开跑。
-    private func copyInVideo(_ src: URL) -> URL? {
-        let ext = src.pathExtension.isEmpty ? "mp4" : src.pathExtension
-        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
-        let dest = docs.appendingPathComponent("pick_\(Int(Date().timeIntervalSince1970)).\(ext)")
-        do {
-            try? FileManager.default.removeItem(at: dest)
-            try FileManager.default.copyItem(at: src, to: dest)
-            let info = VideoClip.probe(dest)
-            videoProbe = info
-            videoNote = ""
-            pickNote = "已拷进 app：" + dest.lastPathComponent + "／" + info.line
-            history = FileHistory.scan()
-            VoiceJournal.line("选视频 \(src.lastPathComponent) → \(dest.lastPathComponent)：\(info.line)")
-            return dest
-        } catch {
-            pickNote = "拷视频失败：" + error.localizedDescription
-            videoProbe = nil
-            VoiceJournal.line("拷选中的视频失败：\(error.localizedDescription)")
+    /// 认领相册选片器已经拷进 Documents 的那一份。拷贝在选择器回调里当场就做完了
+    /// （系统给的临时文件一返回就被收走），这里只剩体检和记账。
+    /// 就地读一次文件头（`VideoClip.probe`：只读头、不解码，几百毫秒），选错了东西当场就知道，不用等开跑。
+    private func adoptVideo(_ dest: URL, from original: String) -> URL? {
+        let info = VideoClip.probe(dest)
+        videoProbe = info
+        videoNote = ""
+        history = FileHistory.scan()
+        guard info.bytes > 0 else {
+            pickNote = "这一条读不出内容：" + dest.lastPathComponent + "／" + info.line
+            VoiceJournal.line("相册视频 \(original) → \(dest.lastPathComponent)：\(info.line)（当没选到）")
             return nil
         }
+        pickNote = "已从相册拿进来：" + dest.lastPathComponent + "（原来叫 \(original)）／" + info.line
+        VoiceJournal.line("相册视频 \(original) → \(dest.lastPathComponent)：\(info.line)")
+        return dest
     }
 
     // MARK: - 样本动作
@@ -464,7 +465,7 @@ struct ContentView: View {
                                      : "查看并清空（\(history.count) 个 / \(FileHistory.human(FileHistory.total(history)))）")
             }
             .buttonStyle(.bordered)
-            Text("「选文件」拷进来的音频和视频、录的、系统原声、转换成品、换了声的成片都一直留在 app 目录里，播完不会自动删 ⇒ 「文件」app 里直接翻得到。这页逐条删、整类删、一键清空。模型目录（581 MB）、voice_log.txt、样本清单不在这页里，也删不到。")
+            Text("从「文件」或相册选进来的音频和视频、录的、系统原声、转换成品、换了声的成片都一直留在 app 目录里，播完不会自动删 ⇒ 「文件」app 里直接翻得到。这页逐条删、整类删、一键清空。模型目录（581 MB）、voice_log.txt、样本清单不在这页里，也删不到。")
                 .font(.caption)
                 .foregroundColor(.secondary)
         }
@@ -1038,7 +1039,7 @@ struct ContentView: View {
                     .font(.caption)
                     .foregroundColor(.secondary)
             } else {
-                Text("空的。点「选视频」从「文件」app 里挑一段。")
+                Text("空的。点「选视频」从相册里挑一段。")
                     .font(.caption)
                     .foregroundColor(.secondary)
             }
@@ -1092,7 +1093,8 @@ struct ContentView: View {
 
     /// 开跑前把账摊在按钮旁边：音轨多长、链子大概要多久。系数是真机量的，不是估的。
     private var videoEstimateLine: String {
-        guard let i = videoProbe, i.audioSecs > 0 else { return "还没选视频" }
+        guard let i = videoProbe else { return "还没选视频" }
+        guard i.audioSecs > 0 else { return "这一条没有音轨 ⇒ 没东西可换，重选一段有声音的" }
         return String(format: "%.0f s 音轨 ≈ %.1f 分钟链子", i.audioSecs, i.audioSecs / 2.5 / 60)
     }
 

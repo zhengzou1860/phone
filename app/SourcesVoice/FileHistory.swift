@@ -11,7 +11,7 @@ import Foundation
 /// `samples/` 是音色条件（那条清单自己已经有「删」按钮）。
 enum FileHistory {
     enum Kind: String, CaseIterable, Identifiable {
-        /// `pick_` 既可能是音频也可能是视频（视频换声选的片源走同一个拷贝入口、同一个前缀），
+        /// `pick_` 既可能是音频也可能是视频（音频走「选文件」、视频走相册，两个入口同一个前缀、同一个落点），
         /// 所以这一格的名字必须两种都能对上，不然他在清理页看到一个 mp4 躺在「源音频」下会以为显示错了。
         case source = "源（音频/视频）"
         case raw = "中间音频（系统原声）"
