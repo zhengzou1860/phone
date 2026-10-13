@@ -292,7 +292,10 @@ enum SwapClip {
             + "下边不再内收，下巴剖面折进遮罩后整张在 224 里高斯糊一次（σ=4，本机八臂的 G 那一格）｜"
             + "补丁＝逐帧网自己混好的 out｜这一版补丁加一档美白＝Lab 里 L×1.06+4.31、a×0.90、b×0.92（＝beauty_ab 第 1 列，本机逐像素对拍最大 5 灰阶）｜"
             + "下巴伸出补丁那 12 行＝这一帧对齐后原片的末行（0.17 及以前是补丁自己的末行）｜"
-            + "五官加深 γ、高频回填、可调透明度遮罩三样这一版都不在（退回第一版的贴法）")
+            + "美白之前先搬一档高频＝把这一帧对齐原片自己的 σ=0.8 高通按 λ=1.0 加回补丁"
+            + "（本机 tools/quality_ab.py 六帧：高频能量比 0.299→0.501，而「不进网、只走 224 重采样」那一格只有 0.410"
+            + "＝这块分辨率天花板被这一档翻过去；↔源 0.784→0.768）｜"
+            + "五官加深 γ、可调透明度遮罩两样这一版不在（退回第一版的贴法）")
 
         let fm = FileManager.default
         let dir = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
@@ -392,7 +395,7 @@ enum SwapClip {
         }
 
         var detectMs: [Double] = [], alignMs: [Double] = [], netMs: [Double] = [], pasteMs: [Double] = []
-        var beautyMs: [Double] = [], maskMs: [Double] = []
+        var beautyMs: [Double] = [], detailMs: [Double] = [], maskMs: [Double] = []
         var appendMs: [Double] = [], decodeMs: [Double] = [], sampleMs: [Double] = [], resids: [Double] = []
         var resids224: [Double] = [], facePx: [Double] = []
         var cosList: [String] = []
@@ -555,6 +558,9 @@ enum SwapClip {
                                 netMs.append(r.ms)
                                 gen = r.out
                                 rawMask = r.mask
+                                let td = DispatchTime.now().uptimeNanoseconds
+                                SwapGeo.restoreDetail(&gen, att, lam: 1.0, sigma: 0.8)
+                                detailMs.append(Double(DispatchTime.now().uptimeNanoseconds - td) / 1_000_000)
                                 let tb = DispatchTime.now().uptimeNanoseconds
                                 SwapGeo.whiten(&gen, side: side)
                                 beautyMs.append(Double(DispatchTime.now().uptimeNanoseconds - tb) / 1_000_000)
@@ -714,13 +720,13 @@ enum SwapClip {
         let size = (attrsOfOut?[.size] as? NSNumber)?.int64Value ?? 0
         let wall = Double(DispatchTime.now().uptimeNanoseconds - wall0) / 1_000_000_000
         let madeSec = Double(made) / max(src.fps, 1)
-        let perFrame = avg(decodeMs) + avg(detectMs) + avg(alignMs) + avg(netMs) + avg(beautyMs) + avg(maskMs) + avg(pasteMs) + avg(appendMs)
+        let perFrame = avg(decodeMs) + avg(detectMs) + avg(alignMs) + avg(netMs) + avg(detailMs) + avg(beautyMs) + avg(maskMs) + avg(pasteMs) + avg(appendMs)
         say("换完 \(made) 帧（编码器头/尾 \(SwapUtil.ms(tailMs))）"
             + "｜成片 \(String(format: "%.1f", Double(size) / 1_048_576)) MB"
             + "｜缓冲 池子给 \(made - poolMiss)／自造 \(poolMiss)"
             + "｜\(why.isEmpty ? "跑到末尾" : why)")
         say("单价 解码 \(SwapUtil.stat(decodeMs))｜检测 \(SwapUtil.stat(detectMs))｜对齐 \(SwapUtil.stat(alignMs))")
-        say("      逐帧网 \(SwapUtil.stat(netMs))｜美白 \(SwapUtil.stat(beautyMs))｜羽化 \(SwapUtil.stat(maskMs))｜回贴 \(SwapUtil.stat(pasteMs))｜提交 \(SwapUtil.stat(appendMs))")
+        say("      逐帧网 \(SwapUtil.stat(netMs))｜高频回填 \(SwapUtil.stat(detailMs))｜美白 \(SwapUtil.stat(beautyMs))｜羽化 \(SwapUtil.stat(maskMs))｜回贴 \(SwapUtil.stat(pasteMs))｜提交 \(SwapUtil.stat(appendMs))")
         say("      \(runner.statsLine())")
         say("总耗时 \(String(format: "%.1f", wall)) s（素材实到 \(String(format: "%.1f", madeSec)) s）"
             + "＝\(String(format: "%.2f", wall / max(madeSec, 0.01)))× 实时｜每帧合计 \(String(format: "%.1f", perFrame)) ms"

@@ -374,6 +374,49 @@ enum SwapGeo {
         }
     }
 
+    /// 把这一帧对齐原片自己的高频（σ=0.8 高通＝毛孔/胡茬那一档颗粒）按 lam 倍搬回补丁。
+    /// 为什么非做不可：他这条片脸 738 px，224 要撑 3.29×，「不进网只走 224 重采样」那格的高频能量比也只有
+    /// 0.410（本机 6 帧，tools/quality_ab.py）＝这颗网的分辨率天花板，贴法／遮罩／羽化都翻不过去；
+    /// 回填 λ=1.0 到 0.501（比那块天花板还高，因为它绕开了 224 那道采样）、λ=0.5 到 0.392（正好贴到天花板），
+    /// 身份 ↔源 0.784→0.768／0.778，缝 L 2.33→2.22。σ 不能再宽：0.6 那版试过 σ=2，连着额头褶/法令纹一起搬＝他一眼判「完全没遮住」。
+    /// 高斯核宽按 cv2 的口径由 σ 现算（2·round(3σ)+1），边界 BORDER_REFLECT_101，末尾 clip 0~1 同 cv2 存 8 位。
+    static func restoreDetail(_ gen: inout [Float], _ att: [Float], lam: Float, sigma: Double = 0.8) {
+        let s = size, plane = s * s
+        let kr = Int((sigma * 3).rounded())
+        let k = 2 * kr + 1
+        var kw = [Float](repeating: 0, count: k)
+        var sum: Float = 0
+        for i in 0..<k {
+            let x = Double(i - kr) / sigma
+            kw[i] = Float(exp(-0.5 * x * x)); sum += kw[i]
+        }
+        for i in 0..<k { kw[i] /= sum }
+        func refl(_ i: Int) -> Int { i < 0 ? -i : (i >= s ? 2 * s - 2 - i : i) }
+        var tmp = [Float](repeating: 0, count: plane)
+        var blr = [Float](repeating: 0, count: plane)
+        for p in 0..<3 {
+            let o = p * plane
+            for y in 0..<s {
+                for x in 0..<s {
+                    var v: Float = 0
+                    for i in 0..<k { v += kw[i] * att[o + refl(y - kr + i) * s + x] }
+                    tmp[y * s + x] = v
+                }
+            }
+            for y in 0..<s {
+                for x in 0..<s {
+                    var v: Float = 0
+                    for i in 0..<k { v += kw[i] * tmp[y * s + refl(x - kr + i)] }
+                    blr[y * s + x] = v
+                }
+            }
+            for i in 0..<plane {
+                let v = gen[o + i] + lam * (att[o + i] - blr[i])
+                gen[o + i] = v < 0 ? 0 : (v > 1 ? 1 : v)
+            }
+        }
+    }
+
     /// 他点名要的那一格＝tools/beauty_ab.py 第 1 列「美白」：只动补丁的明度与偏色，几何、遮罩、贴法一概不碰。
     /// 本机没有 8 位 LAB 可走（补丁在手里是 planar RGB 0~1 float），所以 sRGB↔Lab(D65) 自己换算。
     /// 加数 100*11/255 ＝ PC 那句「uint8 的 L 加 11」折到 0~100 口径；与那一列逐像素对拍最大 5 灰阶
