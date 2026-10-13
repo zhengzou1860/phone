@@ -386,7 +386,7 @@ jobs:
           gh release download voice-models -p 'models-fp16.zip' -D /tmp \
             --repo "$GITHUB_REPOSITORY"
           ls -l /tmp/models-fp16.zip
-          echo "6304efb1444d2b76210ee0d001fcf60393bd09e7cef27f7673ef62ca278450a4  /tmp/models-fp16.zip" \
+          echo "2f0737d541593a128ee8fc07f460cbe096a15f83d1caf09a189413d215c32d28  /tmp/models-fp16.zip" \
             | shasum -a 256 -c -
           rm -rf /tmp/models && mkdir -p /tmp/models
           # 条目全在 zip 根目录（和手机端 ModelManager 探测 Documents/voice_models/*.onnx 同一口径）
