@@ -179,6 +179,8 @@ final class VoiceEngine {
         var fitRate: Double
         var passes: Int
         var mux: VideoClip.MuxResult
+        /// 成片真正落在哪儿：口径表里 `mov` 那两组会换扩展名，调用方不能再拿自己拼的那个名字。
+        var outURL: URL
     }
 
     /// 一条视频每秒音频在手机上要占的**常驻**：源 Float 64 KB（16k × 4 B）
@@ -322,8 +324,35 @@ final class VoiceEngine {
             }
 
             onStage("回写画面（一个像素都不动，只换声音）…")
-            let mux = try VideoClip.mux(video: inputVideo, audioWav: fitWav,
-                                        out: outputVideo, say: VoiceJournal.line)
+            // 真机上「哪一组口径配得出成片」我手上没有数：这台机器上从没让 AVAssetWriter 编过音轨，
+            // 0.1/32 那一跑就死在 writer failed「Cannot Encode Media」。所以按兼容性从好到差挨个试，
+            // 成哪组用哪组，每组的判决都留在日志里——下一趟就不用再猜了。
+            var mux: VideoClip.MuxResult? = nil
+            var landed = outputVideo
+            var lastErr = ""
+            for cfg in VideoClip.candidates {
+                let target = cfg.ext == outputVideo.pathExtension
+                    ? outputVideo
+                    : outputVideo.deletingPathExtension().appendingPathExtension(cfg.ext)
+                do {
+                    mux = try VideoClip.mux(video: inputVideo, audioWav: fitWav,
+                                            out: target, cfg: cfg, say: VoiceJournal.line)
+                    landed = target
+                    break
+                } catch {
+                    lastErr = error.localizedDescription
+                    VoiceJournal.line("换口径：\(lastErr)")
+                    onStage("这一组配不出来，换下一组…")
+                }
+            }
+            guard let won = mux else {
+                let tried = VideoClip.candidates.map { $0.name }.joined(separator: "、")
+                throw ChainError.input("四组口径全配不出来（试过 \(tried)）｜最后一句：\(lastErr)")
+            }
+            if landed.path != outputVideo.path {
+                try? FileManager.default.removeItem(at: outputVideo)
+                VoiceJournal.line("原打算叫 \(outputVideo.lastPathComponent)，换成 \(landed.lastPathComponent)")
+            }
 
             var temps = [chainWav]
             if fitWav.path != chainWav.path { temps.append(fitWav) }
@@ -336,13 +365,14 @@ final class VoiceEngine {
                 }
             }
 
-            VoiceJournal.line(String(format: "视频换声完成：%d 片／转换 %.2f s／对齐 %.2f s／墙钟 %.1f s → %@ %.1f MB",
+            VoiceJournal.line(String(format: "视频换声完成：%d 片／转换 %.2f s／对齐 %.2f s／墙钟 %.1f s"
+                                     + "／口径 \(won.cfgName) → %@ %.1f MB",
                                      passes, convSecs, fitSecs, Date().timeIntervalSince(t0),
-                                     outputVideo.lastPathComponent,
-                                     Double(mux.bytes) / 1_048_576))
+                                     landed.lastPathComponent,
+                                     Double(won.bytes) / 1_048_576))
             return VideoResult(sourceSeconds: Double(source.count) / AudioProcessor.sampleRate,
                                convertedSeconds: convSecs, fitSeconds: fitSecs, fitRate: rate,
-                               passes: passes, mux: mux)
+                               passes: passes, mux: won, outURL: landed)
         }.value
     }
 

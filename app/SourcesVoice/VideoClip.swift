@@ -8,9 +8,9 @@ import CoreMedia
 /// 为什么画面走**透传**：这一条线一个像素都不动，只换声音 ⇒ 不解码不重编，
 /// 原样把码流块交给 muxer（`outputSettings: nil` + 轨自己的 formatDescriptions 当提示）。
 /// 同一棵树上的换脸线已经拿这套写法在真机把音频原样搬通过（app/SourcesSwap/SwapClip.swift:347-378），
-/// 那里音频是透传、画面是重编；这里反过来：画面透传、音频重编成 AAC。
-/// 透传的代价是源必须是本机 muxer 收得出的编码，认不认得当场问 `writer.canAdd`，
-/// 不认得就一行话报出去——不能等链子跑完几分钟才发现出不了片。
+/// 那里音频是透传、画面是重编；这里反过来。反过来这一半真机上没验过，所以不在一种口径上押死：
+/// 容器（mp4／mov）× 音轨（AAC／原样 PCM）四组按兼容性从好到差挨个试，成哪组用哪组。
+/// `canAdd` 只回答「加不加得进去」，配不出来是跑到一半的事 ⇒ 每组的失败都带 domain#code 进日志。
 ///
 /// 音频读的是 `withAudioBufferList`：AVFoundation 在闭包里给一份**保证连续**的 AudioBufferList，
 /// 所以不用自己碰 CMBlockBuffer 那几个 C 函数。采样率/声道也一并写进 outputSettings，
@@ -144,11 +144,46 @@ enum VideoClip {
         var bytes: Int64 = 0
         var wall = 0.0
         var note = ""
+        /// 成片实际是用哪一组口径配出来的（`candidates` 里那一个名字）。
+        var cfgName = ""
     }
 
-    /// 每秒成片在盘上大概占多少：画面按输入那条的码率现算，音频按 8 KB/秒（64 kbps AAC）。
-    /// 界面开跑前要报这个账，因为这是唯一一份「删不掉也不能留」的大件。
-    static let aacBytesPerSecond: Double = 8_000
+    /// 一次回写用的口径：容器 + 音轨输出设置 + 界面认得的扩展名。
+    struct MuxCfg {
+        let name: String
+        let ext: String
+        let fileType: AVFileType
+        let audioSettings: [String: Any]
+    }
+
+    static let aacSettings: [String: Any] = [
+        AVFormatIDKey: kAudioFormatMPEG4AAC,
+        AVSampleRateKey: AudioProcessor.sampleRate,
+        AVNumberOfChannelsKey: 1,
+        AVEncoderBitRateKey: 64_000,
+    ]
+
+    /// 不编音轨：样本原样进容器。真机上「编音轨」这一格从没通过（换脸线是原样透传旧音轨、
+    /// VR 线只编画面），所以留这条退路。
+    static let pcmSettings: [String: Any] = [
+        AVFormatIDKey: kAudioFormatLinearPCM,
+        AVSampleRateKey: AudioProcessor.sampleRate,
+        AVNumberOfChannelsKey: 1,
+        AVLinearPCMBitDepthKey: 16,
+        AVLinearPCMIsFloatKey: false,
+        AVLinearPCMIsNonInterleaved: false,
+        AVLinearPCMIsBigEndianKey: false,
+    ]
+
+    /// 按「他拿去播的兼容性」从好到差排：mp4 在前，AAC 在前。0.1/32 那一跑死在
+    /// `writer failed Cannot Encode Media`，日志分不出是容器不收这条画面码流还是音轨编码器起不来
+    /// ⇒ 一趟里挨个试这四组，成哪组用哪组，每组失败的 domain#code 都留在日志里当判决。
+    static let candidates: [MuxCfg] = [
+        MuxCfg(name: "mp4+AAC", ext: "mp4", fileType: .mp4, audioSettings: aacSettings),
+        MuxCfg(name: "mov+AAC", ext: "mov", fileType: .mov, audioSettings: aacSettings),
+        MuxCfg(name: "mp4+PCM", ext: "mp4", fileType: .mp4, audioSettings: pcmSettings),
+        MuxCfg(name: "mov+PCM", ext: "mov", fileType: .mov, audioSettings: pcmSettings),
+    ]
 
     /// 把 `audioWav` 装到 `video` 原来那条画面上，落 `out`。
     ///
@@ -156,7 +191,10 @@ enum VideoClip {
     /// muxer 按时间交错写盘，音轨前沿落到画面后头编码器就不收画面了——老写法只在 append 成功之后
     /// 才喂音频，于是不收 ⇒ 不喂 ⇒ 互等 15 秒死掉（app/SourcesSwap/SwapClip.swift:409-415 那段注释）。
     /// 所以这里每搬一块画面前先把音频往前喂 2 秒，卡在队列上也照样继续喂。
-    static func mux(video: URL, audioWav: URL, out: URL, say: (String) -> Void) throws -> MuxResult {
+    ///
+    /// `cfg` 决定容器和音轨输出口径（调用方从 `candidates` 里按顺序挑，不成换下一组）。
+    static func mux(video: URL, audioWav: URL, out: URL, cfg: MuxCfg,
+                    say: (String) -> Void) throws -> MuxResult {
         let fm = FileManager.default
         try? fm.removeItem(at: out)
         let t0 = Date()
@@ -181,17 +219,21 @@ enum VideoClip {
         }
         reader.add(vOut)
 
-        guard let writer = try? AVAssetWriter(outputURL: out, fileType: .mp4) else {
-            throw ChainError.input("AVAssetWriter 建不起来（\(out.lastPathComponent)）")
+        say("回写口径 \(cfg.name)｜画面子类型 \(fourcc(hint))｜片源 \(video.lastPathComponent)")
+
+        guard let writer = try? AVAssetWriter(outputURL: out, fileType: cfg.fileType) else {
+            throw ChainError.input("AVAssetWriter 建不起来（\(out.lastPathComponent)，容器 \(cfg.fileType.rawValue)）")
         }
         let vin = AVAssetWriterInput(mediaType: .video, outputSettings: nil, sourceFormatHint: hint)
         vin.expectsMediaDataInRealTime = false
         guard writer.canAdd(vin) else {
-            throw ChainError.input("canAdd 为假：这条画面轨的编码本机 muxer 不收（子类型 \(fourcc(hint))）")
+            try? fm.removeItem(at: out)
+            throw ChainError.input("canAdd 为假［\(cfg.name)］：这条画面码流（\(fourcc(hint))）本机 muxer 不收"
+                                   + "｜\(errText(writer.error))")
         }
         writer.add(vin)
 
-        // 新音轨：链子写好的 wav 用第二个 reader 读回 PCM 块，writer 那条输入带 AAC 的 outputSettings
+        // 新音轨：链子写好的 wav 用第二个 reader 读回 PCM 块，writer 那条输入带 cfg 给的输出口径
         // ⇒ 重编发生在 writer 内部，这里一块样本都不用自己拼。
         let wAsset = AVURLAsset(url: audioWav)
         guard let wTrack = wAsset.tracks(withMediaType: .audio).first else {
@@ -205,34 +247,39 @@ enum VideoClip {
             throw ChainError.input("\(audioWav.lastPathComponent) 的输出生不出来")
         }
         wReader.add(aOut)
-        let ain = AVAssetWriterInput(mediaType: .audio, outputSettings: [
-            AVFormatIDKey: kAudioFormatMPEG4AAC,
-            AVSampleRateKey: AudioProcessor.sampleRate,
-            AVNumberOfChannelsKey: 1,
-            AVEncoderBitRateKey: 64_000,
-        ])
+        let ain = AVAssetWriterInput(mediaType: .audio, outputSettings: cfg.audioSettings)
         ain.expectsMediaDataInRealTime = false
         guard writer.canAdd(ain) else {
-            throw ChainError.input("canAdd 为假：16k 单声道 64 kbps AAC 这条输出本机不收")
+            throw ChainError.input("canAdd 为假［\(cfg.name)］：16k 单声道这条音轨输出本机不收"
+                                   + "｜\(errText(writer.error))")
         }
         writer.add(ain)
 
         do { try writer.startWriting() } catch {
             reader.cancelReading()
             try? fm.removeItem(at: out)
-            throw ChainError.input("startWriting 抛错：\(error.localizedDescription)")
+            throw ChainError.input("startWriting 抛错［\(cfg.name)］：\(errText(error))")
         }
         writer.startSession(atSourceTime: .zero)
         // 不显式开读，copyNextSampleBuffer 第一下就回 nil ⇒ 看起来「跑完了」其实 0 帧
         guard reader.startReading() else {
             writer.cancelWriting()
             try? fm.removeItem(at: out)
-            throw ChainError.input("画面 startReading 失败：\(reader.error?.localizedDescription ?? "-")")
+            throw ChainError.input("画面 startReading 失败：\(readerName(reader.status)) \(errText(reader.error))")
         }
         guard wReader.startReading() else {
             writer.cancelWriting()
             try? fm.removeItem(at: out)
-            throw ChainError.input("音频 startReading 失败：\(wReader.error?.localizedDescription ?? "-")")
+            throw ChainError.input("音频 startReading 失败：\(readerName(wReader.status)) \(errText(wReader.error))")
+        }
+        // 死在配置阶段还是跑到一半是两回事。上一版没这一道，日志只剩一句 writer failed，
+        // 于是「容器不收这条画面码流」和「音轨编码器起不来」两种可能分不开。
+        guard writer.status.rawValue == 1 else {
+            writer.cancelWriting()
+            try? fm.removeItem(at: out)
+            throw ChainError.input("开读之后 writer 就不是 writing 了［\(cfg.name)］："
+                                   + "\(writerName(writer.status)) \(errText(writer.error))"
+                                   + "｜音轨那份 \(audioWav.lastPathComponent)")
         }
 
         var frames = 0
@@ -277,11 +324,14 @@ enum VideoClip {
                     }
                 } else {
                     aNote = "第 \(aOK + 1) 块音频 append 被拒｜writer \(writerName(writer.status))"
-                        + " \(writer.error?.localizedDescription ?? "-")"
+                        + " \(errText(writer.error))｜这条输入 \(errText(ain.error))"
                     return
                 }
             }
-            if writer.status.rawValue != 1 { aNote = "writer 已不是 writing（\(writerName(writer.status))）" }
+            if writer.status.rawValue != 1 {
+                aNote = "writer 已不是 writing（\(writerName(writer.status))）\(errText(writer.error))"
+                    + "｜音轨这条输入 \(errText(ain.error))"
+            }
         }
 
         var why = ""
@@ -289,7 +339,7 @@ enum VideoClip {
             autoreleasepool {
                 guard let sb = vOut.copyNextSampleBuffer() else { why = "片源到末尾"; return }
                 guard reader.status.rawValue == 1 else {
-                    why = "画面 reader 状态 \(readerName(reader.status))：\(reader.error?.localizedDescription ?? "-")"
+                    why = "画面 reader 状态 \(readerName(reader.status))：\(errText(reader.error))"
                     return
                 }
                 let pts = CMSampleBufferGetPresentationTimeStamp(sb)
@@ -317,13 +367,15 @@ enum VideoClip {
                     Thread.sleep(forTimeInterval: 0.005)
                 }
                 if writer.status.rawValue != 1 {
-                    why = "writer 已经不是 writing（\(writerName(writer.status))）\(writer.error?.localizedDescription ?? "-")"
+                    let an = aNote.isEmpty ? "" : "｜\(aNote)"
+                    why = "writer 已经不是 writing（\(writerName(writer.status))）\(errText(writer.error))"
+                        + "｜搬到第 \(frames) 块画面、音频 \(aOK) 块\(an)"
                     return
                 }
                 // 透传：块原样交出去，时间戳一个数都不改（改了成片就和原片口型对不上）。
                 // 也不能 CMSampleBufferInvalidate——append 只是入队，取数据在另一条线程上。
                 if !vin.append(sb) {
-                    why = "第 \(frames) 块画面 append 被拒：\(writer.error?.localizedDescription ?? "-")"
+                    why = "第 \(frames) 块画面 append 被拒｜\(errText(writer.error))｜画面这条输入 \(errText(vin.error))"
                     return
                 }
                 frames += 1
@@ -346,24 +398,27 @@ enum VideoClip {
         sem.wait()
         guard writer.status.rawValue == 2 else {      // 2 = completed
             try? fm.removeItem(at: out)
-            throw ChainError.input("成片没收尾：writer \(writerName(writer.status))"
-                                   + " \(writer.error?.localizedDescription ?? "-")（\(why)）")
+            throw ChainError.input("成片没收尾［\(cfg.name)］：writer \(writerName(writer.status))"
+                                   + " \(errText(writer.error))｜画面 \(frames) 块／音频 \(aOK) 块"
+                                   + "｜画面那条 \(errText(vin.error))｜音轨那条 \(errText(ain.error))"
+                                   + "｜\(why)")
         }
         // 中途停（队列不收／append 被拒）时 finishWriting 也能 completed，但那份文件画面短了一截 ⇒ 不算成功
         if why != "片源到末尾" {
             try? fm.removeItem(at: out)
-            throw ChainError.input("画面只搬了 \(frames) 块就停：\(why)")
+            throw ChainError.input("画面只搬了 \(frames) 块就停［\(cfg.name)］：\(why)")
         }
 
         let bytes = ((try? fm.attributesOfItem(atPath: out.path))?[.size] as? NSNumber)?.int64Value ?? 0
         let wall = Date().timeIntervalSince(t0)
         let tail = aNote.isEmpty ? "" : "｜\(aNote)"
-        say(String(format: "回写完成：画面 %d 块 + 音频 %d 块 → %@ %.1f MB／%.1f s"
+        say(String(format: "回写完成［%@］：画面 %d 块 + 音频 %d 块 → %@ %.1f MB／%.1f s"
             + "｜容器时长 %@ s｜头一块画面起点 %@ ms／音频 %@ ms",
-            frames, aOK, out.lastPathComponent, Double(bytes) / 1_048_576, wall,
+            cfg.name, frames, aOK, out.lastPathComponent, Double(bytes) / 1_048_576, wall,
             String(format: "%.2f", secs(asset.duration)), firstV, firstA) + tail)
         return MuxResult(frames: frames, audioBlocks: aOK,
-                         outSeconds: secs(asset.duration), bytes: bytes, wall: wall, note: aNote)
+                         outSeconds: secs(asset.duration), bytes: bytes, wall: wall,
+                         note: aNote, cfgName: cfg.name)
     }
 
     /// FourCC 打成人看的四个字符（h264／hev1／mp4a…），报「本机收不收这条编码」时得说得出是哪路。

@@ -1134,14 +1134,15 @@ struct ContentView: View {
                 })
                 let wall = Date().timeIntervalSince(t0)
                 await MainActor.run {
-                    videoOutURL = output
+                    videoOutURL = r.outURL
                     isVideoing = false
                     history = FileHistory.scan()
-                    videoNote = String(format: "换完：%d 片／音轨 %.1f s → 链子 %.1f s → 对齐 %.1f s（倍率 %.5f）｜成片画面 %d 块＋音频 %d 块／%.1f MB｜墙钟 %.0f s",
+                    videoNote = String(format: "换完：%d 片／音轨 %.1f s → 链子 %.1f s → 对齐 %.1f s（倍率 %.5f）"
+                                       + "｜成片 \(r.mux.cfgName)：画面 %d 块＋音频 %d 块／%.1f MB／墙钟 %.0f s",
                                        r.passes, r.sourceSeconds, r.convertedSeconds, r.fitSeconds,
                                        r.fitRate, r.mux.frames, r.mux.audioBlocks,
                                        Double(r.mux.bytes) / 1_048_576, wall)
-                    videoStatus = r.mux.note.isEmpty ? "换声完成" : "音轨收尾：" + r.mux.note
+                    videoStatus = "换声完成（\(r.mux.cfgName)）｜音轨 \(r.mux.note)"
                     VoiceJournal.line("视频换声界面收尾：\(videoNote)")
                 }
             } catch {
