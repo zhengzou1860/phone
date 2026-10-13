@@ -4,12 +4,13 @@ import UIKit
 import UniformTypeIdentifiers
 
 /// 哪个槽在选文件。共用一个呈现，源槽和参考槽不再各挂一个 fileImporter。
-/// `text` 也走这一个呈现：读小说选的是 .txt/.md，不是音频，但呈现器只管把文件拿进来，
-/// 能不能用由我们自己验（见 `TextFile.load`）。
+/// `text` 和 `video` 也走这一个呈现：一个选的是 .txt/.md，一个选的是视频，都不是音频，
+/// 但呈现器只管把文件拿进来，能不能用由我们自己验（见 `TextFile.load`、`VideoClip.probe`）。
 enum PickSlot: String, Identifiable {
     case source
     case ref
     case text
+    case video
     /// 也借用这一个呈现：嗓音清单页（不是文件选择，见 body 里那个 if）。
     case voice
     /// 同上：历史文件清理页。
@@ -65,6 +66,18 @@ struct ContentView: View {
     @State private var readNote = ""
     @State private var rawTTSURL: URL?
 
+    // 视频换声：一段视频 → 解出音轨 → 现有样本那条链 → 装回原来那条画面（一个像素不动）。
+    // 音色来源和读小说一样：要么清单里点中的样本，要么 ② 那段参考。
+    @State private var videoURL: URL?
+    /// 选完就地读一次文件头（`VideoClip.probe`），所以这里存的是体检数本身，界面上那行和开跑前的预算都从它算。
+    @State private var videoProbe: VideoClip.Info?
+    @State private var videoOutURL: URL?
+    @State private var isVideoing = false
+    @State private var videoStatus = ""
+    @State private var videoNote = ""
+    /// 和音频那条的 `showShare` 分开：一个开关同时挂两个 sheet，弹起来的是哪一个全看 SwiftUI 的心情。
+    @State private var showVideoShare = false
+
     /// 历史文件清理页：Documents 根目录里留下的源/中间/成品。
     /// `wipeArmed` 是「全部删除」的第一次按下 —— 删的是他的录音，一指点没了找不回来，要连点两次。
     @State private var history: [FileHistory.Item] = []
@@ -87,6 +100,7 @@ struct ContentView: View {
                         }
                         convertSection
                         novelSection
+                        videoSection
                         if let url = outputURL {
                             playbackSection(url: url)
                         }
@@ -115,8 +129,8 @@ struct ContentView: View {
         }
     }
 
-    /// 一个呈现四种内容：`.voice` 是自己铺的嗓音清单、`.history` 是自己铺的历史文件清单，
-    /// 其余三个槽还是系统文件选择器。
+    /// 一个呈现六种内容：`.voice` 是自己铺的嗓音清单、`.history` 是自己铺的历史文件清单，
+    /// 其余四个槽（①②／文本／视频）还是系统文件选择器。
     /// 分支写在带 `@ViewBuilder` 的函数里，不赌 `fullScreenCover` 那个闭包是不是 ViewBuilder。
     @ViewBuilder
     private func coverPage(_ slot: PickSlot) -> some View {
@@ -128,6 +142,8 @@ struct ContentView: View {
             DocumentPickerHost(onPick: { url in
                 if slot == .text {
                     loadNovelFile(url)
+                } else if slot == .video {
+                    videoURL = copyInVideo(url)
                 } else {
                     let got = copyIn(url)
                     if slot == .source { sourceURL = got } else { refURL = got }
@@ -343,6 +359,31 @@ struct ContentView: View {
                       Double(frames) / fmt.sampleRate)
     }
 
+    /// 视频的固化副本。和音频一样必须先拷进 Documents：asCopy 给的临时区随时会被清，
+    /// 而这条线要把同一个文件读两遍（解音轨一遍、回写画面一遍），中间隔着几分钟的链子。
+    /// 拷完就地读一次文件头（只读头、不解码，几百毫秒），选错了东西当场就知道，不用等开跑。
+    private func copyInVideo(_ src: URL) -> URL? {
+        let ext = src.pathExtension.isEmpty ? "mp4" : src.pathExtension
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+        let dest = docs.appendingPathComponent("pick_\(Int(Date().timeIntervalSince1970)).\(ext)")
+        do {
+            try? FileManager.default.removeItem(at: dest)
+            try FileManager.default.copyItem(at: src, to: dest)
+            let info = VideoClip.probe(dest)
+            videoProbe = info
+            videoNote = ""
+            pickNote = "已拷进 app：" + dest.lastPathComponent + "／" + info.line
+            history = FileHistory.scan()
+            VoiceJournal.line("选视频 \(src.lastPathComponent) → \(dest.lastPathComponent)：\(info.line)")
+            return dest
+        } catch {
+            pickNote = "拷视频失败：" + error.localizedDescription
+            videoProbe = nil
+            VoiceJournal.line("拷选中的视频失败：\(error.localizedDescription)")
+            return nil
+        }
+    }
+
     // MARK: - 样本动作
 
     private func makeSampleFromRef() {
@@ -419,11 +460,11 @@ struct ContentView: View {
                                   + FileHistory.human(FileHistory.total(history)))
                 pickSlot = .history
             } label: {
-                Text(history.isEmpty ? "查看并清空（app 目录里没有留下的音频）"
+                Text(history.isEmpty ? "查看并清空（app 目录里没有留下的文件）"
                                      : "查看并清空（\(history.count) 个 / \(FileHistory.human(FileHistory.total(history)))）")
             }
             .buttonStyle(.bordered)
-            Text("「选文件」拷进来的、录的、系统原声、转换成品都一直留在 app 目录里，播完不会自动删 ⇒ 「文件」app 里直接翻得到。这页逐条删、整类删、一键清空。模型目录（581 MB）、voice_log.txt、样本清单不在这页里，也删不到。")
+            Text("「选文件」拷进来的音频和视频、录的、系统原声、转换成品、换了声的成片都一直留在 app 目录里，播完不会自动删 ⇒ 「文件」app 里直接翻得到。这页逐条删、整类删、一键清空。模型目录（581 MB）、voice_log.txt、样本清单不在这页里，也删不到。")
                 .font(.caption)
                 .foregroundColor(.secondary)
         }
@@ -453,7 +494,7 @@ struct ContentView: View {
                     historyGroup(k)
                 }
                 if history.isEmpty {
-                    Text("空的：app 目录里没有留下的音频。")
+                    Text("空的：app 目录里没有留下的文件。")
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
@@ -510,10 +551,10 @@ struct ContentView: View {
         }
     }
 
-    /// 界面上四个槽现在指着哪些文件（删掉时要一起清引用，清单里也要标出来）。
+    /// 界面上这些槽现在指着哪些文件（删掉时要一起清引用，清单里也要标出来）。
     private var currentPaths: Set<String> {
         var s = Set<String>()
-        for u in [sourceURL, refURL, outputURL, rawTTSURL] {
+        for u in [sourceURL, refURL, outputURL, rawTTSURL, videoURL, videoOutURL] {
             if let u = u { s.insert(u.path) }
         }
         return s
@@ -548,6 +589,11 @@ struct ContentView: View {
         if let u = refURL, paths.contains(u.path) { refURL = nil }
         if let u = outputURL, paths.contains(u.path) { outputURL = nil }
         if let u = rawTTSURL, paths.contains(u.path) { rawTTSURL = nil }
+        if let u = videoURL, paths.contains(u.path) {
+            videoURL = nil
+            videoProbe = nil      // 体检数跟着片源走：不清的话界面会拿着上一条的秒数说下一条
+        }
+        if let u = videoOutURL, paths.contains(u.path) { videoOutURL = nil }
     }
 
     // MARK: - 模型状态
@@ -951,6 +997,160 @@ struct ContentView: View {
                     readNote = "没读成，原因在上面那一行。"
                     history = FileHistory.scan()
                     VoiceJournal.line("读小说失败：\(error.localizedDescription)")
+                }
+            }
+        }
+    }
+
+    // MARK: - ⑤ 视频换声（画面不动，只换音轨）
+
+    /// 六条动作共用的互斥位：任何一条在跑就不许再起点别的（手机上链子一次只吃得起一个）。
+    private var busyAnywhere: Bool {
+        isConverting || isReading || isVideoing || isMakingSample
+            || srcRec.isRecording || refRec.isRecording
+    }
+
+    @ViewBuilder
+    private var videoSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("视频换声（画面一个像素不动，只把音轨换成选中样本的音色）").font(.headline)
+
+            HStack(spacing: 12) {
+                Button("选视频") {
+                    VoiceJournal.line("点「选视频」槽=video")
+                    pickSlot = .video
+                }
+                .buttonStyle(.bordered)
+                .disabled(busyAnywhere)
+
+                Button(isVideoing ? "换声中…" : "开始换声") { startVideo() }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(videoURL == nil || busyAnywhere || (pickedID == nil && refURL == nil))
+                Spacer()
+                Text(videoEstimateLine)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+
+            if let u = videoURL {
+                let line = videoProbe?.line ?? "体检数没读到（重选一次）"
+                Text("当前：" + u.lastPathComponent + "／" + line)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            } else {
+                Text("空的。点「选视频」从「文件」app 里挑一段。")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+            if pickedID == nil && refURL == nil {
+                Text("没选样本、② 也空的 ⇒ 这一格不给按：视频里那个人本来就有的嗓子就是「自转换」，转给自己听没意义。")
+                    .font(.caption)
+                    .foregroundColor(.orange)
+            }
+
+            Text("音轨解出来进的就是上面 ①②③④ 那条链，和「转换」「读小说」同一套分段规矩（一遍 ≤150 s，切在最小声的一格）；音高那格同样生效。实测单价：链子 ≈2.5× 实时 ⇒ 60 s 视频约 24 s 链子＋几秒回写。画面走**透传**：不解码不重编，时间戳一个数都不改，所以口型不会漂；成片体积 ≈ 输入那条另加每秒 8 KB 的新 AAC。链子的输出比源长 +0.15%（PC 试点量的），所以后面有一步「整条拉回源长」，40 s 以上的片子不拉就会累积漂 0.06 s。上限取盘和内存更紧的一条（中间 wav 每秒共占 72 KB、另留 1 GB 余量，内存那条 ≈33 分钟），不够会开跑之前一行话拒掉，不写一半把盘填满。中间那两份 wav 跑成即删；成品留在 app 目录（「文件」app 的 Voice 里点开就能看），要收进相册就用「导出」。")
+                .font(.caption)
+                .foregroundColor(.secondary)
+
+            if isVideoing || !videoStatus.isEmpty {
+                Text(videoStatus)
+                    .font(.caption)
+                    .foregroundColor(isVideoing ? .secondary : .accentColor)
+                    .textSelection(.enabled)
+            }
+            if !videoNote.isEmpty {
+                Text(videoNote).font(.caption).foregroundColor(.orange)
+            }
+
+            if let out = videoOutURL {
+                HStack(spacing: 12) {
+                    Button {
+                        VoiceJournal.line("点「导出成片」 \(out.lastPathComponent)")
+                        showVideoShare = true
+                    } label: {
+                        Label("导出成片", systemImage: "square.and.arrow.up")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    Text("放不进界面里，用「导出」存进相册或「文件」")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
+                .sheet(isPresented: $showVideoShare) {
+                    ShareSheet(items: [out],
+                               onDismiss: { showVideoShare = false },
+                               onPresent: {
+                        VoiceJournal.line("视频导出面板已弹起（可「存储到“文件”」／存到相册）")
+                    })
+                }
+                Text(out.path)
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                    .textSelection(.enabled)
+            }
+        }
+    }
+
+    /// 开跑前把账摊在按钮旁边：音轨多长、链子大概要多久。系数是真机量的，不是估的。
+    private var videoEstimateLine: String {
+        guard let i = videoProbe, i.audioSecs > 0 else { return "还没选视频" }
+        return String(format: "%.0f s 音轨 ≈ %.1f 分钟链子", i.audioSecs, i.audioSecs / 2.5 / 60)
+    }
+
+    private func startVideo() {
+        guard let modelDir = models.modelDir, let input = videoURL else { return }
+        let picked = samples.first { $0.id == pickedID }
+        guard picked != nil || refURL != nil else {
+            videoNote = "先在「样本清单」点一个样本（或让 ② 有段参考音频）"
+            VoiceJournal.line("点「开始换声」但没选样本/参考")
+            return
+        }
+        isVideoing = true
+        videoStatus = "读文件头…"
+        videoNote = ""
+        videoOutURL = nil
+        let using: String
+        if let p = picked {
+            using = "样本「\(p.info.name)」"
+        } else {
+            using = "现场参考 \(refURL!.lastPathComponent)"
+        }
+        VoiceJournal.line(String(format: "点「开始换声」片源=%@ 音色=%@ 音高 %+.0f 半音",
+                                 input.lastPathComponent, using, semitones))
+        if engine == nil { engine = VoiceEngine(modelDir: modelDir) }
+        let eng = engine!
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+        let output = docs.appendingPathComponent("video_\(Int(Date().timeIntervalSince1970)).mp4")
+        let t0 = Date()
+
+        Task {
+            do {
+                let r = try await eng.processVideo(inputVideo: input,
+                                                   sample: picked,
+                                                   refWav: picked != nil ? nil : refURL,
+                                                   outputVideo: output,
+                                                   pitchCents: semitones * 100.0,
+                                                   onStage: { txt in
+                    DispatchQueue.main.async { videoStatus = txt }
+                })
+                let wall = Date().timeIntervalSince(t0)
+                await MainActor.run {
+                    videoOutURL = output
+                    isVideoing = false
+                    history = FileHistory.scan()
+                    videoNote = String(format: "换完：%d 片／音轨 %.1f s → 链子 %.1f s → 对齐 %.1f s（倍率 %.5f）｜成片画面 %d 块＋音频 %d 块／%.1f MB｜墙钟 %.0f s",
+                                       r.passes, r.sourceSeconds, r.convertedSeconds, r.fitSeconds,
+                                       r.fitRate, r.mux.frames, r.mux.audioBlocks,
+                                       Double(r.mux.bytes) / 1_048_576, wall)
+                    videoStatus = r.mux.note.isEmpty ? "换声完成" : "音轨收尾：" + r.mux.note
+                    VoiceJournal.line("视频换声界面收尾：\(videoNote)")
+                }
+            } catch {
+                await MainActor.run {
+                    isVideoing = false
+                    videoStatus = "失败：\(error.localizedDescription)"
+                    videoNote = "没换成，原因在上面那一行。中间那两份 wav 会留在盘上，下一趟开跑先扫掉，也可以在「历史文件」页删。"
+                    history = FileHistory.scan()
+                    VoiceJournal.line("视频换声失败：\(error.localizedDescription)")
                 }
             }
         }

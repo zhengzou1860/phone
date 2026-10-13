@@ -69,6 +69,55 @@ final class VoiceEngine {
         }.value
     }
 
+    /// 一条 16 kHz 单声道 Float 进链，按片「②③④ → 移调 → 落盘」。
+    ///
+    /// 为什么要分段：② 的绝对位置表只有 5000 行 ⇒ 一遍最多 200 s（`ChainDriver.encMaxFbankFrames`）。
+    /// 那条 8 分钟素材不是内存不够、也不是闪退，就是走到第 1000 窗撞了这面墙。
+    /// 切法和读小说一致：每片各跑一遍进链，编码器缓存只在切点清零 ⇒ 刀要落在停顿上才听不见接缝。
+    ///
+    /// 音频转换和视频换声共用这一条：两边的分段规矩（硬顶、找安静那格、每片自己算峰值压回）
+    /// 一个字都不差，写两遍迟早分叉——到那时视频那条出的片口型偏了，查起来还得先对两份代码。
+    ///
+    /// `writer` 由调用方开着：峰值守卫是**每片**一次的，收尾（回填 wav 头）也归调用方。
+    static func runSegments(driver: ChainDriver, parts: ChainDriver.SampleParts,
+                            source: [Float], writer: AudioProcessor.WAVWriter,
+                            pitchCents: Double,
+                            onStage: (String) -> Void) throws -> (passes: Int, samples: Int) {
+        let totalSec = Double(source.count) / AudioProcessor.sampleRate
+        let passSamples = Int(convPassSeconds * AudioProcessor.sampleRate)
+        VoiceJournal.line(String(format: "转换预算：源 %.1f s ⇒ %d 片（每片 ≤%.0f s）",
+                                 totalSec, (source.count + passSamples - 1) / passSamples,
+                                 convPassSeconds))
+        if abs(pitchCents) > 1e-6 {
+            VoiceJournal.line(String(format: "后处理 音高 %+.0f 音分：每片各自移", pitchCents))
+        }
+        var start = 0
+        var passes = 0
+        var outSamples = 0
+        let t0 = Date()
+        while start < source.count {
+            let hardEnd = min(start + passSamples, source.count)
+            let end = hardEnd < source.count ? quietCut(source, target: hardEnd) : hardEnd
+            let chunk = Array(source[start..<end])
+            passes += 1
+            VoiceJournal.line(String(format: "转换第 %d 片：源 %.1f~%.1f s（进链 %.1f s／整条 %.1f s）",
+                                     passes, Double(start) / AudioProcessor.sampleRate,
+                                     Double(end) / AudioProcessor.sampleRate,
+                                     Double(chunk.count) / AudioProcessor.sampleRate, totalSec))
+            onStage(String(format: "第 %d 片进链（%.0f s 音频，整条 %.0f s）",
+                           passes, Double(chunk.count) / AudioProcessor.sampleRate, totalSec))
+            let shaped = PostProcessor.pitchShift(try driver.convert(source: chunk, sample: parts),
+                                                  cents: pitchCents)
+            try writer.append(shaped)
+            outSamples += shaped.count
+            start = end
+            onStage(String(format: "第 %d 片已落盘：累计 %.0f s（墙钟 %.0f s）",
+                           passes, Double(outSamples) / AudioProcessor.sampleRate,
+                           Date().timeIntervalSince(t0)))
+        }
+        return (passes, outSamples)
+    }
+
     /// inputWav: 用户要转换的那段
     /// sample / refWav: 目标音色，二选一（sample 优先）
     /// outputWav: 落盘路径
@@ -107,48 +156,193 @@ final class VoiceEngine {
                 throw ChainError.input("参考没准备起来")
             }
 
-            // 为什么要分段：② 的绝对位置表只有 5000 行 ⇒ 一遍最多 200 s（ChainDriver.encMaxFbankFrames）。
-            // 那条 8 分钟素材不是内存不够、也不是闪退，就是走到第 1000 窗撞了这面墙。
-            // 切法和读小说一致：每片各跑一遍「②③④ → 移调 → 落盘」，缓存只在切点清零 ⇒ 刀要落在停顿上。
-            let totalSec = Double(source.count) / AudioProcessor.sampleRate
-            let passSamples = Int(VoiceEngine.convPassSeconds * AudioProcessor.sampleRate)
-            VoiceJournal.line(String(format: "转换预算：源 %.1f s ⇒ %d 片（每片 ≤%.0f s）",
-                                     totalSec, (source.count + passSamples - 1) / passSamples,
-                                     VoiceEngine.convPassSeconds))
-            let writer = try AudioProcessor.WAVWriter(url: outputWav)
-            if abs(pitchCents) > 1e-6 {
-                VoiceJournal.line(String(format: "后处理 音高 %+.0f 音分：每片各自移", pitchCents))
-            }
-            var start = 0
-            var passes = 0
-            var outSamples = 0
             let t0 = Date()
-            while start < source.count {
-                let hardEnd = min(start + passSamples, source.count)
-                let end = hardEnd < source.count ? VoiceEngine.quietCut(source, target: hardEnd)
-                                                 : hardEnd
-                let chunk = Array(source[start..<end])
-                passes += 1
-                VoiceJournal.line(String(format: "转换第 %d 片：源 %.1f~%.1f s（进链 %.1f s／整条 %.1f s）",
-                                         passes, Double(start) / AudioProcessor.sampleRate,
-                                         Double(end) / AudioProcessor.sampleRate,
-                                         Double(chunk.count) / AudioProcessor.sampleRate, totalSec))
-                onStage(String(format: "第 %d 片进链（%.0f s 音频，整条 %.0f s）",
-                               passes, Double(chunk.count) / AudioProcessor.sampleRate, totalSec))
-                let shaped = PostProcessor.pitchShift(try driver.convert(source: chunk, sample: parts),
-                                                      cents: pitchCents)
-                try writer.append(shaped)
-                outSamples += shaped.count
-                start = end
-                onStage(String(format: "第 %d 片已落盘：累计 %.0f s（墙钟 %.0f s）",
-                               passes, Double(outSamples) / AudioProcessor.sampleRate,
-                               Date().timeIntervalSince(t0)))
-            }
+            let writer = try AudioProcessor.WAVWriter(url: outputWav)
+            let (passes, outSamples) = try VoiceEngine.runSegments(
+                driver: driver, parts: parts, source: source, writer: writer,
+                pitchCents: pitchCents, onStage: onStage)
             try writer.finish()
             VoiceJournal.line(String(format: "转换完成：%d 片 → 输出 %.2f s／墙钟 %.1f s／%@（单片峰值最高 %.3f）",
                                      passes, Double(outSamples) / AudioProcessor.sampleRate,
                                      Date().timeIntervalSince(t0), outputWav.lastPathComponent,
                                      writer.maxPeak))
+        }.value
+    }
+
+    // MARK: - 视频换声（提音轨 → 现有样本链 → 回写原画面）
+
+    /// 一次视频换声的读数。`fitRate` 是对齐那一步实际用的倍率，1.0 = 没拉伸。
+    struct VideoResult {
+        var sourceSeconds: Double
+        var convertedSeconds: Double
+        var fitSeconds: Double
+        var fitRate: Double
+        var passes: Int
+        var mux: VideoClip.MuxResult
+    }
+
+    /// 一条视频每秒音频在手机上要占的**常驻**：源 Float 64 KB（16k × 4 B）
+    /// ＋对齐那一步 `timeStretch` 再造的 out／norm／结果三份同长 Float ≈ 256 KB/秒。
+    /// 按 `AudioProcessor.maxDecodeMB`（512 MB）那一格算 ⇒ 上限约 33 分钟；和链子本身无关，
+    /// 链子已经会按 ≤150 s 切片，常驻只有当前那一片。
+    static let videoArrayBytesPerSecond: Double = 256_000
+
+    /// 一条视频每秒在**盘上**要占的中间量：转换后 wav 32 KB ＋对齐 wav 32 KB ＋成片里的 AAC 8 KB
+    /// ＝ 72 KB/秒。画面那条是透传，所以成片的体积 ≈ 输入那条，单独立项扣掉。
+    static let videoTempBytesPerSecond: Double = 72_000
+
+    /// 上限取盘和内存两条里更紧的那一条，超线在开跑之前一行话拒掉（写一半把盘填满更难看）。
+    static func videoSecondsCap(dir: URL, inputBytes: Int64) -> Double {
+        let free = (try? dir.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]))?
+            .volumeAvailableCapacityForImportantUsage ?? 0
+        let room = max(0.0, Double(free) - 1_000_000_000.0 - Double(inputBytes))
+        let byDisk = room / videoTempBytesPerSecond
+        let byMemory = AudioProcessor.maxDecodeMB * 1e6 / videoArrayBytesPerSecond
+        return min(byDisk, byMemory)
+    }
+
+    /// 开跑前把上一轮没清掉的中间 wav 收一遍（崩在半路时它们留在盘上，`video_` 前缀归本条线）。
+    private static func sweepVideoTemps(dir: URL) -> Int64 {
+        let fm = FileManager.default
+        var reclaimed: Int64 = 0
+        for one in (try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.fileSizeKey],
+                                                options: [])) ?? [] {
+            let n = one.lastPathComponent
+            guard n.hasPrefix("video_"), n.hasSuffix("_chain.wav") || n.hasSuffix("_fit.wav") else { continue }
+            let sz = (try? one.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
+            if (try? fm.removeItem(at: one)) == nil { reclaimed += Int64(sz) }
+        }
+        if reclaimed > 0 {
+            VoiceJournal.line("先清掉上轮残留的对齐中间量 \(FileHistory.human(reclaimed))")
+        }
+        return reclaimed
+    }
+
+    /// 视频进链：音轨 → 现有分段链 → 拉回原长 → 装回原来那条画面。
+    ///
+    /// 画面一个像素都不动（透传，见 `VideoClip`），所以这一条比音频转换只多出两头：
+    /// 前面解音轨、后面回写。中间进链走的是和 `convert` **同一个** `runSegments`。
+    ///
+    /// 为什么中间要 `_chain.wav` 和 `_fit.wav` 两份：链子的输出帧数和源逐片对齐，
+    /// PC 试点量过整条 +0.15%（16.97 s → 17.00 s）——听着不多，但每 100 s 就差 0.15 s，
+    /// 一分钟以上的片子口型必偏。拉伸必须拿**整条**算一个倍率（按片各拉会把误差摊进每一片），
+    /// 而整条拉伸要一次读回全部样本 ⇒ 就得分成两个文件。跑完这两个都删掉。
+    ///
+    /// 音色来源和 `readNovel` 一样只有两条，且必须有：视频里那个人本来就有的嗓子就是「自转换」，
+    /// 转给自己听没意义。
+    func processVideo(inputVideo: URL, sample: SampleStore.Sample?, refWav: URL?,
+                      outputVideo: URL, pitchCents: Double = 0.0,
+                      onStage: @escaping (String) -> Void = { VoiceJournal.line($0) }) async throws -> VideoResult {
+        let dir = modelDir
+        return try await Task.detached(priority: .userInitiated) {
+            let name = inputVideo.lastPathComponent
+            let how: String
+            if let s = sample {
+                how = "样本「\(s.info.name)」"
+            } else if let r = refWav {
+                how = "现场参考 \(r.lastPathComponent)"
+            } else {
+                throw ChainError.input("既没在清单里选样本，也没有参考音频（视频这条路没有自转换）")
+            }
+            let info = VideoClip.probe(inputVideo)
+            VoiceJournal.line("VoiceEngine 视频换声开始 \(name) / \(how)／\(info.line)")
+            guard info.hasVideo else { throw ChainError.input("\(name) 里没有画面轨") }
+            guard info.hasAudio else { throw ChainError.input("\(name) 里没有音轨") }
+
+            let outDir = outputVideo.deletingLastPathComponent()
+            VoiceEngine.sweepVideoTemps(dir: outDir)
+            let cap = VoiceEngine.videoSecondsCap(dir: outDir, inputBytes: info.bytes)
+            guard info.audioSecs <= cap else {
+                throw ChainError.input(String(format: "%@ 的音轨 %.1f 分钟，这台机的盘和内存只够 %.1f 分钟"
+                                                + "（中间 wav 每秒共占 72 KB，成片另算 ≈ 输入那条的 \(FileHistory.human(info.bytes))，"
+                                                + "另留 1 GB 余量）⇒ 请先剪短再换声",
+                                              name, info.audioSecs / 60, cap / 60))
+            }
+            VoiceJournal.line(String(format: "视频预算：音轨 %.1f s／画面 %.1f s／容器 %.1f s／额度 %.1f s"
+                                        + "｜链子按 2.5× 实时估 ≈ %.0f s 墙钟",
+                                     info.audioSecs, info.videoSecs, info.containerSecs, cap,
+                                     info.audioSecs / 2.5))
+
+            onStage("解音轨（\(String(format: "%.0f", info.audioSecs)) s）…")
+            let source = try VideoClip.extractAudio(inputVideo, say: VoiceJournal.line)
+            let driver = try ChainDriver(modelDir: dir)
+            driver.onStage = { text in
+                VoiceJournal.line(text)
+                onStage(text)
+            }
+            let parts: ChainDriver.SampleParts
+            if let s = sample {
+                parts = try SampleStore.load(s)
+                onStage("音色用样本「\(s.info.name)」：跳过 ①，不载 sv 图")
+            } else if let r = refWav {
+                let reference = try AudioProcessor.loadWAV16K(r, maxSeconds: ChainDriver.svMaxSecs)
+                onStage("音色用现场参考 \(r.lastPathComponent)：读数 \(reference.count) 样本")
+                parts = try driver.makeSample(reference: reference)
+            } else {
+                throw ChainError.input("参考没准备起来")
+            }
+
+            let base = outputVideo.deletingPathExtension().lastPathComponent
+            let chainWav = outDir.appendingPathComponent(base + "_chain.wav")
+            let t0 = Date()
+            let writer = try AudioProcessor.WAVWriter(url: chainWav)
+            let (passes, outSamples) = try VoiceEngine.runSegments(
+                driver: driver, parts: parts, source: source, writer: writer,
+                pitchCents: pitchCents, onStage: onStage)
+            try writer.finish()
+            let convSecs = Double(outSamples) / AudioProcessor.sampleRate
+
+            // 对齐：把整条拉伸回源的长度。倍率 = 输出长 / 源长，>1 就是念得比源快 ⇒ 加快（变短）。
+            var fitWav = chainWav
+            var fitSecs = convSecs
+            var rate = 1.0
+            let want = source.count
+            let skew = want > 0 ? (Double(outSamples) - Double(want)) / Double(want) : 0
+            if abs(skew) > 0.0005 {
+                rate = 1.0 + skew
+                onStage(String(format: "对齐：链子输出比源长 %.2f%% ⇒ 整条按 %.5f 拉伸", skew * 100, rate))
+                let stretched = PostProcessor.timeStretch(try AudioProcessor.loadWAV16K(chainWav), rate: rate)
+                fitSecs = Double(stretched.count) / AudioProcessor.sampleRate
+                fitWav = outDir.appendingPathComponent(base + "_fit.wav")
+                let w2 = try AudioProcessor.WAVWriter(url: fitWav)
+                // 一片一片喂进去：峰值守卫是**每片**一次的，整条一次 append 等于又变回全局长峰压小整章
+                let hop = Int(VoiceEngine.convPassSeconds * AudioProcessor.sampleRate)
+                var p = 0
+                while p < stretched.count {
+                    try w2.append(Array(stretched[p..<min(p + hop, stretched.count)]))
+                    p += hop
+                }
+                try w2.finish()
+                VoiceJournal.line(String(format: "对齐完成：%.2f s → %.2f s（源 %.2f s，倍率 %.5f，残差 %.3f s）",
+                                         convSecs, fitSecs, Double(want) / AudioProcessor.sampleRate,
+                                         rate, fitSecs - Double(want) / AudioProcessor.sampleRate))
+            } else {
+                VoiceJournal.line(String(format: "对齐跳过：链子输出与源只差 %.4f%%（阈值 0.05%%）⇒ 直接用 %@",
+                                         skew * 100, chainWav.lastPathComponent))
+            }
+
+            onStage("回写画面（一个像素都不动，只换声音）…")
+            let mux = try VideoClip.mux(video: inputVideo, audioWav: fitWav,
+                                        out: outputVideo, say: VoiceJournal.line)
+
+            var temps = [chainWav]
+            if fitWav.path != chainWav.path { temps.append(fitWav) }
+            for t in temps {
+                let sz = (try? t.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
+                if (try? FileManager.default.removeItem(at: t)) == nil {
+                    VoiceJournal.line("中间量已清 \(t.lastPathComponent) \(FileHistory.human(Int64(sz)))")
+                } else {
+                    VoiceJournal.line("中间量没删掉 \(t.lastPathComponent)（历史文件页还能删）")
+                }
+            }
+
+            VoiceJournal.line(String(format: "视频换声完成：%d 片／转换 %.2f s／对齐 %.2f s／墙钟 %.1f s → %@ %.1f MB",
+                                     passes, convSecs, fitSecs, Date().timeIntervalSince(t0),
+                                     outputVideo.lastPathComponent,
+                                     Double(mux.bytes) / 1_048_576))
+            return VideoResult(sourceSeconds: Double(source.count) / AudioProcessor.sampleRate,
+                               convertedSeconds: convSecs, fitSeconds: fitSecs, fitRate: rate,
+                               passes: passes, mux: mux)
         }.value
     }
 

@@ -1,19 +1,24 @@
 import Foundation
 
-/// Documents 根目录里这个 app 自己留下的音频（源 / 中间 / 成品）。
+/// Documents 根目录里这个 app 自己留下的音频和视频（源 / 中间 / 成品）。
 ///
 /// 为什么要单独一页来删：`app/project-voice.yml` 里 `UIFileSharingEnabled` 是开着的，整个 Documents
-/// 直接出现在系统「文件」app 里 ⇒ 录过的源、系统原声、转换成品全躺在上面，别人拿到这台手机也翻得到。
-/// 界面上播完一次不等于手机上没了。
+/// 直接出现在系统「文件」app 里 ⇒ 录过的源、系统原声、转换成品、换了声的视频全躺在上面，
+/// 别人拿到这台手机也翻得到。界面上播完一次不等于手机上没了。
 ///
 /// 只认自己写的那几种前缀，其余一概不列、也删不到：
 /// `voice_models/` 删了要重新下 581 MB，`voice_log.txt` 是唯一的闪退证据，
 /// `samples/` 是音色条件（那条清单自己已经有「删」按钮）。
 enum FileHistory {
     enum Kind: String, CaseIterable, Identifiable {
-        case source = "源音频"
+        /// `pick_` 既可能是音频也可能是视频（视频换声选的片源走同一个拷贝入口、同一个前缀），
+        /// 所以这一格的名字必须两种都能对上，不然他在清理页看到一个 mp4 躺在「源音频」下会以为显示错了。
+        case source = "源（音频/视频）"
         case raw = "中间音频（系统原声）"
         case output = "最终音频"
+        /// 视频换声这一条的三件：成品 mp4 + 转换后 wav + 对齐后 wav，全用 `video_` 前缀。
+        /// 中间那两份跑成了会自己删；崩在半路留下的归这一格收。
+        case video = "视频（成品与中间）"
 
         var id: String { rawValue }
 
@@ -23,6 +28,7 @@ enum FileHistory {
             case .source: return ["pick_", "record_"]
             case .raw: return ["tts_raw_"]
             case .output: return ["output_", "novel_"]
+            case .video: return ["video_"]
             }
         }
 
