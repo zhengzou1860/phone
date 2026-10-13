@@ -30,6 +30,20 @@ jobs:
       - name: show toolchain
         run: sw_vers && xcodebuild -version && xcodebuild -showsdks | grep -i ios
 
+      # 本机（Windows）没有 Swift 工具链，SwapIdents 那套字节格式从来没被真编译器跑过。
+      # 手机 10-13 13:16 的「存档自检」给的是：写进去前 身份证模长 1.0000／权重合起来 87.198，
+      # encode→decode 之后 0.0000／0.000，而盘上第 13~16 个字节是 2c c9 aa 00（不是全 0）⇒ 对账必须在打包这套工具链上做。
+      # 判不出 PASS 就不许往下出包：那种包每一个「已存的人」都会静默出原脸。
+      - name: 身份包编解码逐位对账（不过就不出包）
+        run: |
+          rec() { tee -a /tmp/model.log; }
+          touch /tmp/build.log   # 这步在 build 之前：「report failure log」是 cat model.log build.log，
+                                 # 缺这个文件那条 cat 会失败、把日志盖成 "no build log at all"，四行判决就丢了
+          xcrun swiftc -O app/SourcesSwap/SwapIdents.swift ci/identcodec/main.swift -o /tmp/identtest 2>&1 | rec
+          if [ ! -x /tmp/identtest ]; then echo "CODEC-VERDICT FAIL 测试没编出来" | rec; exit 1; fi
+          /tmp/identtest 2>&1 | rec
+          grep -q "^CODEC-VERDICT PASS" /tmp/model.log || { echo "上面四行就是写／读／交叉／半截的逐位结果"; exit 1; }
+
       # 必须钉 3.11：runner 默认的 python3 落在 onnx2coreml 的 Requires-Python >=3.11,<3.14 之外，
       # 第 1 轮 pip 直接回 "Could not find a version that satisfies the requirement onnx2coreml"，
       # 后面三张图的 convert 全是 rc=127（命令根本没装上）。
