@@ -176,6 +176,7 @@ enum SwapClip {
         var minFacePx: Double = 40
         var sampleEvery: Int = 30
         var footprintStopMB: Int = 900
+        var whiten: Bool = true
     }
 
     /// 源身份的两条来路：新挑的照片（要跑"每人一次"那两步）或列表里已存的人（直接从盘上装）。
@@ -293,9 +294,13 @@ enum SwapClip {
         say("磁盘闸门 这条要 \(String(format: "%.0f", need / 1_048_576)) MB（码率 \(String(format: "%.1f", Double(bitrate) / 1e6)) Mbps）"
             + "｜可用 \(String(format: "%.1f", free / 1_073_741_824)) GB")
         if need > free { return fail("可用空间不够，不出片：素材 \(String(format: "%.0f", src.duration)) s") }
+        // 三元放进变量再插值：`\( )` 里直接写带引号的三元会把收尾引号吃掉
+        let beautyTxt = args.whiten
+            ? "这一版补丁加一档美白＝Lab 里 L×1.06+4.31、a×0.90、b×0.92（＝beauty_ab 第 1 列，本机逐像素对拍最大 5 灰阶）"
+            : "这一版美白关＝补丁不做 Lab 提亮，高频回填那份就是最终补丁（本机六臂：边上亮度台阶 3.33→0.69 灰阶）"
         say("补丁口径 遮罩＝官方 preprocess_mask 那一刀（>0.001 归 1→11 膨胀→11 腐蚀×2→7×7 模糊→10 px 内收衰减），"
             + "下边不再内收，下巴剖面折进遮罩后整张在 224 里高斯糊一次（σ=4，本机八臂的 G 那一格）｜"
-            + "补丁＝逐帧网自己混好的 out｜这一版补丁加一档美白＝Lab 里 L×1.06+4.31、a×0.90、b×0.92（＝beauty_ab 第 1 列，本机逐像素对拍最大 5 灰阶）｜"
+            + "补丁＝逐帧网自己混好的 out｜" + beautyTxt + "｜"
             + "下巴伸出补丁那 12 行＝这一帧对齐后原片的末行（0.17 及以前是补丁自己的末行）｜"
             + "美白之前先搬一档高频＝把这一帧对齐原片自己的 σ=0.8 高通按 λ=1.0 加回补丁"
             + "（本机 tools/quality_ab.py 六帧：高频能量比 0.299→0.501，而「不进网、只走 224 重采样」那一格只有 0.410"
@@ -690,7 +695,7 @@ enum SwapClip {
                                 SwapGeo.restoreDetail(&gen, att, lam: 1.0, sigma: 0.8)
                                 detailMs.append(Double(DispatchTime.now().uptimeNanoseconds - td) / 1_000_000)
                                 let tb = DispatchTime.now().uptimeNanoseconds
-                                SwapGeo.whiten(&gen, side: side)
+                                if args.whiten { SwapGeo.whiten(&gen, side: side) }
                                 beautyMs.append(Double(DispatchTime.now().uptimeNanoseconds - tb) / 1_000_000)
                                 let t3 = DispatchTime.now().uptimeNanoseconds
                                 SwapGeo.preprocessMask(rawMask, &m2)
@@ -862,7 +867,8 @@ enum SwapClip {
         say("单价 预检趟 解码 \(SwapUtil.stat(preDecodeMs))／检测 \(SwapUtil.stat(preDetectMs))")
         let detNote = trackMiss > 0 ? "（出片这趟有 \(trackMiss) 帧退回现检）" : ""
         say("      出片趟 解码 \(SwapUtil.stat(decodeMs))｜检测 \(SwapUtil.stat(detectMs))\(detNote)｜对齐 \(SwapUtil.stat(alignMs))")
-        say("      逐帧网 \(SwapUtil.stat(netMs))｜高频回填 \(SwapUtil.stat(detailMs))｜美白 \(SwapUtil.stat(beautyMs))｜羽化 \(SwapUtil.stat(maskMs))｜回贴 \(SwapUtil.stat(pasteMs))｜提交 \(SwapUtil.stat(appendMs))")
+        let beautyNote = args.whiten ? "" : "（这一趟界面选了关，所以是 0）"
+        say("      逐帧网 \(SwapUtil.stat(netMs))｜高频回填 \(SwapUtil.stat(detailMs))｜美白 \(SwapUtil.stat(beautyMs))\(beautyNote)｜羽化 \(SwapUtil.stat(maskMs))｜回贴 \(SwapUtil.stat(pasteMs))｜提交 \(SwapUtil.stat(appendMs))")
         say("      \(runner.statsLine())")
         say("总耗时 \(String(format: "%.1f", wall)) s（素材实到 \(String(format: "%.1f", madeSec)) s）"
             + "＝\(String(format: "%.2f", wall / max(madeSec, 0.01)))× 实时｜每帧合计 \(String(format: "%.1f", perFrame)) ms"

@@ -32,6 +32,7 @@ struct SwapContentView: View {
     @State private var running = false
     @State private var unitIdx = 0                   // 默认 units[0] = cpuOnly
     @State private var longIdx = 0                   // 默认 1920（长边上限）
+    @State private var beautyIdx = 0                 // 0＝美白开（0.11 以来的那份），1＝关
     @State private var result = ""
     @State private var logTail = ""
     @State private var outURL: URL?
@@ -139,6 +140,14 @@ struct SwapContentView: View {
                         }
                         .pickerStyle(.segmented)
                         .disabled(running)
+                        Picker("补丁美白", selection: $beautyIdx) {
+                            Text("开").tag(0)
+                            Text("关").tag(1)
+                        }
+                        .pickerStyle(.segmented)
+                        .disabled(running)
+                        Text("关＝这一趟不在补丁上做那一档提亮（Lab 里 L×1.06+4.31）。本机六臂量：遮罩边上的亮度台阶 3.33→0.69 灰阶，补丁暗一档（芯 L 122.6→106.0），↔源 0.697→0.674。")
+                            .font(.caption2)
 
                         // 点下去立刻置灰 + 改文案：手机上长任务没有别的反馈手段
                         Button(running ? "换脸跑着…（别看空屏，下面在动）" : "开始换脸") {
@@ -200,7 +209,8 @@ struct SwapContentView: View {
                         以后点名字直接选他，跳过身份证＋身份包那两步（上机实测这两步 70.61 + 18.27 ms），能改名、能删，删掉就把那份字节还回磁盘。
                         贴法退回第一版：你判「反倒是第一版的参数是最好的，包括遮罩的范围」，\
                         所以这一版遮罩走官方 preprocess_mask 那一刀（>0.001 归 1→11 膨胀→11 腐蚀×2→7×7 模糊→10 px 内收衰减），\
-                        补丁直接取逐帧网自己混好的 out。五官加深 γ、可调透明度遮罩、高频回填这三样是我在后面三版里加的，这一版都不在；\
+                        补丁直接取逐帧网自己混好的 out。五官加深 γ、可调透明度遮罩两样是我在后面几版里加的、这一版都不在；\
+                        在的是高频回填（0.19 起，把这一帧对齐原片自己的 σ=0.8 高通按 λ=1.0 加回补丁）和美白（0.11 起，这一版起界面可关）。\
                         CI 给逐帧网挂的第三个出参这一版也没有代码去取它。
                         """)
                             .font(.caption)
@@ -286,10 +296,12 @@ struct SwapContentView: View {
         logTail = SwapJournal.tail(30)
         let units = Self.units[unitIdx].1
         let longEdge = Self.longs[longIdx]
-        SwapJournal.line("开始整片换脸 units=\(Self.units[unitIdx].0) 长边=\(longEdge) 源=\(sourceTag) 片=\(v.lastPathComponent)")
+        let beautyTxt = beautyIdx == 0 ? "开" : "关"
+        SwapJournal.line("开始整片换脸 units=\(Self.units[unitIdx].0) 长边=\(longEdge) 美白=\(beautyTxt) 源=\(sourceTag) 片=\(v.lastPathComponent)")
         var args = SwapClip.Args()
         args.units = units
         args.longEdge = longEdge
+        args.whiten = beautyIdx == 0
         Task.detached {
             let r = SwapClip.run(person: person, video: v, args: args) { line in
                 SwapJournal.line(line)
