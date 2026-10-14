@@ -177,28 +177,74 @@ enum SwapVision {
     }
 
     /// 一次对齐的全部产物：正向矩阵（整幅→224）、它的逆（224→整幅，回贴要用的 back）、
-    /// 用的点位是哪一档（真点位／框猜）、以及拟合质量。
+    /// 用的点位是哪一档（真点位／框猜）、点位多边形是不是被排成了镜像、以及拟合质量。
     struct Alignment {
         let fwd: SwapGeo.Affine
         let back: SwapGeo.Affine
+        let mirrored: Bool        // 5 点的手性与模板相反＝y 口径判错，贴回去是一张翻面的人脸，这帧不许换
         let resid224: Double      // 5 个点到模板的平均距离，单位＝224 方块里的像素
         let residPx: Double       // 同一件事折回原图像素（除以缩放），和 PC 那张 ±2/4/8 px 容忍表直接对账
-        let det: Double           // 负数＝映成了镜像，换出来是一张翻面的人脸
-        let ratio: Double         // 两个奇异值之比，越接近 1 越像"旋转＋等比缩放"
+        let det: Double           // 相似拟合下＝缩放平方，恒正（镜像改由 mirrored 判）
+        let ratio: Double         // 两个奇异值之比；4 参相似恒为 1，留着当「这版没走 6 参」的自证
         let pts: [CGPoint]
         let src: String
         let shortSide: Double
     }
 
-    /// 5 点 → 模板的最小二乘拟合（官方 align_img 同式：6 参数仿射，把旋转/缩放/错切一次吸收掉），
-    /// 顺带把这次拟合有多可信量出来。
+    /// 整片 5 点轨迹对完称高斯（σ＝2 帧＝13 抽头、半径 6），一次走完⇒返回一整条。
+    /// 为什么对称而不是「上一帧加权平均」：因果滤波有滞后，本机在同一格上量到每帧甩开 16.6 px、p95 36 px
+    /// ＝快动段补丁落在头后面，看着是重影；对称核零滞后，代价只在加减速的那几帧（σ2 量到 2.9 px、p95 6.5 px，
+    /// 而这一片每帧真的挪 3.4~7.2 px，所以滞后比运动本身还小）。
+    /// 越界那一侧按「重复边缘」取（与 numpy 的 pad(mode='edge') 同口径），首末帧不会被稀释成 0。
+    /// 一次走完而不是逐帧调：逐帧调每次都要重读整条轨迹，9 分钟那片就是 O(N²)。
+    static func smoothTrack(_ track: [[CGPoint]], sigma: Double = 2.0) -> [[CGPoint]] {
+        let n = track.count
+        guard n > 0 else { return [] }
+        let w = Int(2 * (3 * sigma).rounded() + 1)          // σ＝2 → 13
+        let r = w / 2
+        var k = [Double](repeating: 0, count: w)
+        var tot = 0.0
+        for j in 0..<w {
+            let z = Double(j - r) / sigma
+            k[j] = exp(-0.5 * z * z)
+            tot += k[j]
+        }
+        for j in 0..<w { k[j] /= tot }
+        var out: [[CGPoint]] = []
+        out.reserveCapacity(n)
+        for i in 0..<n {
+            guard track[i].count == 5 else { out.append(track[i]); continue }
+            var sx = [Double](repeating: 0, count: 5), sy = [Double](repeating: 0, count: 5)
+            for j in 0..<w {
+                let t = min(max(i + j - r, 0), n - 1)
+                for p in 0..<5 {
+                    sx[p] += k[j] * Double(track[t][p].x)
+                    sy[p] += k[j] * Double(track[t][p].y)
+                }
+            }
+            out.append((0..<5).map { CGPoint(x: sx[$0], y: sy[$0]) })
+        }
+        return out
+    }
+
+    /// 一张脸（或预检存下来的 5 个点）→ 对齐产物。拟合口径＝4 参相似，见 SwapGeo.fitSimilarity。
     static func align(face f: VNFaceObservation, w: Int, h: Int) -> Alignment? {
         let (pts, src) = sendPoints(face: f, w: w, h: h)
+        let box = pixelBox(f.boundingBox, w, h)
+        return align(pts: pts, src: src, shortSide: Double(min(box.width, box.height)))
+    }
+
+    /// 同上，但点位已经在手上（预检趟那一格：整片的点先存下来，出片这趟只取平滑后的）。
+    static func align(pts: [CGPoint], src: String, shortSide: Double) -> Alignment? {
         let tpl = SwapGeo.template224()
-        guard let fwd = SwapGeo.fitAffine(src: pts, dst: tpl),
+        guard pts.count == tpl.count,
+              let fwd = SwapGeo.fitSimilarity(pts, tpl),
               let back = SwapGeo.inverse(fwd) else { return nil }
-        let det = fwd.a * fwd.e - fwd.b * fwd.d
-        guard abs(det) > 1e-9 else { return nil }
+        let det = fwd.a * fwd.e - fwd.b * fwd.d          // 相似拟合下恒正＝a²＋b²
+        guard det > 1e-9 else { return nil }
+        // 镜像只能这样判：相似拟合不会把点位映反（它只会给一个转正的最优解），
+        // 而 y 口径搞错时 5 个点是真被翻了面的，只有多边形的手性认得出来。翻面＝这帧不换。
+        let mirrored = SwapGeo.signedArea(pts) * SwapGeo.signedArea(tpl) < 0
         var sum = 0.0
         for i in 0..<pts.count {
             let px = Double(pts[i].x), py = Double(pts[i].y)
@@ -207,7 +253,8 @@ enum SwapVision {
             sum += (dx * dx + dy * dy).squareRoot()
         }
         let resid = sum / Double(pts.count)
-        // J = [a b; d e]，JJᵀ 的两个特征值开方＝两个奇异值
+        // J = [a b; d e]，JJᵀ 的两个特征值开方＝两个奇异值。相似拟合下这一对比值恒为 1，
+        // 留在日志里当「这一版真的没走 6 参那一式」的自证。
         let t11 = fwd.a * fwd.a + fwd.b * fwd.b
         let t22 = fwd.d * fwd.d + fwd.e * fwd.e
         let t12 = fwd.a * fwd.d + fwd.b * fwd.e
@@ -216,12 +263,10 @@ enum SwapVision {
         let lmax = tr / 2.0 + disc, lmin = max(0.0, tr / 2.0 - disc)
         let sMax = lmax.squareRoot(), sMin = lmin.squareRoot()
         let ratio = sMin > 1e-9 ? sMax / sMin : 999.0
-        let scale = (abs(det)).squareRoot()
-        let box = pixelBox(f.boundingBox, w, h)
-        return Alignment(fwd: fwd, back: back,
+        let scale = det.squareRoot()
+        return Alignment(fwd: fwd, back: back, mirrored: mirrored,
                          resid224: resid, residPx: scale > 1e-9 ? resid / scale : 999.0,
-                         det: det, ratio: ratio, pts: pts, src: src,
-                         shortSide: Double(min(box.width, box.height)))
+                         det: det, ratio: ratio, pts: pts, src: src, shortSide: shortSide)
     }
 
     /// 静帧（相册里那张源脸）→ 摆正的 CGImage。走 UIKit 重画一遍，

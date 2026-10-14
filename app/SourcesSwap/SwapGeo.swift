@@ -2,9 +2,12 @@ import Foundation
 import CoreGraphics
 
 /// 对齐 / 回贴的数学，逐式对照 PC 那份跑通的实现：
-///   官方 align_face.align_with_five_points（5 点 → 6 参数最小二乘仿射，不是相似变换）
+///   模板点位＋回贴：官方 align_face.align_with_five_points 的 REFERENCE_FACIAL_POINTS 与
 ///   官方 dealign + tools/mfs_dealign.py 的"只贴脸框"版（PC 上 217 帧对拍过：与整幅版差 ≤2 灰阶、17 个像素）
-/// 换脸的几何全靠这 5 个点，所以这里必须和 PC 同式，不能自己换个"更简单"的解。
+///   拟合这一格是唯一的偏离：官方是 5 点 → 6 参数最小二乘仿射，这一版换成 4 参相似拟合。
+///   换的理由不是「更简单」，是量出来的：6 参里各向异性＋剪切那两档没人约束，逐帧点位噪声被它们吸收成形状变化，
+///   同一格内容遮罩全冻住、只挪矩阵时边界爬行 3.0 px/帧（锁成相似 2.3 px），出片整链 3.47→2.22 px/帧。
+///   与 PC 已验的 10 方程 4 未知最小二乘同解（见 fitSimilarity 那一段的对拍数字）。
 enum SwapGeo {
     static let size = 224
 
@@ -20,51 +23,44 @@ enum SwapGeo {
     /// 2×3 仿射：dst = [a b c; d e f] · (x, y, 1)
     struct Affine { var a, b, c, d, e, f: Double }
 
-    /// 6 参数最小二乘（官方 np.linalg.lstsq 的正规方程版）：
-    /// x' 与 y' 各解一个三元一次，设计矩阵同一份 [x y 1]。5 点 10 方程 6 未知，rank 必为 3。
-    static func fitAffine(src: [CGPoint], dst: [CGPoint]) -> Affine? {
+    /// 5 点 → 模板的 4 自由度相似拟合（等比缩放＋旋转＋平移）。先各自减质心，一次项与交叉项归零，
+    /// 剩下 a＝Σ(p̃·d̃)/Σ|p̃|²、b＝Σ(p̃x·d̃y − p̃y·d̃x)/Σ|p̃|²，平移由两个质心补齐。
+    /// 与「10 方程 4 未知最小二乘」同解：本机 20000 组随机 5 点上矩阵元最大差 4.8e-11、
+    /// 224×236 每格位移最大 7.2e-10 px ⇒ 这一式可以直接顶掉上面那一式，不用解 3×3。
+    /// 锁掉的那两档（各向异性＋剪切）正是闪的来源：6 参拟合里它们没有约束，
+    /// 逐帧的点位噪声被它们吸收成形状变化（本机量到放大倍率 avg 1.033、相邻帧 |Δ| 0.009）。
+    static func fitSimilarity(_ src: [CGPoint], _ dst: [CGPoint]) -> Affine? {
         guard src.count == dst.count, src.count >= 3 else { return nil }
-        let n = src.count
-        // XtX 是 3×3，Xt·dst_x 与 Xt·dst_y 两个右端项
-        var s00 = 0.0, s01 = 0.0, s02 = 0.0, s11 = 0.0, s12 = 0.0, s22 = 0.0
-        var bx = 0.0, by = 0.0, b1 = 0.0
-        for i in 0..<n {
-            let x = Double(src[i].x), y = Double(src[i].y)
-            s00 += x * x; s01 += x * y; s02 += x
-            s11 += y * y; s12 += y
-            s22 += 1
-            bx += x * Double(dst[i].x)
-            by += y * Double(dst[i].x)
-            b1 += Double(dst[i].x)
+        let n = Double(src.count)
+        var psx = 0.0, psy = 0.0, dsx = 0.0, dsy = 0.0
+        for i in 0..<src.count {
+            psx += Double(src[i].x); psy += Double(src[i].y)
+            dsx += Double(dst[i].x); dsy += Double(dst[i].y)
         }
-        let m00 = s00, m01 = s01, m02 = s02
-        let m10 = s01, m11 = s11, m12 = s12
-        let m20 = s02, m21 = s12, m22 = s22
-        var cx = 0.0, cy = 0.0, c1 = 0.0
-        for i in 0..<n {
-            let x = Double(src[i].x), y = Double(src[i].y)
-            cx += x * Double(dst[i].y)
-            cy += y * Double(dst[i].y)
-            c1 += Double(dst[i].y)
+        let pmx = psx / n, pmy = psy / n, dmx = dsx / n, dmy = dsy / n
+        var s2 = 0.0, dot = 0.0, cross = 0.0
+        for i in 0..<src.count {
+            let px = Double(src[i].x) - pmx, py = Double(src[i].y) - pmy
+            let qx = Double(dst[i].x) - dmx, qy = Double(dst[i].y) - dmy
+            s2 += px * px + py * py
+            dot += px * qx + py * qy
+            cross += px * qy - py * qx
         }
-        guard let r1 = solve3(m00, m01, m02, m10, m11, m12, m20, m21, m22, bx, by, b1),
-              let r2 = solve3(m00, m01, m02, m10, m11, m12, m20, m21, m22, cx, cy, c1)
-        else { return nil }
-        // r1 = dst_x 的三个系数 (α,β,γ)，r2 = dst_y 的三个系数 ⇒ tfm = [αx βx γx; αy βy γy]
-        return Affine(a: r1[0], b: r1[1], c: r1[2], d: r2[0], e: r2[1], f: r2[2])
+        guard s2 > 1e-12 else { return nil }
+        let a = dot / s2, b = cross / s2
+        return Affine(a: a, b: -b, c: dmx - (a * pmx - b * pmy),
+                      d: b, e: a, f: dmy - (b * pmx + a * pmy))
     }
 
-    private static func solve3(_ m00: Double, _ m01: Double, _ m02: Double,
-                               _ m10: Double, _ m11: Double, _ m12: Double,
-                               _ m20: Double, _ m21: Double, _ m22: Double,
-                               _ b0: Double, _ b1: Double, _ b2: Double) -> [Double]? {
-        let det = m00 * (m11 * m22 - m12 * m21) - m01 * (m10 * m22 - m12 * m20) + m02 * (m10 * m21 - m11 * m20)
-        guard abs(det) > 1e-12 else { return nil }
-        // Cramer：第 j 列换成 b 后的行列式 / det
-        let d0 = b0 * (m11 * m22 - m12 * m21) - m01 * (b1 * m22 - m12 * b2) + m02 * (b1 * m21 - m11 * b2)
-        let d1 = m00 * (b1 * m22 - m12 * b2) - b0 * (m10 * m22 - m12 * m20) + m02 * (m10 * b2 - b1 * m20)
-        let d2 = m00 * (m11 * b2 - b1 * m21) - m01 * (m10 * b2 - b1 * m20) + b0 * (m10 * m21 - m11 * m20)
-        return [d0 / det, d1 / det, d2 / det]
+    /// 5 点围成的多边形有向面积（鞋带公式）。相似拟合只会给一个「转正」的解、det ＝ a²＋b² 恒正，
+    /// 所以点位被排成镜像这件事不能再靠 det 的符号看——用这一式比模板的符号。
+    static func signedArea(_ pts: [CGPoint]) -> Double {
+        var s = 0.0
+        for i in 0..<pts.count {
+            let p = pts[i], q = pts[(i + 1) % pts.count]
+            s += Double(p.x) * Double(q.y) - Double(q.x) * Double(p.y)
+        }
+        return s / 2
     }
 
     /// 3×3 齐次求逆后取前两行 = 官方 back_matrix（np.linalg.pinv，非奇异时同 inv）
