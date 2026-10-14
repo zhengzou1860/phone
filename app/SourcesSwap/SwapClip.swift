@@ -503,7 +503,8 @@ enum SwapClip {
         var resids224: [Double] = [], facePx: [Double] = [], ratios: [Double] = []
         var cosList: [String] = []
         var made = 0, swapped = 0, noFace = 0, smallFace = 0, fitFail = 0, mirror = 0, netFail = 0, poolMiss = 0
-        var preHit = 0, trackMiss = 0          // preHit＝这帧的点取自预检轨迹｜trackMiss＝预检跑了但帧号越界→当场现检
+        var preHit = 0, liveDetect = 0, trackMiss = 0
+        // preHit＝这帧的点取自预检轨迹｜liveDetect＝当场真跑了 Vision 检测的帧数｜trackMiss＝预检跑了但帧号越界
         let hasTrack = !trackPts.isEmpty       // 预检整个没跑成时出片这趟退回逐帧现检（不平滑）
         var probeLeft = 6                       // 「没脸」帧只挑前 6 帧做二次检测对照
         var pointSrc = "—"
@@ -627,6 +628,7 @@ enum SwapClip {
                     preHit += 1
                 } else if !hasTrack || made >= trackPts.count {
                     if hasTrack { trackMiss += 1 }
+                    liveDetect += 1
                     let (obs, derr) = SwapVision.faces(dst, req)
                     if !derr.isEmpty { say("检测抛错：\(derr)") }
                     liveCount = obs.count
@@ -866,8 +868,11 @@ enum SwapClip {
             + "＝\(String(format: "%.2f", wall / max(madeSec, 0.01)))× 实时｜每帧合计 \(String(format: "%.1f", perFrame)) ms"
             + "｜身份复测每次 \(SwapUtil.stat(sampleMs))")
         say("换上人 \(swapped) 帧｜没脸 \(noFace)｜太小 \(smallFace)｜拟合没过 \(fitFail)｜镜像 \(mirror)｜网失败 \(netFail)｜点位 \(pointSrc)")
-        let detSrcTxt = hasTrack ? "取自预检 \(preHit)／当场现检 \(made - preHit)（帧号越界 \(trackMiss)）"
-                                 : "全部当场现检 \(made)（预检没跑成）"
+        var detSrcTxt = "全部当场真检 \(made)（预检没跑成）"
+        if hasTrack {
+            detSrcTxt = "取自预检 \(preHit)｜当场真检 \(liveDetect)｜"
+                      + "预检判这格没脸 \(made - preHit - liveDetect)（帧号越界 \(trackMiss)）"
+        }
         say("      点位来路 \(detSrcTxt)")
         if !resids.isEmpty {
             say("对齐残差 中位 \(String(format: "%.2f", median(resids)))／最大 \(String(format: "%.2f", resids.max() ?? 0)) px（原图像素口径）"
