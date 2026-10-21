@@ -293,17 +293,28 @@ final class SwapRunner {
         }
         guard let arr = try? MLMultiArray(shape: dims.map { NSNumber(value: $0) }, dataType: c.dataType)
         else { return (nil, "\(name) 建不出 MLMultiArray \(dims)") }
-        var v = planar01
+        // 归一化只有 arcface 那一路要（逐帧网 mean/std 传的是 nil）：要才算一份拷贝，不要就原样搬
+        var v: [Float]
         if let m = mean, let s = std, dims.count == 4 {
+            v = planar01
             let plane = dims[2] * dims[3]
             for ch in 0..<min(3, dims[1]) {
                 for i in 0..<plane { v[ch * plane + i] = (v[ch * plane + i] - m[ch]) / s[ch] }
             }
+        } else {
+            v = planar01
         }
         switch c.dataType {
         case .float32:
-            let p = arr.dataPointer.assumingMemoryBound(to: Float32.self)
-            for i in 0..<total { p[i] = Float32(v[i]) }
+            // 新建的数组按行优先连续排 ⇒ 整段 memcpy。逐个数走 150528 遍是 0.22 量出来的「搬运」那一半的钱
+            if SwapRunner.isContiguous(arr, dims: dims) {
+                v.withUnsafeBufferPointer { src in
+                    memcpy(arr.dataPointer, src.baseAddress!, total * MemoryLayout<Float32>.size)
+                }
+            } else {
+                let p = arr.dataPointer.assumingMemoryBound(to: Float32.self)
+                for i in 0..<total { p[i] = Float32(v[i]) }
+            }
         case .float16:
             let p = arr.dataPointer.assumingMemoryBound(to: Float16.self)
             for i in 0..<total { p[i] = Float16(v[i]) }
@@ -317,6 +328,19 @@ final class SwapRunner {
             return (nil, "\(name) 的数组类型 \(c.dataType.rawValue) 我还不会填")
         }
         return (MLFeatureValue(multiArray: arr), "按 multiArray 喂 \(dims)")
+    }
+
+    /// 行优先连续（stride 逐维等于上一维的元素数）才敢整段 memcpy。
+    /// 新建的数组本该如此、CoreML 回来的不保证，所以每次读回来对一遍：认错了不报错，只把画面搬乱。
+    static func isContiguous(_ arr: MLMultiArray, dims: [Int]) -> Bool {
+        let st = arr.strides.map { $0.intValue }
+        guard st.count == dims.count, st.last == 1 else { return false }
+        var expect = 1
+        for k in stride(from: dims.count - 1, through: 0, by: -1) {
+            if st[k] != expect { return false }
+            expect *= dims[k]
+        }
+        return expect == dims.reduce(1, *)
     }
 
     /// planar RGB 0~1 → BGRA 像素缓冲
@@ -350,6 +374,29 @@ final class SwapRunner {
         let strides = arr.strides.map { $0.intValue }
         let total = dims.reduce(1, *)
         guard total > 0, dims.count >= 1, dims.count <= 4 else { return nil }
+        // 连续那一档占绝大多数：逐个数现算偏移（每格 4 次乘加＋一次越界回卷）是 0.22 量出来的「搬运」另一半
+        if isContiguous(arr, dims: dims) {
+            switch arr.dataType {
+            case .float32:
+                var out = [Float](repeating: 0, count: total)
+                out.withUnsafeMutableBufferPointer { d in
+                    memcpy(d.baseAddress!, arr.dataPointer, total * MemoryLayout<Float32>.size)
+                }
+                return out
+            case .float16:
+                let p = arr.dataPointer.assumingMemoryBound(to: Float16.self)
+                var out = [Float](repeating: 0, count: total)
+                out.withUnsafeMutableBufferPointer { d in for i in 0..<total { d[i] = Float(p[i]) } }
+                return out
+            case .float64:
+                let p = arr.dataPointer.assumingMemoryBound(to: Double.self)
+                var out = [Float](repeating: 0, count: total)
+                out.withUnsafeMutableBufferPointer { d in for i in 0..<total { d[i] = Float(p[i]) } }
+                return out
+            default:
+                return nil
+            }
+        }
         var out = [Float](repeating: 0, count: total)
         var idx = [Int](repeating: 0, count: dims.count)
         var off = 0

@@ -1,3 +1,4 @@
+import Combine
 import CoreML
 import PhotosUI
 import SwiftUI
@@ -19,6 +20,20 @@ struct SwapApp: App {
             SwapContentView()
         }
     }
+}
+
+/// 预览往界面上递的那几样。引擎的回调只捕这一个类实例（它跟着 @StateObject 活一辈子），
+/// 不捕 view 那个 struct 的副本——副本每刷新一帧就换一份，抓住旧的写 @State 就是空写。
+final class SwapPreviewMirror: ObservableObject {
+    @Published var img: UIImage?
+    @Published var status = ""
+    @Published var report = ""
+    @Published var on = false
+    @Published var pos = 0.0
+    @Published var dur = 0.0
+    @Published var person = ""
+    /// 手指压在滑杆上的那一阵：位置引擎那一跳不许把 thumb 拽回去（不进 @Published，它不该引起重画）
+    var dragging = false
 }
 
 /// 选片、开始换脸这一摊的状态。跑起来之后界面只靠每秒捞磁盘日志尾巴来动，
@@ -52,6 +67,11 @@ struct SwapContentView: View {
     @State private var runs = 30
     @State private var sendStatus = ""
     @State private var sending = false
+
+    /// 预览那一格界面上看到的东西
+    @StateObject private var pv = SwapPreviewMirror()
+    /// 整台手机同时只跑一路预览，挂在类型上：挂在 struct 上每刷一次界面就换一个实例（新的那条队列白建）
+    private static let engine = SwapPreview()
 
     static let units: [(String, MLComputeUnits)] = [
         ("CPU(cpuOnly)", .cpuOnly),
@@ -183,6 +203,77 @@ struct SwapContentView: View {
                     Divider()
 
                     VStack(alignment: .leading, spacing: 6) {
+                        Text("换脸预览（只看、不导出、手机侧一个字节都不写）").font(.headline)
+
+                        // 这一格约手机屏 1/3 高：逐个「已存的人」贴进来就是在这里比谁像
+                        ZStack {
+                            Color(white: 0.10)
+                            if let im = pv.img {
+                                Image(uiImage: im).resizable().scaledToFit()
+                            } else {
+                                Text(pv.on ? "开跑了，第一格要等三张网装好" : "（还没开）")
+                                    .font(.caption).foregroundColor(.gray)
+                            }
+                        }
+                        .frame(maxWidth: .infinity, minHeight: 190, maxHeight: 300)
+                        .clipped()
+
+                        Text(pv.status.isEmpty ? "（预览没动静）" : pv.status)
+                            .font(.system(size: 10, design: .monospaced))
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+
+                        Text("换一个人（点名字，当场贴到手里的这一格，一帧都不重新处理）").font(.caption)
+                        if idents.isEmpty {
+                            Text("（列表空着：预览只吃「已存的人」，先用上面①②跑一次整片换脸存下一个人）")
+                                .font(.caption2)
+                        }
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: 8) {
+                                ForEach(idents, id: \.id) { it in
+                                    Button((pv.person == it.id ? "◉ " : "○ ") + it.name) { previewPick(it) }
+                                        .buttonStyle(.bordered)
+                                        .disabled(!pv.on)
+                                }
+                            }
+                        }
+
+                        HStack(spacing: 6) {
+                            Text("位置").font(.caption)
+                            Slider(value: $pv.pos, in: 0 ... max(0.1, pv.dur), onEditingChanged: { began in
+                                pv.dragging = began
+                                if !began { seekPreview(pv.pos) }
+                            })
+                            .disabled(!pv.on)
+                            Text(String(format: "共 %.0f s", pv.dur)).font(.caption)
+                        }
+                        .font(.caption)
+
+                        Button(pv.on ? "停预览" : "开始预览") { togglePreview() }
+                            .buttonStyle(.borderedProminent)
+                            .disabled(pv.on ? false : (videoURL == nil || chosenIdent.isEmpty))
+                        if !previewBlock.isEmpty { Text(previewBlock).font(.caption2) }
+
+                        // 我点的这个按钮下面就是真实流水：起网→第几秒→多少钱一帧
+                        Text(pv.on ? "跑着，下面每 1 s 刷一次："
+                            : (logTail.isEmpty ? "（还没跑过）" : "流水尾部："))
+                            .font(.caption)
+                        Text(logTail.isEmpty ? "—" : logTail)
+                            .font(.system(size: 10, design: .monospaced))
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        if !pv.report.isEmpty {
+                            Text(pv.report).font(.caption).textSelection(.enabled)
+                        }
+                        Text("预览跟上面「算力单元」「补丁美白」这两档走；「长边上限」管不到预览——预览自己从 640 起，脸短边不足 150 px 会自己抬到 960、1280。")
+                            .font(.caption2)
+                        Text("预览这一条不做高频回填、也没有整片平滑：皮肤比成片软一档、遮罩边上比成片抖。挑中谁就在上面点他的名字再「开始换脸」出片。")
+                            .font(.caption2)
+                    }
+
+                    Divider()
+
+                    VStack(alignment: .leading, spacing: 6) {
                         Text("逐帧网自检（只那张最小的网，喂随机权重）").font(.headline)
                         Stepper("每次计 \(runs) 帧", value: $runs, in: 5...200, step: 5)
                             .font(.caption)
@@ -212,6 +303,12 @@ struct SwapContentView: View {
                         补丁直接取逐帧网自己混好的 out。五官加深 γ、可调透明度遮罩两样是我在后面几版里加的、这一版都不在；\
                         在的是高频回填（0.19 起，把这一帧对齐原片自己的 σ=0.8 高通按 λ=1.0 加回补丁）和美白（0.11 起，这一版起界面可关）。\
                         CI 给逐帧网挂的第三个出参这一版也没有代码去取它。
+                        这一版多了「换脸预览」。为什么要减帧：0.22 上机量到走完整口径要 73.6 ms/帧，16 帧/秒那一格只有 62.5 ms，差的那一截不是靠耐心能补的。\
+                        这一版从三处减：① 只画 1/3 小窗、回贴不再往整幅 1920 上贴（那一格实测 16.85 ms，像素数随尺寸平方缩）\
+                        ② 不做高频回填（2.60 ms）③ 逐帧网那趟调用里的搬运（8.49 ms，改成整段 memcpy，出片那条一起省）。\
+                        减帧口径＝解码不跳（3.9 ms/帧），每 1/16 秒只挑最贴近的那一帧真换、其余帧沿用上一格画面。\
+                        换人只把「已存的人」那 18 个权重装上（0.22 实测 0.29~0.85 ms）、身份全在权重里与帧无关，\
+                        所以一帧都不必缓存：长度上没有「超过 3 分钟就不行」那道墙，也不写任何文件。
                         """)
                             .font(.caption)
                             .textSelection(.enabled)
@@ -225,9 +322,24 @@ struct SwapContentView: View {
                 facts = SwapFacts.lines()
                 idents = SwapIdents.list()
                 logTail = SwapJournal.tail(30)
+                let mirror = pv
+                let eng = SwapContentView.engine
+                eng.render = { img in mirror.img = img }
+                eng.onShow = { s in mirror.status = s }
+                eng.log = { line in SwapJournal.line(line) }
+                eng.onProgress = { s, d in
+                    mirror.dur = d
+                    if !mirror.dragging { mirror.pos = s }
+                }
+                eng.onFinish = { txt, d in
+                    mirror.on = false
+                    mirror.dragging = false
+                    mirror.dur = d
+                    mirror.report = txt
+                }
             }
             .onReceive(pulse) { _ in
-                if running || benchRunning { logTail = SwapJournal.tail(30) }
+                if running || benchRunning || pv.on { logTail = SwapJournal.tail(30) }
             }
             // cover 不收场就整屏卡在选择页，必须自己关
             .fullScreenCover(isPresented: Binding(get: { picking == "face" },
@@ -257,8 +369,10 @@ struct SwapContentView: View {
                 SwapPickerHost(kind: .video) { url, err in
                     picking = ""
                     if let u = url {
+                        let reclaimed = reclaimOldPicks(keep: u)
                         videoURL = u
-                        SwapJournal.line("选了视频 \(u.lastPathComponent)")
+                        SwapJournal.line("选了视频 \(u.lastPathComponent)"
+                            + (reclaimed > 0 ? "｜顺手还掉旧选片 \(String(format: "%.1f", Double(reclaimed) / 1_048_576)) MB" : ""))
                     } else {
                         SwapJournal.line("选视频没成：\(err ?? "-")")
                         result = "选视频没成：\(err ?? "-")"
@@ -266,6 +380,21 @@ struct SwapContentView: View {
                 }
             }
         }
+    }
+
+    /// 只认自己那批前缀：选片副本一条比一条大，预览又不走出片那条的清扫，
+    /// 不在这里还就一直在 tmp 里堆着。半成品（swap_时间戳.mp4）仍归出片那一趟自己清。
+    private func reclaimOldPicks(keep: URL) -> Int {
+        let fm = FileManager.default
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+        var bytes = 0
+        for one in (try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.fileSizeKey], options: [])) ?? [] {
+            guard one.lastPathComponent.hasPrefix("swap_video_") else { continue }
+            guard one.lastPathComponent != keep.lastPathComponent else { continue }
+            let sz = (try? one.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
+            if (try? fm.removeItem(at: one)) != nil { bytes += sz }
+        }
+        return bytes
     }
 
     private func startSwap() {
@@ -378,6 +507,73 @@ struct SwapContentView: View {
         idents = SwapIdents.list()
     }
 
+    // MARK: - 预览
+
+    /// 「开始预览」点不下去时，原因就写在按钮旁边
+    private var previewBlock: String {
+        if running { return "整片换脸正跑着：这一版预览不和它抢 CPU，先等它收尾" }
+        if benchRunning { return "逐帧网自检正跑着，先等它" }
+        if videoURL == nil { return "还没点②选要预览的视频（预览吃的就是②那一条）" }
+        if chosenIdent.isEmpty { return "预览只吃「已存的人」：先在「已存的人」里点一个名字" }
+        if !FileManager.default.fileExists(atPath: videoURL?.path ?? "") {
+            return "②那份副本上一趟已经还掉了，重新点②选一条"
+        }
+        return ""
+    }
+
+    private func togglePreview() {
+        let eng = SwapContentView.engine
+        if pv.on {
+            SwapJournal.line("预览 点了停预览")
+            eng.stop()
+            pv.status = "停预览点了：这一格收尾就停"
+            return
+        }
+        guard !running, !benchRunning else { return }
+        guard let v = videoURL else { return }
+        guard !chosenIdent.isEmpty else { return }
+        guard FileManager.default.fileExists(atPath: v.path) else {
+            videoURL = nil
+            pv.status = "②那份副本上一趟已经还掉了，重新点②选一条"
+            SwapJournal.line("预览 开始被挡：\(v.lastPathComponent) 这份副本不在了，要重新选")
+            return
+        }
+        var c = SwapPreview.Cfg()
+        c.units = Self.units[unitIdx].1
+        c.unitsTxt = Self.units[unitIdx].0
+        c.whiten = beautyIdx == 0
+        let reject = eng.start(video: v, personId: chosenIdent, cfg: c)
+        if !reject.isEmpty {
+            pv.status = reject
+            SwapJournal.line("预览 开始被挡：\(reject)")
+            return
+        }
+        let whitenTxt = c.whiten ? "开" : "关"
+        pv.on = true
+        pv.img = nil
+        pv.report = ""
+        pv.pos = 0
+        pv.dur = 0
+        pv.person = chosenIdent
+        pv.status = "预览开跑：先把三张网装好，第一格还要等它检测到位"
+        SwapJournal.line("开始预览 units=\(c.unitsTxt) 美白=\(whitenTxt) "
+            + "人=\(SwapIdents.displayName(chosenIdent)) 片=\(v.lastPathComponent)")
+    }
+
+    /// 小窗下面点名字：出片那条也跟着换成他，两边看到的是同一个人
+    private func previewPick(_ it: SwapIdents.Item) {
+        pickIdent(it)
+        guard pv.on else { return }
+        pv.person = it.id
+        SwapContentView.engine.selectPerson(it.id)
+    }
+
+    private func seekPreview(_ sec: Double) {
+        guard pv.on else { return }
+        SwapJournal.line(String(format: "预览 拖到 %.2f s（重开 reader 跳过去，预览不缓存画面）", sec))
+        SwapContentView.engine.seek(sec)
+    }
+
     private func runBench() {
         benchRunning = true
         benchText = ""
@@ -400,8 +596,10 @@ struct SwapContentView: View {
         let facts = SwapFacts.lines().joined(separator: "\n")
         let clip = result.isEmpty ? "（整片换脸还没跑过——先点「开始换脸」）" : result
         let bench = benchText.isEmpty ? "（自检还没跑过）" : benchText
+        let prev = pv.report.isEmpty ? "（预览还没跑过——先点「开始预览」）" : pv.report
         let text = "—— 环境 ——\n" + facts
             + "\n\n—— 整片换脸 ——\n" + clip
+            + "\n\n—— 预览 ——\n" + prev
             + "\n\n—— 逐帧网自检 ——\n" + bench
             + "\n\n—— 流水 ——\n" + SwapJournal.tail(200)
             + "\n\n—— 每趟判决（不滚动，一条片子冲不掉）——\n" + SwapJournal.runs(160)
