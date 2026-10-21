@@ -505,6 +505,9 @@ enum SwapClip {
         var detectMs: [Double] = [], alignMs: [Double] = [], netMs: [Double] = [], pasteMs: [Double] = []
         var beautyMs: [Double] = [], detailMs: [Double] = [], maskMs: [Double] = []
         var appendMs: [Double] = [], decodeMs: [Double] = [], sampleMs: [Double] = [], resids: [Double] = []
+        /// 裁脸＝warpToCrop 那一整块（含缓冲锁）；逐帧整次＝runner.frame 整趟调用（建输入＋装字典＋predict＋取输出摊平）。
+        /// 这两格之前一毫秒都没量，netMs 只框住 predict 那一句，所以 每帧合计 一直是个被低估的数。
+        var warpMs: [Double] = [], frameAllMs: [Double] = []
         var resids224: [Double] = [], facePx: [Double] = [], ratios: [Double] = []
         var cosList: [String] = []
         var made = 0, swapped = 0, noFace = 0, smallFace = 0, fitFail = 0, mirror = 0, netFail = 0, poolMiss = 0
@@ -675,14 +678,18 @@ enum SwapClip {
                             ratios.append(al.ratio)
                             facePx.append(al.shortSide)
                             alignMs.append(Double(DispatchTime.now().uptimeNanoseconds - t2) / 1_000_000)
+                            let tw = DispatchTime.now().uptimeNanoseconds
                             let took = SwapTech.withPixels(dst) { base, bpr -> Bool in
                                 SwapGeo.warpToCrop(UnsafeRawPointer(base), bytesPerRow: bpr, w: w, h: h,
                                                    fwd: al.fwd, side: side, out: &att)
                                 return true
                             }
+                            warpMs.append(Double(DispatchTime.now().uptimeNanoseconds - tw) / 1_000_000)
                             var r: (out: [Float], mask: [Float], ms: Double, note: String) =
                                 (out: [], mask: [], ms: 0.0, note: "裁不出 224")
+                            let tf = DispatchTime.now().uptimeNanoseconds
                             if took == true { r = runner.frame(att224_01: att) }
+                            frameAllMs.append(Double(DispatchTime.now().uptimeNanoseconds - tf) / 1_000_000)
                             if r.out.count != 3 * side * side || r.mask.count != side * side {
                                 // 网没回话：这一帧原样交出去，绝不许丢帧（丢了成片就比素材短）
                                 netFail += 1
@@ -859,7 +866,12 @@ enum SwapClip {
         let wall = Double(DispatchTime.now().uptimeNanoseconds - wall0) / 1_000_000_000 + preWall
         let madeSec = Double(made) / max(src.fps, 1)
         // 预检那一趟的钱要算进每帧合计：它整片先跑了一遍解码＋检测，出片这趟从此不再检测（detectMs 里那格因此接近 0）
-        let perFrame = avg(preDecodeMs) + avg(preDetectMs) + avg(decodeMs) + avg(detectMs) + avg(alignMs) + avg(netMs) + avg(detailMs) + avg(beautyMs) + avg(maskMs) + avg(pasteMs) + avg(appendMs)
+        let perFrame = avg(preDecodeMs) + avg(preDetectMs) + avg(decodeMs) + avg(detectMs) + avg(alignMs) + avg(warpMs) + avg(frameAllMs) + avg(detailMs) + avg(beautyMs) + avg(maskMs) + avg(pasteMs) + avg(appendMs)
+        // 上一版口径：netMs 只框住 predict 那一句，裁脸和「建输入＋装字典＋摊平输出」两格一毫秒都没量⇒那个数是被低估的
+        let perFrameOld = avg(preDecodeMs) + avg(preDetectMs) + avg(decodeMs) + avg(detectMs) + avg(alignMs) + avg(netMs) + avg(detailMs) + avg(beautyMs) + avg(maskMs) + avg(pasteMs) + avg(appendMs)
+        // 预览档＝单趟（解码只跑一遍、检测按真跑过的那格）＋不做提交（不进编码器）；回贴借整片那一格的数＝上限
+        let pvUnit = avg(decodeMs) + max(avg(preDetectMs), avg(detectMs)) + avg(warpMs) + avg(frameAllMs)
+            + avg(detailMs) + avg(beautyMs) + avg(maskMs) + avg(pasteMs)
         say("换完 \(made) 帧（编码器头/尾 \(SwapUtil.ms(tailMs))）"
             + "｜成片 \(String(format: "%.1f", Double(size) / 1_048_576)) MB"
             + "｜缓冲 池子给 \(made - poolMiss)／自造 \(poolMiss)"
@@ -868,11 +880,15 @@ enum SwapClip {
         let detNote = trackMiss > 0 ? "（出片这趟有 \(trackMiss) 帧退回现检）" : ""
         say("      出片趟 解码 \(SwapUtil.stat(decodeMs))｜检测 \(SwapUtil.stat(detectMs))\(detNote)｜对齐 \(SwapUtil.stat(alignMs))")
         let beautyNote = args.whiten ? "" : "（这一趟界面选了关，所以是 0）"
-        say("      逐帧网 \(SwapUtil.stat(netMs))｜高频回填 \(SwapUtil.stat(detailMs))｜美白 \(SwapUtil.stat(beautyMs))\(beautyNote)｜羽化 \(SwapUtil.stat(maskMs))｜回贴 \(SwapUtil.stat(pasteMs))｜提交 \(SwapUtil.stat(appendMs))")
+        say("      逐帧网 \(SwapUtil.stat(netMs))｜裁脸 \(SwapUtil.stat(warpMs))｜逐帧整次 \(SwapUtil.stat(frameAllMs))｜高频回填 \(SwapUtil.stat(detailMs))｜美白 \(SwapUtil.stat(beautyMs))\(beautyNote)｜羽化 \(SwapUtil.stat(maskMs))｜回贴 \(SwapUtil.stat(pasteMs))｜提交 \(SwapUtil.stat(appendMs))")
+        say("      注：逐帧网＝只有 predict 那一句；逐帧整次＝整趟调用（建输入数组＋装 19 键字典＋predict＋取输出摊平），两栏之差＝搬运")
         say("      \(runner.statsLine())")
         say("总耗时 \(String(format: "%.1f", wall)) s（素材实到 \(String(format: "%.1f", madeSec)) s）"
             + "＝\(String(format: "%.2f", wall / max(madeSec, 0.01)))× 实时｜每帧合计 \(String(format: "%.1f", perFrame)) ms"
             + "｜身份复测每次 \(SwapUtil.stat(sampleMs))")
+        say("      每帧合计这一版把 裁脸＋逐帧整次 计进来了；按上一版没量这两格的口径是 \(String(format: "%.1f", perFrameOld)) ms（跨版比数只比这一格）")
+        say("预览试算 单趟不编码每帧 \(String(format: "%.1f", pvUnit)) ms＝解码＋检测＋裁脸＋逐帧整次＋高频回填＋美白＋羽化＋回贴（提交那格去掉＝不进编码器；回贴借整片那一格的数＝上限）"
+            + "｜16 帧/秒的格＝62.5 ms/帧，这一趟每播 1 s 要 \(String(format: "%.0f", pvUnit * 16)) ms（一秒 1000 ms）")
         say("换上人 \(swapped) 帧｜没脸 \(noFace)｜太小 \(smallFace)｜拟合没过 \(fitFail)｜镜像 \(mirror)｜网失败 \(netFail)｜点位 \(pointSrc)")
         var detSrcTxt = "全部当场真检 \(made)（预检没跑成）"
         if hasTrack {
