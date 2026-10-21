@@ -182,6 +182,7 @@ enum SwapVision {
         let fwd: SwapGeo.Affine
         let back: SwapGeo.Affine
         let mirrored: Bool        // 5 点的手性与模板相反＝y 口径判错，贴回去是一张翻面的人脸，这帧不许换
+        let chir: (nose: Double, mouth: Double)   // 判镜像那两把叉的原值：被挡的帧要靠它当场复盘点位
         let resid224: Double      // 5 个点到模板的平均距离，单位＝224 方块里的像素
         let residPx: Double       // 同一件事折回原图像素（除以缩放），和 PC 那张 ±2/4/8 px 容忍表直接对账
         let det: Double           // 相似拟合下＝缩放平方，恒正（镜像改由 mirrored 判）
@@ -243,8 +244,13 @@ enum SwapVision {
         let det = fwd.a * fwd.e - fwd.b * fwd.d          // 相似拟合下恒正＝a²＋b²
         guard det > 1e-9 else { return nil }
         // 镜像只能这样判：相似拟合不会把点位映反（它只会给一个转正的最优解），
-        // 而 y 口径搞错时 5 个点是真被翻了面的，只有多边形的手性认得出来。翻面＝这帧不换。
-        let mirrored = SwapGeo.signedArea(pts) * SwapGeo.signedArea(tpl) < 0
+        // 而 y 口径搞错时 5 个点是真被翻了面的，只有手性认得出来。翻面＝这帧不换。
+        // 判据是眼轴×鼻位、眼轴×嘴角中点这两把叉各自与模板比号（0.25 起）：
+        // 旧的那式＝5 点围成多边形的有向面积，它是两大块相消，合成几何算到俯仰 30° 只剩模板的 8%、
+        // 45° 直接翻号＝抬头低头被当成镜像挡掉（tools/_swap_yaw.py，两把叉在这些姿态下符号都不动）。
+        let chir = SwapGeo.chirality(pts)
+        let chirTpl = SwapGeo.chirality(tpl)
+        let mirrored = chir.nose * chirTpl.nose < 0 || chir.mouth * chirTpl.mouth < 0
         var sum = 0.0
         for i in 0..<pts.count {
             let px = Double(pts[i].x), py = Double(pts[i].y)
@@ -264,7 +270,7 @@ enum SwapVision {
         let sMax = lmax.squareRoot(), sMin = lmin.squareRoot()
         let ratio = sMin > 1e-9 ? sMax / sMin : 999.0
         let scale = det.squareRoot()
-        return Alignment(fwd: fwd, back: back, mirrored: mirrored,
+        return Alignment(fwd: fwd, back: back, mirrored: mirrored, chir: chir,
                          resid224: resid, residPx: scale > 1e-9 ? resid / scale : 999.0,
                          det: det, ratio: ratio, pts: pts, src: src, shortSide: shortSide)
     }

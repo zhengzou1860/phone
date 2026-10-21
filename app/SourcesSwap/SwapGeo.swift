@@ -52,15 +52,22 @@ enum SwapGeo {
                       d: b, e: a, f: dmy - (b * pmx + a * pmy))
     }
 
-    /// 5 点围成的多边形有向面积（鞋带公式）。相似拟合只会给一个「转正」的解、det ＝ a²＋b² 恒正，
-    /// 所以点位被排成镜像这件事不能再靠 det 的符号看——用这一式比模板的符号。
-    static func signedArea(_ pts: [CGPoint]) -> Double {
-        var s = 0.0
-        for i in 0..<pts.count {
-            let p = pts[i], q = pts[(i + 1) % pts.count]
-            s += Double(p.x) * Double(q.y) - Double(q.x) * Double(p.y)
-        }
-        return s / 2
+    /// 手性两把叉（点序 [眼左,眼右,鼻,嘴角左,嘴角右]）：眼轴×鼻位、眼轴×嘴角中点。
+    /// 相似拟合只会给一个「转正」的解、det ＝ a²＋b² 恒正，所以点位被排成镜像不能靠 det 的符号看，
+    /// 只能靠手性：判法＝这两把叉各自与模板同号否。
+    /// 为什么不用 5 点围成多边形的有向面积（0.24 及以前的判据）：它是两大块相消，正脸那点余量只剩模板面积的 1 倍，
+    /// 合成几何（tools/_swap_yaw.py）算出来俯仰 30° 就只剩 8%、45° 直接翻号＝抬头低头被当成镜像挡掉。
+    /// 这两把叉在偏航／俯仰／滚转下符号都不动，而 y 真被翻面（鼻跑到眼轴之上）时两把一起翻号。
+    static func chirality(_ pts: [CGPoint]) -> (nose: Double, mouth: Double) {
+        guard pts.count == 5 else { return (0, 0) }
+        let ux = Double(pts[1].x) - Double(pts[0].x)
+        let uy = Double(pts[1].y) - Double(pts[0].y)
+        let ex = (Double(pts[0].x) + Double(pts[1].x)) / 2
+        let ey = (Double(pts[0].y) + Double(pts[1].y)) / 2
+        let mx = (Double(pts[3].x) + Double(pts[4].x)) / 2
+        let my = (Double(pts[3].y) + Double(pts[4].y)) / 2
+        return (ux * (Double(pts[2].y) - ey) - uy * (Double(pts[2].x) - ex),
+                ux * (my - ey) - uy * (mx - ex))
     }
 
     /// 3×3 齐次求逆后取前两行 = 官方 back_matrix（np.linalg.pinv，非奇异时同 inv）

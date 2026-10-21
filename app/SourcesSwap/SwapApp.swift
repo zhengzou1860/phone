@@ -223,7 +223,7 @@ struct SwapContentView: View {
                             .textSelection(.enabled)
                             .frame(maxWidth: .infinity, alignment: .leading)
 
-                        Text("换一个人（点名字，当场贴到手里的这一格，一帧都不重新处理）").font(.caption)
+                        Text("换一个人：点名字选中，然后点下面的「开始预览」。预览跑着时这里改不动，要换人先「停预览」。").font(.caption)
                         if idents.isEmpty {
                             Text("（列表空着：预览只吃「已存的人」，先用上面①②跑一次整片换脸存下一个人）")
                                 .font(.caption2)
@@ -231,11 +231,15 @@ struct SwapContentView: View {
                         ScrollView(.horizontal, showsIndicators: false) {
                             HStack(spacing: 8) {
                                 ForEach(idents, id: \.id) { it in
-                                    Button((pv.person == it.id ? "◉ " : "○ ") + it.name) { previewPick(it) }
+                                    Button((chosenIdent == it.id ? "◉ " : "○ ") + it.name) { pickIdent(it) }
                                         .buttonStyle(.bordered)
-                                        .disabled(!pv.on)
+                                        .disabled(pv.on || running)
                                 }
                             }
+                        }
+                        if pv.on && !pv.person.isEmpty {
+                            Text("画面里现在的人：「\(SwapIdents.displayName(pv.person))」（这一趟就是他，不换）")
+                                .font(.caption)
                         }
 
                         HStack(spacing: 6) {
@@ -265,11 +269,13 @@ struct SwapContentView: View {
                         if !pv.report.isEmpty {
                             Text(pv.report).font(.caption).textSelection(.enabled)
                         }
-                        Text("预览跟上面「算力单元」「补丁美白」这两档走；「长边上限」管不到预览——预览自己从 640 起，脸短边不足 150 px 会自己抬到 960、1280。"
+                        Text("预览跟上面「算力单元」「补丁美白」这两档走；进链固定 640 那一档，上面「长边上限」管不到预览、预览自己也不抬尺寸"
+                            + "（0.23 上机量过：640 档每播 1 s 素材要 909 ms，960 档 1105 ms 就过不了 16 帧那一头）。"
                             + "预览跑着时「算力单元」改不动（它只在装那三张网的那一刻生效），要换档先停预览；"
                             + "「补丁美白」是每一格现读的，改了当场生效。")
                             .font(.caption2)
-                        Text("预览这一条不做高频回填、也没有整片平滑：皮肤比成片软一档、遮罩边上比成片抖。挑中谁就在上面点他的名字再「开始换脸」出片。")
+                        Text("预览的补丁与成片同一口径：高频回填在做；差的是成片那一步整片对称平滑（预览当场检测，遮罩边上比成片抖）。"
+                            + "挑中谁就在上面点他的名字再「开始换脸」出片。")
                             .font(.caption2)
                     }
 
@@ -306,11 +312,13 @@ struct SwapContentView: View {
                         在的是高频回填（0.19 起，把这一帧对齐原片自己的 σ=0.8 高通按 λ=1.0 加回补丁）和美白（0.11 起，这一版起界面可关）。\
                         CI 给逐帧网挂的第三个出参这一版也没有代码去取它。
                         这一版多了「换脸预览」。为什么要减帧：0.22 上机量到走完整口径要 73.6 ms/帧，16 帧/秒那一格只有 62.5 ms，差的那一截不是靠耐心能补的。\
-                        这一版从三处减：① 预览自己按 640 进链（脸短边不足 150 px 抬到 960），小窗里给的就是这条小链的整幅画面，\
-                        回贴不再往 1920 上贴（那一格实测 16.85 ms，像素数随尺寸平方缩）\
-                        ② 不做高频回填（2.60 ms）③ 逐帧网那趟调用里的搬运（8.49 ms，改成整段 memcpy，出片那条一起省）。\
+                        从两处减：① 进链钉死 640 那一档，小窗里给的就是这条小链的整幅画面，\
+                        回贴不再往 1920 上贴（那一格实测 16.85 ms，像素数随尺寸平方缩）。0.23 上机两档都量过：640 档每换一帧 53.34 ms＝每播 1 s 素材 909 ms，\
+                        960 档 63.45 ms＝1105 ms 已经过不了 16 帧那一头 ⇒ 脸小也不再自己抬尺寸，就按 640 的样子看\
+                        ② 逐帧网那趟调用里的搬运（8.49 ms，改成整段 memcpy，出片那条一起省）。\
+                        高频回填 0.25 起加回来（2.60 ms）：补丁这一段与成片同一口径，加完每播 1 s 素材约 951 ms，还在 1000 ms 以内。\
                         减帧口径＝解码不跳（3.9 ms/帧），每 1/16 秒只挑最贴近的那一帧真换、其余帧沿用上一格画面。\
-                        换人只把「已存的人」那 18 个权重装上（0.22 实测 0.29~0.85 ms）、身份全在权重里与帧无关，\
+                        人在「开始预览」之前点名字定下，一整趟不换：身份全在那 18 个权重里、与帧无关，\
                         所以一帧都不必缓存：长度上没有「超过 3 分钟就不行」那道墙，也不写任何文件。
                         """)
                             .font(.caption)
@@ -575,14 +583,6 @@ struct SwapContentView: View {
         pv.status = "预览开跑：先把三张网装好，第一格还要等它检测到位"
         SwapJournal.line("开始预览 units=\(c.unitsTxt) 美白=\(whitenTxt) "
             + "人=\(SwapIdents.displayName(chosenIdent)) 片=\(v.lastPathComponent)")
-    }
-
-    /// 小窗下面点名字：出片那条也跟着换成他，两边看到的是同一个人。
-    /// 名字上那个 ◉ 由引擎回话才点（装没收时画面里还是原来那个人）
-    private func previewPick(_ it: SwapIdents.Item) {
-        pickIdent(it)
-        guard pv.on else { return }
-        SwapContentView.engine.selectPerson(it.id)
     }
 
     private func seekPreview(_ sec: Double) {

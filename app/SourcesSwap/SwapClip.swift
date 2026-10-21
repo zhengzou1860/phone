@@ -668,8 +668,10 @@ enum SwapClip {
                             // （相似拟合表达不了镜像，det＝a²＋b² 恒正，只能这样判）
                             mirror += 1
                             if mirror <= 3 {
-                                say("第 \(made) 帧 5 点手性与模板相反（y 口径判反）｜面积 \(String(format: "%.0f", SwapGeo.signedArea(ptsIn)))"
-                                    + "→这帧不换")
+                                let ptTxt = al.pts.map { String(format: "%.0f,%.0f", $0.x, $0.y) }.joined(separator: " ")
+                                say("第 \(made) 帧 5 点手性与模板相反（y 口径判反）"
+                                    + "｜叉 \(String(format: "%.0f", al.chir.nose))／\(String(format: "%.0f", al.chir.mouth))"
+                                    + "｜点位 \(al.src)｜短边 \(String(format: "%.0f", al.shortSide)) px｜5 点 \(ptTxt)→这帧不换")
                             }
                         } else {
                             let t2 = DispatchTime.now().uptimeNanoseconds
