@@ -35,7 +35,8 @@ final class SwapPreview {
         var longEdge = 640
     }
 
-    /// 界面挂的四个口子：出画、状态一行、进流水、停下来的那一句（连带这条素材的秒数＝滑杆的范围）
+    /// 界面挂的口子：出画、点这一下的那句答案（只在被挡／开跑／停下时递，跑动中的逐秒实况不往这里走）、
+    /// 进流水、停下来的那一句（连带这条素材的秒数＝滑杆的范围）
     var render: ((UIImage) -> Void)?
     var onShow: ((String) -> Void)?
     var log: ((String) -> Void)?
@@ -317,10 +318,6 @@ final class SwapPreview {
                 if sec - lastStat >= 1.0 {
                     lastStat = sec
                     progress(sec, src.duration)
-                    let w = seconds() - wall0
-                    show(String(format: "播到 %.1f/%.1f s｜新画面 %.1f 帧/真实秒｜每格 %.1f ms｜换上 %d｜没脸 %d｜镜像 %d｜足迹 %d MB",
-                                sec, src.duration, w > 0.1 ? Double(nSwap) / w : 0,
-                                avg(swapMs), nSwap, noFace, mirror, SwapFacts.footprintMB()))
                 }
             }
             if done { break }
@@ -403,33 +400,34 @@ final class SwapPreview {
         lock.unlock()
         guard let pid = pid, pid != person else { return }
         guard let one = SwapIdents.load(id: pid) else {
-            say("预览开不起来：「\(SwapIdents.displayName(pid))」的存档读不出来，先停预览换一个人")
-            confirm("")
-            refuseRun()
+            refuse("预览开不起来：「\(SwapIdents.displayName(pid))」的存档读不出来，先停预览换一个人")
             return
         }
         let eNorm = SwapIdents.norm(one.emb), wNorm = SwapIdents.weightsNorm(one.weights)
         guard eNorm > 0.5, wNorm > 1e-6 else {
-            say("预览开不起来：「\(one.name)」这份包里的数是空的（身份证模长 \(String(format: "%.4f", eNorm))"
+            refuse("预览开不起来：「\(one.name)」这份包里的数是空的（身份证模长 \(String(format: "%.4f", eNorm))"
                 + "／权重合起来模长 \(String(format: "%.3f", wNorm))），先停预览换一个人")
-            confirm("")
-            refuseRun()
             return
         }
         let t0 = ns()
         let put = runner.useWeights(one.weights)
         let ms = msFrom(t0)
         guard put.count == 18 else {
-            say("预览开不起来：\(put.note)，先停预览换一个人")
-            confirm("")
-            refuseRun()
+            refuse("预览开不起来：\(put.note)，先停预览换一个人")
             return
         }
         person = pid
         confirm(pid)
         say("预览 装到人「\(one.name)」：读盘＋装权重 \(SwapUtil.ms(ms))｜\(put.note)"
             + "｜跳过 ①②（上机实测这两步 70.61 + 18.27 ms）｜足迹 \(SwapFacts.footprintMB()) MB")
-        show("预览的人＝「\(one.name)」")
+    }
+
+    /// 开不起来：这句既进流水（发电脑要看的那份），也当场顶到界面那一行——点了「开始预览」总得有个说法
+    private func refuse(_ s: String) {
+        say(s)
+        show(s)
+        confirm("")
+        refuseRun()
     }
 
     /// 身份权重装不上就别跑了：那张 runner 身上没身份，逐帧网只会凑出一张不认识的脸

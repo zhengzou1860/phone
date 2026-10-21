@@ -26,8 +26,10 @@ struct SwapApp: App {
 /// 不捕 view 那个 struct 的副本——副本每刷新一帧就换一份，抓住旧的写 @State 就是空写。
 final class SwapPreviewMirror: ObservableObject {
     @Published var img: UIImage?
+    /// 只装「点了这一下」的一句话答案（被挡、停了、开跑）；处理过程的逐秒实况不再往这里递
     @Published var status = ""
-    @Published var report = ""
+    /// 这一趟的整份账：不在界面上摆，只喂「发到电脑」那一份正文
+    var report = ""
     @Published var on = false
     @Published var pos = 0.0
     @Published var dur = 0.0
@@ -36,8 +38,8 @@ final class SwapPreviewMirror: ObservableObject {
     var dragging = false
 }
 
-/// 选片、开始换脸这一摊的状态。跑起来之后界面只靠每秒捞磁盘日志尾巴来动，
-/// 后台线程不许直接碰 SwiftUI 的 @State。
+/// 选片、开始换脸这一摊的状态。界面上不摆处理过程流水（0.25 起按他令撤掉），
+/// 跑起来的实况只落在磁盘流水里、由「发到电脑」整份交出去；后台线程不许直接碰 SwiftUI 的 @State。
 struct SwapContentView: View {
     @State private var facts: [String] = []
     @State private var faceURL: URL?
@@ -49,7 +51,6 @@ struct SwapContentView: View {
     @State private var longIdx = 0                   // 默认 1920（长边上限）
     @State private var beautyIdx = 0                 // 0＝美白开（0.11 以来的那份），1＝关
     @State private var result = ""
-    @State private var logTail = ""
     @State private var outURL: URL?
 
     @State private var idents: [SwapIdents.Item] = []
@@ -80,8 +81,6 @@ struct SwapContentView: View {
         ("ANE(cpuAndNeuralEngine)", .cpuAndNeuralEngine),
     ]
     static let longs = [1920, 1280, 960, 640]
-
-    private let pulse = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
     var body: some View {
         NavigationView {
@@ -169,21 +168,12 @@ struct SwapContentView: View {
                         Text("关＝这一趟不在补丁上做那一档提亮（Lab 里 L×1.06+4.31）。本机六臂量：遮罩边上的亮度台阶 3.33→0.69 灰阶，补丁暗一档（芯 L 122.6→106.0），↔源 0.697→0.674。")
                             .font(.caption2)
 
-                        // 点下去立刻置灰 + 改文案：手机上长任务没有别的反馈手段
-                        Button(running ? "换脸跑着…（别看空屏，下面在动）" : "开始换脸") {
+                        // 点下去立刻置灰 + 改文案：界面上没有流水，这一下的反馈就在按钮自己身上
+                        Button(running ? "换脸跑着…（跑完这里给一句话）" : "开始换脸") {
                             startSwap()
                         }
                         .buttonStyle(.borderedProminent)
                         .disabled(running || !hasSource || videoURL == nil)
-
-                        // 我点的这个按钮下面就是真实流水：送达→执行→到第几帧→结果
-                        Text(running ? "跑着，下面每 1 s 刷一次："
-                            : (logTail.isEmpty ? "（还没跑过）" : "上一次跑完的流水尾部："))
-                            .font(.caption)
-                        Text(logTail.isEmpty ? "—" : logTail)
-                            .font(.system(size: 10, design: .monospaced))
-                            .textSelection(.enabled)
-                            .frame(maxWidth: .infinity, alignment: .leading)
 
                         if !result.isEmpty {
                             Text(result).font(.caption).textSelection(.enabled)
@@ -217,11 +207,6 @@ struct SwapContentView: View {
                         }
                         .frame(maxWidth: .infinity, minHeight: 190, maxHeight: 300)
                         .clipped()
-
-                        Text(pv.status.isEmpty ? "（预览没动静）" : pv.status)
-                            .font(.system(size: 10, design: .monospaced))
-                            .textSelection(.enabled)
-                            .frame(maxWidth: .infinity, alignment: .leading)
 
                         Text("换一个人：点名字选中，然后点下面的「开始预览」。预览跑着时这里改不动，要换人先「停预览」。").font(.caption)
                         if idents.isEmpty {
@@ -257,18 +242,9 @@ struct SwapContentView: View {
                             .buttonStyle(.borderedProminent)
                             .disabled(!pv.on && !previewBlock.isEmpty)
                         if !previewBlock.isEmpty { Text(previewBlock).font(.caption2) }
+                        // 只递这一下点出来的那句答案（被挡／开了／停了）；跑动中的逐秒实况不再上界面
+                        if !pv.status.isEmpty { Text(pv.status).font(.caption).textSelection(.enabled) }
 
-                        // 我点的这个按钮下面就是真实流水：起网→第几秒→多少钱一帧
-                        Text(pv.on ? "跑着，下面每 1 s 刷一次："
-                            : (logTail.isEmpty ? "（还没跑过）" : "流水尾部："))
-                            .font(.caption)
-                        Text(logTail.isEmpty ? "—" : logTail)
-                            .font(.system(size: 10, design: .monospaced))
-                            .textSelection(.enabled)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                        if !pv.report.isEmpty {
-                            Text(pv.report).font(.caption).textSelection(.enabled)
-                        }
                         Text("预览跟上面「算力单元」「补丁美白」这两档走；进链固定 640 那一档，上面「长边上限」管不到预览、预览自己也不抬尺寸"
                             + "（0.23 上机量过：640 档每播 1 s 素材要 909 ms，960 档 1105 ms 就过不了 16 帧那一头）。"
                             + "预览跑着时「算力单元」改不动（它只在装那三张网的那一刻生效），要换档先停预览；"
@@ -332,7 +308,6 @@ struct SwapContentView: View {
             .onAppear {
                 facts = SwapFacts.lines()
                 idents = SwapIdents.list()
-                logTail = SwapJournal.tail(30)
                 let mirror = pv
                 let eng = SwapContentView.engine
                 eng.render = { img in mirror.img = img }
@@ -349,9 +324,6 @@ struct SwapContentView: View {
                     mirror.dur = d
                     mirror.report = txt
                 }
-            }
-            .onReceive(pulse) { _ in
-                if running || benchRunning || pv.on { logTail = SwapJournal.tail(30) }
             }
             // cover 不收场就整屏卡在选择页，必须自己关
             .fullScreenCover(isPresented: Binding(get: { picking == "face" },
@@ -434,7 +406,6 @@ struct SwapContentView: View {
         running = true
         result = ""
         outURL = nil
-        logTail = SwapJournal.tail(30)
         let units = Self.units[unitIdx].1
         let longEdge = Self.longs[longIdx]
         let beautyTxt = beautyIdx == 0 ? "开" : "关"
@@ -468,12 +439,13 @@ struct SwapContentView: View {
             }
             DispatchQueue.main.async {
                 outURL = r.out
-                result = r.note
+                // 整份账只进「发到电脑」的正文；界面上成了一句、没成把 fail 那一句（账的最后一行）递上来
+                result = r.out != nil ? "换脸跑完，成片在沙盒"
+                    : (r.note.split(separator: "\n").last.map(String.init) ?? "换脸没成")
                 running = false
                 videoURL = nil
                 facts = SwapFacts.lines()
                 idents = SwapIdents.list()
-                logTail = SwapJournal.tail(30)
             }
         }
     }
