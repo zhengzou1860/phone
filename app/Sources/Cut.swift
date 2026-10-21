@@ -674,6 +674,10 @@ enum CutEngine {
         var rot = -1
         var probeCols: [[Double]] = Array(repeating: [], count: 4)
         var probeRows: [(sample: Int, sims: [Double])] = []
+        /// 每张取样帧记一下「这一帧里过了尺寸闸的每张脸各读到的（正脸偏移, 4 个朝向的余弦）」。
+        /// 命中判定和末尾那张候选闸门回算表都从这份数据出——一趟扫描就把每个档位各留几帧算全，
+        /// 他要的「侧一点也留」该落在哪个数，看报告那一行就行，不用反复装机试。
+        var recs: [(sample: Int, faces: [(dev: Double?, sims: [Double])])] = []
         func lockRotation(_ why: String) {
             var bestK = 0, bestMed = -99.0
             for k in 0..<4 {
@@ -681,9 +685,6 @@ enum CutEngine {
                 bestMed = m; bestK = k
             }
             rot = bestK
-            for row in probeRows where row.sims[bestK] >= cosTh && row.sample < o.keep.count {
-                o.keep[row.sample] = true
-            }
             Journal.line("扫描 朝向定 k=\(bestK) 中位=\(String(format: "%.3f", bestMed)) 试探 \(probeRows.count) 张（\(why)）")
         }
         let mem0 = Facts.footprintMB()
@@ -714,7 +715,7 @@ enum CutEngine {
                     o.samples += 1
                     if !obs.isEmpty { o.framesWithFace += 1 }
                     _ = withPixels(buffer) { base, bpr -> Bool in
-                        var best = -9.0
+                        var faceRows: [(dev: Double?, sims: [Double])] = []
                         for f in obs {
                             let pw = Double(f.boundingBox.width) * Double(w) * sideScale
                             let ph = Double(f.boundingBox.height) * Double(h) * sideScale
@@ -723,20 +724,24 @@ enum CutEngine {
                                 o.yawSeen += 1
                                 o.yawAbs.append(abs(Double(truncating: y)))
                             }
-                            // 正脸闸放在跑尺子之前：挡掉一张就少跑一次尺子。
-                            // 量的那格从鼻尖换成嘴角中点——鼻尖那个点上机他肉眼报"偏到鼻翼侧"，
-                            // 两次跑都是 偏左 400+/偏右 100+ 且离中线 0.06＝这个点自带固定横偏，
-                            // 和"头转了"是同一个方向，没法分开标阈值。
-                            // rot < 0（朝向还没锁）时只记数不挡：那几帧是按 k=0 量的，横着的脸
-                            // 嘴角中点必然偏到一边，挡下去就是把朝向试探饿死——
-                            // 0.12 那次「剪完只留下第一帧」正是这么来的。
+                            // 正脸度这里只量、只记，不在这一格挡掉这张脸：
+                            // ① 拿它省尺子省不出时间——上机单价 检测 20.6 ms/帧 vs 尺子 3.7 ms/次，
+                            //    653 帧的检测 13.4 s 是主项，535 张全跑尺子也只 2.0 s；
+                            // ② 0.12 那版在跑尺子之前挡，把朝向试探的样本一起挡没了，
+                            //    结果「剪完只留下第一帧」。挡在判定这一步，这个坑结构上就不存在了。
+                            // 量的那格用嘴角中点而不是鼻尖：鼻尖那个点上机他肉眼报"偏到鼻翼侧"，
+                            // 自带一个固定横偏，和"头转了"是同一个方向，分不开也标不出阈值。
+                            // 这个投影读数对整个点集做旋转(任何 k)都不变，所以 rot<0 那几帧
+                            // 按 k=0 量出来的数和锁定之后同一个口径。
+                            var dev: Double? = nil
                             if let fr = Align.frontality(f, k: rot < 0 ? 0 : rot, w: w, h: h) {
-                                let dev = abs(fr.mouth - 0.5)
-                                o.mouthDevs.append(dev)
+                                let d = abs(fr.mouth - 0.5)
+                                dev = d
+                                o.mouthDevs.append(d)
                                 o.noseDevs.append(abs(fr.nose - 0.5))
                                 o.offMid.append(fr.off)
                                 if fr.mouth < 0.5 { o.turnLeft += 1 } else { o.turnRight += 1 }
-                                if rot >= 0 && dev > frontTh { o.turnBlocked += 1; continue }
+                                if d > frontTh { o.turnBlocked += 1 }
                             }
                             o.gated += 1
                             let ks = rot < 0 ? [0, 1, 2, 3] : [rot]
@@ -752,22 +757,18 @@ enum CutEngine {
                                 embedRuns += 1
                                 sims[k] = cosine(anchor, v)
                             }
+                            faceRows.append((dev: dev, sims: sims))
                             if rot < 0 {
                                 probeRows.append((sample: sample, sims: sims))
                                 for k in 0..<4 where sims[k] > -8 { probeCols[k].append(sims[k]) }
-                                if let m = sims.max(), m > best { best = m }
                                 if probeRows.count >= probeN {
                                     lockRotation("够 \(probeN) 张")
                                 } else if !probeRows.isEmpty && sample >= 300 {
                                     lockRotation("闸门太紧，第 300 帧用这 \(probeRows.count) 张定的")
                                 }
-                            } else {
-                                let c = sims[rot]
-                                if c > best { best = c }
-                                if c >= cosTh && sample < o.keep.count { o.keep[sample] = true }
                             }
                         }
-                        if best > -8 { o.bigSims.append(best) }
+                        if !faceRows.isEmpty { recs.append((sample: sample, faces: faceRows)) }
                         return true
                     }
                     sample += 1
@@ -789,6 +790,29 @@ enum CutEngine {
         if rot < 0 && !probeRows.isEmpty { lockRotation("样本取完才定") }
         if sample < nSamples && stopNote.isEmpty { stopNote = endedNote(reader) }
 
+        // 命中判定统一在这一步做：这一帧里只要有一张脸「对锚点的余弦够 且 正脸度落在窗内」就留。
+        // 五官点缺到算不出正脸度的那张（dev==nil）不按侧脸算——他要的是「能检测到五官的保留」，
+        // 点位都没有的脸归到「这张闸不看它」，而不是替它判侧。
+        func kept(_ th: Double) -> [Int] {
+            guard rot >= 0 else { return [] }
+            return recs.filter { r in
+                r.sample < nSamples &&
+                r.faces.contains { $0.sims[rot] >= cosTh && ($0.dev ?? 0) <= th }
+            }.map { $0.sample }
+        }
+        var ladder = ""
+        if rot >= 0 {
+            for i in kept(frontTh) { o.keep[i] = true }
+            for r in recs {
+                let c = r.faces.filter { ($0.dev ?? 0) <= frontTh }.map { $0.sims[rot] }.max()
+                if let c = c, c > -8 { o.bigSims.append(c) }
+            }
+            let ths = [0.10, 0.15, 0.22, 0.30, 0.45, 0.60, 0.80, 1.00]
+            ladder = "同一趟数据回算 闸门放在 "
+                + ths.map { String(format: "%.2f", $0) + "→\(kept($0).count) 帧" }.joined(separator: "｜")
+                + "｜不挡→\(kept(1e9).count) 帧"
+        }
+
         o.detectMs = o.samples > 0 ? detectSum / Double(o.samples) : 0
         o.embedMs = embedRuns > 0 ? embedSum / Double(embedRuns) : 0
         o.segments = segmentsFromKeep(o.keep)
@@ -800,8 +824,8 @@ enum CutEngine {
         let wall = Double(DispatchTime.now().uptimeNanoseconds - wall0) / 1_000_000_000
         let pct = o.samples > 0 ? Double(o.hits) / Double(o.samples) * 100 : 0
         var line = "扫 \(o.samples) 取样帧（step=\(step)，源 \(totalFrames) 帧 / \(String(format: "%.1f", duration)) s，直出长边 \(decodedLong)→源折算 ×\(String(format: "%.2f", sideScale))）"
-        line += "\n有脸的帧 \(o.framesWithFace)/\(o.samples)；两道闸都过的脸 \(o.gated) 张；裁脸失败 \(cropFails) 张"
-        line += "\n正脸闸 |嘴角中点偏移| ≤ \(String(format: "%.2f", frontTh))：挡掉 \(o.turnBlocked) 张（量到读数的脸 \(o.mouthDevs.count) 张，朝向锁定前只记数不挡）"
+        line += "\n有脸的帧 \(o.framesWithFace)/\(o.samples)；≥\(String(format: "%.0f", sideTh)) px 的脸 \(o.gated) 张（每张都跑了尺子）；裁脸失败 \(cropFails) 张"
+        line += "\n正脸闸 |嘴角中点偏移| ≤ \(String(format: "%.2f", frontTh))：\(o.mouthDevs.count) 张量到读数，落在窗外 \(o.turnBlocked) 张（窗外＝判侧脸时不算它，不省尺子）"
         if let a = spread(o.mouthDevs), let b = spread(o.noseDevs), let c = spread(o.offMid) {
             line += "\n  偏移 嘴角中点 \(a)｜鼻尖原值 \(b)｜鼻尖离中线 \(c)（占两眼间距）"
             line += "｜嘴角中点偏左 \(o.turnLeft) 偏右 \(o.turnRight)"
@@ -817,10 +841,11 @@ enum CutEngine {
             line += "\n  → 用 **转\(rot * 90)°**；点位 \(pointSrc)"
         }
         line += "\n**命中 \(o.hits)/\(o.samples) 帧（\(String(format: "%.0f", pct))%）→ \(o.segments.count) 段，合计 \(String(format: "%.1f", total)) s**"
+        if !ladder.isEmpty { line += "\n  \(ladder)（这一行是拿这一趟的读数换档重算，不用再扫一遍）" }
         if let med = median(o.bigSims), let mx = o.bigSims.max() {
-            line += "\n  过闸脸对锚点的余弦 中位 \(String(format: "%.3f", med)) 最高 \(String(format: "%.3f", mx))（闸门 \(String(format: "%.2f", cosTh))）"
+            line += "\n  落在窗内的脸对锚点的余弦 中位 \(String(format: "%.3f", med)) 最高 \(String(format: "%.3f", mx))（闸门 \(String(format: "%.2f", cosTh))）"
         } else {
-            line += "\n  没有一张脸跑到尺子：尺寸 ≥\(String(format: "%.0f", sideTh)) px 且 嘴角中点偏移 ≤\(String(format: "%.2f", frontTh)) 这两道闸一张都没过"
+            line += "\n  没有一张脸跑到尺子：尺寸 ≥\(String(format: "%.0f", sideTh)) px 这一道闸一张都没过"
         }
         line += "\n单价：检测 \(String(format: "%.1f", o.detectMs)) ms/帧 + 尺子 \(String(format: "%.1f", o.embedMs)) ms/次；本次实耗 \(String(format: "%.1f", wall)) s"
         if Ruler.shared.failures > 0 {
@@ -1053,11 +1078,12 @@ final class Cutter: ObservableObject {
     @Published var showPicker = false
     @Published var step = 1
     @Published var sideTh = 96.0
-    /// 正脸度上限＝**两嘴角中点**在两眼连线轴上允许偏离正中多少（|读数-0.5|）。超过就当侧脸挡掉；调小＝只留更正的脸。
-    /// 刻度从鼻尖换成嘴角中点：手机 Vision 那个鼻尖两次跑都是 偏左 400+/偏右 100+、离中线 0.06（眼距），
+    /// 正脸度上限＝**两嘴角中点**在两眼连线轴上允许偏离正中多少（|读数-0.5|）。调大＝侧一点也留，调到 1.50 这张闸基本不挡。
+    /// 量的格用嘴角中点而不是鼻尖：手机 Vision 那个鼻尖两次跑都是 偏左 400+/偏右 100+、离中线 0.06（眼距），
     /// 也就是这个点自带一个固定横偏，和"头真转了"同向，标不出阈值——0.12 按 PC 的点位标，上机挡掉 528/535。
-    /// 嘴角中点这条：他先点的那张侧脸读 0.343，同一片里他看着正的一簇读到 0.02～0.09 ⇒ 上限落在 0.15。
-    @Published var frontTh = 0.15
+    /// 0.15 那档上机只留了 132/653 帧，他判「有点严格了，我说的是能检测到五官的保留」⇒ 退到 0.45。
+    /// 这一格该落多少不用猜：报告里「同一趟数据回算 闸门放在 …→… 帧」那一行就是这片子每档各留几帧。
+    @Published var frontTh = 0.45
     /// 已选为锚点的是这一帧里的第几张脸（-1＝还没选）；绿框会把它描成橙色，让"选上了"这件事看得见
     @Published var chosen = -1
     @Published var temps: [TempFile] = []
@@ -1425,8 +1451,8 @@ struct CutView: View {
                         Text("脸短边下限 \(Int(cut.sideTh)) px（按源片尺寸）")
                             .font(.footnote)
                     }
-                    Stepper(value: $cut.frontTh, in: 0.05...0.50, step: 0.01) {
-                        Text("挡侧脸 \(String(format: "%.2f", cut.frontTh))（量的是嘴角中点偏离正中多少；调小＝只留正对镜头的，0.50＝这张闸不挡）")
+                    Stepper(value: $cut.frontTh, in: 0.05...1.50, step: 0.05) {
+                        Text("挡侧脸 \(String(format: "%.2f", cut.frontTh))（量的是嘴角中点偏离正中多少；调大＝侧一点也留着，1.50＝这张闸基本不挡。报告里「同一趟数据回算」那行列了每档各留几帧）")
                             .font(.footnote)
                     }
                 }
