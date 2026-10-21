@@ -15,7 +15,8 @@ import Vision
 /// ⇒ 长度上没有「超过 3 分钟就不行」那道墙，足迹还是日志里那 25~100 MB 的量级。
 ///
 /// 每帧省下来的钱来自 0.22 量出的三处（那一版预览试算 73.6 ms/帧，过不了 16 fps 的 62.5 ms 门槛）：
-///   ① 只画小窗：进链按 640 那一档解码，回贴的像素数随尺寸平方缩（整片那一格实测 16.85 ms）
+///   ① 进链按 640 那一档（脸短边不足 150 px 抬到 960），交出去的是这条小链的整幅画面：
+///      回贴的像素数随尺寸平方缩（整片 1920 那一格实测 16.85 ms）
 ///   ② 不做高频回填（σ=0.8 高通那一档，实测 2.60 ms；代价＝预览里的皮肤比成片软一档）
 ///   ③ 逐帧网那趟调用里的搬运（实测 8.49 ms，改在 SwapModels 那两处 memcpy，出片那条一起省）
 ///
@@ -374,6 +375,13 @@ final class SwapPreview {
         maskMs.append(msFrom(t3))
 
         let t4 = ns()
+        // 画布每一格先从原帧重铺：不铺就只有脸框那一片有像素、其余整幅是空的，界面上看着＝黑底上一小块脸。
+        // 出片那条同样是每帧先把原帧拷进 dst（SwapClip 的「拷帧失败」那一格）。切人重画也走这条路，
+        // 不然第二个人的补丁是叠在第一个人脸上贴的，羽化那一圈会混出双层边。
+        guard SwapTech.copyRows(from: hd, to: dst) else {
+            if netFail < 2 { say("预览 画布重铺失败：\(frameW)x\(frameH) 两张缓冲对不上") }
+            return false
+        }
         if CVPixelBufferLockBaseAddress(dst, []) != kCVReturnSuccess { return false }
         var pasted = false
         if let base = CVPixelBufferGetBaseAddress(dst) {
@@ -446,7 +454,7 @@ final class SwapPreview {
         say("预览单价 每换一帧 \(String(format: "%.2f", unit)) ms＝检测 \(SwapUtil.stat(detectMs))"
             + "＋裁脸 \(SwapUtil.stat(warpMs))＋逐帧网 \(SwapUtil.stat(frameMs))"
             + "＋美白 \(SwapUtil.stat(beautyMs))＋羽化 \(SwapUtil.stat(maskMs))"
-            + "＋回贴小窗 \(SwapUtil.stat(pasteMs))（这一档不做高频回填）")
+            + "＋画布重铺＋脸框回贴 \(SwapUtil.stat(pasteMs))（这一档不做高频回填）")
         say("      解码 \(SwapUtil.stat(decodeMs))×\(String(format: "%.1f", fps)) 帧/秒"
             + "｜整帧含节奏 \(SwapUtil.stat(swapMs))｜美白这一趟\(c.whiten ? "开" : "关")")
         say("      这一趟 换出 \(nSwap) 格／读掉 \(nDecode) 格｜没脸 \(noFace)｜太小 \(smallFace)｜拟合没过 \(fitFail)"
