@@ -161,12 +161,19 @@ enum Align {
         return "y 原点 \(desc.joined(separator: "｜"))→「\(topLeft ? "不翻" : "翻")」(\(how))｜\(box)｜5点 \(raw)"
     }
 
-    /// 一张脸送进尺子要的那 5 个点（模板口径：左眼、右眼、鼻尖、左嘴角、右嘴角，
-    /// "左"指**转正后的画面左侧**）在转正后的像素坐标。缺任一 region 就回 nil，
-    /// 由调用方决定退回什么——正脸闸和尺子必须用同一套点位换算，否则两边判的不是同一张脸。
-    /// 左右槽位全部在转正后的空间里按 x 排，所以 Vision 的 left/right 到底指被拍者哪一侧
-    /// 这个我从没验过的口径问题，根本不参与结果。
-    static func upPoints(_ f: VNFaceObservation, k: Int, w: Int, h: Int) -> [CGPoint]? {
+    /// 眼中点→嘴中点这条连线就是投影后的正中线（两端都取的是左右对称结构，脑袋转的时候整条线一起挪）。
+    /// 把鼻尖压回这条线：沿线的位置留着（那正是转向的信号），垂直于它的偏差清零（那是这个点自己取偏）。
+    static func toMidline(_ q: CGPoint, eyeMid: CGPoint, mouthMid: CGPoint) -> (pt: CGPoint, off: CGFloat)? {
+        let dx = mouthMid.x - eyeMid.x, dy = mouthMid.y - eyeMid.y
+        let l2 = Double(dx * dx + dy * dy)
+        guard l2 > 1e-9 else { return nil }
+        let t = ((q.x - eyeMid.x) * dx + (q.y - eyeMid.y) * dy) / CGFloat(l2)
+        let pt = CGPoint(x: eyeMid.x + t * dx, y: eyeMid.y + t * dy)
+        return (pt, ((q.x - pt.x) * (q.x - pt.x) + (q.y - pt.y) * (q.y - pt.y)).squareRoot())
+    }
+
+    /// 第 6 个点＝Vision 原样给的鼻尖（没压回中线的那个），只用来量它离中线有多偏，不进尺子。
+    static func upPoints6(_ f: VNFaceObservation, k: Int, w: Int, h: Int) -> [CGPoint]? {
         guard let p = parts(f) else { return nil }
         let U = { (q: CGPoint) -> CGPoint in
             Align.toUpright(Align.toPixels(q, box: f.boundingBox, w, h), k: k, w: w, h: h)
@@ -174,7 +181,20 @@ enum Align {
         let e = p.eyes.map(U), lp = p.lips.map(U), n = U(p.nose)
         let eyes = e[0].x <= e[1].x ? [e[0], e[1]] : [e[1], e[0]]
         let corners = [lp.min(by: { $0.x < $1.x })!, lp.max(by: { $0.x < $1.x })!]
-        return [eyes[0], eyes[1], n, corners[0], corners[1]]
+        let eyeMid = CGPoint(x: (eyes[0].x + eyes[1].x) / 2, y: (eyes[0].y + eyes[1].y) / 2)
+        let mouthMid = CGPoint(x: (corners[0].x + corners[1].x) / 2, y: (corners[0].y + corners[1].y) / 2)
+        let fixed = toMidline(n, eyeMid: eyeMid, mouthMid: mouthMid)?.pt ?? n
+        return [eyes[0], eyes[1], fixed, corners[0], corners[1], n]
+    }
+
+    /// 一张脸送进尺子要的那 5 个点（模板口径：左眼、右眼、鼻尖、左嘴角、右嘴角，
+    /// "左"指**转正后的画面左侧**）在转正后的像素坐标。缺任一 region 就回 nil，
+    /// 由调用方决定退回什么——正脸闸和尺子必须用同一套点位换算，否则两边判的不是同一张脸。
+    /// 左右槽位全部在转正后的空间里按 x 排，所以 Vision 的 left/right 到底指被拍者哪一侧
+    /// 这个我从没验过的口径问题，根本不参与结果。
+    static func upPoints(_ f: VNFaceObservation, k: Int, w: Int, h: Int) -> [CGPoint]? {
+        guard let up = upPoints6(f, k: k, w: w, h: h) else { return nil }
+        return Array(up.prefix(5))
     }
 
     /// 一张脸送进尺子要的那 5 个点（转正后的像素坐标映回 raw 像素）。
@@ -186,16 +206,31 @@ enum Align {
         return (pts.map { Align.toRaw($0, k: k, w: w, h: h) }, up == nil ? "框猜" : "真点位")
     }
 
-    /// 正脸度：鼻尖落在两眼连线轴上的几成处。0.5＝左右对称＝正对镜头，
-    /// 头一侧过去鼻尖就往一侧挪，|读数 - 0.5| 越大越侧。
+    /// 正中线上的一个点投影到两眼连线轴上的几成处。0.5＝左右对称＝正对镜头。
     /// 走投影而不是图像 x：这条轴跟着眼睛自己转，所以脑袋歪（roll）、
     /// 甚至整幅图躺着还没转正（k 取错）都不改变这个读数——闸门在试探朝向那几帧里也成立。
-    static func frontality(_ f: VNFaceObservation, k: Int, w: Int, h: Int) -> Double? {
-        guard let up = upPoints(f, k: k, w: w, h: h) else { return nil }
+    private static func axisT(_ up: [CGPoint], _ p: CGPoint) -> Double? {
         let ux = up[1].x - up[0].x, uy = up[1].y - up[0].y
         let l2 = Double(ux * ux + uy * uy)
         guard l2 > 1e-6 else { return nil }
-        return Double((up[2].x - up[0].x) * ux + (up[2].y - up[0].y) * uy) / l2
+        return Double((p.x - up[0].x) * ux + (p.y - up[0].y) * uy) / l2
+    }
+
+    /// 正脸度的三个读数：
+    /// mouth＝两嘴角中点落在两眼连线的几成处（闸门按这个）；嘴角是左右对称结构，中点必在正中线上，
+    /// 不会因为某个点取偏就自带固定偏差。
+    /// nose＝Vision 原样那个鼻尖（0.12 的闸门量的是它，上机把 535 张里挡掉 528 张，留着只为和那一轮对账）。
+    /// off＝那个原样鼻尖离正中线有多远，按两眼间距归一（0.1＝偏了半个眼距的两成）——
+    /// 这一格直接回答"鼻尖定到鼻翼侧"到底有多偏。
+    static func frontality(_ f: VNFaceObservation, k: Int, w: Int, h: Int) -> (mouth: Double, nose: Double, off: Double)? {
+        guard let up = upPoints6(f, k: k, w: w, h: h) else { return nil }
+        let eyeMid = CGPoint(x: (up[0].x + up[1].x) / 2, y: (up[0].y + up[1].y) / 2)
+        let mid = CGPoint(x: (up[3].x + up[4].x) / 2, y: (up[3].y + up[4].y) / 2)
+        guard let n = axisT(up, up[5]), let m = axisT(up, mid) else { return nil }
+        let dx = up[1].x - up[0].x, dy = up[1].y - up[0].y
+        let eyeDist = (dx * dx + dy * dy).squareRoot()
+        let off = eyeDist > 1 ? (toMidline(up[5], eyeMid: eyeMid, mouthMid: mid)?.off ?? 0) / eyeDist : 0
+        return (m, n, Double(off))
     }
 
     /// 屏幕上画黄点用的 5 个点，给成**显示口径的归一化点**（原点左上、y 向下，和绿框那套换算同向）。
@@ -209,7 +244,12 @@ enum Align {
             return CGPoint(x: n.x, y: 1 - n.y)
         }
         let lp = p.lips.map(D)
-        return p.eyes.map(D) + [D(p.nose)] + [lp.min(by: { $0.x < $1.x })!, lp.max(by: { $0.x < $1.x })!]
+        let corners = [lp.min(by: { $0.x < $1.x })!, lp.max(by: { $0.x < $1.x })!]
+        let eyeMid = CGPoint(x: (p.eyes[0].x + p.eyes[1].x) / 2, y: (p.eyes[0].y + p.eyes[1].y) / 2)
+        let mouthMid = CGPoint(x: (corners[0].x + corners[1].x) / 2, y: (corners[0].y + corners[1].y) / 2)
+        let n = D(p.nose)
+        let fixed = toMidline(n, eyeMid: D(eyeMid), mouthMid: mouthMid)?.pt ?? n
+        return p.eyes.map(D) + [fixed] + corners
     }
 
     /// 相似变换（旋转+等比缩放+平移）最小二乘：dst = [[a,-b],[b,a]]·src + t
@@ -476,12 +516,18 @@ struct ScanOutcome {
     var framesWithFace = 0
     var gated = 0
     var hits = 0
-    /// 过了正脸闸那批脸的 |正脸度-0.5|，报告里出中位/最高；被挡掉的只进 turnBlocked
-    var frontDevs: [Double] = []
+    /// 每一张过了尺寸闸的脸的三个读数（挡没挡都记，这几份分布就是标定闸门的依据）
+    var mouthDevs: [Double] = []
+    var noseDevs: [Double] = []
+    /// 原样鼻尖离「眼中→嘴中」这条正中线的距离，按两眼间距归一
+    var offMid: [Double] = []
+    /// 嘴角中点落在两眼中点的哪一侧：只认单边＝这批脸一致地朝着一个方向，两侧都有＝头在来回转
+    var turnLeft = 0
+    var turnRight = 0
     var turnBlocked = 0
     /// Vision 自己给的 yaw 在这台机器上到底填不填（填了几张、最大多少），只记不用于闸门
     var yawSeen = 0
-    var yawMax = 0.0
+    var yawAbs: [Double] = []
     var bigSims: [Double] = []
     var detectMs = 0.0
     var embedMs = 0.0
@@ -628,7 +674,7 @@ enum CutEngine {
         var rot = -1
         var probeCols: [[Double]] = Array(repeating: [], count: 4)
         var probeRows: [(sample: Int, sims: [Double])] = []
-        func lockRotation() {
+        func lockRotation(_ why: String) {
             var bestK = 0, bestMed = -99.0
             for k in 0..<4 {
                 guard !probeCols[k].isEmpty, let m = CutEngine.median(probeCols[k]), m > bestMed else { continue }
@@ -638,7 +684,7 @@ enum CutEngine {
             for row in probeRows where row.sims[bestK] >= cosTh && row.sample < o.keep.count {
                 o.keep[row.sample] = true
             }
-            Journal.line("扫描 朝向定 k=\(bestK) 中位=\(String(format: "%.3f", bestMed)) 试探 \(probeRows.count) 张")
+            Journal.line("扫描 朝向定 k=\(bestK) 中位=\(String(format: "%.3f", bestMed)) 试探 \(probeRows.count) 张（\(why)）")
         }
         let mem0 = Facts.footprintMB()
         o.memMax = mem0
@@ -673,16 +719,24 @@ enum CutEngine {
                             let pw = Double(f.boundingBox.width) * Double(w) * sideScale
                             let ph = Double(f.boundingBox.height) * Double(h) * sideScale
                             if min(pw, ph) < sideTh { continue }
-                            // 正脸闸放在跑尺子之前：挡掉一张就少跑一次尺子
-                            if let fr = Align.frontality(f, k: rot < 0 ? 0 : rot, w: w, h: h) {
-                                let dev = abs(fr - 0.5)
-                                if dev > frontTh { o.turnBlocked += 1; continue }
-                                o.frontDevs.append(dev)
-                            }
                             if let y = f.yaw {
                                 o.yawSeen += 1
-                                let a = abs(Double(truncating: y))
-                                if a > o.yawMax { o.yawMax = a }
+                                o.yawAbs.append(abs(Double(truncating: y)))
+                            }
+                            // 正脸闸放在跑尺子之前：挡掉一张就少跑一次尺子。
+                            // 量的那格从鼻尖换成嘴角中点——鼻尖那个点上机他肉眼报"偏到鼻翼侧"，
+                            // 两次跑都是 偏左 400+/偏右 100+ 且离中线 0.06＝这个点自带固定横偏，
+                            // 和"头转了"是同一个方向，没法分开标阈值。
+                            // rot < 0（朝向还没锁）时只记数不挡：那几帧是按 k=0 量的，横着的脸
+                            // 嘴角中点必然偏到一边，挡下去就是把朝向试探饿死——
+                            // 0.12 那次「剪完只留下第一帧」正是这么来的。
+                            if let fr = Align.frontality(f, k: rot < 0 ? 0 : rot, w: w, h: h) {
+                                let dev = abs(fr.mouth - 0.5)
+                                o.mouthDevs.append(dev)
+                                o.noseDevs.append(abs(fr.nose - 0.5))
+                                o.offMid.append(fr.off)
+                                if fr.mouth < 0.5 { o.turnLeft += 1 } else { o.turnRight += 1 }
+                                if rot >= 0 && dev > frontTh { o.turnBlocked += 1; continue }
                             }
                             o.gated += 1
                             let ks = rot < 0 ? [0, 1, 2, 3] : [rot]
@@ -702,7 +756,11 @@ enum CutEngine {
                                 probeRows.append((sample: sample, sims: sims))
                                 for k in 0..<4 where sims[k] > -8 { probeCols[k].append(sims[k]) }
                                 if let m = sims.max(), m > best { best = m }
-                                if probeRows.count >= probeN { lockRotation() }
+                                if probeRows.count >= probeN {
+                                    lockRotation("够 \(probeN) 张")
+                                } else if !probeRows.isEmpty && sample >= 300 {
+                                    lockRotation("闸门太紧，第 300 帧用这 \(probeRows.count) 张定的")
+                                }
                             } else {
                                 let c = sims[rot]
                                 if c > best { best = c }
@@ -728,7 +786,7 @@ enum CutEngine {
             if !ended.isEmpty { break outer }
         }
         reader.cancelReading()
-        if rot < 0 && !probeRows.isEmpty { lockRotation() }
+        if rot < 0 && !probeRows.isEmpty { lockRotation("样本取完才定") }
         if sample < nSamples && stopNote.isEmpty { stopNote = endedNote(reader) }
 
         o.detectMs = o.samples > 0 ? detectSum / Double(o.samples) : 0
@@ -742,13 +800,14 @@ enum CutEngine {
         let wall = Double(DispatchTime.now().uptimeNanoseconds - wall0) / 1_000_000_000
         let pct = o.samples > 0 ? Double(o.hits) / Double(o.samples) * 100 : 0
         var line = "扫 \(o.samples) 取样帧（step=\(step)，源 \(totalFrames) 帧 / \(String(format: "%.1f", duration)) s，直出长边 \(decodedLong)→源折算 ×\(String(format: "%.2f", sideScale))）"
-        line += "\n有脸的帧 \(o.framesWithFace)/\(o.samples)；≥\(String(format: "%.0f", sideTh)) px 的脸 \(o.gated) 张；裁脸失败 \(cropFails) 张"
-        line += "\n正脸闸 |鼻尖偏移| ≤ \(String(format: "%.2f", frontTh))：挡掉 \(o.turnBlocked) 张"
-        if let med = median(o.frontDevs), let mx = o.frontDevs.max() {
-            line += "；过闸 \(o.frontDevs.count) 张 偏移 中位 \(String(format: "%.3f", med)) 最高 \(String(format: "%.3f", mx))"
+        line += "\n有脸的帧 \(o.framesWithFace)/\(o.samples)；两道闸都过的脸 \(o.gated) 张；裁脸失败 \(cropFails) 张"
+        line += "\n正脸闸 |嘴角中点偏移| ≤ \(String(format: "%.2f", frontTh))：挡掉 \(o.turnBlocked) 张（量到读数的脸 \(o.mouthDevs.count) 张，朝向锁定前只记数不挡）"
+        if let a = spread(o.mouthDevs), let b = spread(o.noseDevs), let c = spread(o.offMid) {
+            line += "\n  偏移 嘴角中点 \(a)｜鼻尖原值 \(b)｜鼻尖离中线 \(c)（占两眼间距）"
+            line += "｜嘴角中点偏左 \(o.turnLeft) 偏右 \(o.turnRight)"
         }
         line += "｜Vision 自己的 yaw 有值的 \(o.yawSeen) 张"
-        if o.yawSeen > 0 { line += "，最大 \(String(format: "%.2f", o.yawMax)) rad" }
+        if let y = spread(o.yawAbs) { line += " \(y) rad" }
         if rot >= 0 {
             let meds = (0..<4).map { k -> String in
                 guard let m = CutEngine.median(probeCols[k]) else { return "转\(k * 90)° —" }
@@ -761,7 +820,7 @@ enum CutEngine {
         if let med = median(o.bigSims), let mx = o.bigSims.max() {
             line += "\n  过闸脸对锚点的余弦 中位 \(String(format: "%.3f", med)) 最高 \(String(format: "%.3f", mx))（闸门 \(String(format: "%.2f", cosTh))）"
         } else {
-            line += "\n  没有任何 ≥\(String(format: "%.0f", sideTh)) px 的脸可判——锚点这闸一张都没过"
+            line += "\n  没有一张脸跑到尺子：尺寸 ≥\(String(format: "%.0f", sideTh)) px 且 嘴角中点偏移 ≤\(String(format: "%.2f", frontTh)) 这两道闸一张都没过"
         }
         line += "\n单价：检测 \(String(format: "%.1f", o.detectMs)) ms/帧 + 尺子 \(String(format: "%.1f", o.embedMs)) ms/次；本次实耗 \(String(format: "%.1f", wall)) s"
         if Ruler.shared.failures > 0 {
@@ -782,6 +841,16 @@ enum CutEngine {
     private static func median(_ v: [Double]) -> Double? {
         guard !v.isEmpty else { return nil }
         return v.sorted()[v.count / 2]
+    }
+
+    /// 中位／一成／九成分位，用来看闸门该落在哪：只给中位会把"整片都偏"和"一半偏一半正"混成一句话。
+    private static func spread(_ v: [Double]) -> String? {
+        guard !v.isEmpty else { return nil }
+        let s = v.sorted()
+        let at = { (q: Double) -> String in
+            String(format: "%.3f", s[min(s.count - 1, max(0, Int(Double(s.count - 1) * q)))])
+        }
+        return "中位 \(at(0.5)) 一成 \(at(0.1)) 九成 \(at(0.9))"
     }
 }
 
@@ -984,9 +1053,11 @@ final class Cutter: ObservableObject {
     @Published var showPicker = false
     @Published var step = 1
     @Published var sideTh = 96.0
-    /// 正脸度上限＝鼻尖在两眼连线轴上允许偏离正中多少（|读数-0.5|）。超过就当侧脸挡掉；
-    /// 调小＝只留更正的脸，调到 0.30 基本不挡。
-    @Published var frontTh = 0.12
+    /// 正脸度上限＝**两嘴角中点**在两眼连线轴上允许偏离正中多少（|读数-0.5|）。超过就当侧脸挡掉；调小＝只留更正的脸。
+    /// 刻度从鼻尖换成嘴角中点：手机 Vision 那个鼻尖两次跑都是 偏左 400+/偏右 100+、离中线 0.06（眼距），
+    /// 也就是这个点自带一个固定横偏，和"头真转了"同向，标不出阈值——0.12 按 PC 的点位标，上机挡掉 528/535。
+    /// 嘴角中点这条：他先点的那张侧脸读 0.343，同一片里他看着正的一簇读到 0.02～0.09 ⇒ 上限落在 0.15。
+    @Published var frontTh = 0.15
     /// 已选为锚点的是这一帧里的第几张脸（-1＝还没选）；绿框会把它描成橙色，让"选上了"这件事看得见
     @Published var chosen = -1
     @Published var temps: [TempFile] = []
@@ -1119,10 +1190,10 @@ final class Cutter: ObservableObject {
                 text = v == nil ? "这张脸算不出向量：\(why)"
                     : "锚点存下（这张脸源片短边 \(String(format: "%.0f", side)) px，点位 \(src)）｜\(vecFingerprint(v!))"
                 if let fr = Align.frontality(face, k: 0, w: img.width, h: img.height) {
-                    let dev = abs(fr - 0.5)
-                    text += "\n这张脸的鼻尖偏移 \(String(format: "%.3f", dev))（闸门 \(String(format: "%.2f", fth))）"
+                    let dev = abs(fr.mouth - 0.5), ndev = abs(fr.nose - 0.5)
+                    text += "\n这张脸的偏移 嘴角中点 \(String(format: "%.3f", dev))（闸门按这个）｜鼻尖原值 \(String(format: "%.3f", ndev))｜鼻尖离中线 \(String(format: "%.3f", fr.off))（占两眼间距）"
                     if dev > fth {
-                        text += "\n⚠️ 这张锚点自己就是侧脸——拿侧脸当尺子，正脸的帧也会跟着掉分。停到脸正一点的帧再点一次。"
+                        text += "\n⚠️ 按当前闸门这张锚点算侧脸（嘴角中点 \(String(format: "%.3f", dev)) ＞ \(String(format: "%.2f", fth))）。屏幕上这张脸看着正的话，就把「挡侧脸」调大；要换锚点就停到脸正一点的帧再点一次。"
                     }
                 }
                 if v != nil && src.hasPrefix("框猜") {
@@ -1354,8 +1425,8 @@ struct CutView: View {
                         Text("脸短边下限 \(Int(cut.sideTh)) px（按源片尺寸）")
                             .font(.footnote)
                     }
-                    Stepper(value: $cut.frontTh, in: 0.05...0.30, step: 0.01) {
-                        Text("挡侧脸 \(String(format: "%.2f", cut.frontTh))（调小＝只留正对镜头的）")
+                    Stepper(value: $cut.frontTh, in: 0.05...0.50, step: 0.01) {
+                        Text("挡侧脸 \(String(format: "%.2f", cut.frontTh))（量的是嘴角中点偏离正中多少；调小＝只留正对镜头的，0.50＝这张闸不挡）")
                             .font(.footnote)
                     }
                 }
