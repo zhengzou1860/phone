@@ -27,7 +27,7 @@ struct ContentView: View {
     @State private var engine: VoiceEngine?
     @State private var isConverting = false
     @State private var convertStatus = ""
-    @State private var outputURL: URL?
+    @State private var outputURL: URL?          // ①「转换」的成品（④ 走 novelOutURL）
     @State private var sendStatus = ""
     @State private var isSending = false
     @State private var feReport = ""
@@ -66,6 +66,11 @@ struct ContentView: View {
     @State private var readStatus = ""
     @State private var readNote = ""
     @State private var rawTTSURL: URL?
+    /// ④ 的成品单独一格。以前和 ① 共用 `outputURL` ⇒ 谁后跑谁把上一条的播放键顶掉，
+    /// 而那一整块又在 0.1/32 被「视频换声」挤到了页面最底下，两条的播放键一起看不见了。
+    @State private var novelOutURL: URL?
+    /// 两个 sheet 不能共用一个开关：弹起来是哪一个全看 SwiftUI 的心情（同 `showVideoShare` 那条理由）。
+    @State private var showNovelShare = false
 
     // 视频换声：一段视频 → 解出音轨 → 现有样本那条链 → 装回原来那条画面（一个像素不动）。
     // 音色来源和读小说一样：要么清单里点中的样本，要么 ② 那段参考。
@@ -102,9 +107,6 @@ struct ContentView: View {
                         convertSection
                         novelSection
                         videoSection
-                        if let url = outputURL {
-                            playbackSection(url: url)
-                        }
                     }
                     // 放在 if 外面：模型没下（或像 0.1/24 那样被误删）时，留下的录音照样要能删。
                     historySection
@@ -555,7 +557,7 @@ struct ContentView: View {
     /// 界面上这些槽现在指着哪些文件（删掉时要一起清引用，清单里也要标出来）。
     private var currentPaths: Set<String> {
         var s = Set<String>()
-        for u in [sourceURL, refURL, outputURL, rawTTSURL, videoURL, videoOutURL] {
+        for u in [sourceURL, refURL, outputURL, novelOutURL, rawTTSURL, videoURL, videoOutURL] {
             if let u = u { s.insert(u.path) }
         }
         return s
@@ -589,6 +591,7 @@ struct ContentView: View {
         if let u = sourceURL, paths.contains(u.path) { sourceURL = nil }
         if let u = refURL, paths.contains(u.path) { refURL = nil }
         if let u = outputURL, paths.contains(u.path) { outputURL = nil }
+        if let u = novelOutURL, paths.contains(u.path) { novelOutURL = nil }
         if let u = rawTTSURL, paths.contains(u.path) { rawTTSURL = nil }
         if let u = videoURL, paths.contains(u.path) {
             videoURL = nil
@@ -671,6 +674,9 @@ struct ContentView: View {
                     .font(.caption)
                     .foregroundColor(.secondary)
             }
+            if let url = outputURL {
+                playbackSection(url: url, headline: "转换结果", share: $showShare)
+            }
         }
     }
 
@@ -748,15 +754,19 @@ struct ContentView: View {
                     Button {
                         player.play(url: raw)
                     } label: {
-                        Label(player.isPlaying ? "播放中" : "播系统原声",
-                              systemImage: player.isPlaying ? "speaker.wave.2.fill" : "play.fill")
+                        Label(isMine(raw) && player.isPlaying ? "播放中" : "播系统原声",
+                              systemImage: isMine(raw) && player.isPlaying ? "speaker.wave.2.fill" : "play.fill")
                     }
                     .buttonStyle(.bordered)
-                    .disabled(player.isPlaying)
+                    .disabled(isMine(raw) && player.isPlaying)
                     Text(raw.lastPathComponent)
                         .font(.caption2)
                         .foregroundColor(.secondary)
                 }
+            }
+
+            if let url = novelOutURL {
+                playbackSection(url: url, headline: "朗读结果", share: $showNovelShare)
             }
         }
     }
@@ -951,7 +961,7 @@ struct ContentView: View {
         isReading = true
         readStatus = "分句、合成中…"
         readNote = ""
-        outputURL = nil
+        novelOutURL = nil
         rawTTSURL = nil
         VoiceJournal.line(String(format: "点「读给我听」%d 字（%@）音色=%@ 音高 %+.0f 半音 嗓音=%@",
                                  text.count,
@@ -981,7 +991,7 @@ struct ContentView: View {
                 })
                 let wall = Date().timeIntervalSince(t0)
                 await MainActor.run {
-                    outputURL = output
+                    novelOutURL = output
                     rawTTSURL = raw
                     isReading = false
                     history = FileHistory.scan()
@@ -1159,21 +1169,23 @@ struct ContentView: View {
         }
     }
 
+    /// 一条成品wav的三件套：播放 / 停止 / 导出。①「转换」和 ④「读小说」各挂一份在自己的格子里，
+    /// 共用一个 PlayController，所以「播放中」只点亮正在响的那一行。
     @ViewBuilder
-    private func playbackSection(url: URL) -> some View {
+    private func playbackSection(url: URL, headline: String, share: Binding<Bool>) -> some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text("转换结果")
+            Text(headline)
                 .font(.headline)
 
             HStack(spacing: 15) {
                 Button {
                     player.play(url: url)
                 } label: {
-                    Label(player.isPlaying ? "播放中" : "播放",
-                          systemImage: player.isPlaying ? "speaker.wave.2.fill" : "play.fill")
+                    Label(isMine(url) && player.isPlaying ? "播放中" : "播放",
+                          systemImage: isMine(url) && player.isPlaying ? "speaker.wave.2.fill" : "play.fill")
                 }
                 .buttonStyle(.bordered)
-                .disabled(player.isPlaying)
+                .disabled(isMine(url) && player.isPlaying)
 
                 Button {
                     player.stop()
@@ -1181,27 +1193,27 @@ struct ContentView: View {
                     Label("停止", systemImage: "stop.fill")
                 }
                 .buttonStyle(.bordered)
-                .disabled(!player.isPlaying)
+                .disabled(!isMine(url) || !player.isPlaying)
 
                 Button {
-                    VoiceJournal.line("点「导出」 \(url.lastPathComponent)")
-                    showShare = true
+                    VoiceJournal.line("点「导出\(headline)」 \(url.lastPathComponent)")
+                    share.wrappedValue = true
                 } label: {
                     Label("导出", systemImage: "square.and.arrow.up")
                 }
                 .buttonStyle(.bordered)
             }
-            .sheet(isPresented: $showShare) {
+            .sheet(isPresented: share) {
                 // LiveContainer 里 UIActivityViewController 没实测过；起不来就是这一片空白，
                 // 日志里那句「导出面板已弹起」不出现即是证据，兜底是路径本身就在屏幕上。
                 ShareSheet(items: [url],
-                           onDismiss: { showShare = false },
+                           onDismiss: { share.wrappedValue = false },
                            onPresent: {
                     VoiceJournal.line("导出面板已弹起（可「存储到“文件”」）")
                 })
             }
 
-            if !player.status.isEmpty {
+            if isMine(url), !player.status.isEmpty {
                 Text(player.status)
                     .font(.caption)
                     .foregroundColor(.secondary)
@@ -1212,6 +1224,9 @@ struct ContentView: View {
                 .textSelection(.enabled)
         }
     }
+
+    /// 正在响的到底是不是这一行。
+    private func isMine(_ url: URL) -> Bool { player.playingURL == url }
 
     private func startConversion() {
         guard let modelDir = models.modelDir, let inputURL = sourceURL else { return }

@@ -16,6 +16,9 @@ import AVFoundation
 final class PlayController: NSObject, ObservableObject {
     @Published var isPlaying = false
     @Published var status = ""
+    /// 正在响的是哪一条。① 和 ④ 各挂一个播放器共用这一个 controller，
+    /// 只留 isPlaying 的话「播放中」会同时点亮在两条上，看不出谁在响。
+    @Published var playingURL: URL?
 
     private var player: AVAudioPlayer?
 
@@ -36,6 +39,7 @@ final class PlayController: NSObject, ObservableObject {
             VoiceJournal.line("准备播 \(url.lastPathComponent)：" + formatText(url))
             if p.play() {
                 isPlaying = true
+                playingURL = url
                 status = "播放中"
                 watch(p)
             } else {
@@ -55,6 +59,7 @@ final class PlayController: NSObject, ObservableObject {
         player?.stop()
         player = nil
         isPlaying = false
+        playingURL = nil
     }
 
     /// 现在的输出设备一句话写进日志（听筒/外放/耳机在日志里分得开）
@@ -106,6 +111,7 @@ final class PlayController: NSObject, ObservableObject {
                 try? await Task.sleep(nanoseconds: 100_000_000)
                 if !p.isPlaying {
                     s.isPlaying = false
+                    s.playingURL = nil
                     s.status = p.currentTime > 0 ? "放完了" : "播放中途停了"
                     break
                 }

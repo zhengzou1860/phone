@@ -36,7 +36,7 @@ targets:
         CFBundleIdentifier: com.qoder.voice
         CFBundlePackageType: APPL
         CFBundleShortVersionString: "0.1"
-        CFBundleVersion: "37"
+        CFBundleVersion: "38"
         CFBundleInfoDictionaryVersion: "6.0"
         # 「导出到手机」的第二条路：开了这两个开关后 Documents 整个出现在「文件」app 里，
         # 录的音、样本、输出 wav 可以就地看和播，不必每条都点一次分享面板。
