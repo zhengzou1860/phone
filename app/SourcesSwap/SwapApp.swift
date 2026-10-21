@@ -152,7 +152,7 @@ struct SwapContentView: View {
                             }
                         }
                         .pickerStyle(.segmented)
-                        .disabled(running)
+                        .disabled(running || pv.on)
                         Picker("长边上限", selection: $longIdx) {
                             ForEach(0 ..< Self.longs.count, id: \.self) { i in
                                 Text("\(Self.longs[i]) px").tag(i)
@@ -251,7 +251,7 @@ struct SwapContentView: View {
 
                         Button(pv.on ? "停预览" : "开始预览") { togglePreview() }
                             .buttonStyle(.borderedProminent)
-                            .disabled(pv.on ? false : (videoURL == nil || chosenIdent.isEmpty))
+                            .disabled(!pv.on && !previewBlock.isEmpty)
                         if !previewBlock.isEmpty { Text(previewBlock).font(.caption2) }
 
                         // 我点的这个按钮下面就是真实流水：起网→第几秒→多少钱一帧
@@ -265,7 +265,9 @@ struct SwapContentView: View {
                         if !pv.report.isEmpty {
                             Text(pv.report).font(.caption).textSelection(.enabled)
                         }
-                        Text("预览跟上面「算力单元」「补丁美白」这两档走；「长边上限」管不到预览——预览自己从 640 起，脸短边不足 150 px 会自己抬到 960、1280。")
+                        Text("预览跟上面「算力单元」「补丁美白」这两档走；「长边上限」管不到预览——预览自己从 640 起，脸短边不足 150 px 会自己抬到 960、1280。"
+                            + "预览跑着时「算力单元」改不动（它只在装那三张网的那一刻生效），要换档先停预览；"
+                            + "「补丁美白」是每一格现读的，改了当场生效。")
                             .font(.caption2)
                         Text("预览这一条不做高频回填、也没有整片平滑：皮肤比成片软一档、遮罩边上比成片抖。挑中谁就在上面点他的名字再「开始换脸」出片。")
                             .font(.caption2)
@@ -331,6 +333,7 @@ struct SwapContentView: View {
                     mirror.dur = d
                     if !mirror.dragging { mirror.pos = s }
                 }
+                eng.onPerson = { pid in mirror.person = pid }
                 eng.onFinish = { txt, d in
                     mirror.on = false
                     mirror.dragging = false
@@ -426,12 +429,25 @@ struct SwapContentView: View {
         let units = Self.units[unitIdx].1
         let longEdge = Self.longs[longIdx]
         let beautyTxt = beautyIdx == 0 ? "开" : "关"
+        if SwapContentView.engine.isActive {
+            SwapJournal.line("开始整片换脸：预览还开着，先叫停它并把三张网交出来（两条同跑＝两份足迹＋互相抢 CPU）")
+        }
         SwapJournal.line("开始整片换脸 units=\(Self.units[unitIdx].0) 长边=\(longEdge) 美白=\(beautyTxt) 源=\(sourceTag) 片=\(v.lastPathComponent)")
         var args = SwapClip.Args()
         args.units = units
         args.longEdge = longEdge
         args.whiten = beautyIdx == 0
         Task.detached {
+            // 预览还开着就先叫停，并等它把三张网＋两块整幅缓冲交出来再装自己这一份
+            SwapContentView.engine.stop()
+            var waited = 0.0
+            while SwapContentView.engine.isActive && waited < 5.0 {
+                Thread.sleep(forTimeInterval: 0.2)
+                waited += 0.2
+            }
+            if waited > 0 {
+                SwapJournal.line(String(format: "预览交还网络用了 %.1f s", waited))
+            }
             let r = SwapClip.run(person: person, video: v, args: args) { line in
                 SwapJournal.line(line)
             }
@@ -554,17 +570,17 @@ struct SwapContentView: View {
         pv.report = ""
         pv.pos = 0
         pv.dur = 0
-        pv.person = chosenIdent
+        pv.person = ""
         pv.status = "预览开跑：先把三张网装好，第一格还要等它检测到位"
         SwapJournal.line("开始预览 units=\(c.unitsTxt) 美白=\(whitenTxt) "
             + "人=\(SwapIdents.displayName(chosenIdent)) 片=\(v.lastPathComponent)")
     }
 
-    /// 小窗下面点名字：出片那条也跟着换成他，两边看到的是同一个人
+    /// 小窗下面点名字：出片那条也跟着换成他，两边看到的是同一个人。
+    /// 名字上那个 ◉ 由引擎回话才点（装没收时画面里还是原来那个人）
     private func previewPick(_ it: SwapIdents.Item) {
         pickIdent(it)
         guard pv.on else { return }
-        pv.person = it.id
         SwapContentView.engine.selectPerson(it.id)
     }
 

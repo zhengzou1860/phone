@@ -39,6 +39,9 @@ final class SwapPreview {
     var onFinish: ((String, Double) -> Void)?
     /// 滑杆用的数字口径：（现在播到第几秒, 这条素材共几秒）。界面不许去解析上面那行字。
     var onProgress: ((Double, Double) -> Void)?
+    /// 装成功的那个人才回给界面：换人有三条失败路（读不出／空包／形状不对），
+    /// 那三种情况画面里还是原来那个人，名字却跟着手指走就会假报「已经换成他」
+    var onPerson: ((String) -> Void)?
 
     private enum Outcome { case stop, ended, seek(Double), reroute(Int, Double) }
 
@@ -118,6 +121,7 @@ final class SwapPreview {
 
     /// seek／抬尺寸都靠重开一趟 pass；切人在 pass 里就地办，不用重开 reader
     private func drive(video: URL) {
+        rep = []      // 一趟一份报告：不清就会把上一趟的整份日志背在身上，越跑越长
         var sec = 0.0
         var le = snapCfg().longEdge
         while true {
@@ -141,6 +145,14 @@ final class SwapPreview {
 
     private func finishRun(_ r: Outcome) {
         lock.lock(); busy = false; lock.unlock()
+        // 停下来的那一刻把三张网和两块整幅缓冲交回去：出片那条自己还要装一份 runner，
+        // 预览留着不放就是把下一次「开始换脸」顶到它自己的足迹闸门上
+        runner = nil
+        runnerUnits = nil
+        person = ""
+        heldAl = nil
+        work = nil
+        held = nil
         let tail: String
         switch r {
         case .stop: tail = "预览停了"
@@ -166,6 +178,10 @@ final class SwapPreview {
             }
             runner = r
             runnerUnits = c.units
+            // 新建的那张 runner 身上没带任何身份权重，而 person 还记着上一个人：
+            // 不清零的话 applyPending 会以为「还是他」而跳过装权重，每一帧都画不出
+            person = ""
+            heldAl = nil
         }
         guard let runner = runner else { return .stop }
         guard let src = SwapSource(url: video, longEdge: longEdge, onLine: { self.say($0) }) else {
@@ -197,10 +213,10 @@ final class SwapPreview {
         nSwap = 0; nDecode = 0; noFace = 0; smallFace = 0; mirror = 0; fitFail = 0; netFail = 0
 
         guard let reader = try? AVAssetReader(asset: src.asset) else { say("预览 reader 建不起来"); return .stop }
-        let aStart = src.asset.start
-        let from = CMTimeAdd(aStart, CMTimeMakeWithSeconds(min(max(0, fromSec), max(0, src.duration - 0.05)),
-                                                          preferredTimescale: 600))
-        let to = CMTimeAdd(aStart, CMTimeMakeWithSeconds(src.duration, preferredTimescale: 600))
+        // 不读 asset.start：这一版 SDK 里 AVURLAsset 没有 start 这个成员（出片那条也一直按 0 起算），
+        // 而这里的秒数本来就是拿头一块 PTS 当原点算的，timeRange 只要圈住「从这一秒到末尾」就够
+        let from = CMTimeMakeWithSeconds(min(max(0, fromSec), max(0, src.duration - 0.05)), preferredTimescale: 600)
+        let to = CMTimeMakeWithSeconds(src.duration, preferredTimescale: 600)
         if CMTimeCompare(to, from) > 0 { reader.timeRange = CMTimeRange(start: from, end: to) }
         let vOut = AVAssetReaderVideoCompositionOutput(
             videoTracks: [src.track],
@@ -380,12 +396,14 @@ final class SwapPreview {
         guard let pid = pid, pid != person else { return }
         guard let one = SwapIdents.load(id: pid) else {
             say("预览 换人失败：「\(SwapIdents.displayName(pid))」的存档读不出来，还是原来那个人")
+            confirm(person)
             return
         }
         let eNorm = SwapIdents.norm(one.emb), wNorm = SwapIdents.weightsNorm(one.weights)
         guard eNorm > 0.5, wNorm > 1e-6 else {
             say("预览 换人没收：「\(one.name)」这份包里的数是空的（身份证模长 \(String(format: "%.4f", eNorm))"
                 + "／权重合起来模长 \(String(format: "%.3f", wNorm))），还是原来那个人")
+            confirm(person)
             return
         }
         let t0 = ns()
@@ -393,11 +411,13 @@ final class SwapPreview {
         let ms = msFrom(t0)
         guard put.count == 18 else {
             say("预览 换人没收：\(put.note)，还是原来那个人")
+            confirm(person)
             return
         }
         person = pid
+        confirm(pid)
         var redrew = "手里还没有已画的帧，等下一格"
-        if let hd = held, let al = heldAl, compose(runner, al: al, whiten: whiten) {
+        if held != nil, let al = heldAl, compose(runner, al: al, whiten: whiten) {
             let t1 = ns()
             if let wk = work { publish(wk) }
             redrew = "同一帧重画 \(SwapUtil.ms(msFrom(t1)))"
@@ -439,7 +459,7 @@ final class SwapPreview {
 
     private func say(_ s: String) {
         rep.append(s)
-        log?(s)
+        DispatchQueue.main.async { [weak self] in self?.log?(s) }
     }
 
     private func show(_ s: String) {
@@ -448,6 +468,11 @@ final class SwapPreview {
 
     private func progress(_ sec: Double, _ dur: Double) {
         DispatchQueue.main.async { [weak self] in self?.onProgress?(sec, dur) }
+    }
+
+    /// 画面里现在装的到底是谁：只在这一步真装上／没收时才回话
+    private func confirm(_ pid: String) {
+        DispatchQueue.main.async { [weak self] in self?.onPerson?(pid) }
     }
 
     private func pollStop() -> Bool {

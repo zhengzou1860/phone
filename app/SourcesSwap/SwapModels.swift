@@ -307,7 +307,7 @@ final class SwapRunner {
         switch c.dataType {
         case .float32:
             // 新建的数组按行优先连续排 ⇒ 整段 memcpy。逐个数走 150528 遍是 0.22 量出来的「搬运」那一半的钱
-            if SwapRunner.isContiguous(arr, dims: dims) {
+            if total > 0, SwapRunner.isContiguous(arr, dims: dims) {
                 v.withUnsafeBufferPointer { src in
                     memcpy(arr.dataPointer, src.baseAddress!, total * MemoryLayout<Float32>.size)
                 }
