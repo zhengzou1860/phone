@@ -159,7 +159,7 @@ enum SwapGeo {
         for i in 0..<m.count { m[i] = m[i] > 0.001 ? 1.0 : m[i] }
         m = boxMax(m, s, 11)
         m = boxMin(m, s, 11); m = boxMin(m, s, 11)   // iterations=2
-        m = boxMaxX(m, s, 41)                        // 只往左右各放 20 px
+        m = boxMaxX(m, s, 61)                        // 只往左右各放 30 px（41→61：10-22 对拍那批臂都是这一档）
         m = boxBlur(m, s, 7)
         var m1 = [Float](repeating: 0, count: s * s)
         for y in 10..<s { for x in 10..<(s - 10) { m1[y * s + x] = 1.0 } }
@@ -281,15 +281,19 @@ enum SwapGeo {
     // ④ 0.28 起＝「这一格整幅原像素＋一个色差」（tailShift）：台阶 +1.34、硬线 5.68、伸出带纹理 0.71
     //    （回到有纹理那一档），而下巴带覆盖 95.3%、↔源 0.771、能量比 0.506 三个一个没动
     //    （那 20 行本来就不带身份信息）。
-    static let chinRamp0 = 224.0                    // 这一行以上 alpha 照旧满（＝补丁自己那一行都不打折）
-    static let chinExt = 20.0                       // 伸出补丁几行
-    // 0.14 这里是 24 行（肉眼边界到 230 行），他装上后判「现在的都有点过了，可以收点了」⇒ 收成 12：
-    // 边界回到 224 行，尾巴正好在巴尖（233）那一格收住。
-    // 10-21 他判「下巴还有一半没遮罩」⇒ 又推回 20：alpha 0.5 那条边界从 224 行落到 233 行＝正好落在检测框下沿。
-    // 本机 20 帧（tools/_swap_maskrange.py）：巴尖那一横条的覆盖率 68.7%→88.0%。
+    // ⑤ 10-22 换图对拍（源＝aa/3.png 目标＝aa/4.png，tools/_swap_img.py）＝他判「为什么都延伸到肩膀了，
+    //    下巴这还是有明显的分界线痕迹，我看所有的都有」的那一条：所有臂的「硬行」都落在 223 行（补丁下沿），
+    //    缝净 26.65。成因＝补丁末几行以 −3.5 L/行往下掉、原图从 224 起是亮的，而 ④ 那档「带内均值差」
+    //    在接缝处错开，多出 +21 L 的台阶。改成切线对齐（上下两侧各拟合一条直线，在第 223.5 行对上值和斜率），
+    //    硬线 22.72→4.87、缝净 26.65→5.97，肩那一带也不再被提亮（肩差 5.46→−0.02）。
+    // 这一刀同时挪到肩线：alpha 满格压到第 385 行（肩线），386~398 之间淡出。
+    // 那 13 行淡出段里的内容与原片逐像素相同（＝接缝偏置到第 263 行就衰减完了），所以看不出边。
+    static let chinRamp0 = 385.0                   // alpha 满格压到这一行（肩线）
+    static let chinExt = 175.0                    // 补丁下面还留这么多行（385→398 之间淡出）
     static var chinRamp1: Double { Double(size - 1) + chinExt }   // 到这一行掉到 0
 
-    /// smoothstep 1→0：补丁那 224 行连同末行全是 1（不再被这一刀切），落差整段落在伸出去那 chinExt 行上
+    /// smoothstep 1→0：第 385 行之前 alpha 一律满（补丁那 224 行、还有下巴到肩那一段都是 1），
+    /// 落差整段落在 385~398 之间
     private static func chinProfile(_ fy: Double) -> Float {
         if fy <= chinRamp0 { return 1 }
         let t = (fy - chinRamp0) / (chinRamp1 - chinRamp0)
@@ -303,9 +307,9 @@ enum SwapGeo {
     // 同一档羽化若在整幅那一层糊（B 臂），台阶只到 6.79 而本机合成段要 2.3 倍的钱 ⇒ 糊在 224 里，
     // 两条路的 alpha 逐像素差 均值 2.43／最大 26.59（0~255 刻度）。
     static let featherSigma = 4.0
-    static var maskRows: Int { Int(chinRamp1) + 1 }        // 244 行＝补丁 224 行＋伸出那 20 行
+    static var maskRows: Int { Int(chinRamp1) + 1 }        // 399 行＝补丁 224 行＋下巴到肩那 175 行
 
-    /// 224 那张遮罩 → 244×224 的成品 alpha：下巴剖面先折进来（伸出那几行拿末行接下去），
+    /// 224 那张遮罩 → 399×224 的成品 alpha：下巴剖面先折进来（下面那几行拿末行接下去），
     /// 再整张高斯摊开一次。贴回时取样就直接落在这张上，不再按行现算剖面。
     /// out 的长度必须是 maskRows*size，调用方按帧复用这一格缓冲。
     static func featherMask(_ m2: [Float], _ out: inout [Float]) {
@@ -352,43 +356,96 @@ enum SwapGeo {
         return o
     }
 
-    /// 补丁线以下那 chinExt 行的色差（planar 序 R,G,B，0~1 刻度与 gen 同）：
-    /// 上块＝补丁里下巴那 7 行（216~222）中线 ±30 的均值，下块＝补丁线底下 4 行（224~227）
-    /// 按 back 映到整幅上取到的原像素均值。两者之差就是「网画的下巴比这一帧原片暗多少」，
-    /// 往下伸的那几行原样本上加这一个差，接缝两侧同色、纹理还是原片自己的。
-    private static func tailShift(_ p: UnsafeMutablePointer<UInt8>, rowPix: Int, w: Int, h: Int,
-                                  gen: [Float], back: Affine) -> [Float] {
+    /// 接缝偏置往下几行内衰减到零（对齐 224 空间）＝本机对拍他选的那一档 40 行
+    static let seamDecayRows = 40.0
+
+    /// 接缝偏置的衰减：第 224 行满格，seamDecayRows 行内 smoothstep 到 0。
+    /// 40 这一档是他在本机对拍图里选的（rig 的 nseam＝40 那臂）。
+    private static func seamDecay(_ fy: Double) -> Float {
+        let t = (fy - Double(size - 1)) / seamDecayRows
+        if t <= 0 { return 1 }
+        if t >= 1 { return 0 }
+        return Float(1 - t * t * (3 - 2 * t))
+    }
+
+    /// 最小二乘拟合一条直线 y = a·x + b
+    private static func fitLine(_ xs: [Double], _ ys: [Double]) -> (Double, Double) {
+        let n = Double(xs.count)
+        guard n >= 2 else { return (0, ys.first ?? 0) }
+        var mx = 0.0, my = 0.0
+        for i in 0..<xs.count { mx += xs[i]; my += ys[i] }
+        mx /= n; my /= n
+        var sxy = 0.0, sxx = 0.0
+        for i in 0..<xs.count {
+            let dx = xs[i] - mx
+            sxy += dx * (ys[i] - my); sxx += dx * dx
+        }
+        guard sxx > 1e-12 else { return (0, my) }
+        let a = sxy / sxx
+        return (a, my - a * mx)
+    }
+
+    /// 补丁线（223/224）那道接缝的色差（planar 序 R,G,B，0~1 刻度与 gen 同）：
+    /// 补丁末 10 行（214~223）与原图接下去的 10 行（224~233）各自拟合一条直线，
+    /// 在第 223.5 行上把两条直线的值对上，差值就是原图那一侧要加的偏置。
+    /// 为什么不再用带内均值差（旧 tailShift）：补丁末几行以 −3.5 L/行往下掉，原图从 224 起是亮的，
+    /// 均值差在接缝处错开，多出 +21 L 的台阶＝他判「下巴这还是有明显的分界线痕迹」。
+    /// 本机对拍（tools/_swap_img.py，源＝aa/3.png 目标＝aa/4.png）：硬线 22.72→4.87、缝净 26.65→5.97。
+    private static func seamTangent(_ p: UnsafePointer<UInt8>, rowPix: Int, w: Int, h: Int,
+                                    gen: [Float], back: Affine) -> [Float] {
         let s = size, plane = s * s, c0 = s / 2 - 30, c1 = s / 2 + 30
-        var up = [Float](repeating: 0, count: 3), dn = [Float](repeating: 0, count: 3)
-        var nu = 0, nd = 0
-        for y in (s - 8)..<(s - 1) {
-            for x in c0..<c1 {
-                for pl in 0..<3 { up[pl] += gen[pl * plane + y * s + x] }
-                nu += 1
+        var segP = [[Double]](repeating: [], count: 3)
+        var segG = [[Double]](repeating: [], count: 3)
+        var xsP = [Double](), xsG = [Double]()
+        for i in 0..<10 {
+            xsP.append(Double(s - 10 + i) + 0.5)
+            xsG.append(Double(s + i) + 0.5)
+        }
+        // 补丁侧：gen 的行均值（列 c0..<c1，与本机对拍同一组列）
+        for y in (s - 10)..<s {
+            for pl in 0..<3 {
+                var m = 0.0
+                for x in c0..<c1 { m += Double(gen[pl * plane + y * s + x]) }
+                segP[pl].append(m / Double(c1 - c0))
             }
         }
-        for k in 0..<4 {
+        // 原图侧：把对齐空间的 (x, 224+k) 按 back 映回整幅，直接取那一格的原像素
+        for k in 0..<10 {
             let fy = Double(s + k)
-            for c in c0..<c1 {
-                let fx = Double(c)
-                let gx = back.a * fx + back.b * fy + back.c
-                let gy = back.d * fx + back.e * fy + back.f
-                let ix = Int(gx.rounded()), iy = Int(gy.rounded())
-                guard ix >= 0, iy >= 0, ix < w, iy < h else { continue }
-                let o = iy * rowPix * 4 + ix * 4
-                dn[0] += Float(p[o + 2]); dn[1] += Float(p[o + 1]); dn[2] += Float(p[o])
-                nd += 1
+            for pl in 0..<3 {
+                var m = 0.0
+                var hit = 0
+                for x in c0..<c1 {
+                    let fx = Double(x)
+                    let gx = back.a * fx + back.b * fy + back.c
+                    let gy = back.d * fx + back.e * fy + back.f
+                    let ix = Int(gx.rounded()), iy = Int(gy.rounded())
+                    guard ix >= 0, iy >= 0, ix < w, iy < h else { continue }
+                    let o = iy * rowPix * 4 + ix * 4
+                    switch pl {
+                    case 0: m += Double(p[o + 2]) / 255.0      // R
+                    case 1: m += Double(p[o + 1]) / 255.0      // G
+                    default: m += Double(p[o]) / 255.0         // B
+                    }
+                    hit += 1
+                }
+                guard hit >= (c1 - c0) else { return [0, 0, 0] }   // 这一行整个在画面外＝没得对色
+                segG[pl].append(m / Double(hit))
             }
         }
-        // 补丁线底下那 4 行整幅越界（脸贴到画面下沿）＝这一格没得对色，色差取 0＝行为同旧版减一步
-        guard nu > 0, nd >= (c1 - c0) else { return [0, 0, 0] }
-        let fu = Float(nu), fd = Float(nd)
-        return (0..<3).map { up[$0] / fu - dn[$0] / (fd * 255.0) }
+        var out = [Float](repeating: 0, count: 3)
+        for pl in 0..<3 {
+            let fp = fitLine(xsP, segP[pl])
+            let fg = fitLine(xsG, segG[pl])
+            out[pl] = Float((fp.0 * 223.5 + fp.1) - (fg.0 * 223.5 + fg.1))
+        }
+        return out
     }
 
     /// 官方 dealign 的框内版：整幅像素 (gx,gy) 用正向 M（整幅→模板）去 224 结果和 mask 里取样，
     /// 再按 mask 就地混进 BGRA。clip 到 0~255 同 cv2 存盘那一步。
-    /// 补丁底下伸出去那 chinExt 行：取样落不进 gen 的那几格用「这一格整幅原像素＋tailShift 那个色差」，
+    /// 补丁底下伸出去那几行：取样落不进 gen 的那几格用「这一格整幅原像素＋接缝偏置」，
+    /// 偏置按对齐行往下衰减（224 行满格、40 行内到 0），
     /// 不再平铺对齐原片的末行（旧版那样接出来的是一条纵向纹理≈0 的亮带，压着补丁里画暗了的下巴，
     /// 接缝就是他判的「遮罩和源脸边缘处有深色边痕迹」）。
     static func pasteBack(_ base: UnsafeMutableRawPointer, bytesPerRow: Int, w: Int, h: Int,
@@ -404,7 +461,7 @@ enum SwapGeo {
         let p = base.assumingMemoryBound(to: UInt8.self)
         let rowPix = bytesPerRow / 4
         let plane = size * size
-        let sh = tailShift(p, rowPix: rowPix, w: w, h: h, gen: gen, back: back)
+        let se = seamTangent(p, rowPix: rowPix, w: w, h: h, gen: gen, back: back)
         for gy in yi0..<yi1 {
             for gx in xi0..<xi1 {
                 let u = Double(gx), v = Double(gy)
@@ -418,10 +475,11 @@ enum SwapGeo {
                 let dx = Float(fx - Double(x0)), dy = Float(fy - Double(y0))
                 let x1 = min(x0 + 1, size - 1), y1 = min(y0 + 1, maskRows - 1)
                 let o = gy * rowPix * 4 + gx * 4
+                let dec = seamDecay(fy)
                 for (ci, planeIdx) in [(2, 0), (1, 1), (0, 2)] {   // BGRA 内存序：B←planar R 反着写
                     let g = planeIdx * plane
-                    // 补丁只到 223 行；224 往上（含 223↔224 那一格插值）落进「这一格原像素＋色差」
-                    let tv = Float(p[o + ci]) / 255.0 + sh[planeIdx]
+                    // 补丁只到 223 行；224 往上（含 223↔224 那一格插值）落进「这一格原像素＋接缝偏置」
+                    let tv = Float(p[o + ci]) / 255.0 + se[planeIdx] * dec
                     let a00 = y0 < size ? gen[g + y0 * size + x0] : tv
                     let a10 = y0 < size ? gen[g + y0 * size + x1] : tv
                     let a01 = y1 < size ? gen[g + y1 * size + x0] : tv
