@@ -49,7 +49,7 @@ struct SwapContentView: View {
     @State private var running = false
     @State private var unitIdx = 0                   // 默认 units[0] = cpuOnly
     @State private var longIdx = 0                   // 默认 1920（长边上限）
-    @State private var beautyIdx = 0                 // 0＝美白开（0.11 以来的那份），1＝关
+    @State private var beautyIdx = 1                 // 0＝美白开，1＝关；10-22 起默认关（他肉眼判：关比开好）
     @State private var result = ""
     @State private var outURL: URL?
 
@@ -165,7 +165,7 @@ struct SwapContentView: View {
                         }
                         .pickerStyle(.segmented)
                         .disabled(running)
-                        Text("关＝这一趟不在补丁上做那一档提亮（Lab 里 L×1.06+4.31）。本机六臂量：遮罩边上的亮度台阶 3.33→0.69 灰阶，补丁暗一档（芯 L 122.6→106.0），↔源 0.697→0.674。")
+                        Text("默认关。开＝在补丁上做一档提亮（Lab 里 L×1.06+4.31）；本机量：开着遮罩边上的亮度台阶 3.33 灰阶、关掉 0.69，补丁芯 L 122.6↔106.0，↔源 0.697↔0.674。")
                             .font(.caption2)
 
                         // 点下去立刻置灰 + 改文案：界面上没有流水，这一下的反馈就在按钮自己身上

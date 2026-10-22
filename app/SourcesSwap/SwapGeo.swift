@@ -149,7 +149,7 @@ enum SwapGeo {
 
     // MARK: - 反向：size×size 的结果 + mask 贴回整幅（只在脸的外接框里做）
 
-    /// 官方 preprocess_mask：>0.001 归 1 → 11×11 膨胀 → 11×11 腐蚀×2 → 横向再放宽 1×21 → 7×7 模糊 → 乘 10 px 内收衰减
+    /// 官方 preprocess_mask：>0.001 归 1 → 11×11 膨胀 → 11×11 腐蚀×2 → 横向再放宽 1×41 → 7×7 模糊 → 乘 10 px 内收衰减
     /// 只这两处偏离官方：下边不再内收（下巴下半截就是被那一刀切掉的），左右和上边照旧；
     /// 腐蚀之后加一刀只往左右长的放宽——「侧脸没遮完」是横向的缺口，各向同性地放大会连带往头发和额头上长。
     /// 下边缘的剖面不在这里乘，由 featherMask 折进 244 行那张再整张糊一次（伸出补丁那几行只有现算才有）。
@@ -159,7 +159,7 @@ enum SwapGeo {
         for i in 0..<m.count { m[i] = m[i] > 0.001 ? 1.0 : m[i] }
         m = boxMax(m, s, 11)
         m = boxMin(m, s, 11); m = boxMin(m, s, 11)   // iterations=2
-        m = boxMaxX(m, s, 21)                        // 只往左右各放 10 px
+        m = boxMaxX(m, s, 41)                        // 只往左右各放 20 px
         m = boxBlur(m, s, 7)
         var m1 = [Float](repeating: 0, count: s * s)
         for y in 10..<s { for x in 10..<(s - 10) { m1[y * s + x] = 1.0 } }
