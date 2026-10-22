@@ -149,15 +149,17 @@ enum SwapGeo {
 
     // MARK: - 反向：size×size 的结果 + mask 贴回整幅（只在脸的外接框里做）
 
-    /// 官方 preprocess_mask：>0.001 归 1 → 11×11 膨胀 → 11×11 腐蚀×2 → 7×7 模糊 → 乘 10 px 内收衰减
-    /// 只这一处偏离官方：下边不再内收（下巴下半截就是被那一刀切掉的），左右和上边照旧。
-    /// 下边缘的剖面不在这里乘，由 featherMask 折进 236 行那张再整张糊一次（伸出补丁那几行只有现算才有）。
+    /// 官方 preprocess_mask：>0.001 归 1 → 11×11 膨胀 → 11×11 腐蚀×2 → 横向再放宽 1×21 → 7×7 模糊 → 乘 10 px 内收衰减
+    /// 只这两处偏离官方：下边不再内收（下巴下半截就是被那一刀切掉的），左右和上边照旧；
+    /// 腐蚀之后加一刀只往左右长的放宽——「侧脸没遮完」是横向的缺口，各向同性地放大会连带往头发和额头上长。
+    /// 下边缘的剖面不在这里乘，由 featherMask 折进 244 行那张再整张糊一次（伸出补丁那几行只有现算才有）。
     static func preprocessMask(_ inMask: [Float], _ m2: inout [Float]) {
         let s = size
         var m = inMask
         for i in 0..<m.count { m[i] = m[i] > 0.001 ? 1.0 : m[i] }
         m = boxMax(m, s, 11)
         m = boxMin(m, s, 11); m = boxMin(m, s, 11)   // iterations=2
+        m = boxMaxX(m, s, 21)                        // 只往左右各放 10 px
         m = boxBlur(m, s, 7)
         var m1 = [Float](repeating: 0, count: s * s)
         for y in 10..<s { for x in 10..<(s - 10) { m1[y * s + x] = 1.0 } }
@@ -183,6 +185,21 @@ enum SwapGeo {
                 var v = t[y * s + x]
                 let y0 = max(0, y - r), y1 = min(s - 1, y + r)
                 for yy in y0...y1 { v = max(v, t[yy * s + x]) }
+                o[y * s + x] = v
+            }
+        }
+        return o
+    }
+
+    /// 只沿着一行取最大值 ＝ cv2.dilate(m, np.ones((1, k)))：核只有一行，所以列方向一个像素也不动
+    private static func boxMaxX(_ a: [Float], _ s: Int, _ k: Int) -> [Float] {
+        let r = k / 2
+        var o = [Float](repeating: 0, count: a.count)
+        for y in 0..<s {
+            for x in 0..<s {
+                var v = a[y * s + x]
+                let x0 = max(0, x - r), x1 = min(s - 1, x + r)
+                for xx in x0...x1 { v = max(v, a[y * s + xx]) }
                 o[y * s + x] = v
             }
         }
@@ -261,13 +278,15 @@ enum SwapGeo {
     // 也试过拿补丁末行接（0.17 及以前）：那一行是网画的下颌暗面，平铺在脖子上＝一道横着的黑缝。
     // 本机 4 帧对拍（tools/ring_chin.py）：巴尖那道带暗弧 223→0 px，暗像素 4418→1322 px²，
     // ↔源 0.775、能量比 0.240 一个没动（那 12 行本来就不带身份信息）。
-    static let chinRamp0 = 214.0                    // 这一行以上 alpha 照旧满
-    static let chinExt = 12.0                       // 伸出补丁几行
+    static let chinRamp0 = 224.0                    // 这一行以上 alpha 照旧满（＝补丁自己那一行都不打折）
+    static let chinExt = 20.0                       // 伸出补丁几行
     // 0.14 这里是 24 行（肉眼边界到 230 行），他装上后判「现在的都有点过了，可以收点了」⇒ 收成 12：
     // 边界回到 224 行，尾巴正好在巴尖（233）那一格收住。
+    // 10-21 他判「下巴还有一半没遮罩」⇒ 又推回 20：alpha 0.5 那条边界从 224 行落到 233 行＝正好落在检测框下沿。
+    // 本机 20 帧（tools/_swap_maskrange.py）：巴尖那一横条的覆盖率 68.7%→88.0%。
     static var chinRamp1: Double { Double(size - 1) + chinExt }   // 到这一行掉到 0
 
-    /// smoothstep 1→0：补丁边框那一行（223）上还有 0.61，内外连续，所以边框不露直线
+    /// smoothstep 1→0：补丁那 224 行连同末行全是 1（不再被这一刀切），落差整段落在伸出去那 chinExt 行上
     private static func chinProfile(_ fy: Double) -> Float {
         if fy <= chinRamp0 { return 1 }
         let t = (fy - chinRamp0) / (chinRamp1 - chinRamp0)
@@ -281,9 +300,9 @@ enum SwapGeo {
     // 同一档羽化若在整幅那一层糊（B 臂），台阶只到 6.79 而本机合成段要 2.3 倍的钱 ⇒ 糊在 224 里，
     // 两条路的 alpha 逐像素差 均值 2.43／最大 26.59（0~255 刻度）。
     static let featherSigma = 4.0
-    static var maskRows: Int { Int(chinRamp1) + 1 }        // 236 行＝补丁 224 行＋伸出那 12 行
+    static var maskRows: Int { Int(chinRamp1) + 1 }        // 244 行＝补丁 224 行＋伸出那 20 行
 
-    /// 224 那张遮罩 → 236×224 的成品 alpha：下巴剖面先折进来（伸出那几行拿末行接下去），
+    /// 224 那张遮罩 → 244×224 的成品 alpha：下巴剖面先折进来（伸出那几行拿末行接下去），
     /// 再整张高斯摊开一次。贴回时取样就直接落在这张上，不再按行现算剖面。
     /// out 的长度必须是 maskRows*size，调用方按帧复用这一格缓冲。
     static func featherMask(_ m2: [Float], _ out: inout [Float]) {
@@ -352,7 +371,7 @@ enum SwapGeo {
                 let fx = fwd.a * u + fwd.b * v + fwd.c
                 let fy = fwd.d * u + fwd.e * v + fwd.f
                 guard fx >= 0, fy >= 0, fx <= Double(size - 1), fy <= chinRamp1 else { continue }
-                // alpha 落在 featherMask 那张 236×224 上（剖面和羽化都在里面了），不再按行现算
+                // alpha 落在 featherMask 那张 244×224 上（剖面和羽化都在里面了），不再按行现算
                 let mk = bilinearFloat(mask, size, mask.count / size, fx, fy)
                 if mk <= 0 { continue }
                 let x0 = Int(fx), y0 = Int(fy)
