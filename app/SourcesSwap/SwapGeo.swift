@@ -356,7 +356,7 @@ enum SwapGeo {
     /// 上块＝补丁里下巴那 7 行（216~222）中线 ±30 的均值，下块＝补丁线底下 4 行（224~227）
     /// 按 back 映到整幅上取到的原像素均值。两者之差就是「网画的下巴比这一帧原片暗多少」，
     /// 往下伸的那几行原样本上加这一个差，接缝两侧同色、纹理还是原片自己的。
-    private static func tailShift(_ p: UnsafeMutableRawPointer, rowPix: Int, w: Int, h: Int,
+    private static func tailShift(_ p: UnsafeMutablePointer<UInt8>, rowPix: Int, w: Int, h: Int,
                                   gen: [Float], back: Affine) -> [Float] {
         let s = size, plane = s * s, c0 = s / 2 - 30, c1 = s / 2 + 30
         var up = [Float](repeating: 0, count: 3), dn = [Float](repeating: 0, count: 3)
@@ -367,8 +367,10 @@ enum SwapGeo {
                 nu += 1
             }
         }
-        for fy in Double(s)..<(Double(s) + 4) {
-            for fx in Double(c0)..<Double(c1) {
+        for k in 0..<4 {
+            let fy = Double(s + k)
+            for c in c0..<c1 {
+                let fx = Double(c)
                 let gx = back.a * fx + back.b * fy + back.c
                 let gy = back.d * fx + back.e * fy + back.f
                 let ix = Int(gx.rounded()), iy = Int(gy.rounded())
