@@ -596,7 +596,6 @@ enum SwapClip {
         var rawMask = [Float](repeating: 0, count: side * side)
         var m2 = [Float](repeating: 0, count: side * side)
         var alpha = [Float](repeating: 0, count: SwapGeo.maskRows * side)
-        var tail = [Float](repeating: 0, count: 3 * side)
         var f112 = [Float](repeating: 0, count: 3 * 112 * 112)
 
         while why.isEmpty {
@@ -710,14 +709,9 @@ enum SwapClip {
                                 SwapGeo.preprocessMask(rawMask, &m2)
                                 SwapGeo.featherMask(m2, &alpha)
                                 let tm = DispatchTime.now().uptimeNanoseconds
-                                // 补丁底下伸出那 12 行接的是原片末行：他自己脖子的颜色，未美白
-                                for pl in 0..<3 {
-                                    let b = pl * side * side + (side - 1) * side
-                                    for x in 0..<side { tail[pl * side + x] = att[b + x] }
-                                }
                                 let pasted = SwapTech.withPixels(dst) { base, bpr -> Bool in
                                     SwapGeo.pasteBack(base, bytesPerRow: bpr, w: w, h: h,
-                                                      gen: gen, tail: tail, mask: alpha,
+                                                      gen: gen, mask: alpha,
                                                       fwd: al.fwd, back: al.back)
                                     return true
                                 }

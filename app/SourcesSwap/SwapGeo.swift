@@ -272,12 +272,15 @@ enum SwapGeo {
     }
 
     // 下巴往下：补丁只有 0~223 行，而本机量下来下巴尖（检测框下沿）映到第 233 行（P10 230／P90 242）
-    // ——巴尖压根不在补丁里，光挪遮罩内收量最多盖到 218 行。
-    // 所以剖面伸出补丁 chinExt 行，伸出那几行接的是「这一帧对齐后的原片末行」（tail），不是补丁末行。
-    // 试过镜像接（把倒数几行翻下来）：脖子上会多出一道弧形的下巴鬼影，比复制更难看，已弃。
-    // 也试过拿补丁末行接（0.17 及以前）：那一行是网画的下颌暗面，平铺在脖子上＝一道横着的黑缝。
-    // 本机 4 帧对拍（tools/ring_chin.py）：巴尖那道带暗弧 223→0 px，暗像素 4418→1322 px²，
-    // ↔源 0.775、能量比 0.240 一个没动（那 12 行本来就不带身份信息）。
+    // ——巴尖压根不在补丁里，光挪遮罩内收量最多盖到 218 行。所以剖面伸出补丁 chinExt 行。
+    // 伸出那几行接什么，本机 20 帧对拍过四档（tools/_swap_tail.py）：
+    // ① 拿补丁末行平铺（0.17 及以前）＝那一行是网画的下颌暗面，摊在脖子上是一道横着的黑缝；
+    // ② 拿对齐原片末行平铺（0.18~0.27）＝一条纵向纹理 0.41（补丁内 0.9）的亮带，压着比原片暗 8.96 L 的
+    //    换脸下巴，补丁线那道台阶 −16.61 L、相邻行最大跳变 18.30＝他判的「遮罩和源脸边缘处有深色边痕迹」；
+    // ③ 镜像接＝脖子上多一道弧形的下巴鬼影，比平铺更难看；
+    // ④ 0.28 起＝「这一格整幅原像素＋一个色差」（tailShift）：台阶 +1.34、硬线 5.68、伸出带纹理 0.71
+    //    （回到有纹理那一档），而下巴带覆盖 95.3%、↔源 0.771、能量比 0.506 三个一个没动
+    //    （那 20 行本来就不带身份信息）。
     static let chinRamp0 = 224.0                    // 这一行以上 alpha 照旧满（＝补丁自己那一行都不打折）
     static let chinExt = 20.0                       // 伸出补丁几行
     // 0.14 这里是 24 行（肉眼边界到 230 行），他装上后判「现在的都有点过了，可以收点了」⇒ 收成 12：
@@ -349,11 +352,45 @@ enum SwapGeo {
         return o
     }
 
+    /// 补丁线以下那 chinExt 行的色差（planar 序 R,G,B，0~1 刻度与 gen 同）：
+    /// 上块＝补丁里下巴那 7 行（216~222）中线 ±30 的均值，下块＝补丁线底下 4 行（224~227）
+    /// 按 back 映到整幅上取到的原像素均值。两者之差就是「网画的下巴比这一帧原片暗多少」，
+    /// 往下伸的那几行原样本上加这一个差，接缝两侧同色、纹理还是原片自己的。
+    private static func tailShift(_ p: UnsafeMutableRawPointer, rowPix: Int, w: Int, h: Int,
+                                  gen: [Float], back: Affine) -> [Float] {
+        let s = size, plane = s * s, c0 = s / 2 - 30, c1 = s / 2 + 30
+        var up = [Float](repeating: 0, count: 3), dn = [Float](repeating: 0, count: 3)
+        var nu = 0, nd = 0
+        for y in (s - 8)..<(s - 1) {
+            for x in c0..<c1 {
+                for pl in 0..<3 { up[pl] += gen[pl * plane + y * s + x] }
+                nu += 1
+            }
+        }
+        for fy in Double(s)..<(Double(s) + 4) {
+            for fx in Double(c0)..<Double(c1) {
+                let gx = back.a * fx + back.b * fy + back.c
+                let gy = back.d * fx + back.e * fy + back.f
+                let ix = Int(gx.rounded()), iy = Int(gy.rounded())
+                guard ix >= 0, iy >= 0, ix < w, iy < h else { continue }
+                let o = iy * rowPix * 4 + ix * 4
+                dn[0] += Float(p[o + 2]); dn[1] += Float(p[o + 1]); dn[2] += Float(p[o])
+                nd += 1
+            }
+        }
+        // 补丁线底下那 4 行整幅越界（脸贴到画面下沿）＝这一格没得对色，色差取 0＝行为同旧版减一步
+        guard nu > 0, nd >= (c1 - c0) else { return [0, 0, 0] }
+        let fu = Float(nu), fd = Float(nd)
+        return (0..<3).map { up[$0] / fu - dn[$0] / (fd * 255.0) }
+    }
+
     /// 官方 dealign 的框内版：整幅像素 (gx,gy) 用正向 M（整幅→模板）去 224 结果和 mask 里取样，
     /// 再按 mask 就地混进 BGRA。clip 到 0~255 同 cv2 存盘那一步。
-    /// tail ＝ 这一帧对齐后原片的末行（planar，长 3*size）：补丁底下伸出去的那 chinExt 行由它接手。
+    /// 补丁底下伸出去那 chinExt 行：取样落不进 gen 的那几格用「这一格整幅原像素＋tailShift 那个色差」，
+    /// 不再平铺对齐原片的末行（旧版那样接出来的是一条纵向纹理≈0 的亮带，压着补丁里画暗了的下巴，
+    /// 接缝就是他判的「遮罩和源脸边缘处有深色边痕迹」）。
     static func pasteBack(_ base: UnsafeMutableRawPointer, bytesPerRow: Int, w: Int, h: Int,
-                          gen: [Float], tail: [Float], mask: [Float], fwd: Affine, back: Affine,
+                          gen: [Float], mask: [Float], fwd: Affine, back: Affine,
                           padRatio: Double = 0.06) {
         let roi = faceRoi(back: back, yMax: chinRamp1)
         let rw = roi.x1 - roi.x0, rh = roi.y1 - roi.y0
@@ -365,6 +402,7 @@ enum SwapGeo {
         let p = base.assumingMemoryBound(to: UInt8.self)
         let rowPix = bytesPerRow / 4
         let plane = size * size
+        let sh = tailShift(p, rowPix: rowPix, w: w, h: h, gen: gen, back: back)
         for gy in yi0..<yi1 {
             for gx in xi0..<xi1 {
                 let u = Double(gx), v = Double(gy)
@@ -379,12 +417,13 @@ enum SwapGeo {
                 let x1 = min(x0 + 1, size - 1), y1 = min(y0 + 1, maskRows - 1)
                 let o = gy * rowPix * 4 + gx * 4
                 for (ci, planeIdx) in [(2, 0), (1, 1), (0, 2)] {   // BGRA 内存序：B←planar R 反着写
-                    let g = planeIdx * plane, t = planeIdx * size
-                    // 补丁只到 223 行；224 往上（含 223↔224 那一格插值）落进 tail
-                    let a00 = y0 < size ? gen[g + y0 * size + x0] : tail[t + x0]
-                    let a10 = y0 < size ? gen[g + y0 * size + x1] : tail[t + x1]
-                    let a01 = y1 < size ? gen[g + y1 * size + x0] : tail[t + x0]
-                    let a11 = y1 < size ? gen[g + y1 * size + x1] : tail[t + x1]
+                    let g = planeIdx * plane
+                    // 补丁只到 223 行；224 往上（含 223↔224 那一格插值）落进「这一格原像素＋色差」
+                    let tv = Float(p[o + ci]) / 255.0 + sh[planeIdx]
+                    let a00 = y0 < size ? gen[g + y0 * size + x0] : tv
+                    let a10 = y0 < size ? gen[g + y0 * size + x1] : tv
+                    let a01 = y1 < size ? gen[g + y1 * size + x0] : tv
+                    let a11 = y1 < size ? gen[g + y1 * size + x1] : tv
                     let v0 = a00 + (a10 - a00) * dx
                     let v1 = a01 + (a11 - a01) * dx
                     let g2 = v0 + (v1 - v0) * dy

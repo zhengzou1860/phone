@@ -68,7 +68,7 @@ final class SwapPreview {
     private var held: CVPixelBuffer?
     private var frameW = 0, frameH = 0
     private var att = [Float](), gen = [Float](), rawMask = [Float]()
-    private var m2 = [Float](), alpha = [Float](), tailRows = [Float]()
+    private var m2 = [Float](), alpha = [Float]()
     private var decodeMs: [Double] = [], detectMs: [Double] = [], warpMs: [Double] = []
     private var frameMs: [Double] = [], beautyMs: [Double] = [], maskMs: [Double] = []
     private var pasteMs: [Double] = [], swapMs: [Double] = [], detailMs: [Double] = []
@@ -205,7 +205,6 @@ final class SwapPreview {
         rawMask = [Float](repeating: 0, count: side * side)
         m2 = [Float](repeating: 0, count: side * side)
         alpha = [Float](repeating: 0, count: SwapGeo.maskRows * side)
-        tailRows = [Float](repeating: 0, count: 3 * side)
         decodeMs = []; detectMs = []; warpMs = []; frameMs = []
         beautyMs = []; maskMs = []; pasteMs = []; swapMs = []; detailMs = []
         nSwap = 0; nDecode = 0; noFace = 0; smallFace = 0; mirror = 0; fitFail = 0; netFail = 0
@@ -367,10 +366,6 @@ final class SwapPreview {
         let t3 = ns()
         SwapGeo.preprocessMask(rawMask, &m2)
         SwapGeo.featherMask(m2, &alpha)
-        for pl in 0..<3 {
-            let b = pl * side * side + (side - 1) * side
-            for x in 0..<side { tailRows[pl * side + x] = att[b + x] }
-        }
         maskMs.append(msFrom(t3))
 
         let t4 = ns()
@@ -384,7 +379,7 @@ final class SwapPreview {
         var pasted = false
         if let base = CVPixelBufferGetBaseAddress(dst) {
             SwapGeo.pasteBack(base, bytesPerRow: CVPixelBufferGetBytesPerRow(dst), w: frameW, h: frameH,
-                              gen: gen, tail: tailRows, mask: alpha, fwd: al.fwd, back: al.back)
+                              gen: gen, mask: alpha, fwd: al.fwd, back: al.back)
             pasted = true
         }
         CVPixelBufferUnlockBaseAddress(dst, [])
