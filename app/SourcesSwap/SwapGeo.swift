@@ -374,6 +374,35 @@ enum SwapGeo {
     /// 本机量到那一块相对原片偏暗 16 L（均值 −5.4 L），搬到补丁侧以后接缝以下逐像素等于原片（0.00 L）。
     static let seamTaperRows = 10.0
 
+    // MARK: - 接缝那道分界线：把交接从半个对齐像素摊到 16 行（他 10-23 令「把那条分界线隐藏掉吧」）
+    //
+    // 成因（先定位再动手，tools/_veil26.py 按对齐行带扫出来的）：补丁在下巴／脖子那一片本来就比
+    // 原片暗 5~10 L（行 196-223 那几带 −6.7~−9.8 L），而贴的交接压在**一个对齐像素**里
+    // （gen[223] 与原像素那半格的双线性）＝u≈6.2 时 3.57 L 的落差摊在 6 个输出像素上＝一条线。
+    // ⚠️ 我第一版那把尺（沿输出行求均值，tools/_veil25.py 旧臂）量出来接缝只跳 0.71 L、与原片自己
+    // 的 0.63 L 没差＝根本没这条线——**错在接缝在这张图里是斜的**（仿射带旋转），按输出行求均值
+    // 把上下两档混在同一行里抹平了。尺子必须按对齐行带量：跳＝mean(成品−原片) 在 [220,223.5) 减 [224,228)。
+    // 改法＝α 在接缝上方 seamFadeRows 行里 smoothstep 淡到 0（补丁自己把脖子交回原片）：
+    // 那一档落差从 6 个输出像素摊到 ~99 个＝不再是线；差图（成品−原片 ×8）上原来沿接缝有一串亮珠，
+    // 淡出以后那串没了（图 tools/_veil25_map_b336.png，肉眼与尺子同向）。
+    // 本机三帧（tools/_veil25.py，跨缝跳／↔源／贴区；地板＝原片自己 +0.06/−0.01/+0.03 L）：
+    //   b336（脸 740 px，u=6.20）跳 −3.57 → 淡 8 −0.87／淡 16 −0.53／淡 24 −0.47／淡 40 −0.45；↔源 0.715 一分不掉；
+    //   b312（u=5.87）跳 +3.16 → 淡 8 +0.13／淡 16 −0.16／淡 40 −0.22；↔源 0.793 → 0.787／0.781／0.744；
+    //   b384（u=5.52）跳 −1.76 → 淡 8 −0.56／淡 16 −0.47／淡 40 −0.48；↔源 0.744 → 0.732／0.723／0.668。
+    // 鼻孔差、洞差、带通四档在淡 16 以内全不动（b336 带通 1.000/0.981/1.068/1.003 → 0.994/0.977/1.063/1.003）；
+    // 淡到 40 行开始亏（↔源 掉 0.03~0.08、b336 ↔目标 0.262→0.223、带通 0.949＝把目标的脸搬回来了）。
+    // 取 16＝他报的那一帧（b336）↔源零代价、三帧跳都压到 0.5 L 档；8 那一格 b336 还留 −0.87。
+    // 淡出的是巴尖（≈对齐 233 行）以上那 16 行巴／颈，盖全脸那件事不受影响；接缝以下本来就逐字节等于原片。
+    static let seamFadeRows = 16.0
+
+    /// 接缝上方的 α 行因子：第 223.5−16 行以上＝1，到第 223.5 行＝0，再往下恒 0（那一片就是原片）
+    static func seamFade(_ fy: Double) -> Float {
+        let t = (fy - (Double(size) - 0.5 - seamFadeRows)) / seamFadeRows
+        if t <= 0 { return 1 }
+        if t >= 1 { return 0 }
+        return Float(1 - t * t * (3 - 2 * t))
+    }
+
     /// 补丁末 10 行的补色权重：第 213 行 0、第 223 行 1
     private static func seamTaper(_ row: Int) -> Float {
         let t = (Double(row) - (Double(size - 1) - seamTaperRows)) / seamTaperRows
@@ -539,8 +568,9 @@ enum SwapGeo {
                 let fx = fwd.a * u + fwd.b * v + fwd.c
                 let fy = fwd.d * u + fwd.e * v + fwd.f
                 guard fx >= 0, fy >= 0, fx <= Double(size - 1), fy <= chinRamp1 else { continue }
-                // alpha 落在 featherMask 那张 399×224 上（剖面和羽化都在里面了），不再按行现算
-                let mk = bilinearFloat(mask, size, mask.count / size, fx, fy)
+                // alpha 落在 featherMask 那张 399×224 上（剖面和羽化都在里面了），不再按行现算；
+                // 再乘一道接缝淡出＝把补丁与原片的交接从半个对齐像素摊到 16 行（见 seamFade 那一段）
+                let mk = bilinearFloat(mask, size, mask.count / size, fx, fy) * seamFade(fy)
                 if mk <= 0 { continue }
                 let x0 = Int(fx), y0 = Int(fy)
                 let dx = Float(fx - Double(x0)), dy = Float(fy - Double(y0))
