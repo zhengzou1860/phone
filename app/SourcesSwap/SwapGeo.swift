@@ -153,6 +153,16 @@ enum SwapGeo {
     /// 只这两处偏离官方：下边不再内收（下巴下半截就是被那一刀切掉的），左右和上边照旧；
     /// 腐蚀之后加一刀只往左右长的放宽——「侧脸没遮完」是横向的缺口，各向同性地放大会连带往头发和额头上长。
     /// 下边缘的剖面不在这里乘，由 featherMask 折进 244 行那张再整张糊一次（伸出补丁那几行只有现算才有）。
+    ///
+    /// 最后再乘一道「收形」＝ min(1, 网自己的 mask ÷ shrinkK)：几何那几步（阈值 0.001＋横放宽 61 px）把遮罩撑到
+    /// 比网真正画过的那一片大得多——本机三帧量下来，α>0.5 且在 224 窗口里的可见贴区占整幅 46~55 %，
+    /// 其中 **22~33 % 的格子网自己的 mask < 0.3**，也就是那一片它根本没重画，贴进去的是原片缩到 224
+    /// 再放大 5.5~6.2 倍的那一份＝一张糊掉的原片，边界正是 1×61 横核长出来的直边＝他 10-23 描的那个正方形、
+    /// 判的那层「整个遮罩一层白膜」。乘完这三帧的可见贴区 55.1→38.6 %／50.3→40.5 %／46.2→34.2 %，
+    /// 「没画」那一份压到 4.0 %／3.6 %／6.3 %，而 ↔源 0.787→0.786／0.790→0.790／0.743→0.745
+    /// ＝那一片本来就不带身份信息，撤掉它身份一格不赔（tools/_veil23.py）。
+    static let shrinkK: Float = 0.3
+
     static func preprocessMask(_ inMask: [Float], _ m2: inout [Float]) {
         let s = size
         var m = inMask
@@ -164,7 +174,8 @@ enum SwapGeo {
         var m1 = [Float](repeating: 0, count: s * s)
         for y in 10..<s { for x in 10..<(s - 10) { m1[y * s + x] = 1.0 } }
         m1 = boxBlur(m1, s, 11)
-        for i in 0..<m.count { m2[i] = m[i] * m1[i] }
+        let k = shrinkK
+        for i in 0..<m.count { m2[i] = m[i] * m1[i] * min(1.0, inMask[i] / k) }
     }
 
     /// 矩形核膨胀：可分离（先行后列）；越界按 OpenCV 形态学默认边界＝不参与（比 -inf/ +inf 弱）
@@ -287,7 +298,7 @@ enum SwapGeo {
     //    在接缝处错开，多出 +21 L 的台阶。改成切线对齐（上下两侧各拟合一条直线，在第 223.5 行对上值和斜率），
     //    硬线 22.72→4.87、缝净 26.65→5.97，肩那一带也不再被提亮（肩差 5.46→−0.02）。
     // 这一刀同时挪到肩线：alpha 满格压到第 385 行（肩线），386~398 之间淡出。
-    // 那 13 行淡出段里的内容与原片逐像素相同（＝接缝偏置到第 263 行就衰减完了），所以看不出边。
+    // 那 13 行淡出段里的内容与原片逐像素相同（接缝色差已经搬到补丁侧了，接缝以下一个像素都不动），所以看不出边。
     static let chinRamp0 = 385.0                   // alpha 满格压到这一行（肩线）
     static let chinExt = 175.0                    // 补丁下面还留这么多行（385→398 之间淡出）
     static var chinRamp1: Double { Double(size - 1) + chinExt }   // 到这一行掉到 0
@@ -356,16 +367,19 @@ enum SwapGeo {
         return o
     }
 
-    /// 接缝偏置往下几行内衰减到零（对齐 224 空间）＝本机对拍他选的那一档 40 行
-    static let seamDecayRows = 40.0
+    /// 接缝色差搬到补丁侧：补丁末 10 行（214~223）按 smoothstep 渐变地补上 −se，
+    /// 让补丁末行的颜色对上原图第 224 行往下走的那条趋势线。
+    /// 为什么不再加在原片那一侧（0.29/0.30 那档）：加在原片上＝给脖子那一整块染色，
+    /// 出来就是下巴下面一个直边矩形（他 10-22 圈的那道分界线）；
+    /// 本机量到那一块相对原片偏暗 16 L（均值 −5.4 L），搬到补丁侧以后接缝以下逐像素等于原片（0.00 L）。
+    static let seamTaperRows = 10.0
 
-    /// 接缝偏置的衰减：第 224 行满格，seamDecayRows 行内 smoothstep 到 0。
-    /// 40 这一档是他在本机对拍图里选的（rig 的 nseam＝40 那臂）。
-    private static func seamDecay(_ fy: Double) -> Float {
-        let t = (fy - Double(size - 1)) / seamDecayRows
-        if t <= 0 { return 1 }
-        if t >= 1 { return 0 }
-        return Float(1 - t * t * (3 - 2 * t))
+    /// 补丁末 10 行的补色权重：第 213 行 0、第 223 行 1
+    private static func seamTaper(_ row: Int) -> Float {
+        let t = (Double(row) - (Double(size - 1) - seamTaperRows)) / seamTaperRows
+        if t <= 0 { return 0 }
+        if t >= 1 { return 1 }
+        return Float(t * t * (3 - 2 * t))
     }
 
     /// 最小二乘拟合一条直线 y = a·x + b
@@ -387,7 +401,7 @@ enum SwapGeo {
 
     /// 补丁线（223/224）那道接缝的色差（planar 序 R,G,B，0~1 刻度与 gen 同）：
     /// 补丁末 10 行（214~223）与原图接下去的 10 行（224~233）各自拟合一条直线，
-    /// 在第 223.5 行上把两条直线的值对上，差值就是原图那一侧要加的偏置。
+    /// 在第 223.5 行上把两条直线的值对上，差值就是补丁侧要减掉的量（0.31 起不再往原片那一侧加）。
     /// 为什么不再用带内均值差（旧 tailShift）：补丁末几行以 −3.5 L/行往下掉，原图从 224 起是亮的，
     /// 均值差在接缝处错开，多出 +21 L 的台阶＝他判「下巴这还是有明显的分界线痕迹」。
     /// 本机对拍（tools/_swap_img.py，源＝aa/3.png 目标＝aa/4.png）：硬线 22.72→4.87、缝净 26.65→5.97。
@@ -442,57 +456,141 @@ enum SwapGeo {
         return out
     }
 
+    // MARK: - 逐频带搬（他 10-23 令「就是糊，包括遮罩五官的位置，把回填从一档改成逐频带搬」）
+    //
+    // restoreDetail 那一档在 224 里搬，能搬到的最细周期＝一个对齐像素。脸一大，一个对齐像素盖好几个输出像素，
+    // 那一档就比原片自己的细节粗得多。本机在脸 952×1131 那一帧量（tools/_band3.py，补丁内 α 满格那块，
+    // 「成品/原片」的带通能量比）：<0.8 档 0.319、0.8-2 档 0.536，而 2-4／4-8 档已经是 1.098／1.078
+    // ＝细的两档搬不回来，粗的两档网络自己画过了还有余。所以「搬不搬」跟着放大倍率 u 走：
+    // u < 1.6（＝一个对齐像素盖不满 1.6 个输出像素）一档都不搬＝成品逐字节等于现役——
+    // 脸 51×66 那张 u=0.32、脸 175×232 那张 u=0.91，那里硬搬会把 ↔源 0.861 打到 0.545、↔目标 0.014 抬到 0.464
+    // ＝把目标自己的脸搬回来（他判的「没遮住」）。
+    //
+    // 搬的是哪一档＝「224 这张网格装不下的那一档」：原片亮度 − 这一帧对齐原片（att）双线性映回整幅。
+    // 取样的坐标与补丁用的完全是同一组（x0/y0/x1/y1、dx/dy），手机上不额外糊任何一张图、不多开一张整幅缓冲，
+    // 钱＝贴回循环里每个像素多读 4 个数。本机对拍（tools/_band3.py「224 网格高通 仅亮度」那一臂，
+    // 灰度两侧都走浮点＝与 Swift 同一式；先前一版按 8 位灰度量出的 1.107／1.105 是把 <0.8 那档被
+    // ±0.5 灰阶的量化抖动抬假了，作废）：
+    //   搬 2 档（σ=2 的 17 抽高斯）b336 1.055／1.048、b384 1.047／1.068｜↔源 0.701／0.746
+    //   这一臂                b336 1.062／1.101、b384 1.071／1.120｜↔源 0.713／0.743
+    //   现役                  b336 0.319／0.536、b384 0.341／0.590｜↔源 0.718／0.747
+    // ＝粗的那档补得更足、身份少丢一格、钱是一份高斯的几分之一。四邻高通（0.942／0.652）和 5 盒×2（1.056／1.075）在这两臂之间。
+    // 搬的是亮度（三通道同一个量）：灰度是线性组合，逐通道与仅亮度在灰度带通上是同一个数，差的只有色度和钱。
+    static let bandSigmas: [Double] = [0.8, 2.0, 4.0, 8.0]
+
+    /// 一个对齐像素盖几个输出像素 ＝ back（模板→整幅）那支的尺度 ＝ 1／fwd（整幅→模板）的尺度
+    static func upscale(_ fwd: Affine) -> Double {
+        let det = abs(fwd.a * fwd.e - fwd.b * fwd.d)
+        return det > 1e-9 ? 1.0 / det.squareRoot() : 0.0
+    }
+
+    /// 搬前 K 档（σ ≤ u/2）；0 ＝ 一档都不搬。这一版只用它当闸门（K>0 才搬），档界由 att 那张网格自己定
+    static func bandCount(_ up: Double) -> Int {
+        var n = 0
+        for s in bandSigmas { if s <= up / 2.0 { n += 1 } else { break } }
+        return n
+    }
+
+    /// 这一帧搬不搬（pasteBack 与流水那一格共用这一个判断，两处不许各写一遍）
+    static func wantsBand(_ fwd: Affine) -> Bool { bandCount(upscale(fwd)) > 0 }
+
+    /// att 的亮度面（0~255 刻度）：三张平面按 BT.601 合一张，5 万点，一次一帧。
+    /// 只有闸门要搬时才算；不搬时这一张根本不建。
+    private static func lumPlane(_ att: [Float]) -> [Float] {
+        let plane = size * size
+        var g = [Float](repeating: 0, count: plane)
+        for i in 0..<plane {
+            g[i] = (0.299 * att[i] + 0.587 * att[plane + i] + 0.114 * att[2 * plane + i]) * 255.0
+        }
+        return g
+    }
+
     /// 官方 dealign 的框内版：整幅像素 (gx,gy) 用正向 M（整幅→模板）去 224 结果和 mask 里取样，
     /// 再按 mask 就地混进 BGRA。clip 到 0~255 同 cv2 存盘那一步。
-    /// 补丁底下伸出去那几行：取样落不进 gen 的那几格用「这一格整幅原像素＋接缝偏置」，
-    /// 偏置按对齐行往下衰减（224 行满格、40 行内到 0），
-    /// 不再平铺对齐原片的末行（旧版那样接出来的是一条纵向纹理≈0 的亮带，压着补丁里画暗了的下巴，
-    /// 接缝就是他判的「遮罩和源脸边缘处有深色边痕迹」）。
+    /// 补丁底下伸出去那几行：取样落不进 gen 的那几格用「这一格整幅原像素」，
+    /// 接缝色差改加在补丁末 10 行上（seamTaper）——
+    /// 原来那档是把色差加在原片一侧往下衰减 40 行，出来是下巴下面一个直边矩形（他 10-22 圈的那道分界）。
+    /// 逐频带搬并进同一个循环（不是回贴之后再叠一遍）：见上面那段。返回值＝建 att 亮度面那一句花了多少 ms（没搬＝0），给单价那一格记账。
+    @discardableResult
     static func pasteBack(_ base: UnsafeMutableRawPointer, bytesPerRow: Int, w: Int, h: Int,
-                          gen: [Float], mask: [Float], fwd: Affine, back: Affine,
-                          padRatio: Double = 0.06) {
+                          gen: [Float], mask: [Float], att: [Float], fwd: Affine, back: Affine,
+                          padRatio: Double = 0.06) -> Double {
         let roi = faceRoi(back: back, yMax: chinRamp1)
         let rw = roi.x1 - roi.x0, rh = roi.y1 - roi.y0
         let xi0 = max(0, Int(floor(roi.x0 - rw * padRatio)))
         let yi0 = max(0, Int(floor(roi.y0 - rh * padRatio)))
         let xi1 = min(w, Int(ceil(roi.x1 + rw * padRatio)))
         let yi1 = min(h, Int(ceil(roi.y1 + rh * padRatio)))
-        if xi1 <= xi0 || yi1 <= yi0 { return }
+        if xi1 <= xi0 || yi1 <= yi0 { return 0 }
         let p = base.assumingMemoryBound(to: UInt8.self)
         let rowPix = bytesPerRow / 4
         let plane = size * size
         let se = seamTangent(p, rowPix: rowPix, w: w, h: h, gen: gen, back: back)
+        // 逐频带搬：闸门＝一个对齐像素盖够 1.6 个输出像素（bandCount>0），不搬时下面这张根本不建。
+        // 建的是 att 的亮度面（224×224，一帧一次），高通在下面那个循环里就地取——
+        // 取样坐标与补丁那三档完全同一组，所以不糊图、不开整幅缓冲。
+        let tb = DispatchTime.now().uptimeNanoseconds
+        let lum = wantsBand(fwd) ? lumPlane(att) : [Float]()
+        let bandMs = Double(DispatchTime.now().uptimeNanoseconds - tb) / 1_000_000
+        let hasLum = !lum.isEmpty
         for gy in yi0..<yi1 {
             for gx in xi0..<xi1 {
                 let u = Double(gx), v = Double(gy)
                 let fx = fwd.a * u + fwd.b * v + fwd.c
                 let fy = fwd.d * u + fwd.e * v + fwd.f
                 guard fx >= 0, fy >= 0, fx <= Double(size - 1), fy <= chinRamp1 else { continue }
-                // alpha 落在 featherMask 那张 244×224 上（剖面和羽化都在里面了），不再按行现算
+                // alpha 落在 featherMask 那张 399×224 上（剖面和羽化都在里面了），不再按行现算
                 let mk = bilinearFloat(mask, size, mask.count / size, fx, fy)
                 if mk <= 0 { continue }
                 let x0 = Int(fx), y0 = Int(fy)
                 let dx = Float(fx - Double(x0)), dy = Float(fy - Double(y0))
                 let x1 = min(x0 + 1, size - 1), y1 = min(y0 + 1, maskRows - 1)
                 let o = gy * rowPix * 4 + gx * 4
-                let dec = seamDecay(fy)
+                // 逐频带搬＝「224 这张网格装不下的那一档」＝这一格整幅原片亮度 − att 亮度面在
+                // 同一组坐标上的双线性。只在补丁里、α 从 0.95 缓坡爬到 1.0（硬切会沿遮罩等值线留一圈边）。
+                // 行方向同样不许硬断：接缝以下贴的＝逐字节原片，若第 223 行带着这一项、第 224 行归零，
+                // 沿整条 223/224 接缝就留一道亮线（＝他 10-23 报的「下巴的白线」）。
+                // 本机三帧量接缝上方那半格相对原片亮多少：硬门 +13.2／+8.2／+13.9 L（配补丁 taper 那档 +11.0／+16.9／+20.5），
+                // 原片自己同一条线 +0.05／+0.04／−0.01 L＝地板。
+                // 改成末 10 行（对齐 213→223）smoothstep 淡出到 0：三帧全部落回「不搬」那一档（−1.6／−5.2／−7.6），
+                // 而带通四档 1.034/1.016/1.090/1.007 → 1.001/0.982/1.070/1.001、↔源 0.785、鼻孔差 3.66 一分没丢
+                // （tools/_veil24.py，b336 七臂特写在 _veil24_b336.png：第 2 格有线、第 4 格没有）。
+                var hpv: Float = 0
+                if hasLum, mk > 0.95 {
+                    let q = min(1.0, max(0.0, (fy - Double(size - 11)) / 10.0))
+                    let fade = Float(1.0 - q * q * (3.0 - 2.0 * q))
+                    if fade > 0 {
+                        let ry0 = min(y0, size - 1), ry1 = min(y1, size - 1)
+                        let w00 = (1 - dx) * (1 - dy), w10 = dx * (1 - dy)
+                        let w01 = (1 - dx) * dy, w11 = dx * dy
+                        let grid = w00 * lum[ry0 * size + x0] + w10 * lum[ry0 * size + x1]
+                            + w01 * lum[ry1 * size + x0] + w11 * lum[ry1 * size + x1]
+                        let ogv = 0.299 * Float(p[o + 2]) + 0.587 * Float(p[o + 1]) + 0.114 * Float(p[o])
+                        hpv = (ogv - grid) * min(1.0, (mk - 0.95) * 20.0) * fade
+                    }
+                }
+                // 补丁末 10 行按 taper 补上 −se（接缝色差搬到补丁侧）
+                let t0 = y0 < size ? seamTaper(y0) : 0
+                let t1 = y1 < size ? seamTaper(y1) : 0
                 for (ci, planeIdx) in [(2, 0), (1, 1), (0, 2)] {   // BGRA 内存序：B←planar R 反着写
                     let g = planeIdx * plane
-                    // 补丁只到 223 行；224 往上（含 223↔224 那一格插值）落进「这一格原像素＋接缝偏置」
-                    let tv = Float(p[o + ci]) / 255.0 + se[planeIdx] * dec
-                    let a00 = y0 < size ? gen[g + y0 * size + x0] : tv
-                    let a10 = y0 < size ? gen[g + y0 * size + x1] : tv
-                    let a01 = y1 < size ? gen[g + y1 * size + x0] : tv
-                    let a11 = y1 < size ? gen[g + y1 * size + x1] : tv
+                    // 补丁只到 223 行；224 往上（含 223↔224 那一格插值）直接用原像素：
+                    // 不再叠接缝偏置——那一格是把脖子整块染色，出来是下巴下面一个直边矩形
+                    let tv = Float(p[o + ci]) / 255.0
+                    let a00 = y0 < size ? max(0, min(1, gen[g + y0 * size + x0] - se[planeIdx] * t0)) : tv
+                    let a10 = y0 < size ? max(0, min(1, gen[g + y0 * size + x1] - se[planeIdx] * t0)) : tv
+                    let a01 = y1 < size ? max(0, min(1, gen[g + y1 * size + x0] - se[planeIdx] * t1)) : tv
+                    let a11 = y1 < size ? max(0, min(1, gen[g + y1 * size + x1] - se[planeIdx] * t1)) : tv
                     let v0 = a00 + (a10 - a00) * dx
                     let v1 = a01 + (a11 - a01) * dx
                     let g2 = v0 + (v1 - v0) * dy
                     let orig = Float(p[o + ci])
-                    let v2 = g2 * 255.0 * mk + orig * (1 - mk)
+                    let v2 = g2 * 255.0 * mk + orig * (1 - mk) + hpv
                     p[o + ci] = UInt8(max(0, min(255, v2 + 0.5)))
                 }
             }
         }
+        return bandMs
     }
 
     /// 把这一帧对齐原片自己的高频（σ=0.8 高通＝毛孔/胡茬那一档颗粒）按 lam 倍搬回补丁。

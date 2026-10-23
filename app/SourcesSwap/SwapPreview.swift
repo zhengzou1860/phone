@@ -379,7 +379,7 @@ final class SwapPreview {
         var pasted = false
         if let base = CVPixelBufferGetBaseAddress(dst) {
             SwapGeo.pasteBack(base, bytesPerRow: CVPixelBufferGetBytesPerRow(dst), w: frameW, h: frameH,
-                              gen: gen, mask: alpha, fwd: al.fwd, back: al.back)
+                              gen: gen, mask: alpha, att: att, fwd: al.fwd, back: al.back)
             pasted = true
         }
         CVPixelBufferUnlockBaseAddress(dst, [])
