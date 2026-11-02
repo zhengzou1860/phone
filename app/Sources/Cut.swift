@@ -1132,6 +1132,10 @@ final class Cutter: ObservableObject {
     /// 0.15 那档上机只留了 132/653 帧，他判「有点严格了，我说的是能检测到五官的保留」⇒ 退到 0.45。
     /// 这一格该落多少不用猜：报告里「同一趟数据回算 闸门放在 …→… 帧」那一行就是这片子每档各留几帧。
     @Published var frontTh = 0.45
+    /// 最短时长闸门：段比它短就直接从段表里去掉（＝不导出）。0＝不筛。
+    /// 这一格放多少不用猜：段表上面那行把筛前的各段长度按升序列出来了，照那个数挑。
+    /// 它不碰扫描也不碰命中判定，只在段表这一层筛，所以试档不用重扫一遍。
+    @Published var minLen = 0.0
     /// 这批绿框是哪一秒那一帧检出来的（停帧检脸时记下）。锚点的 faceIndex 只在这一帧作数。
     @Published var facesAt = 0.0
     /// 「要保留的人」最多三个
@@ -1157,6 +1161,45 @@ final class Cutter: ObservableObject {
     var scannedStep = 1
     /// 上一次扫描量出来的朝向（k×90°，-1 = 没量到），导出拿它对账
     var scannedRot = -1
+    /// 上一次扫描的**筛前**段表（命中判定原样切出来的那一份）。改「最短时长」拿它就地重算，
+    /// 试几个档不用重扫整片——整片是几分钟的事，而这个闸门只在段表这一层筛。
+    @Published var rawSegments: [Segment] = []
+
+    /// 就地按当前 minLen 重切段表（导出的就是这一份）
+    func applyMinLen() {
+        let lens = rawSegments.map { $0.seconds(fps: fps, step: scannedStep).length }
+        var keep: [Segment] = []
+        for (i, s) in rawSegments.enumerated() where lens[i] + 1e-9 >= minLen { keep.append(s) }
+        segments = keep
+    }
+
+    func setMinLen(_ v: Double) {
+        guard v != minLen else { return }
+        minLen = v
+        applyMinLen()
+        Journal.line("剪辑 最短时长 \(String(format: "%.2f", v)) s｜\(rawSegments.count) 段→\(segments.count) 段")
+    }
+
+    /// 段表上面那一行实况：闸门放在多少、筛前筛后各几段、成片多长
+    var segGateLine: String {
+        guard !rawSegments.isEmpty else { return "" }
+        let total = segments.reduce(0.0) { $0 + $1.seconds(fps: fps, step: scannedStep).length }
+        let t = String(format: "%.2f", total)
+        if minLen <= 0 { return "最短时长 0.00 s＝不筛｜\(segments.count) 段，合计 \(t) s" }
+        let g = String(format: "%.2f", minLen)
+        return "最短时长 ≥\(g) s：\(rawSegments.count) 段→\(segments.count) 段"
+            + "（筛掉 \(rawSegments.count - segments.count) 段比它短）｜成片合计 \(t) s"
+    }
+
+    /// 筛前段长升序，最多列 10 个——这一行就是给他挑「最短时长该放多少」用的尺子
+    var segLengthsLine: String {
+        guard !rawSegments.isEmpty else { return "" }
+        let lens = rawSegments.map { $0.seconds(fps: fps, step: scannedStep).length }.sorted()
+        let shown = lens.prefix(10).map { String(format: "%.2f", $0) }.joined(separator: " ")
+        var line = "筛前段长升序 \(shown) s"
+        if lens.count > 10 { line += "…（共 \(lens.count) 段，最长 \(String(format: "%.2f", lens.last ?? 0)) s）" }
+        return line
+    }
 
     /// 选完那一刻就收 cover：拷文件还在后台跑，主界面显示进度比停在相册里强
     func pickStarted() {
@@ -1178,6 +1221,7 @@ final class Cutter: ObservableObject {
         facesAt = 0
         report = ""
         segments = []
+        rawSegments = []
         faces = []
         exportNote = ""
         cleanArmed = false
@@ -1334,6 +1378,7 @@ final class Cutter: ObservableObject {
         stop.on = false
         report = ""
         segments = []
+        rawSegments = []
         scannedRot = -1
         exportNote = ""
         PressureWatch.reset()
@@ -1354,7 +1399,8 @@ final class Cutter: ObservableObject {
                 guard let self = self else { return }
                 self.busy = false
                 self.report = o.text
-                self.segments = o.segments
+                self.rawSegments = o.segments
+                self.applyMinLen()
                 self.scannedRot = o.rot
                 let each = o.perAnchorHits.enumerated()
                     .map { "\($0.offset + 1)号 \($0.element)" }.joined(separator: "/")
@@ -1373,7 +1419,10 @@ final class Cutter: ObservableObject {
 
     func export() {
         guard let url = videoURL, !segments.isEmpty else {
-            exportNote = "没有段可导（先扫，命中 ≥1 段）"
+            // 两种空段表要说清：压根没扫过，还是扫到了但被最短时长全筛光（后者是他 dial 出来的）
+            exportNote = rawSegments.isEmpty
+                ? "没有段可导（先扫，命中 ≥1 段）"
+                : "没有段可导（最短时长 \(String(format: "%.2f", minLen)) s 把 \(rawSegments.count) 段全筛光了——往回调小，或调到 0.00 不筛）"
             return
         }
         busy = true
@@ -1449,6 +1498,7 @@ final class Cutter: ObservableObject {
     func sendReport() {
         var text = "—— 剪辑 ——\n\(videoURL?.lastPathComponent ?? "没选视频")\n\(status)\n"
         text += "要保留的人 \(anchors.count) 个：\n" + (anchors.isEmpty ? "（一个都没选）\n" : anchorList + "\n")
+        if !segGateLine.isEmpty { text += "段表：\(segGateLine)｜\(segLengthsLine)\n" }
         text += report.isEmpty ? "还没扫\n" : report + "\n"
         if !exportNote.isEmpty { text += "导出：\(exportNote)\n" }
         text += "历史文件：\(temps.count) 个 \(String(format: "%.1f", temps.reduce(0.0) { $0 + $1.mb })) MB（不含当前这条）\n"
@@ -1554,6 +1604,13 @@ struct CutView: View {
                         Text("挡侧脸 \(String(format: "%.2f", cut.frontTh))（量的是嘴角中点偏离正中多少；调大＝侧一点也留着，1.50＝这张闸基本不挡。报告里「同一趟数据回算」那行列了每档各留几帧）")
                             .font(.footnote)
                     }
+                    // 这一格不走 $cut.minLen 的直连绑定：改值时要顺手拿筛前段表重切一遍，
+                    // 而整片扫描是几分钟的事——试档只重切段表，不重扫。
+                    Stepper(value: Binding(get: { cut.minLen }, set: { cut.setMinLen($0) }),
+                            in: 0.0...4.0, step: 0.25) {
+                        Text("最短时长 \(String(format: "%.2f", cut.minLen)) s（比这个短的段直接从段表去掉、不导出；0.00＝不筛。挑多少看段表那行「筛前段长升序」，改这一格不用重扫）")
+                            .font(.footnote)
+                    }
                 }
 
                 if !cut.report.isEmpty {
@@ -1563,6 +1620,12 @@ struct CutView: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                     VStack(alignment: .leading, spacing: 2) {
                         Text("段表（导出按这个拼）").font(.footnote)
+                        if !cut.segGateLine.isEmpty {
+                            Text(cut.segGateLine)
+                                .font(.system(size: 10, design: .monospaced))
+                            Text(cut.segLengthsLine)
+                                .font(.system(size: 10, design: .monospaced))
+                        }
                         ForEach(Array(cut.segments.enumerated()), id: \.offset) { _, s in
                             let t = s.seconds(fps: cut.fps, step: cut.scannedStep)
                             Text(String(format: "  %.2f - %.2f s（%.2f s）", t.start, t.end, t.length))
