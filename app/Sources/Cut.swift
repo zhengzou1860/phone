@@ -529,6 +529,10 @@ struct ScanOutcome {
     var yawSeen = 0
     var yawAbs: [Double] = []
     var bigSims: [Double] = []
+    /// 多人那一格的分账：每个锚点单独「落在窗内的脸对它的余弦」和「它一个人能命中几帧」。
+    /// 并集好看但某一个人压根没扫出来，就是靠这两行看出来的。
+    var perAnchorSims: [[Double]] = []
+    var perAnchorHits: [Int] = []
     var detectMs = 0.0
     var embedMs = 0.0
     var memMax = 0
@@ -615,7 +619,9 @@ enum CutEngine {
     }
 
     /// 整片扫描：每帧检测一次，只有脸短边（折算回源像素）达标**且这张脸是正脸的**才裁脸跑尺子。
-    static func scan(url: URL, anchor: [Float], cosTh: Double, sideTh: Double, frontTh: Double,
+    /// anchors＝最多三个「要保留的人」，命中是**或**：一张脸只要对其中任一个够分，这一帧就留。
+    /// 多人不比单人贵：裁脸＋跑尺子按「朝向」花一次，几个锚点都只是同一份嵌入上的点积。
+    static func scan(url: URL, anchors: [[Float]], cosTh: Double, sideTh: Double, frontTh: Double,
                      step: Int,
                      stop: StopFlag, progress: @escaping (String) -> Void) -> ScanOutcome {
         var o = ScanOutcome()
@@ -674,10 +680,10 @@ enum CutEngine {
         var rot = -1
         var probeCols: [[Double]] = Array(repeating: [], count: 4)
         var probeRows: [(sample: Int, sims: [Double])] = []
-        /// 每张取样帧记一下「这一帧里过了尺寸闸的每张脸各读到的（正脸偏移, 4 个朝向的余弦）」。
+        /// 每张取样帧记一下「这一帧里过了尺寸闸的每张脸各读到的（正脸偏移, 每个锚点 × 4 个朝向的余弦）」。
         /// 命中判定和末尾那张候选闸门回算表都从这份数据出——一趟扫描就把每个档位各留几帧算全，
         /// 他要的「侧一点也留」该落在哪个数，看报告那一行就行，不用反复装机试。
-        var recs: [(sample: Int, faces: [(dev: Double?, sims: [Double])])] = []
+        var recs: [(sample: Int, faces: [(dev: Double?, sims: [[Double]])])] = []
         func lockRotation(_ why: String) {
             var bestK = 0, bestMed = -99.0
             for k in 0..<4 {
@@ -715,7 +721,7 @@ enum CutEngine {
                     o.samples += 1
                     if !obs.isEmpty { o.framesWithFace += 1 }
                     _ = withPixels(buffer) { base, bpr -> Bool in
-                        var faceRows: [(dev: Double?, sims: [Double])] = []
+                        var faceRows: [(dev: Double?, sims: [[Double]])] = []
                         for f in obs {
                             let pw = Double(f.boundingBox.width) * Double(w) * sideScale
                             let ph = Double(f.boundingBox.height) * Double(h) * sideScale
@@ -745,7 +751,9 @@ enum CutEngine {
                             }
                             o.gated += 1
                             let ks = rot < 0 ? [0, 1, 2, 3] : [rot]
-                            var sims = [-9.0, -9.0, -9.0, -9.0]
+                            // sims[锚点][朝向]。裁脸＋跑尺子只按**朝向**花，几个锚点共用同一份嵌入，
+                            // 多人多的只是每个锚点一次点积（微秒级）⇒ 选三个人不比选一个人贵。
+                            var sims = Array(repeating: [-9.0, -9.0, -9.0, -9.0], count: anchors.count)
                             for k in ks {
                                 let (kp, src) = Align.sendPoints(face: f, k: k, w: w, h: h)
                                 pointSrc = src
@@ -755,12 +763,15 @@ enum CutEngine {
                                 guard let v = Ruler.shared.embed(crop) else { continue }
                                 embedSum += Double(DispatchTime.now().uptimeNanoseconds - e0) / 1_000_000
                                 embedRuns += 1
-                                sims[k] = cosine(anchor, v)
+                                for a in anchors.indices { sims[a][k] = cosine(anchors[a], v) }
                             }
                             faceRows.append((dev: dev, sims: sims))
                             if rot < 0 {
-                                probeRows.append((sample: sample, sims: sims))
-                                for k in 0..<4 where sims[k] > -8 { probeCols[k].append(sims[k]) }
+                                // 朝向试探看的是「这张脸朝哪个方向最像我们要找的人中的某一个」＝各锚点取最高分，
+                                // 这样三个人里只要有一个是正着给尺子看到的，这个朝向就会被选中。
+                                let best = (0..<4).map { k in sims.map { $0[k] }.max() ?? -9.0 }
+                                probeRows.append((sample: sample, sims: best))
+                                for k in 0..<4 where best[k] > -8 { probeCols[k].append(best[k]) }
                                 if probeRows.count >= probeN {
                                     lockRotation("够 \(probeN) 张")
                                 } else if !probeRows.isEmpty && sample >= 300 {
@@ -790,21 +801,38 @@ enum CutEngine {
         if rot < 0 && !probeRows.isEmpty { lockRotation("样本取完才定") }
         if sample < nSamples && stopNote.isEmpty { stopNote = endedNote(reader) }
 
-        // 命中判定统一在这一步做：这一帧里只要有一张脸「对锚点的余弦够 且 正脸度落在窗内」就留。
+        // 命中判定统一在这一步做：这一帧里只要有一张脸「对**任意一个**锚点的余弦够 且 正脸度落在窗内」就留
+        // ＝或的关系，段表还是从这一条 keep[] 按取样号升序切出来的（不是几个人各自的段拼盘）。
         // 五官点缺到算不出正脸度的那张（dev==nil）不按侧脸算——他要的是「能检测到五官的保留」，
         // 点位都没有的脸归到「这张闸不看它」，而不是替它判侧。
-        func kept(_ th: Double) -> [Int] {
+        func kept(_ th: Double, _ a: Int? = nil) -> [Int] {
             guard rot >= 0 else { return [] }
             return recs.filter { r in
                 r.sample < nSamples &&
-                r.faces.contains { $0.sims[rot] >= cosTh && ($0.dev ?? 0) <= th }
+                r.faces.contains { f in
+                    guard (f.dev ?? 0) <= th else { return false }
+                    if let a = a { return f.sims[a][rot] >= cosTh }
+                    return f.sims.contains { $0[rot] >= cosTh }
+                }
             }.map { $0.sample }
         }
         var ladder = ""
         if rot >= 0 {
             for i in kept(frontTh) { o.keep[i] = true }
+            // 每个锚点单独一份账：它一个人能命中几帧、窗内的脸对它的余弦有多高。
+            // 并集那一格光看数字看不出"第三个人压根没扫出来"，这两行就是给这个的。
+            for a in anchors.indices {
+                o.perAnchorHits.append(kept(frontTh, a).count)
+                var sims: [Double] = []
+                for r in recs {
+                    let c = r.faces.filter { ($0.dev ?? 0) <= frontTh }.map { $0.sims[a][rot] }.max()
+                    if let c = c, c > -8 { sims.append(c) }
+                }
+                o.perAnchorSims.append(sims)
+            }
             for r in recs {
-                let c = r.faces.filter { ($0.dev ?? 0) <= frontTh }.map { $0.sims[rot] }.max()
+                let c = r.faces.filter { ($0.dev ?? 0) <= frontTh }
+                    .map { f in f.sims.map { $0[rot] }.max() ?? -9 }.max()
                 if let c = c, c > -8 { o.bigSims.append(c) }
             }
             let ths = [0.10, 0.15, 0.22, 0.30, 0.45, 0.60, 0.80, 1.00]
@@ -841,9 +869,22 @@ enum CutEngine {
             line += "\n  → 用 **转\(rot * 90)°**；点位 \(pointSrc)"
         }
         line += "\n**命中 \(o.hits)/\(o.samples) 帧（\(String(format: "%.0f", pct))%）→ \(o.segments.count) 段，合计 \(String(format: "%.1f", total)) s**"
+        if rot >= 0 && anchors.count > 1 {
+            line += "\n多人分账（\(anchors.count) 个人，各自单独算、同一道正脸闸）："
+                + o.perAnchorHits.enumerated()
+                    .map { "锚点\($0.offset + 1) 单独 \($0.element) 帧" }.joined(separator: "｜")
+                + "｜并集 \(o.hits) 帧（成片按这一条时间轴升序拼，不是各人拼盘）"
+            for (i, sims) in o.perAnchorSims.enumerated() {
+                if let med = median(sims), let mx = sims.max() {
+                    line += "\n  锚点\(i + 1) 窗内余弦 中位 \(String(format: "%.3f", med)) 最高 \(String(format: "%.3f", mx))"
+                } else {
+                    line += "\n  锚点\(i + 1) 窗内没有一张脸对它算出过分＝这个人这一趟一张都没认出来（换锚点那帧脸大一点、正一点，或把他那帧单独扫一遍对账）"
+                }
+            }
+        }
         if !ladder.isEmpty { line += "\n  \(ladder)（这一行是拿这一趟的读数换档重算，不用再扫一遍）" }
         if let med = median(o.bigSims), let mx = o.bigSims.max() {
-            line += "\n  落在窗内的脸对锚点的余弦 中位 \(String(format: "%.3f", med)) 最高 \(String(format: "%.3f", mx))（闸门 \(String(format: "%.2f", cosTh))）"
+            line += "\n  落在窗内的脸对任一锚点的余弦 中位 \(String(format: "%.3f", med)) 最高 \(String(format: "%.3f", mx))（闸门 \(String(format: "%.2f", cosTh))）"
         } else {
             line += "\n  没有一张脸跑到尺子：尺寸 ≥\(String(format: "%.0f", sideTh)) px 这一道闸一张都没过"
         }
@@ -1070,7 +1111,14 @@ final class Cutter: ObservableObject {
     @Published var fps = 30.0
     @Published var natural = CGSize.zero
     @Published var faces: [VNFaceObservation] = []
-    @Published var anchor: [Float]?
+    /// 一个「要保留的人」＝停帧后点某张脸算出来的一条嵌入。最多三个，命中是或的关系。
+    struct Anchor {
+        let faceIndex: Int   // 选它那一刻**这一帧**里的第几张脸（换帧检脸后这个号就是另一张脸了）
+        let at: Double       // 它是哪一秒那一帧算出来的，用来判 faceIndex 还作不作数
+        let vec: [Float]
+        let note: String     // 这张脸多大、点位哪来的、指纹、以及当时给过的提醒
+    }
+    @Published var anchors: [Anchor] = []
     @Published var anchorNote = ""
     @Published var report = ""
     @Published var segments: [Segment] = []
@@ -1084,8 +1132,22 @@ final class Cutter: ObservableObject {
     /// 0.15 那档上机只留了 132/653 帧，他判「有点严格了，我说的是能检测到五官的保留」⇒ 退到 0.45。
     /// 这一格该落多少不用猜：报告里「同一趟数据回算 闸门放在 …→… 帧」那一行就是这片子每档各留几帧。
     @Published var frontTh = 0.45
-    /// 已选为锚点的是这一帧里的第几张脸（-1＝还没选）；绿框会把它描成橙色，让"选上了"这件事看得见
-    @Published var chosen = -1
+    /// 这批绿框是哪一秒那一帧检出来的（停帧检脸时记下）。锚点的 faceIndex 只在这一帧作数。
+    @Published var facesAt = 0.0
+    /// 「要保留的人」最多三个
+    static let maxAnchors = 3
+    /// 当前这批框里，第 i 张是不是已经被选当锚点（描橙＋打勾靠它；换帧后自动作废）
+    func isArmed(_ i: Int) -> Bool {
+        anchors.contains { $0.faceIndex == i && abs($0.at - facesAt) < 1e-6 }
+    }
+    /// 已选的人逐个列一行，界面上和「发到电脑」的报告里都用这一份。
+    /// 每人只留 note 的第一行（多大、点位、指纹）——偏移读数和那几条 ⚠️ 提醒在点他那一刻
+    /// 已经单独显示过了，三个人各带三四行会把状态区撑得一屏看不见。
+    var anchorList: String {
+        anchors.enumerated()
+            .map { "锚点\($0.offset + 1)（第 \($0.element.faceIndex + 1) 张脸 @\(String(format: "%.2f", $0.element.at))s）\($0.element.note.components(separatedBy: "\n").first ?? "")" }
+            .joined(separator: "\n")
+    }
     @Published var temps: [TempFile] = []
     @Published var cleanArmed = false
 
@@ -1111,8 +1173,9 @@ final class Cutter: ObservableObject {
         videoURL = url
         let freed = Temps.dropOldPicks(keep: url)
         if freed > 0.05 { Journal.line("清理 换片自动删旧副本 释放 \(String(format: "%.1f", freed)) MB") }
-        anchor = nil
+        anchors = []
         anchorNote = ""
+        facesAt = 0
         report = ""
         segments = []
         faces = []
@@ -1165,13 +1228,13 @@ final class Cutter: ObservableObject {
                     toleranceBefore: .zero, toleranceAfter: .zero)
     }
 
+    /// 停帧检脸**不清**已选的人：三个人很可能不同时出现在同一帧里，
+    /// 所以正确用法是「停到 A 正脸的帧点 A → 拖到 B 的帧停帧检脸点 B → …」，选中的逐个累加。
     func detect() {
         guard let a = asset else { status = "还没选视频"; return }
         busy = true
         status = "取这一帧…"
         faces = []
-        chosen = -1
-        anchor = nil
         anchorNote = ""
         let at = seconds
         Task.detached { [weak self] in
@@ -1183,8 +1246,9 @@ final class Cutter: ObservableObject {
                 guard let self = self else { return }
                 self.busy = false
                 self.faces = obs
+                self.facesAt = at      // 这批框的号只在这一帧作数（锚点描橙/打勾靠它对）
                 self.anchorNote = ""
-                self.status = "\(note)｜检到 \(obs.count) 张脸——点一个绿框当要保留的人\n\(origin)"
+                self.status = "\(note)｜检到 \(obs.count) 张脸——点绿框加一个要保留的人（已选 \(self.anchors.count)/\(Cutter.maxAnchors)）\n\(origin)"
                 Journal.line("剪辑 静帧 \(note) 脸 \(obs.count)")
             }
         }
@@ -1198,13 +1262,31 @@ final class Cutter: ObservableObject {
         return "第 \(i + 1) 张 \(Int(px)) px"
     }
 
+    /// 点一张框＝加一个「要保留的人」；再点同一张＝把他去掉。上限三个（多一个都不许，命中是或的关系，
+    /// 人越多越容易把不相干的帧也捞进来——那道尺寸闸和正脸闸不因人多而放宽）。
     func choose(_ index: Int) {
         guard index < faces.count, let a = asset else { return }
+        if let k = anchors.firstIndex(where: { $0.faceIndex == index && abs($0.at - facesAt) < 1e-6 }) {
+            anchors.remove(at: k)
+            anchorNote = "把第 \(index + 1) 张脸去掉了（还剩 \(anchors.count) 个人）"
+            status = anchors.isEmpty ? "\(anchorNote)｜还没人选，先点绿框" : "\(anchorNote)｜\(anchorList)"
+            Journal.line("剪辑 取消锚点 第\(index + 1) 张 剩 \(anchors.count) 人")
+            return
+        }
+        guard anchors.count < Cutter.maxAnchors else {
+            anchorNote = "最多 \(Cutter.maxAnchors) 个人——要换就先点掉一个已选中的框。"
+            status = anchorNote
+            return
+        }
         busy = true
         status = "裁这一张脸…"
         let face = faces[index]
-        let at = seconds
+        // 取 facesAt 那一帧，而不是当前的 seconds：框是 facesAt 那一批检出来的，
+        // 人可能已经拖走了进度条（多人时这很常见：点完 A 拖到 B）。按拖后的时间取帧，
+        // 裁的就是另一张脸了。isArmed 也靠这个 at 对上他点的那个框。
+        let at = facesAt
         let th = sideTh, fth = frontTh
+        let no = anchors.count + 1
         Task.detached { [weak self] in
             let (img, _) = CutEngine.frameImage(asset: a, at: at)
             var text = "取不到这一帧"
@@ -1214,7 +1296,7 @@ final class Cutter: ObservableObject {
                 let (v, side, why, src) = CutEngine.anchorFrom(image: img, face: face, sideScale: 1)
                 vec = v
                 text = v == nil ? "这张脸算不出向量：\(why)"
-                    : "锚点存下（这张脸源片短边 \(String(format: "%.0f", side)) px，点位 \(src)）｜\(vecFingerprint(v!))"
+                    : "存下（这张脸源片短边 \(String(format: "%.0f", side)) px，点位 \(src)）｜\(vecFingerprint(v!))"
                 if let fr = Align.frontality(face, k: 0, w: img.width, h: img.height) {
                     let dev = abs(fr.mouth - 0.5), ndev = abs(fr.nose - 0.5)
                     text += "\n这张脸的偏移 嘴角中点 \(String(format: "%.3f", dev))（闸门按这个）｜鼻尖原值 \(String(format: "%.3f", ndev))｜鼻尖离中线 \(String(format: "%.3f", fr.off))（占两眼间距）"
@@ -1232,18 +1314,20 @@ final class Cutter: ObservableObject {
             Task { @MainActor in
                 guard let self = self else { return }
                 self.busy = false
-                self.anchor = vec
-                self.chosen = vec == nil ? -1 : index
+                if let v = vec {
+                    self.anchors.append(Anchor(faceIndex: index, at: at, vec: v, note: text))
+                }
                 self.anchorNote = text
-                self.status = text + (vec == nil ? "" : "｜可以「整片扫描」了")
-                Journal.line("剪辑 锚点 \(text)")
+                self.status = vec == nil ? text
+                    : "第 \(no) 个人存下，已选 \(self.anchors.count)/\(Cutter.maxAnchors)｜\(text)｜可以「整片扫描」了（三个人是或的关系：任意一个在画面里这段就留）"
+                Journal.line("剪辑 锚点\(no) \(text)")
             }
         }
     }
 
     func scan() {
-        guard let url = videoURL, let anchor = anchor else {
-            status = "先点一个框当锚点"
+        guard let url = videoURL, !anchors.isEmpty else {
+            status = "先点一个绿框当要保留的人"
             return
         }
         busy = true
@@ -1254,12 +1338,13 @@ final class Cutter: ObservableObject {
         exportNote = ""
         PressureWatch.reset()
         let st = step, scth = sideTh, fth = frontTh
+        let vecs = anchors.map { $0.vec }
         scannedStep = st
-        status = "整片扫描中…（step=\(st)）"
-        Journal.line("剪辑 扫描 开始 \(url.lastPathComponent) step=\(st) 闸0.30/\(scth) 正脸\(String(format: "%.2f", fth)) 足迹\(Facts.footprintMB())MB")
+        status = "整片扫描中…（step=\(st)，\(vecs.count) 个人取或）"
+        Journal.line("剪辑 扫描 开始 \(url.lastPathComponent) step=\(st) 闸0.30/\(scth) 正脸\(String(format: "%.2f", fth)) 人数\(vecs.count) 足迹\(Facts.footprintMB())MB")
         let flag = stop
         Task.detached { [weak self] in
-            let o = CutEngine.scan(url: url, anchor: anchor, cosTh: 0.30, sideTh: scth,
+            let o = CutEngine.scan(url: url, anchors: vecs, cosTh: 0.30, sideTh: scth,
                                    frontTh: fth,
                                    step: st, stop: flag) { line in
                 Task { @MainActor in self?.status = line }
@@ -1271,7 +1356,12 @@ final class Cutter: ObservableObject {
                 self.report = o.text
                 self.segments = o.segments
                 self.scannedRot = o.rot
-                self.status = "扫完：\(o.hits)/\(o.samples) 帧命中，\(o.segments.count) 段"
+                let each = o.perAnchorHits.enumerated()
+                    .map { "\($0.offset + 1)号 \($0.element)" }.joined(separator: "/")
+                // 人数用 vecs.count 而不是 perAnchorHits.count：那份账只在朝向定下来之后才填，
+                // 朝向没定（rot<0）时它是空的，拿它报人数会说成「0 个人取或」。
+                self.status = "扫完（\(vecs.count) 个人取或）：\(o.hits)/\(o.samples) 帧命中，\(o.segments.count) 段"
+                    + (vecs.count > 1 ? "｜各人单独 \(each) 帧" : "")
             }
         }
     }
@@ -1358,7 +1448,7 @@ final class Cutter: ObservableObject {
 
     func sendReport() {
         var text = "—— 剪辑 ——\n\(videoURL?.lastPathComponent ?? "没选视频")\n\(status)\n"
-        text += "锚点：\(anchorNote)（有向量=\(anchor != nil)）\n"
+        text += "要保留的人 \(anchors.count) 个：\n" + (anchors.isEmpty ? "（一个都没选）\n" : anchorList + "\n")
         text += report.isEmpty ? "还没扫\n" : report + "\n"
         if !exportNote.isEmpty { text += "导出：\(exportNote)\n" }
         text += "历史文件：\(temps.count) 个 \(String(format: "%.1f", temps.reduce(0.0) { $0 + $1.mb })) MB（不含当前这条）\n"
@@ -1389,7 +1479,7 @@ struct CutView: View {
                     Button("选视频") { cut.showPicker = true }
                     Button("整片扫描") { cut.scan() }
                         .buttonStyle(.borderedProminent)
-                        .disabled(cut.busy || cut.anchor == nil)
+                        .disabled(cut.busy || cut.anchors.isEmpty)
                     if cut.busy { Button("停止") { cut.stopScan() } }
                     Button("发到电脑") { cut.sendReport() }
                 }
@@ -1425,15 +1515,24 @@ struct CutView: View {
                     }
                     .font(.footnote)
                     if !cut.faces.isEmpty {
-                        Text("点绿框或点下面按钮都行——选中的就是「要保留的人」")
+                        Text("点绿框＝加一个「要保留的人」（橙框＝已选，再点一次取消）。最多 \(Cutter.maxAnchors) 个人，命中是**或**：任意一个在画面里，这一段就留。三个人不必同框——拖到下一个人的正脸帧再「停帧检脸」接着点。")
                             .font(.footnote)
                         HStack(spacing: 6) {
                             ForEach(Array(cut.faces.enumerated()), id: \.offset) { i, _ in
-                                Button(cut.chosen == i ? "✓ " + cut.faceLabel(i) : cut.faceLabel(i)) { cut.choose(i) }
+                                Button(cut.isArmed(i) ? "✓ " + cut.faceLabel(i) : cut.faceLabel(i)) { cut.choose(i) }
                             }
                         }
                         .buttonStyle(.bordered)
                         .font(.footnote)
+                        // 取帧＋算向量在后台跑，这段连点两张会把两个人算成同一帧的号；
+                        // 屏上此刻描不出「哪个成了」，所以这一段直接把按钮按住到本轮算完。
+                        .disabled(cut.busy)
+                    }
+                    if !cut.anchors.isEmpty {
+                        Text("已选 \(cut.anchors.count)/\(Cutter.maxAnchors) 个人").font(.footnote)
+                        Text(cut.anchorList)
+                            .font(.system(size: 11, design: .monospaced))
+                            .textSelection(.enabled)
                     }
                     if !cut.anchorNote.isEmpty {
                         Text(cut.anchorNote)
@@ -1521,12 +1620,14 @@ struct CutView: View {
 
     func faceBoxes(in size: CGSize) -> some View {
         let box = contentRect(in: size)
-        return AnyView(ForEach(Array(cut.faces.enumerated()), id: \.offset) { _, f in
+        return AnyView(ForEach(Array(cut.faces.enumerated()), id: \.offset) { i, f in
             let r = f.boundingBox
             // 用 Group 不用 ZStack：ZStack 自己有尺寸，成员全靠 .position 摆时会塌成一点
             Group {
                 Rectangle()
-                    .stroke(Color.green, lineWidth: 2)
+                    // 已选当锚点的那张描橙加粗——"选上了"这件事得在框上看得见，而不是只有一行字
+                    .stroke(cut.isArmed(i) ? Color.orange : Color.green,
+                            lineWidth: cut.isArmed(i) ? 4 : 2)
                     .frame(width: r.width * box.width, height: r.height * box.height)
                     .position(x: box.minX + (r.minX + r.width / 2) * box.width,
                               y: box.minY + (1 - (r.minY + r.height / 2)) * box.height)
