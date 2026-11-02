@@ -621,8 +621,11 @@ enum CutEngine {
     /// 整片扫描：每帧检测一次，只有脸短边（折算回源像素）达标**且这张脸是正脸的**才裁脸跑尺子。
     /// anchors＝最多三个「要保留的人」，命中是**或**：一张脸只要对其中任一个够分，这一帧就留。
     /// 多人不比单人贵：裁脸＋跑尺子按「朝向」花一次，几个锚点都只是同一份嵌入上的点积。
+    /// minSec＞0 时启用跳探：一段命中流刚开头就往后跳 minSec 那么长探一枪，探针全 miss 就说明
+    ///   这一窗里不可能有够 minSec 的段（见下面那段推导），中间那些帧连像素都不取＝省下的检测时间。
+    ///   注意它只影响**扫描这趟跳不跳**，段表口径和判定都不动；0.00＝逐帧扫，一点不跳。
     static func scan(url: URL, anchors: [[Float]], cosTh: Double, sideTh: Double, frontTh: Double,
-                     step: Int,
+                     step: Int, minSec: Double,
                      stop: StopFlag, progress: @escaping (String) -> Void) -> ScanOutcome {
         var o = ScanOutcome()
         let asset = AVURLAsset(url: url)
@@ -698,89 +701,192 @@ enum CutEngine {
         var stopNote = ""
         let wall0 = DispatchTime.now().uptimeNanoseconds
 
+        // —— 跳探（他提的那条）：命中帧 a 往后跳 L 个取样帧探一枪。
+        //    为什么一跳就能判死：段要留到 ≥minSec 就得从 a 铺到 a+L-1，而段内空洞最多 kOut-1 帧
+        //    （再多就收尾/不成段了），所以"这一窗里有够长的段"必然表现为 [a+L-1, a+L-1+kOut-1] 这
+        //    kOut 帧里至少一帧命中。这 kOut 帧全 miss ⇒ 这一窗里不可能有够长的段 ⇒ 中间那些帧连像素
+        //    都不取。反过来探针一打活就立刻回扫这一窗（backfill），所以段表、余弦分布和逐帧扫一样。
+        //    锚点还必须是「一段命中流的头」：a 前面连着 kOut 个取样帧都是**真检过而且没命中**的
+        //    （state==1）。从头追着的流不能起跳——段头在 a 左边时长出来能盖过 a 左边那几帧，
+        //    探针窗全 miss 也证明不了这段不够长（它只需要在 a 左边铺够 L 帧就够 minSec 了）。
+        var probeAt = -1, jumpFrom = -1
+        var skipped = 0, deadWins = 0, aliveWins = 0, backfilled = 0
+        let L = minSec > 0 ? max(1, Int(((minSec * fps) / Double(step)).rounded(.up))) : 0
+        let kOutGap = 3      // 与下面 segmentsFromKeep 的 kOut 同一个数：探针窗要给足这个空洞上限
+        /// 每个取样帧这一趟到底检没检：0＝没检过（跳过／还没到），1＝检了没命中，2＝检了命中。
+        /// 「起跳点是一段命中流的头」这一条就靠它对账，不能拿 keep[] 看——那份是扫完之后统一判的。
+        var state = [Int](repeating: 0, count: nSamples)
+        func isRunHead(_ si: Int) -> Bool {
+            var back = 0
+            while back < kOutGap && si - 1 - back >= 0 {
+                if state[si - 1 - back] != 1 { return false }
+                back += 1
+            }
+            return true
+        }
+
+        // —— 一个取样帧的全部活：取像素→Vision 检脸→过尺寸闸的每张脸量正脸度、裁脸跑尺子。
+        //    主循环和跳探打活之后的回扫都调这一个函数，两边口径必须逐字一样，否则段表会和
+        //    不跳探的那版长得不一样。像素只在真要检测时才取：不取＝这条流水线根本没硬解它。
+        func judge(_ sb: CMSampleBuffer, _ si: Int) -> (hit: Bool, ended: String) {
+            guard let buffer = CMSampleBufferGetImageBuffer(sb) else { return (false, "sample 里没有像素缓冲") }
+            let w = CVPixelBufferGetWidth(buffer), h = CVPixelBufferGetHeight(buffer)
+            let d0 = DispatchTime.now().uptimeNanoseconds
+            let handler = VNImageRequestHandler(cvPixelBuffer: buffer, orientation: .up, options: [:])
+            var obs: [VNFaceObservation] = []
+            do {
+                try handler.perform([request])
+                obs = request.results ?? []
+            } catch {
+                return (false, "第 \(si) 取样帧 Vision 抛错: \(error)")
+            }
+            detectSum += Double(DispatchTime.now().uptimeNanoseconds - d0) / 1_000_000
+            o.samples += 1
+            if !obs.isEmpty { o.framesWithFace += 1 }
+            var hit = false
+            _ = withPixels(buffer) { base, bpr -> Bool in
+                var faceRows: [(dev: Double?, sims: [[Double]])] = []
+                for f in obs {
+                    let pw = Double(f.boundingBox.width) * Double(w) * sideScale
+                    let ph = Double(f.boundingBox.height) * Double(h) * sideScale
+                    if min(pw, ph) < sideTh { continue }
+                    if let y = f.yaw {
+                        o.yawSeen += 1
+                        o.yawAbs.append(abs(Double(truncating: y)))
+                    }
+                    // 正脸度这里只量、只记，不在这一格挡掉这张脸：
+                    // ① 拿它省尺子省不出时间——上机单价 检测 20.6 ms/帧 vs 尺子 3.7 ms/次，
+                    //    653 帧的检测 13.4 s 是主项，535 张全跑尺子也只 2.0 s；
+                    // ② 0.12 那版在跑尺子之前挡，把朝向试探的样本一起挡没了，
+                    //    结果「剪完只留下第一帧」。挡在判定这一步，这个坑结构上就不存在了。
+                    // 量的那格用嘴角中点而不是鼻尖：鼻尖那个点上机他肉眼报"偏到鼻翼侧"，
+                    // 自带一个固定横偏，和"头转了"是同一个方向，分不开也标不出阈值。
+                    // 这个投影读数对整个点集做旋转(任何 k)都不变，所以 rot<0 那几帧
+                    // 按 k=0 量出来的数和锁定之后同一个口径。
+                    var dev: Double? = nil
+                    if let fr = Align.frontality(f, k: rot < 0 ? 0 : rot, w: w, h: h) {
+                        let d = abs(fr.mouth - 0.5)
+                        dev = d
+                        o.mouthDevs.append(d)
+                        o.noseDevs.append(abs(fr.nose - 0.5))
+                        o.offMid.append(fr.off)
+                        if fr.mouth < 0.5 { o.turnLeft += 1 } else { o.turnRight += 1 }
+                        if d > frontTh { o.turnBlocked += 1 }
+                    }
+                    o.gated += 1
+                    let ks = rot < 0 ? [0, 1, 2, 3] : [rot]
+                    // sims[锚点][朝向]。裁脸＋跑尺子只按**朝向**花，几个锚点共用同一份嵌入，
+                    // 多人多的只是每个锚点一次点积（微秒级）⇒ 选三个人不比选一个人贵。
+                    var sims = Array(repeating: [-9.0, -9.0, -9.0, -9.0], count: anchors.count)
+                    for k in ks {
+                        let (kp, src) = Align.sendPoints(face: f, k: k, w: w, h: h)
+                        pointSrc = src
+                        guard let crop = Align.cropBGRA(base, bytesPerRow: bpr, w: w, h: h,
+                                                        keypoints: kp) else { cropFails += 1; continue }
+                        let e0 = DispatchTime.now().uptimeNanoseconds
+                        guard let v = Ruler.shared.embed(crop) else { continue }
+                        embedSum += Double(DispatchTime.now().uptimeNanoseconds - e0) / 1_000_000
+                        embedRuns += 1
+                        for a in anchors.indices { sims[a][k] = cosine(anchors[a], v) }
+                    }
+                    faceRows.append((dev: dev, sims: sims))
+                    if rot < 0 {
+                        // 朝向试探看的是「这张脸朝哪个方向最像我们要找的人中的某一个」＝各锚点取最高分，
+                        // 这样三个人里只要有一个是正着给尺子看到的，这个朝向就会被选中。
+                        let best = (0..<4).map { k in sims.map { $0[k] }.max() ?? -9.0 }
+                        probeRows.append((sample: si, sims: best))
+                        for k in 0..<4 where best[k] > -8 { probeCols[k].append(best[k]) }
+                        if probeRows.count >= probeN {
+                            lockRotation("够 \(probeN) 张")
+                        } else if !probeRows.isEmpty && si >= 300 {
+                            lockRotation("闸门太紧，第 300 帧用这 \(probeRows.count) 张定的")
+                        }
+                    }
+                }
+                if !faceRows.isEmpty {
+                    recs.append((sample: si, faces: faceRows))
+                    // 和末尾 kept(frontTh) 逐字同一条判据（一帧里任意一张脸对任意一个人够分、
+                    // 且正脸度落在窗内＝命中）。朝向还没锁定之前 sims 是空的，那时一律不算命中。
+                    if rot >= 0 {
+                        hit = faceRows.contains { f in
+                            (f.dev ?? 0) <= frontTh && f.sims.contains { $0[rot] >= cosTh }
+                        }
+                    }
+                }
+                return true
+            }
+            // 朝向还没锁定那几帧 hit 必然算 false（没定朝向就不算命中），state 要记成 0＝没数：
+            // 记成 1 会让 isRunHead 把「没锁定」当成「检了没命中」，从一段真命中流的中间起跳，
+            // 那条推导（锚点左边连着 kOut 帧都是真没脸）就不成立了。
+            state[si] = rot >= 0 ? (hit ? 2 : 1) : 0
+            return (hit, "")
+        }
+
+        // 探针打活＝这一窗里真有够长的段：刚才跳过的帧必须补检测回来，段表才和逐帧扫一致。
+        // reader 只能往前流，所以另开一条只盖住这一窗的 reader，跑完立刻关（不留第二份解码队列）。
+        func backfill(_ from: Int, _ to: Int) {
+            guard to >= from, let r2 = try? AVAssetReader(asset: asset) else { return }
+            let t0 = CMTime(seconds: Double(from * step) / fps, preferredTimescale: 600)
+            let t1 = CMTime(seconds: Double((to + 1) * step) / fps, preferredTimescale: 600)
+            r2.timeRange = CMTimeRange(start: t0, end: t1)
+            guard let o2 = try? AVAssetReaderTrackOutput(track: track, outputSettings: settings) else { return }
+            r2.add(o2)
+            guard r2.startReading() else { return }
+            var idx = from
+            autoreleasepool {
+                while idx <= to {
+                    guard let sb = o2.copyNextSampleBuffer() else { break }
+                    defer { CMSampleBufferInvalidate(sb) }
+                    let fr = Int((CMTimeGetSeconds(sb.presentationTimeStamp) * fps).rounded())
+                    let si = fr / step
+                    // 过路帧不检也不硬算：step>1 时两个取样点之间那些帧、还有 seek 落到关键帧
+                    // 之前带出来的一截，都按 PTS 认——拿它们顶替取样号会把段表错位。
+                    if si < idx { continue }
+                    if si > to { break }
+                    let (_, e) = judge(sb, si)
+                    if !e.isEmpty { stopNote = e; break }
+                    idx = si + 1
+                    let now = Facts.footprintMB()
+                    if now > o.memMax { o.memMax = now }
+                    if now > Runner.footprintStopMB {
+                        stopNote = "回扫到取样帧 \(si) 足迹 \(now) MB 超收兵线 \(Runner.footprintStopMB) MB"; break
+                    }
+                    if stop.on { stopNote = "你按了停止"; break }
+                    if PressureWatch.sawPressure { stopNote = "系统已喊内存压力"; break }
+                }
+                backfilled += idx - from
+                r2.cancelReading()
+            }
+        }
+
+        // —— 跳探主循环：命中帧 a 往后跳 L 个取样帧探一枪。
         outer: while sample < nSamples {
             var ended = ""
             autoreleasepool {
                 guard let sb = output.copyNextSampleBuffer() else { ended = "片源到末尾"; return }
                 defer { CMSampleBufferInvalidate(sb) }
-                guard let buffer = CMSampleBufferGetImageBuffer(sb) else { ended = "sample 里没有像素缓冲"; return }
-                let taken = frameIndex % step == 0
-                let w = CVPixelBufferGetWidth(buffer), h = CVPixelBufferGetHeight(buffer)
-                let d0 = DispatchTime.now().uptimeNanoseconds
-                let handler = VNImageRequestHandler(cvPixelBuffer: buffer, orientation: .up, options: [:])
-                var obs: [VNFaceObservation] = []
-                do {
-                    try handler.perform([request])
-                    obs = request.results ?? []
-                } catch {
-                    ended = "第 \(frameIndex) 源帧 Vision 抛错: \(error)"
-                }
-                if !ended.isEmpty { return }
-                if taken {
-                    detectSum += Double(DispatchTime.now().uptimeNanoseconds - d0) / 1_000_000
-                    o.samples += 1
-                    if !obs.isEmpty { o.framesWithFace += 1 }
-                    _ = withPixels(buffer) { base, bpr -> Bool in
-                        var faceRows: [(dev: Double?, sims: [[Double]])] = []
-                        for f in obs {
-                            let pw = Double(f.boundingBox.width) * Double(w) * sideScale
-                            let ph = Double(f.boundingBox.height) * Double(h) * sideScale
-                            if min(pw, ph) < sideTh { continue }
-                            if let y = f.yaw {
-                                o.yawSeen += 1
-                                o.yawAbs.append(abs(Double(truncating: y)))
+                if frameIndex % step == 0 {
+                    if probeAt >= 0 && sample < probeAt {
+                        skipped += 1               // 已判死的短段窗：这一帧不取像素、不检测
+                    } else {
+                        let (h, e) = judge(sb, sample)
+                        if !e.isEmpty { ended = e; return }
+                        if probeAt >= 0 {
+                            if h {
+                                backfill(jumpFrom + 1, probeAt - 1)
+                                // 回扫里出的事（抛错／按了停止／内存压力）也算这趟的结局，别再往下流了
+                                if !stopNote.isEmpty { ended = stopNote; return }
+                                aliveWins += 1
+                                probeAt = -1; jumpFrom = -1
+                            } else if sample >= probeAt + kOutGap - 1 {
+                                deadWins += 1     // 探针窗给满了还是全 miss ⇒ 这一窗判死
+                                probeAt = -1; jumpFrom = -1
                             }
-                            // 正脸度这里只量、只记，不在这一格挡掉这张脸：
-                            // ① 拿它省尺子省不出时间——上机单价 检测 20.6 ms/帧 vs 尺子 3.7 ms/次，
-                            //    653 帧的检测 13.4 s 是主项，535 张全跑尺子也只 2.0 s；
-                            // ② 0.12 那版在跑尺子之前挡，把朝向试探的样本一起挡没了，
-                            //    结果「剪完只留下第一帧」。挡在判定这一步，这个坑结构上就不存在了。
-                            // 量的那格用嘴角中点而不是鼻尖：鼻尖那个点上机他肉眼报"偏到鼻翼侧"，
-                            // 自带一个固定横偏，和"头转了"是同一个方向，分不开也标不出阈值。
-                            // 这个投影读数对整个点集做旋转(任何 k)都不变，所以 rot<0 那几帧
-                            // 按 k=0 量出来的数和锁定之后同一个口径。
-                            var dev: Double? = nil
-                            if let fr = Align.frontality(f, k: rot < 0 ? 0 : rot, w: w, h: h) {
-                                let d = abs(fr.mouth - 0.5)
-                                dev = d
-                                o.mouthDevs.append(d)
-                                o.noseDevs.append(abs(fr.nose - 0.5))
-                                o.offMid.append(fr.off)
-                                if fr.mouth < 0.5 { o.turnLeft += 1 } else { o.turnRight += 1 }
-                                if d > frontTh { o.turnBlocked += 1 }
-                            }
-                            o.gated += 1
-                            let ks = rot < 0 ? [0, 1, 2, 3] : [rot]
-                            // sims[锚点][朝向]。裁脸＋跑尺子只按**朝向**花，几个锚点共用同一份嵌入，
-                            // 多人多的只是每个锚点一次点积（微秒级）⇒ 选三个人不比选一个人贵。
-                            var sims = Array(repeating: [-9.0, -9.0, -9.0, -9.0], count: anchors.count)
-                            for k in ks {
-                                let (kp, src) = Align.sendPoints(face: f, k: k, w: w, h: h)
-                                pointSrc = src
-                                guard let crop = Align.cropBGRA(base, bytesPerRow: bpr, w: w, h: h,
-                                                                keypoints: kp) else { cropFails += 1; continue }
-                                let e0 = DispatchTime.now().uptimeNanoseconds
-                                guard let v = Ruler.shared.embed(crop) else { continue }
-                                embedSum += Double(DispatchTime.now().uptimeNanoseconds - e0) / 1_000_000
-                                embedRuns += 1
-                                for a in anchors.indices { sims[a][k] = cosine(anchors[a], v) }
-                            }
-                            faceRows.append((dev: dev, sims: sims))
-                            if rot < 0 {
-                                // 朝向试探看的是「这张脸朝哪个方向最像我们要找的人中的某一个」＝各锚点取最高分，
-                                // 这样三个人里只要有一个是正着给尺子看到的，这个朝向就会被选中。
-                                let best = (0..<4).map { k in sims.map { $0[k] }.max() ?? -9.0 }
-                                probeRows.append((sample: sample, sims: best))
-                                for k in 0..<4 where best[k] > -8 { probeCols[k].append(best[k]) }
-                                if probeRows.count >= probeN {
-                                    lockRotation("够 \(probeN) 张")
-                                } else if !probeRows.isEmpty && sample >= 300 {
-                                    lockRotation("闸门太紧，第 300 帧用这 \(probeRows.count) 张定的")
-                                }
-                            }
+                        } else if h && L >= 2 && rot >= 0 && isRunHead(sample)
+                                    && sample + L + kOutGap - 2 < nSamples {
+                            jumpFrom = sample
+                            probeAt = sample + L - 1
                         }
-                        if !faceRows.isEmpty { recs.append((sample: sample, faces: faceRows)) }
-                        return true
                     }
                     sample += 1
                     let now = Facts.footprintMB()
@@ -790,7 +896,8 @@ enum CutEngine {
                     else if now > Runner.footprintStopMB { ended = "足迹 \(now) MB 超收兵线 \(Runner.footprintStopMB) MB" }
                     if !ended.isEmpty { stopNote = ended; return }
                     if sample % 60 == 0 {
-                        progress("扫到第 \(sample)/\(nSamples) 取样帧（源帧 \(frameIndex)）足迹 \(Facts.footprintMB()) MB")
+                        progress("扫到第 \(sample)/\(nSamples) 取样帧（源帧 \(frameIndex)）足迹 \(Facts.footprintMB()) MB"
+                                 + (skipped > 0 ? "｜跳探已省 \(skipped) 帧没检测" : ""))
                     }
                 }
                 frameIndex += 1
@@ -843,7 +950,7 @@ enum CutEngine {
 
         o.detectMs = o.samples > 0 ? detectSum / Double(o.samples) : 0
         o.embedMs = embedRuns > 0 ? embedSum / Double(embedRuns) : 0
-        o.segments = segmentsFromKeep(o.keep)
+        o.segments = segmentsFromKeep(o.keep, kIn: 2, kOut: kOutGap)
         o.hits = o.keep.filter { $0 }.count
         o.rot = rot
 
@@ -851,7 +958,7 @@ enum CutEngine {
         for s in o.segments { total += s.seconds(fps: fps, step: step).length }
         let wall = Double(DispatchTime.now().uptimeNanoseconds - wall0) / 1_000_000_000
         let pct = o.samples > 0 ? Double(o.hits) / Double(o.samples) * 100 : 0
-        var line = "扫 \(o.samples) 取样帧（step=\(step)，源 \(totalFrames) 帧 / \(String(format: "%.1f", duration)) s，直出长边 \(decodedLong)→源折算 ×\(String(format: "%.2f", sideScale))）"
+        var line = "扫 \(o.samples) 取样帧（step=\(step)，这一趟真检的；这片一共 \(nSamples) 个取样帧，源 \(totalFrames) 帧 / \(String(format: "%.1f", duration)) s，直出长边 \(decodedLong)→源折算 ×\(String(format: "%.2f", sideScale))）"
         line += "\n有脸的帧 \(o.framesWithFace)/\(o.samples)；≥\(String(format: "%.0f", sideTh)) px 的脸 \(o.gated) 张（每张都跑了尺子）；裁脸失败 \(cropFails) 张"
         line += "\n正脸闸 |嘴角中点偏移| ≤ \(String(format: "%.2f", frontTh))：\(o.mouthDevs.count) 张量到读数，落在窗外 \(o.turnBlocked) 张（窗外＝判侧脸时不算它，不省尺子）"
         if let a = spread(o.mouthDevs), let b = spread(o.noseDevs), let c = spread(o.offMid) {
@@ -869,6 +976,15 @@ enum CutEngine {
             line += "\n  → 用 **转\(rot * 90)°**；点位 \(pointSrc)"
         }
         line += "\n**命中 \(o.hits)/\(o.samples) 帧（\(String(format: "%.0f", pct))%）→ \(o.segments.count) 段，合计 \(String(format: "%.1f", total)) s**"
+        if L > 0 {
+            let save = Double(skipped) * o.detectMs / 1000
+            line += "\n跳探（最短时长 \(String(format: "%.2f", minSec)) s＝\(L) 取样帧）：判死 \(deadWins) 窗、打活 \(aliveWins) 窗"
+                + "｜跳掉 \(skipped) 帧没检测（按检测单价约省 \(String(format: "%.1f", save)) s）、探针打活回扫补检 \(backfilled) 帧"
+            if skipped > 0 {
+                line += "\n  段表只可能少了「比 \(String(format: "%.2f", minSec)) s 短」的那些段——短段被跳探判死时整窗本来就要被最短时长筛掉；"
+                    + "够长的段一定被探针打活、回扫补齐，所以**导出用的段表和逐帧扫一致**。"
+            }
+        }
         if rot >= 0 && anchors.count > 1 {
             line += "\n多人分账（\(anchors.count) 个人，各自单独算、同一道正脸闸）："
                 + o.perAnchorHits.enumerated()
@@ -882,7 +998,13 @@ enum CutEngine {
                 }
             }
         }
-        if !ladder.isEmpty { line += "\n  \(ladder)（这一行是拿这一趟的读数换档重算，不用再扫一遍）" }
+        if !ladder.isEmpty {
+            line += "\n  \(ladder)（这一行是拿这一趟的读数换档重算，不用再扫一遍"
+            if skipped > 0 {
+                line += "；本趟跳探跳过了 \(skipped) 帧没检，这里每档几帧只按**检到的**那些算"
+            }
+            line += "）"
+        }
         if let med = median(o.bigSims), let mx = o.bigSims.max() {
             line += "\n  落在窗内的脸对任一锚点的余弦 中位 \(String(format: "%.3f", med)) 最高 \(String(format: "%.3f", mx))（闸门 \(String(format: "%.2f", cosTh))）"
         } else {
@@ -1132,9 +1254,10 @@ final class Cutter: ObservableObject {
     /// 0.15 那档上机只留了 132/653 帧，他判「有点严格了，我说的是能检测到五官的保留」⇒ 退到 0.45。
     /// 这一格该落多少不用猜：报告里「同一趟数据回算 闸门放在 …→… 帧」那一行就是这片子每档各留几帧。
     @Published var frontTh = 0.45
-    /// 最短时长闸门：段比它短就直接从段表里去掉（＝不导出）。0＝不筛。
+    /// 最短时长闸门：① 扫的时候按它跳探省检测（比它短的段整窗判死，中间那些帧不检测）；
+    /// ② 段比它短就直接从段表里去掉（＝不导出）。0＝不筛，也＝逐帧老实扫。
     /// 这一格放多少不用猜：段表上面那行把筛前的各段长度按升序列出来了，照那个数挑。
-    /// 它不碰扫描也不碰命中判定，只在段表这一层筛，所以试档不用重扫一遍。
+    /// 注意往**小**调只能重切段表，往扫描时那一档以下调就回不来了：那一趟被跳探判死的短段没检过。
     @Published var minLen = 0.0
     /// 这批绿框是哪一秒那一帧检出来的（停帧检脸时记下）。锚点的 faceIndex 只在这一帧作数。
     @Published var facesAt = 0.0
@@ -1161,6 +1284,9 @@ final class Cutter: ObservableObject {
     var scannedStep = 1
     /// 上一次扫描量出来的朝向（k×90°，-1 = 没量到），导出拿它对账
     var scannedRot = -1
+    /// 上一次扫描那一趟用的最短时长：跳探按它省检测，所以往回调到它**以下**时，
+    /// 被跳探判死的短段是没检过的、重切段表也变不出来——这一格就是用来提醒这件事的。
+    var scannedMinSec = 0.0
     /// 上一次扫描的**筛前**段表（命中判定原样切出来的那一份）。改「最短时长」拿它就地重算，
     /// 试几个档不用重扫整片——整片是几分钟的事，而这个闸门只在段表这一层筛。
     @Published var rawSegments: [Segment] = []
@@ -1180,15 +1306,22 @@ final class Cutter: ObservableObject {
         Journal.line("剪辑 最短时长 \(String(format: "%.2f", v)) s｜\(rawSegments.count) 段→\(segments.count) 段")
     }
 
-    /// 段表上面那一行实况：闸门放在多少、筛前筛后各几段、成片多长
+    /// 段表上面那一行实况：闸门放在多少、筛前筛后各几段、成片多长。
+    /// 往扫描那一档以下调要提醒一句：跳探把比那一档短的段整窗判死了，那些帧压根没检，
+    /// 光重切段表变不出它们——要看全只能把这一格调回去（或更大）再重扫。
     var segGateLine: String {
         guard !rawSegments.isEmpty else { return "" }
         let total = segments.reduce(0.0) { $0 + $1.seconds(fps: fps, step: scannedStep).length }
         let t = String(format: "%.2f", total)
-        if minLen <= 0 { return "最短时长 0.00 s＝不筛｜\(segments.count) 段，合计 \(t) s" }
-        let g = String(format: "%.2f", minLen)
-        return "最短时长 ≥\(g) s：\(rawSegments.count) 段→\(segments.count) 段"
-            + "（筛掉 \(rawSegments.count - segments.count) 段比它短）｜成片合计 \(t) s"
+        var line = minLen <= 0
+            ? "最短时长 0.00 s＝不筛｜\(segments.count) 段，合计 \(t) s"
+            : "最短时长 ≥\(String(format: "%.2f", minLen)) s：\(rawSegments.count) 段→\(segments.count) 段"
+                + "（筛掉 \(rawSegments.count - segments.count) 段比它短）｜成片合计 \(t) s"
+        if scannedMinSec > 0 && minLen < scannedMinSec - 1e-9 {
+            line += "｜⚠️ 这一趟是按 \(String(format: "%.2f", scannedMinSec)) s 跳探扫的，比它短的段扫描时就没检测"
+                + "＝这一档回算不出来（导出的长段不受影响）；要看全得重扫"
+        }
+        return line
     }
 
     /// 筛前段长升序，最多列 10 个——这一行就是给他挑「最短时长该放多少」用的尺子
@@ -1222,6 +1355,7 @@ final class Cutter: ObservableObject {
         report = ""
         segments = []
         rawSegments = []
+        scannedMinSec = 0
         faces = []
         exportNote = ""
         cleanArmed = false
@@ -1382,16 +1516,17 @@ final class Cutter: ObservableObject {
         scannedRot = -1
         exportNote = ""
         PressureWatch.reset()
-        let st = step, scth = sideTh, fth = frontTh
+        let st = step, scth = sideTh, fth = frontTh, msl = minLen
         let vecs = anchors.map { $0.vec }
         scannedStep = st
-        status = "整片扫描中…（step=\(st)，\(vecs.count) 个人取或）"
-        Journal.line("剪辑 扫描 开始 \(url.lastPathComponent) step=\(st) 闸0.30/\(scth) 正脸\(String(format: "%.2f", fth)) 人数\(vecs.count) 足迹\(Facts.footprintMB())MB")
+        scannedMinSec = msl
+        status = "整片扫描中…（step=\(st)，\(vecs.count) 个人取或，最短时长 \(String(format: "%.2f", msl)) s\(msl > 0 ? "＝跳探省检测" : "＝逐帧扫")）"
+        Journal.line("剪辑 扫描 开始 \(url.lastPathComponent) step=\(st) 闸0.30/\(scth) 正脸\(String(format: "%.2f", fth)) 最短\(String(format: "%.2f", msl))s 人数\(vecs.count) 足迹\(Facts.footprintMB())MB")
         let flag = stop
         Task.detached { [weak self] in
             let o = CutEngine.scan(url: url, anchors: vecs, cosTh: 0.30, sideTh: scth,
                                    frontTh: fth,
-                                   step: st, stop: flag) { line in
+                                   step: st, minSec: msl, stop: flag) { line in
                 Task { @MainActor in self?.status = line }
             }
             Ruler.shared.release()
@@ -1605,10 +1740,10 @@ struct CutView: View {
                             .font(.footnote)
                     }
                     // 这一格不走 $cut.minLen 的直连绑定：改值时要顺手拿筛前段表重切一遍，
-                    // 而整片扫描是几分钟的事——试档只重切段表，不重扫。
+                    // 而整片扫描是几分钟的事——扫完之后试档只重切段表，不重扫（往扫描那一档以下调除外）。
                     Stepper(value: Binding(get: { cut.minLen }, set: { cut.setMinLen($0) }),
                             in: 0.0...4.0, step: 0.25) {
-                        Text("最短时长 \(String(format: "%.2f", cut.minLen)) s（比这个短的段直接从段表去掉、不导出；0.00＝不筛。挑多少看段表那行「筛前段长升序」，改这一格不用重扫）")
+                        Text("最短时长 \(String(format: "%.2f", cut.minLen)) s（比它短的段不导出；**扫描也照它跳探**：命中后直接往后跳这么长探一枪，探针那几帧都没脸＝这一窗判死、中间那些帧不检测＝省时间；探针打活就回扫补齐，导出的段表和逐帧扫一模一样。0.00＝逐帧老实扫）")
                             .font(.footnote)
                     }
                 }
