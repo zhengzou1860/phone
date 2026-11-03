@@ -365,6 +365,8 @@ final class SwapPreview {
         SwapGeo.restoreDetail(&gen, att, lam: 1.0, sigma: 0.8)
         detailMs.append(msFrom(t2a))
 
+        SwapGeo.vetoGreen(&gen, att)
+
         let t2 = ns()
         if whiten { SwapGeo.whiten(&gen, side: side) }
         beautyMs.append(msFrom(t2))

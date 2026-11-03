@@ -529,6 +529,7 @@ enum SwapClip {
         var beautyMs: [Double] = [], detailMs: [Double] = [], maskMs: [Double] = []
         var bandMs: [Double] = []
         var bandOn = 0                     // 这一趟有多少帧的放大倍率过了闸门（逐频带搬真开了）
+        var greenVeto = 0                  // 网没画出来、被换成原片的那一格有多少
         var appendMs: [Double] = [], decodeMs: [Double] = [], sampleMs: [Double] = [], resids: [Double] = []
         /// 裁脸＝warpToCrop 那一整块（含缓冲锁）；逐帧整次＝runner.frame 整趟调用（建输入＋装字典＋predict＋取输出摊平）。
         /// 这两格之前一毫秒都没量，netMs 只框住 predict 那一句，所以 每帧合计 一直是个被低估的数。
@@ -728,6 +729,8 @@ enum SwapClip {
                                 let td = DispatchTime.now().uptimeNanoseconds
                                 SwapGeo.restoreDetail(&gen, att, lam: 1.0, sigma: 0.8)
                                 detailMs.append(Double(DispatchTime.now().uptimeNanoseconds - td) / 1_000_000)
+                                // 网没画出来的那一片是一片绿：那一格改用原片顶上（换完再美白，明度跟周围一致）
+                                greenVeto += SwapGeo.vetoGreen(&gen, att)
                                 let tb = DispatchTime.now().uptimeNanoseconds
                                 if args.whiten { SwapGeo.whiten(&gen, side: side) }
                                 beautyMs.append(Double(DispatchTime.now().uptimeNanoseconds - tb) / 1_000_000)
@@ -926,7 +929,7 @@ enum SwapClip {
         let detNote = trackMiss > 0 ? "（出片这趟有 \(trackMiss) 帧退回现检）" : ""
         say("      出片趟 解码 \(SwapUtil.stat(decodeMs))｜检测 \(SwapUtil.stat(detectMs))\(detNote)｜对齐 \(SwapUtil.stat(alignMs))")
         let beautyNote = args.whiten ? "" : "（这一趟界面选了关，所以是 0）"
-        say("      逐帧网 \(SwapUtil.stat(netMs))｜裁脸 \(SwapUtil.stat(warpMs))｜逐帧整次 \(SwapUtil.stat(frameAllMs))｜高频回填 \(SwapUtil.stat(detailMs))｜美白 \(SwapUtil.stat(beautyMs))\(beautyNote)｜遮罩 \(SwapUtil.stat(maskMs))｜回贴 \(SwapUtil.stat(pasteMs))（内含逐频带搬：闸门开 \(bandOn)／\(made) 帧，建 att 亮度面 \(SwapUtil.stat(bandMs))，高通取样就在回贴那个循环里、钱并进回贴这一格）｜提交 \(SwapUtil.stat(appendMs))")
+        say("      逐帧网 \(SwapUtil.stat(netMs))｜裁脸 \(SwapUtil.stat(warpMs))｜逐帧整次 \(SwapUtil.stat(frameAllMs))｜高频回填 \(SwapUtil.stat(detailMs))｜美白 \(SwapUtil.stat(beautyMs))\(beautyNote)｜遮罩 \(SwapUtil.stat(maskMs))｜回贴 \(SwapUtil.stat(pasteMs))（内含逐频带搬：闸门开 \(bandOn)／\(made) 帧，建 att 亮度面 \(SwapUtil.stat(bandMs))，高通取样就在回贴那个循环里、钱并进回贴这一格）｜网没画出来换成原片 \(greenVeto) 格｜提交 \(SwapUtil.stat(appendMs))")
         say("      遮罩来源 分割网算 \(parseN) 次（\(SwapUtil.stat(parseMsLog))）｜按脸缓存，漂移 \(String(format: "%.4f", maskCache.lastDrift)) 过 \(String(format: "%.2f", SwapMaskCache.driftGate)) 才重算"
             + "｜摊到整片是每帧 \(String(format: "%.2f", parseN > 0 ? parseMsLog.reduce(0, +) / Double(max(1, made)) : 0)) ms")
         say("      注：逐帧网＝只有 predict 那一句；逐帧整次＝整趟调用（建输入数组＋装 19 键字典＋predict＋取输出摊平），两栏之差＝搬运")

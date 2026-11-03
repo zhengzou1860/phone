@@ -149,124 +149,11 @@ enum SwapGeo {
 
     // MARK: - 反向：size×size 的结果 + mask 贴回整幅（只在脸的外接框里做）
 
-    /// 官方 preprocess_mask：>0.001 归 1 → 11×11 膨胀 → 11×11 腐蚀×2 → 横向再放宽 1×41 → 7×7 模糊 → 乘 10 px 内收衰减
-    /// 只这两处偏离官方：下边不再内收（下巴下半截就是被那一刀切掉的），左右和上边照旧；
-    /// 腐蚀之后加一刀只往左右长的放宽——「侧脸没遮完」是横向的缺口，各向同性地放大会连带往头发和额头上长。
-    /// 下边缘的剖面不在这里乘，由 featherMask 折进 244 行那张再整张糊一次（伸出补丁那几行只有现算才有）。
-    ///
-    /// 最后再乘一道「收形」＝ min(1, 网自己的 mask ÷ shrinkK)：几何那几步（阈值 0.001＋横放宽 61 px）把遮罩撑到
-    /// 比网真正画过的那一片大得多——本机三帧量下来，α>0.5 且在 224 窗口里的可见贴区占整幅 46~55 %，
-    /// 其中 **22~33 % 的格子网自己的 mask < 0.3**，也就是那一片它根本没重画，贴进去的是原片缩到 224
-    /// 再放大 5.5~6.2 倍的那一份＝一张糊掉的原片，边界正是 1×61 横核长出来的直边＝他 10-23 描的那个正方形、
-    /// 判的那层「整个遮罩一层白膜」。乘完这三帧的可见贴区 55.1→38.6 %／50.3→40.5 %／46.2→34.2 %，
-    /// 「没画」那一份压到 4.0 %／3.6 %／6.3 %，而 ↔源 0.787→0.786／0.790→0.790／0.743→0.745
-    /// ＝那一片本来就不带身份信息，撤掉它身份一格不赔（tools/_veil23.py）。
-    static let shrinkK: Float = 0.3
-
-    static func preprocessMask(_ inMask: [Float], _ m2: inout [Float]) {
-        let s = size
-        var m = inMask
-        for i in 0..<m.count { m[i] = m[i] > 0.001 ? 1.0 : m[i] }
-        m = boxMax(m, s, 11)
-        m = boxMin(m, s, 11); m = boxMin(m, s, 11)   // iterations=2
-        m = boxMaxX(m, s, 61)                        // 只往左右各放 30 px（41→61：10-22 对拍那批臂都是这一档）
-        m = boxBlur(m, s, 7)
-        var m1 = [Float](repeating: 0, count: s * s)
-        for y in 10..<s { for x in 10..<(s - 10) { m1[y * s + x] = 1.0 } }
-        m1 = boxBlur(m1, s, 11)
-        let k = shrinkK
-        for i in 0..<m.count { m2[i] = m[i] * m1[i] * min(1.0, inMask[i] / k) }
-    }
-
-    /// 矩形核膨胀：可分离（先行后列）；越界按 OpenCV 形态学默认边界＝不参与（比 -inf/ +inf 弱）
-    private static func boxMax(_ a: [Float], _ s: Int, _ k: Int) -> [Float] {
-        let r = k / 2
-        var t = [Float](repeating: 0, count: a.count)
-        for y in 0..<s {
-            for x in 0..<s {
-                var v = a[y * s + x]
-                let x0 = max(0, x - r), x1 = min(s - 1, x + r)
-                for xx in x0...x1 { v = max(v, a[y * s + xx]) }
-                t[y * s + x] = v
-            }
-        }
-        var o = t
-        for x in 0..<s {
-            for y in 0..<s {
-                var v = t[y * s + x]
-                let y0 = max(0, y - r), y1 = min(s - 1, y + r)
-                for yy in y0...y1 { v = max(v, t[yy * s + x]) }
-                o[y * s + x] = v
-            }
-        }
-        return o
-    }
-
-    /// 只沿着一行取最大值 ＝ cv2.dilate(m, np.ones((1, k)))：核只有一行，所以列方向一个像素也不动
-    private static func boxMaxX(_ a: [Float], _ s: Int, _ k: Int) -> [Float] {
-        let r = k / 2
-        var o = [Float](repeating: 0, count: a.count)
-        for y in 0..<s {
-            for x in 0..<s {
-                var v = a[y * s + x]
-                let x0 = max(0, x - r), x1 = min(s - 1, x + r)
-                for xx in x0...x1 { v = max(v, a[y * s + xx]) }
-                o[y * s + x] = v
-            }
-        }
-        return o
-    }
-
-    private static func boxMin(_ a: [Float], _ s: Int, _ k: Int) -> [Float] {
-        let r = k / 2
-        var t = [Float](repeating: 0, count: a.count)
-        for y in 0..<s {
-            for x in 0..<s {
-                var v = a[y * s + x]
-                let x0 = max(0, x - r), x1 = min(s - 1, x + r)
-                for xx in x0...x1 { v = min(v, a[y * s + xx]) }
-                t[y * s + x] = v
-            }
-        }
-        var o = t
-        for x in 0..<s {
-            for y in 0..<s {
-                var v = t[y * s + x]
-                let y0 = max(0, y - r), y1 = min(s - 1, y + r)
-                for yy in y0...y1 { v = min(v, t[yy * s + x]) }
-                o[y * s + x] = v
-            }
-        }
-        return o
-    }
-
     /// cv2.blur(k×k) ＝ 均值滤波，边界 BORDER_REFLECT_101（不复制边缘、不补 0）
     private static func refl101(_ i: Int, _ n: Int) -> Int {
         if i >= 0 && i < n { return i }
         if i < 0 { return -i }              // REFLECT_101: -1 → 1
         return 2 * n - 2 - i
-    }
-
-    private static func boxBlur(_ a: [Float], _ s: Int, _ k: Int) -> [Float] {
-        let r = k / 2
-        var t = [Float](repeating: 0, count: a.count)
-        let inv = 1.0 / Float(k)
-        for y in 0..<s {
-            for x in 0..<s {
-                var v: Float = 0
-                for d in (-r)...r { v += a[y * s + refl101(x + d, s)] }
-                t[y * s + x] = v * inv
-            }
-        }
-        var o = [Float](repeating: 0, count: a.count)
-        for x in 0..<s {
-            for y in 0..<s {
-                var v: Float = 0
-                for d in (-r)...r { v += t[refl101(y + d, s) * s + x] }
-                o[y * s + x] = v * inv
-            }
-        }
-        return o
     }
 
     /// 224 方块（含中心）按 back = M⁻¹（模板→整幅）映回原图后的外接矩形 ＝ mfs_dealign.py 的 face_roi
@@ -297,62 +184,72 @@ enum SwapGeo {
     //    缝净 26.65。成因＝补丁末几行以 −3.5 L/行往下掉、原图从 224 起是亮的，而 ④ 那档「带内均值差」
     //    在接缝处错开，多出 +21 L 的台阶。改成切线对齐（上下两侧各拟合一条直线，在第 223.5 行对上值和斜率），
     //    硬线 22.72→4.87、缝净 26.65→5.97，肩那一带也不再被提亮（肩差 5.46→−0.02）。
-    // 这一刀同时挪到肩线：alpha 满格压到第 385 行（肩线），386~398 之间淡出。
-    // 那 13 行淡出段里的内容与原片逐像素相同（接缝色差已经搬到补丁侧了，接缝以下一个像素都不动），所以看不出边。
-    static let chinRamp0 = 385.0                   // alpha 满格压到这一行（肩线）
-    static let chinExt = 175.0                    // 补丁下面还留这么多行（385→398 之间淡出）
-    static var chinRamp1: Double { Double(size - 1) + chinExt }   // 到这一行掉到 0
+    // 这一刀同时挪到肩线：那一段（385→398）后来由分割网自己的遮罩接管，alpha 在第 223.5 行以下一律是 0，
+    // 接缝以下一个像素都不动，所以看不出边。
+    static let chinExt = 175.0                    // 补丁下面还留这么多行（224→398）
+    static var chinRamp1: Double { Double(size - 1) + chinExt }   // 遮罩缓冲的下沿
 
-    /// smoothstep 1→0：第 385 行之前 alpha 一律满（补丁那 224 行、还有下巴到肩那一段都是 1），
-    /// 落差整段落在 385~398 之间
-    private static func chinProfile(_ fy: Double) -> Float {
-        if fy <= chinRamp0 { return 1 }
-        let t = (fy - chinRamp0) / (chinRamp1 - chinRamp0)
-        if t >= 1 { return 0 }
-        return Float(1 - t * t * (3 - 2 * t))
-    }
+    // 遮罩缓冲的行数：399 行＝补丁 224 行＋下巴到肩那 175 行。
+    // 224 以下那几行贴着掩码缓冲的下沿（bilinear 取样不许越界），但接缝淡出（seamFade）
+    // 把第 223.5 行以下的 α 全部压成 0，所以那一片实际贴不上去——原片一像素不动。
+    static var maskRows: Int { Int(chinRamp1) + 1 }
 
-    // MARK: - 遮罩在 224 这一层糊一次（他 10-13 点名的那一格：八臂里的 G「G更自然」）
-    //
-    // 本机八臂的数：遮罩边上的亮度台阶 7.81→6.02、轮廓粗糙 4.3→4.0 px、↔源 0.794→0.784、能量比 0.226→0.240。
-    // 同一档羽化若在整幅那一层糊（B 臂），台阶只到 6.79 而本机合成段要 2.3 倍的钱 ⇒ 糊在 224 里，
-    // 两条路的 alpha 逐像素差 均值 2.43／最大 26.59（0~255 刻度）。
-    static let featherSigma = 4.0
-    static var maskRows: Int { Int(chinRamp1) + 1 }        // 399 行＝补丁 224 行＋下巴到肩那 175 行
+    // MARK: - 分割网出遮罩（0.35：概率图先二值化再糊，去掉脸心上那层透明膜）
 
-    /// 224 那张遮罩 → 399×224 的成品 alpha：下巴剖面先折进来（下面那几行拿末行接下去），
-    /// 再整张高斯摊开一次。贴回时取样就直接落在这张上，不再按行现算剖面。
-    /// out 的长度必须是 maskRows*size，调用方按帧复用这一格缓冲。
-    static func featherMask(_ m2: [Float], _ out: inout [Float]) {
-        let s = size
-        var m = [Float](repeating: 0, count: maskRows * s)
-        for y in 0..<maskRows {
-            let sy = min(y, s - 1)
-            let pf = chinProfile(Double(y))
-            for x in 0..<s { m[y * s + x] = m2[sy * s + x] * pf }
-        }
-        out = gaussBlur(m, s, maskRows, featherSigma)
-    }
-
-    /// 分割网出的概率图 → 399×224 的成品 alpha：σ=2 摊开一次，末行往下复制 175 行。
+    /// 分割网的概率图在脸心上并不饱和：本机量到 P_face 均值 0.90、p10 0.76、p50 0.92。
+    /// 旧配方 α＝blur(P,σ2) ⇒ 脸心那一片 α 稳定停在 0.85 上下，
+    /// 而贴回是 v2 = g2·255·α + 原片·(1−α) ⇒ 原片匀匀地掺进来 15 %，
+    /// 出来就是原片的脸（鼻子、嘴、下巴线）鬼影一样透过换上去的脸＝他判的「一层透明膜」。
     ///
-    /// 为什么不再走官方那一刀（preprocess_mask：阈值→膨胀→腐蚀→横 dilate→内收）：
-    /// 那一刀的形状＝逐帧网自己画过的那一片，目标本人的脸有大半根本没被换掉
-    /// （本机量到可见贴区只占整幅 33~39 %）；分割这一张按「皮肤＋五官」分语义，
-    /// 贴区盖住目标脸的比例从 ~90 % 提到 ~96 %，身份那一格也涨（本机 tools/_swap_parse.py：
-    /// 现役 0.783/0.777/0.736 → 分割软σ2(gen) 0.837/0.778/0.766）。
-    /// 为什么也不再叠一层 σ=4 的羽化（featherMask 那一把）：那一把是为「遮罩边上一道白膜」调的，
-    /// 分割出来的概率图边界本来就是软的，再糊一遍只会把下巴那一圈糊掉。
-    static let parseBlurSigma = 2.0
+    /// 这一版先把概率图二值化（0.5）再糊一次（σ=1）：
+    /// 0.5 等值线跟糊概率图那一版一样 ⇒ 贴区大小不变，只把脸心从 0.85 顶到 1。
+    /// 本机两帧对拍（tools/_veil35k.py）：
+    ///   1 秒那一帧 漏脸 11.5 %→4.0 %、盖脸 95.2 %→96.0 %、带通四档 0.718/0.806/0.897/0.961→0.996/0.959/0.979/1.036；
+    ///   4 秒那一帧 漏脸 15.3 %→3.6 %、绿线那 536 个绿像素→0（靠补丁那一道）。
+    /// σ=1 比旧的 σ=2 还省（核 9 抽 vs 17 抽）。
+    static let parseBlurSigma = 1.0
+    static let parseThresh: Float = 0.5
 
     static func parseMask(_ prob224: [Float], _ out: inout [Float]) {
         let s = size
-        let blurred = gaussBlur(prob224, s, s, parseBlurSigma)
+        let n = s * s
+        var bin = [Float](repeating: 0, count: n)
+        for i in 0..<n { bin[i] = prob224[i] > parseThresh ? 1 : 0 }
+        let blurred = gaussBlur(bin, s, s, parseBlurSigma)
         if out.count != maskRows * s { out = [Float](repeating: 0, count: maskRows * s) }
         for y in 0..<maskRows {
             let sy = min(y, s - 1)
             for x in 0..<s { out[y * s + x] = blurred[sy * s + x] }
         }
+    }
+
+    // MARK: - 网没画出来的那一片（0.35：绿的那一格改用原片顶上）
+
+    /// 逐帧网的出参把「它没画的那一片」留成一片绿。本机三帧量到（tools/_veil35m.py）：
+    /// 整张 224 裁剪里 G−max(R,B) 最大 0.60／0.63／0.71；而原片裁剪（真脸皮）那一档最高只有 0.047。
+    /// 0.08 落在两者中间：网的绿一刀全切掉（4 秒那一帧成品里的 536 个绿像素→0），
+    /// 脸皮一格都不误伤。
+    /// 为什么不用网自己的 mask 出参（出参1）当判据：那一格在脸心上也有 ≈0 的散点（p10 0.005），
+    /// 拿它当门会在脸上打洞。
+    static let greenVetoThr: Float = 0.08
+
+    /// 补丁里「绿得不像脸皮」的那一格换成原片那一格（＝那一格就当没贴网的东西）。
+    /// 换完再走美白：明度跟周围贴上去的那张脸一致，不会留一块比周围暗的斑。
+    /// 返回换掉的格子数。
+    @discardableResult
+    static func vetoGreen(_ gen: inout [Float], _ att: [Float], thr: Float = greenVetoThr) -> Int {
+        let s = size, plane = s * s
+        var n = 0
+        for k in 0..<plane {
+            let r = gen[k], g = gen[plane + k], b = gen[2 * plane + k]
+            if g - max(r, b) > thr {
+                gen[k] = att[k]
+                gen[plane + k] = att[plane + k]
+                gen[2 * plane + k] = att[2 * plane + k]
+                n += 1
+            }
+        }
+        return n
     }
 
     /// planar 数组（planes×s×s）→ 放大到 planes×t×t。双线性，半像素口径（与 cv2.resize 一致）。
@@ -652,7 +549,7 @@ enum SwapGeo {
                 let fx = fwd.a * u + fwd.b * v + fwd.c
                 let fy = fwd.d * u + fwd.e * v + fwd.f
                 guard fx >= 0, fy >= 0, fx <= Double(size - 1), fy <= chinRamp1 else { continue }
-                // alpha 落在 featherMask 那张 399×224 上（剖面和羽化都在里面了），不再按行现算；
+                // alpha 落在分割网出的那张 399×224 上（往下顺延到第 398 行），不再按行现算剖面；
                 // 再乘一道接缝淡出＝把补丁与原片的交接从半个对齐像素摊到 16 行（见 seamFade 那一段）
                 let mk = bilinearFloat(mask, size, mask.count / size, fx, fy) * seamFade(fy)
                 if mk <= 0 { continue }
