@@ -179,7 +179,8 @@ final class SwapRunner {
     }
 
     /// 四张都装上。凑不齐或接口对不上就把诊断文本整体带回来——不许半死不活地继续跑。
-    static func load(units: MLComputeUnits, onLine: (String) -> Void) -> (runner: SwapRunner?, note: String) {
+    /// onLine 是 @escaping：缺模型时那一下要走网络下载，进度要递到界面上。
+    static func load(units: MLComputeUnits, onLine: @escaping (String) -> Void) -> (runner: SwapRunner?, note: String) {
         var note = ""
         // 模型不再跟着 ipa 走（0.33 起）：盘上那一份缺了就先下一份。
         // 下了再改程序不用重下——版本号＝四张 onnx 的 sha256，程序改了模型没变。

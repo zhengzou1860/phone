@@ -167,12 +167,15 @@ enum SwapStore {
         let fm = FileManager.default
         guard let fh = try? FileHandle(forReadingFrom: archive) else { return (false, "归档打不开") }
         defer { try? fh.close() }
-        guard let magic = try? fh.read(upToCount: 4), let mb = [UInt8](magic), mb.count == 4,
-              mb[0] == 0x53, mb[1] == 0x57, mb[2] == 0x50, mb[3] == 0x4D
+        guard let magic = try? fh.read(upToCount: 4) else { return (false, "归档头不是 SWPM") }
+        let mb = [UInt8](magic)
+        guard mb.count == 4, mb[0] == 0x53, mb[1] == 0x57, mb[2] == 0x50, mb[3] == 0x4D
         else { return (false, "归档头不是 SWPM") }
-        guard let lenData = try? fh.read(upToCount: 4), let lb = [UInt8](lenData), lb.count == 4 else {
+        guard let lenData = try? fh.read(upToCount: 4) else {
             return (false, "归档头长度读不出来")
         }
+        let lb = [UInt8](lenData)
+        guard lb.count == 4 else { return (false, "归档头长度读不出来") }
         let hlen = Int(lb[0]) | (Int(lb[1]) << 8) | (Int(lb[2]) << 16) | (Int(lb[3]) << 24)
         guard hlen > 0, hlen < 4_000_000, let head = try? fh.read(upToCount: hlen) else {
             return (false, "归档头读不出来")
@@ -192,7 +195,7 @@ enum SwapStore {
             do {
                 try fm.createDirectory(at: p.deletingLastPathComponent(), withIntermediateDirectories: true)
                 if fm.fileExists(atPath: p.path) { try fm.removeItem(at: p) }
-                fm.createFile(atPath: p.path, contents: nil)
+                _ = fm.createFile(atPath: p.path, contents: nil)
                 let out = try FileHandle(forWritingTo: p)
                 var left = f.size
                 while left > 0 {
@@ -260,7 +263,8 @@ enum SwapStore {
         try? m.version.write(to: dir.appendingPathComponent("version.txt"), atomically: true, encoding: .utf8)
         var rv = URLResourceValues()
         rv.isExcludedFromBackup = true          // 几百 MB 权重不进 iCloud 备份
-        try? dir.setResourceValues(rv)
+        var modelDir = dir                       // setResourceValues 是 mutating 的，URL 得是可改的
+        try? modelDir.setResourceValues(rv)
         onLine("模型 解好了：\(ex.note)｜版本 \(m.version)")
         return (true, "模型 下好了：版本 \(m.version)｜四张齐")
     }

@@ -185,7 +185,7 @@ enum SwapClip {
         case saved(String)
     }
 
-    static func run(person: Person, video: URL, args: Args, onLine: (String) -> Void) -> (out: URL?, note: String) {
+    static func run(person: Person, video: URL, args: Args, onLine: @escaping (String) -> Void) -> (out: URL?, note: String) {
         var rep: [String] = []
         func say(_ s: String) { rep.append(s); onLine(s) }
         func fail(_ s: String) -> (out: URL?, note: String) {
