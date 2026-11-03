@@ -94,6 +94,9 @@ struct SwapContentView: View {
 
                     VStack(alignment: .leading, spacing: 6) {
                         Text("模型（0.33 起四张网单独下到手机上）").font(.headline)
+                        Text("0.34 起先从同一张网上的电脑拿模型（手机直连 GitHub 慢得离谱），"
+                             + "第一次会问「允许访问本地网络」，点允许。电脑不在就用 GitHub 那条。")
+                            .font(.caption2)
                         Text("改了程序不用重下：版本号＝四张 onnx 的 sha256，程序改了模型没变。模型换了才重下。")
                             .font(.caption2)
                         Button(modelBusy ? "下模型跑着…" : (SwapStore.haveAll() ? "查模型版本" : "下模型")) { downloadModels() }
@@ -292,7 +295,10 @@ struct SwapContentView: View {
                         逐帧那张（MobileFaceSwapUNet）、人脸分割那张（BiSeNet 19 类，CelebAMask-HQ 那套）。\
                         0.33 起这四张不再跟着 ipa 走：CI 把它们打成 models.bin 挂在 release 上，手机第一次用时\
                         下到 Documents/swap_models（sha256 对不上就不解包）；版本号＝四张 onnx 的 sha256 ⇒ \
-                        改了程序不用重下模型，模型换了才重下。前两张每人只算一次；逐帧那张 CPU 上机量过 12.00 ms/帧；\
+                        改了程序不用重下模型，模型换了才重下。0.34 起这 344 MB 先从同一张网上的电脑拿\
+                        （手机直连 GitHub 那条被掐着走，实测 30 KB/s；同一台电脑上倒是 4.5 MB/s），\
+                        清单仍以 GitHub 发布位为准；哪条源下的都过 sha256，对不上就换下一条；\
+                        卡住 45 s 没有新字节也换下一条，不再无声挂一小时。前两张每人只算一次；逐帧那张 CPU 上机量过 12.00 ms/帧；\
                         分割那张一帧 0.2 s 上跑不起，所以按脸缓存（见下）。\
                         遮罩彻底换了：0.32 那一版走的是官方 preprocess_mask 那一刀（>0.001 归 1→11 膨胀→11 腐蚀×2\
                         →7×7 模糊→10 px 内收衰减）再乘一道收形，那把 alpha 撑得比网真正画过的那一片大，\

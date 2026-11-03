@@ -26,11 +26,14 @@ targets:
         CFBundleExecutable: SwapBench
         CFBundleIdentifier: com.qoder.swapbench
         CFBundlePackageType: APPL
-        CFBundleShortVersionString: "0.33"
-        CFBundleVersion: "33"
+        CFBundleShortVersionString: "0.34"
+        CFBundleVersion: "34"
         CFBundleInfoDictionaryVersion: "6.0"
         NSPhotoLibraryAddUsageDescription: "要把换好脸的片段存回相册"
         NSPhotoLibraryUsageDescription: "要选一张源脸照片和一条要换脸的视频"
+        # 0.34 起模型先从局域网上那台电脑拿（手机直连 GitHub 那条被掐着走，344 MB 能爬一两个小时）。
+        # 走局域网必须写这一句：iOS 14 以后没这句就直接把本机网络访问挡掉，连弹窗都不弹。
+        NSLocalNetworkUsageDescription: "要把模型从同一张网上的电脑上拿到手机里"
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
         LSRequiresIPhoneOS: true

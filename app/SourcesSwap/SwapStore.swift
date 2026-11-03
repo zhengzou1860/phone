@@ -14,7 +14,22 @@ import CryptoKit
 ///   （不用 zip：iOS 没有现成的解 zip，逐段 inflate 得自己写一套；存成不压缩的归档省掉那一整套，
 ///     少一个能出错的环节比省几十 MB 划算）
 enum SwapStore {
-    static let base = "https://github.com/zhengzou1860/phone/releases/download/channel-swap"
+    /// 模型从哪儿下：清单和归档分开排。
+    ///
+    /// 清单（1 KB）以 GitHub 上那条发布位为准，局域网那份只当兜底：版本号是「这四张网换没换」的凭据，
+    /// 不能让电脑上一份旧的说了算。
+    /// 归档（344 MB）反过来，先走局域网上那台电脑：手机直连 GitHub 那条路被掐着走时能爬一两个小时
+    /// （实测 30 KB/s，同一台电脑上却是 4.5 MB/s）；走局域网一分钟就完。哪条下来的都过 sha256，对不上就换下一条。
+    static let manifestBases = [
+        "https://github.com/zhengzou1860/phone/releases/download/channel-swap",
+        "http://192.168.31.99:8716",
+        "http://192.168.31.100:8716",
+    ]
+    static let archiveBases = [
+        "http://192.168.31.99:8716",
+        "http://192.168.31.100:8716",
+        "https://github.com/zhengzou1860/phone/releases/download/channel-swap",
+    ]
     static let manifestName = "models.json"
     static let archiveName = "models.bin"
     static let dirName = "swap_models"
@@ -73,28 +88,39 @@ enum SwapStore {
 
     // MARK: - 清单
 
-    /// 清单就几 KB：版本对得上就不用再动那 345 MB
-    static func fetchManifest(timeout: TimeInterval = 30) -> (m: Manifest?, note: String) {
-        guard let url = URL(string: "\(base)/\(manifestName)") else { return (nil, "地址非法") }
-        var req = URLRequest(url: url)
-        req.timeoutInterval = timeout
-        req.cachePolicy = .reloadIgnoringLocalCacheData
-        let sem = DispatchSemaphore(value: 0)
-        var data: Data?, code = -1, err = ""
-        URLSession.shared.dataTask(with: req) { d, r, e in
-            if let e { err = e.localizedDescription }
-            if let r = r as? HTTPURLResponse { code = r.statusCode }
-            data = d
-            sem.signal()
-        }.resume()
-        if sem.wait(timeout: .now() + timeout + 5) == .timedOut { return (nil, "清单超时 \(Int(timeout)) s") }
-        guard code == 200, let d = data else { return (nil, "清单 HTTP \(code) \(err)") }
-        do {
-            let m = try JSONDecoder().decode(Manifest.self, from: d)
-            return (m, "清单 \(d.count) 字节｜版本 \(m.version)")
-        } catch {
-            return (nil, "清单解不开：\(error)")
+    /// 清单就几 KB：版本对得上就不用再动那 345 MB。
+    /// 挨个源试，第一个通的就算；note 里带上是哪一条源通的。
+    static func fetchManifest(timeout: TimeInterval = 30) -> (m: Manifest?, note: String, base: String?) {
+        var why: [String] = []
+        for b in manifestBases {
+            guard let url = URL(string: "\(b)/\(manifestName)") else { why.append("\(b) 地址非法"); continue }
+            var req = URLRequest(url: url)
+            req.timeoutInterval = timeout
+            req.cachePolicy = .reloadIgnoringLocalCacheData
+            let sem = DispatchSemaphore(value: 0)
+            var data: Data?, code = -1, err = ""
+            URLSession.shared.dataTask(with: req) { d, r, e in
+                if let e { err = e.localizedDescription }
+                if let r = r as? HTTPURLResponse { code = r.statusCode }
+                data = d
+                sem.signal()
+            }.resume()
+            if sem.wait(timeout: .now() + timeout + 5) == .timedOut {
+                why.append("\(b) 超时 \(Int(timeout)) s")
+                continue
+            }
+            guard code == 200, let d = data else {
+                why.append("\(b) HTTP \(code) \(err)")
+                continue
+            }
+            do {
+                let m = try JSONDecoder().decode(Manifest.self, from: d)
+                return (m, "清单 \(d.count) 字节｜版本 \(m.version)｜源 \(b)", b)
+            } catch {
+                why.append("\(b) 清单解不开：\(error)")
+            }
         }
+        return (nil, "拿不到清单：" + why.joined(separator: "；"), nil)
     }
 
     // MARK: - 下载
@@ -103,10 +129,32 @@ enum SwapStore {
     /// 所以当场挪到自己的路径上（挪晚了文件已经不在）。
     final class Grabber: NSObject, URLSessionDownloadDelegate {
         var onProgress: ((Int64, Int64) -> Void)?
+        var onStatus: ((String) -> Void)?
         private let sem = DispatchSemaphore(value: 0)
+        private let lock = NSLock()
         private var dst: URL?
         private var note = ""
         private var code = -1
+        private var lastAt: UInt64 = DispatchTime.now().uptimeNanoseconds
+        private var finished = false
+        private var saidStatus = false
+
+        /// 这么久没有新字节就当这条源卡住了。挂着的下载最烦：不动、也不报错，等它一小时。
+        static let stallSec: Double = 45
+
+        private func setNote(_ text: String) {
+            lock.lock()
+            if note.isEmpty { note = text }
+            lock.unlock()
+        }
+
+        private func markFinished(_ text: String) {
+            setNote(text)
+            lock.lock()
+            finished = true
+            lock.unlock()
+            sem.signal()
+        }
 
         func grab(_ url: URL, to dst: URL, timeout: TimeInterval) -> (ok: Bool, note: String) {
             self.dst = dst
@@ -116,6 +164,22 @@ enum SwapStore {
             let session = URLSession(configuration: cfg, delegate: self, delegateQueue: nil)
             let task = session.downloadTask(with: url)
             task.resume()
+            // 看门狗：卡住的源掐掉，让上面换下一条，别在一棵树上吊死
+            DispatchQueue.global().async { [weak self] in
+                while let s = self {
+                    s.lock.lock()
+                    let fin = s.finished
+                    let idle = Double(DispatchTime.now().uptimeNanoseconds - s.lastAt) / 1e9
+                    s.lock.unlock()
+                    if fin { return }
+                    if idle > Grabber.stallSec {
+                        s.markFinished("这条源卡住了：\(Int(idle)) s 没有新字节")
+                        task.cancel()
+                        return
+                    }
+                    Thread.sleep(forTimeInterval: 2)
+                }
+            }
             if sem.wait(timeout: .now() + timeout + 15) == .timedOut {
                 task.cancel()
                 session.invalidateAndCancel()
@@ -130,23 +194,40 @@ enum SwapStore {
         func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
                         didWriteData bytesWritten: Int64, totalBytesWritten: Int64,
                         totalBytesExpectedToWrite: Int64) {
+            lock.lock()
+            lastAt = DispatchTime.now().uptimeNanoseconds
+            let first = !saidStatus
+            saidStatus = true
+            let resp = downloadTask.response
+            lock.unlock()
+            if first, let r = resp as? HTTPURLResponse {
+                onStatus?("模型 归档 HTTP \(r.statusCode)｜\(r.url?.absoluteString ?? urlText(resp))")
+            }
             onProgress?(totalBytesWritten, totalBytesExpectedToWrite)
+        }
+
+        private func urlText(_ resp: URLResponse?) -> String {
+            guard let u = resp?.url else { return "?" }
+            return u.absoluteString
         }
 
         func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
                         didFinishDownloadingTo location: URL) {
             code = (downloadTask.response as? HTTPURLResponse)?.statusCode ?? -1
-            guard code == 200 else { note = "模型归档 HTTP \(code)（发布位上还没有这一份？）"; return }
+            guard code == 200 else { setNote("模型归档 HTTP \(code)（发布位上还没有这一份？）"); return }
             do {
                 if let d = dst { try? FileManager.default.removeItem(at: d) }
                 try FileManager.default.moveItem(at: location, to: dst ?? location)
             } catch {
-                note = "下下来的文件挪不走：\(error.localizedDescription)"
+                setNote("下下来的文件挪不走：\(error.localizedDescription)")
             }
         }
 
         func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-            if let error { note = "下载失败：\(error.localizedDescription)" }
+            if let error { setNote("下载失败：\(error.localizedDescription)") }
+            lock.lock()
+            finished = true
+            lock.unlock()
             sem.signal()
         }
     }
@@ -224,8 +305,8 @@ enum SwapStore {
             return (true, "模型 盘上那一份就是齐的（版本 \(localVersion())），不联网、不重下")
         }
         guard let dir = dir else { return (false, "模型 拿不到 Documents 目录") }
-        let (man, mnote) = fetchManifest()
-        guard let m = man else { return (false, "模型 拿不到清单：\(mnote)") }
+        let (man, mnote, _) = fetchManifest()
+        guard let m = man else { return (false, "模型 \(mnote)") }
         onLine("模型 清单到手：\(mnote)｜\(String(format: "%.0f", Double(m.bytes) / 1_048_576)) MB")
         if haveAll() && localVersion() == m.version {
             return (true, "模型 盘上那一份就是最新的（版本 \(m.version)），不用重下")
@@ -233,39 +314,55 @@ enum SwapStore {
         do { try fm.createDirectory(at: dir, withIntermediateDirectories: true) } catch {
             return (false, "模型 建不出目录：\(error.localizedDescription)")
         }
-        guard let url = URL(string: "\(base)/\(archiveName)") else { return (false, "模型 归档地址非法") }
         let tmp = dir.appendingPathComponent("archive.part")
-        try? fm.removeItem(at: tmp)
-        let grab = Grabber()
-        var lastMB = -1
-        grab.onProgress = { got, total in
-            let mb = Int(got / 1_048_576)
-            if mb - lastMB >= 32 || (total > 0 && got >= total) {
-                lastMB = mb
-                let tot = total > 0 ? String(format: "%.0f", Double(total) / 1_048_576) : "?"
-                onLine("模型 下到 \(mb)/\(tot) MB")
+        var why: [String] = []
+        for b in archiveBases {
+            guard let url = URL(string: "\(b)/\(archiveName)") else { why.append("\(b) 地址非法"); continue }
+            try? fm.removeItem(at: tmp)
+            let grab = Grabber()
+            var lastMB = -1
+            grab.onStatus = { onLine($0) }
+            grab.onProgress = { got, total in
+                let mb = Int(got / 1_048_576)
+                if mb - lastMB >= 16 || (total > 0 && got >= total) {
+                    lastMB = mb
+                    let tot = total > 0 ? String(format: "%.0f", Double(total) / 1_048_576) : "?"
+                    onLine("模型 下到 \(mb)/\(tot) MB（\(b)）")
+                }
             }
-        }
-        let g = grab.grab(url, to: tmp, timeout: 3600)
-        guard g.ok else { try? fm.removeItem(at: tmp); return (false, "模型 \(g.note)") }
-        guard let sha = sha256(tmp) else {
+            let g = grab.grab(url, to: tmp, timeout: 1800)
+            guard g.ok else {
+                try? fm.removeItem(at: tmp)
+                why.append("\(b) \(g.note)")
+                onLine("模型 这条源不成：\(g.note)｜换下一条")
+                continue
+            }
+            guard let sha = sha256(tmp) else {
+                try? fm.removeItem(at: tmp)
+                why.append("\(b) sha256 算不出来")
+                continue
+            }
+            guard sha == m.sha256 else {
+                try? fm.removeItem(at: tmp)
+                why.append("\(b) 整包 sha256 对不上（要 \(m.sha256.prefix(12))… 拿到 \(sha.prefix(12))…）")
+                onLine("模型 \(b) 那份对不上（多半是电脑上的缓存旧了）｜换下一条")
+                continue
+            }
+            onLine("模型 整包 sha256 对上了（\(sha.prefix(12))…）｜开始解包")
+            let ex = extract(tmp, manifest: m, to: dir)
             try? fm.removeItem(at: tmp)
-            return (false, "模型 sha256 算不出来")
+            guard ex.ok else {
+                why.append("\(b) \(ex.note)")
+                continue
+            }
+            try? m.version.write(to: dir.appendingPathComponent("version.txt"), atomically: true, encoding: .utf8)
+            var rv = URLResourceValues()
+            rv.isExcludedFromBackup = true          // 几百 MB 权重不进 iCloud 备份
+            var modelDir = dir                       // setResourceValues 是 mutating 的，URL 得是可改的
+            try? modelDir.setResourceValues(rv)
+            onLine("模型 解好了：\(ex.note)｜版本 \(m.version)")
+            return (true, "模型 下好了：版本 \(m.version)｜四张齐")
         }
-        guard sha == m.sha256 else {
-            try? fm.removeItem(at: tmp)
-            return (false, "模型 整包 sha256 对不上（要 \(m.sha256.prefix(12))… 拿到 \(sha.prefix(12))…）")
-        }
-        onLine("模型 整包 sha256 对上了（\(sha.prefix(12))…）｜开始解包")
-        let ex = extract(tmp, manifest: m, to: dir)
-        try? fm.removeItem(at: tmp)
-        guard ex.ok else { return (false, "模型 \(ex.note)") }
-        try? m.version.write(to: dir.appendingPathComponent("version.txt"), atomically: true, encoding: .utf8)
-        var rv = URLResourceValues()
-        rv.isExcludedFromBackup = true          // 几百 MB 权重不进 iCloud 备份
-        var modelDir = dir                       // setResourceValues 是 mutating 的，URL 得是可改的
-        try? modelDir.setResourceValues(rv)
-        onLine("模型 解好了：\(ex.note)｜版本 \(m.version)")
-        return (true, "模型 下好了：版本 \(m.version)｜四张齐")
+        return (false, "模型 几条源都没成：" + why.joined(separator: "；"))
     }
 }
