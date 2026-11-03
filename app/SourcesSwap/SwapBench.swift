@@ -23,34 +23,9 @@ enum SwapBench {
 
     static func locate() -> (url: URL?, note: String) {
         if let c = cachedLocate { return c }
-        let fm = FileManager.default
-        let found: (url: URL?, note: String)
-        if let u = Bundle.main.url(forResource: resource, withExtension: "mlmodelc") {
-            found = (u, "包里带的是已编译 mlmodelc")
-        } else {
-            var pkg: URL? = Bundle.main.url(forResource: resource, withExtension: "mlpackage")
-            if pkg == nil {
-                for base in [Bundle.main.bundleURL, Bundle.main.resourceURL].compactMap({ $0 }) {
-                    let u = base.appendingPathComponent("\(resource).mlpackage")
-                    var isDir: ObjCBool = false
-                    if fm.fileExists(atPath: u.path, isDirectory: &isDir), isDir.boolValue {
-                        pkg = u
-                        break
-                    }
-                }
-            }
-            if let p = pkg {
-                let t0 = DispatchTime.now().uptimeNanoseconds
-                do {
-                    let c = try MLModel.compileModel(at: p)
-                    found = (c, "包里是 mlpackage，A13 现场编译成功（\(SwapUtil.ms(Double(DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000))）")
-                } catch {
-                    found = (nil, "mlpackage 现场编译失败: \(error)")
-                }
-            } else {
-                found = (nil, "包里没有 \(resource).mlmodelc 也没有 \(resource).mlpackage")
-            }
-        }
+        // 走 SwapRunner.locate：0.33 起模型在 Documents/swap_models 那一份（盘上下来的），
+        // 不在包里了。这里自己摸一遍包的话永远摸不到。
+        let found = SwapRunner.locate(resource)
         cachedLocate = found
         return found
     }

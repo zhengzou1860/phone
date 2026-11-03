@@ -22,18 +22,22 @@ enum SwapFacts {
         ]
     }
 
-    /// 三张网逐个报。只认包里有哪个文件，绝不在主线程调 compileModel——那可能现场编几分钟。
+    /// 四张网逐个报。0.33 起模型不再跟着 ipa 走：一行说盘上那一份（Documents/swap_models），
+    /// 一行说包里那份（老 ipa 才有）。绝不在主线程调 compileModel——那可能现场编几分钟。
     /// CI 是把 mlpackage 当普通目录拷进 .app 的，所以除了 Bundle.url 还要直接按路径摸。
     static func modelNote() -> String {
-        let names = [SwapNets.arcResource, SwapNets.buildResource, SwapNets.unetResource]
+        let names = [SwapNets.arcResource, SwapNets.buildResource, SwapNets.unetResource, SwapNets.parseResource]
         var parts: [String] = []
         for res in names {
-            if Bundle.main.url(forResource: res, withExtension: "mlmodelc") != nil { parts.append("\(res)✓编") }
+            if SwapStore.local(res) != nil { parts.append("\(res)✓盘") }
+            else if Bundle.main.url(forResource: res, withExtension: "mlmodelc") != nil { parts.append("\(res)✓编") }
             else if hasDir("\(res).mlpackage") { parts.append("\(res)✓待编") }
             else { parts.append("\(res)✗") }
         }
         let miss = parts.filter { $0.contains("✗") }.count
-        return parts.joined(separator: " ") + (miss == 0 ? "｜三张齐，能出片" : "｜缺 \(miss) 张：CI 那轮没拷全，出不了片")
+        let store = SwapStore.statusLine()
+        return parts.joined(separator: " ") + "｜" + store
+            + (miss == 0 ? "｜四张齐，能出片" : "｜缺 \(miss) 张：先点「下模型」下齐（或直接开始换脸会自动下），出不了片")
     }
 
     private static func hasDir(_ name: String) -> Bool {

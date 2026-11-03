@@ -334,6 +334,90 @@ enum SwapGeo {
         out = gaussBlur(m, s, maskRows, featherSigma)
     }
 
+    /// 分割网出的概率图 → 399×224 的成品 alpha：σ=2 摊开一次，末行往下复制 175 行。
+    ///
+    /// 为什么不再走官方那一刀（preprocess_mask：阈值→膨胀→腐蚀→横 dilate→内收）：
+    /// 那一刀的形状＝逐帧网自己画过的那一片，目标本人的脸有大半根本没被换掉
+    /// （本机量到可见贴区只占整幅 33~39 %）；分割这一张按「皮肤＋五官」分语义，
+    /// 贴区盖住目标脸的比例从 ~90 % 提到 ~96 %，身份那一格也涨（本机 tools/_swap_parse.py：
+    /// 现役 0.783/0.777/0.736 → 分割软σ2(gen) 0.837/0.778/0.766）。
+    /// 为什么也不再叠一层 σ=4 的羽化（featherMask 那一把）：那一把是为「遮罩边上一道白膜」调的，
+    /// 分割出来的概率图边界本来就是软的，再糊一遍只会把下巴那一圈糊掉。
+    static let parseBlurSigma = 2.0
+
+    static func parseMask(_ prob224: [Float], _ out: inout [Float]) {
+        let s = size
+        let blurred = gaussBlur(prob224, s, s, parseBlurSigma)
+        if out.count != maskRows * s { out = [Float](repeating: 0, count: maskRows * s) }
+        for y in 0..<maskRows {
+            let sy = min(y, s - 1)
+            for x in 0..<s { out[y * s + x] = blurred[sy * s + x] }
+        }
+    }
+
+    /// planar 数组（planes×s×s）→ 放大到 planes×t×t。双线性，半像素口径（与 cv2.resize 一致）。
+    /// 分割网只认 512×512，喂进去的就是对齐 224 那张放大上去的。
+    static func upscalePlanar(_ src: [Float], from s: Int, to t: Int) -> [Float]? {
+        guard s > 0, t > 0, src.count % (s * s) == 0 else { return nil }
+        let planes = src.count / (s * s)
+        var out = [Float](repeating: 0, count: planes * t * t)
+        let scale = Double(s) / Double(t)
+        src.withUnsafeBufferPointer { sp in
+            out.withUnsafeMutableBufferPointer { op in
+                for pl in 0..<planes {
+                    let base = pl * s * s
+                    for y in 0..<t {
+                        let fy = (Double(y) + 0.5) * scale - 0.5
+                        let y0 = Int(fy.rounded(.down))
+                        let dy = Float(fy - Double(y0))
+                        let ya = min(max(y0, 0), s - 1), yb = min(max(y0 + 1, 0), s - 1)
+                        for x in 0..<t {
+                            let fx = (Double(x) + 0.5) * scale - 0.5
+                            let x0 = Int(fx.rounded(.down))
+                            let dx = Float(fx - Double(x0))
+                            let xa = min(max(x0, 0), s - 1), xb = min(max(x0 + 1, 0), s - 1)
+                            let v00 = sp[base + ya * s + xa], v10 = sp[base + ya * s + xb]
+                            let v01 = sp[base + yb * s + xa], v11 = sp[base + yb * s + xb]
+                            let a = v00 + (v10 - v00) * dx
+                            let b = v01 + (v11 - v01) * dx
+                            op[pl * t * t + y * t + x] = a + (b - a) * dy
+                        }
+                    }
+                }
+            }
+        }
+        return out
+    }
+
+    /// 单通道方图缩放（n×n → m×m），双线性，半像素口径（同 cv2.INTER_LINEAR）
+    static func resizeBilinear(_ src: [Float], from s: Int, to t: Int) -> [Float] {
+        guard s > 0, t > 0, src.count >= s * s else { return [Float](repeating: 0, count: t * t) }
+        var out = [Float](repeating: 0, count: t * t)
+        let scale = Double(s) / Double(t)
+        src.withUnsafeBufferPointer { sp in
+            out.withUnsafeMutableBufferPointer { op in
+                for y in 0..<t {
+                    let fy = (Double(y) + 0.5) * scale - 0.5
+                    let y0 = Int(fy.rounded(.down))
+                    let dy = Float(fy - Double(y0))
+                    let ya = min(max(y0, 0), s - 1), yb = min(max(y0 + 1, 0), s - 1)
+                    for x in 0..<t {
+                        let fx = (Double(x) + 0.5) * scale - 0.5
+                        let x0 = Int(fx.rounded(.down))
+                        let dx = Float(fx - Double(x0))
+                        let xa = min(max(x0, 0), s - 1), xb = min(max(x0 + 1, 0), s - 1)
+                        let v00 = sp[ya * s + xa], v10 = sp[ya * s + xb]
+                        let v01 = sp[yb * s + xa], v11 = sp[yb * s + xb]
+                        let a = v00 + (v10 - v00) * dx
+                        let b = v01 + (v11 - v01) * dx
+                        op[y * t + x] = a + (b - a) * dy
+                    }
+                }
+            }
+        }
+        return out
+    }
+
     /// cv2 由 σ 现算核长：float 输入取 round(σ·4·2+1) 再凑奇数（σ=4 ⇒ 33 抽），归一化到和为 1
     private static func gaussKernel(_ sigma: Double) -> [Float] {
         var n = Int((sigma * 8.0 + 1.0).rounded())

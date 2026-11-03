@@ -36,6 +36,8 @@ final class SwapPreviewMirror: ObservableObject {
     @Published var person = ""
     /// 手指压在滑杆上的那一阵：位置引擎那一跳不许把 thumb 拽回去（不进 @Published，它不该引起重画）
     var dragging = false
+    /// 模型下载/就位的那一句（0.33 起模型单独下到手机上，第一次用时那一下是几百 MB）
+    @Published var modelText = ""
 }
 
 /// 选片、开始换脸这一摊的状态。界面上不摆处理过程流水（0.25 起按他令撤掉），
@@ -68,6 +70,7 @@ struct SwapContentView: View {
     @State private var runs = 30
     @State private var sendStatus = ""
     @State private var sending = false
+    @State private var modelBusy = false
 
     /// 预览那一格界面上看到的东西
     @StateObject private var pv = SwapPreviewMirror()
@@ -88,6 +91,18 @@ struct SwapContentView: View {
                 VStack(alignment: .leading, spacing: 10) {
                     Text("环境").font(.headline)
                     ForEach(facts, id: \.self) { Text($0).font(.caption) }
+
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("模型（0.33 起四张网单独下到手机上）").font(.headline)
+                        Text("改了程序不用重下：版本号＝四张 onnx 的 sha256，程序改了模型没变。模型换了才重下。")
+                            .font(.caption2)
+                        Button(modelBusy ? "下模型跑着…" : (SwapStore.haveAll() ? "查模型版本" : "下模型")) { downloadModels() }
+                            .buttonStyle(.bordered)
+                            .disabled(modelBusy || running)
+                        Text(pv.modelText.isEmpty ? SwapStore.statusLine() : pv.modelText)
+                            .font(.caption)
+                            .textSelection(.enabled)
+                    }
 
                     Divider()
 
@@ -201,7 +216,7 @@ struct SwapContentView: View {
                             if let im = pv.img {
                                 Image(uiImage: im).resizable().scaledToFit()
                             } else {
-                                Text(pv.on ? "开跑了，第一格要等三张网装好" : "（还没开）")
+                                Text(pv.on ? "开跑了，第一格要等四张网装好" : "（还没开）")
                                     .font(.caption).foregroundColor(.gray)
                             }
                         }
@@ -247,7 +262,7 @@ struct SwapContentView: View {
 
                         Text("预览跟上面「算力单元」「补丁美白」这两档走；进链固定 640 那一档，上面「长边上限」管不到预览、预览自己也不抬尺寸"
                             + "（0.23 上机量过：640 档每播 1 s 素材要 909 ms，960 档 1105 ms 就过不了 16 帧那一头）。"
-                            + "预览跑着时「算力单元」改不动（它只在装那三张网的那一刻生效），要换档先停预览；"
+                            + "预览跑着时「算力单元」改不动（它只在装那四张网的那一刻生效），要换档先停预览；"
                             + "「补丁美白」是每一格现读的，改了当场生效。")
                             .font(.caption2)
                         Text("预览的补丁与成片同一口径：高频回填在做；差的是成片那一步整片对称平滑（预览当场检测，遮罩边上比成片抖）。"
@@ -273,20 +288,36 @@ struct SwapContentView: View {
 
                     DisclosureGroup("这一版在判什么") {
                         Text("""
-                        三张 fp32 网全在包里：身份证（arcface）、每人一次的 18 个权重张量（BuildFaceSwap）、\
-                        逐帧那张（MobileFaceSwapUNet）。前两张每人只算一次，这一版第一次在 A13 上量出这两步多少钱；\
-                        逐帧那张 CPU 上机已经量过 12.00 ms/帧。
+                        四张 fp32 网：身份证（arcface）、每人一次的 18 个权重张量（BuildFaceSwap）、\
+                        逐帧那张（MobileFaceSwapUNet）、人脸分割那张（BiSeNet 19 类，CelebAMask-HQ 那套）。\
+                        0.33 起这四张不再跟着 ipa 走：CI 把它们打成 models.bin 挂在 release 上，手机第一次用时\
+                        下到 Documents/swap_models（sha256 对不上就不解包）；版本号＝四张 onnx 的 sha256 ⇒ \
+                        改了程序不用重下模型，模型换了才重下。前两张每人只算一次；逐帧那张 CPU 上机量过 12.00 ms/帧；\
+                        分割那张一帧 0.2 s 上跑不起，所以按脸缓存（见下）。\
+                        遮罩彻底换了：0.32 那一版走的是官方 preprocess_mask 那一刀（>0.001 归 1→11 膨胀→11 腐蚀×2\
+                        →7×7 模糊→10 px 内收衰减）再乘一道收形，那把 alpha 撑得比网真正画过的那一片大，\
+                        贴进去的三成是网自己没重画过的原片。本机量到现役（0.32）三帧的换后<->源是 0.783／0.777／0.736。\
+                        这一版改用人脸分割网出遮罩：BiSeNet 19 类取皮肤／鼻／眼镜／眼／眉／耳／嘴／唇十二类，\
+                        在 224 空间 σ=2 高斯糊一次当 alpha（官方那一刀整套不做了：膨胀／腐蚀／内收／σ=4 羽化全不要），\
+                        往下顺延到第 398 行，同一套接缝淡出（对齐 207→223.5 行 smoothstep 到 0）照旧。\
+                        本机三帧盖脸 89.9 % → 96.7／96.3／95.5 %，换后<->源 0.837／0.778／0.766（平均 0.765 → 0.794）。\
+                        补丁那一路也跟着换：逐帧网第三个出参 mfs_gen_face＝没混过的那份 gen（out 是 gen·mask+(1−mask)·att，\
+                        带着目标本人四成，身份一格赔在那儿；本机用 out 那一格 0.738／0.750／0.678，用 gen 那一格 0.837／0.778／0.766）。\
+                        速度：分割一帧 0.2 s 上下，逐帧跑不起，所以按脸缓存——对齐 224 那张算一个 16×16 的亮度签名，\
+                        漂移过 0.05（转头、镜头切）才重跑，另加一条 parseMs×12 s 的兜底间隔。\
+                        本机量过「拿别帧的遮罩来用」：换后<->源只掉 0.003~0.018（0.837→0.834／0.778→0.770／0.766→0.748），\
+                        但盖脸掉得狠（96.7 %→89.6 %、95.5 %→73.8 %）＝身份那一格看不出来，边界看得出来，所以漂移闸门不能松。\
+                        其余口径与 0.32 一样：高频回填（σ=0.8、λ=1.0）、接缝色差加在补丁末 10 行、\
+                        频带搬（一个对齐像素盖满 1.6 个输出像素才搬）、美白可关、码率按尺寸给到 6 Mbps 以上。
                         片子上机走的是「摆正后的帧→检测→对齐→224 裁片→逐帧网→回贴→重编 h264」，\
                         跑完自己存相册、成功才删沙盒那份。
                         界面上每 sampleEvery=30 帧复测一次身份余弦（PC 参照：换后<->源 0.81~0.90）——\
-                        这一版质量不许降，所以三张网都是 fp32，码率按尺寸给到 6 Mbps 以上。
+                        这一版质量不许降，所以四张网都是 fp32，码率按尺寸给到 6 Mbps 以上。
                         这一版多了「已存的人」：一张照片的身份（18 个权重＋512 维身份证）落进 Documents/swap_idents，\
                         以后点名字直接选他，跳过身份证＋身份包那两步（上机实测这两步 70.61 + 18.27 ms），能改名、能删，删掉就把那份字节还回磁盘。
-                        贴法退回第一版：你判「反倒是第一版的参数是最好的，包括遮罩的范围」，\
-                        所以这一版遮罩走官方 preprocess_mask 那一刀（>0.001 归 1→11 膨胀→11 腐蚀×2→7×7 模糊→10 px 内收衰减），\
-                        补丁直接取逐帧网自己混好的 out。五官加深 γ、可调透明度遮罩两样是我在后面几版里加的、这一版都不在；\
+                        五官加深 γ、可调透明度遮罩两样是我在后面几版里加的、这一版都不在；\
                         在的是高频回填（0.19 起，把这一帧对齐原片自己的 σ=0.8 高通按 λ=1.0 加回补丁）和美白（0.11 起，这一版起界面可关）。\
-                        CI 给逐帧网挂的第三个出参这一版也没有代码去取它。
+                        CI 给逐帧网挂的第三个出参（mfs_gen_face），0.32 那一版没有代码去取它，这一版开始取了。
                         这一版多了「换脸预览」。为什么要减帧：0.22 上机量到走完整口径要 73.6 ms/帧，16 帧/秒那一格只有 62.5 ms，差的那一截不是靠耐心能补的。\
                         从两处减：① 进链钉死 640 那一档，小窗里给的就是这条小链的整幅画面，\
                         回贴不再往 1920 上贴（那一格实测 16.85 ms，像素数随尺寸平方缩）。0.23 上机两档都量过：640 档每换一帧 53.34 ms＝每播 1 s 素材 909 ms，\
@@ -302,15 +333,14 @@ struct SwapContentView: View {
                         补丁末几行以 −3.5 L/行往下掉，原图从 224 起是亮的，缝净量到 26.65。\
                         现在改成切线对齐：补丁末 10 行与原图紧接的 10 行各拟合一条直线，在第 223.5 行把值和斜率对上，\
                         0.29~0.30 把差出来的那个色差加在原片那一侧、往下 40 行衰减——出来是下巴下面一个直边矩形（他 10-22 圈的那道分界），本机量到那一块相对原片最大偏暗 16 L（均值 −5.4 L）。0.31 把它搬到补丁侧：接缝以下一个像素都不动，色差改加在补丁末 10 行上（smoothstep，第 213 行 0、第 223 行 1）；接缝那一步的相邻行跳变 7.10 → 5.28 L（原图自己那一步 3.57 L）。\
-                        遮罩那一把 alpha 也压到肩线（第 385 行满格、386~398 之间淡出，那一段里的内容与原片逐像素相同，看不出边），横 dilate 41→61。\
-                        0.32 在这把 α 上再乘一道接缝淡出＝对齐 207→223.5 行 smoothstep 到 0：补丁那片下巴／颈比原片暗 5~10 L，而交接原来压在半个对齐像素里\
+                        0.32 那一版的遮罩还压到肩线（第 385 行满格、386~398 之间淡出）并横 dilate 41→61；\
+                        这一版那把 alpha 是分割网给的，形状已经是脸自己那一块，不再撑到肩、不再做横 dilate，也不再乘那道收形。\
+                        0.32 在 α 上乘的那道接缝淡出留着（＝对齐 207→223.5 行 smoothstep 到 0）：补丁那片下巴／颈比原片暗 5~10 L，而交接原来压在半个对齐像素里\
                         ＝一条线（他 10-23「下巴下那条分界线还是非常明显」）。本机三帧（b336／b312／b384）跨缝跳 −3.57／+3.16／−1.76 L → 淡完 −0.53／−0.16／−0.47，\
-                        地板＝原片自己 +0.06／−0.01／+0.03；↔源 0.715 不掉、鼻孔差与带通四档不动；淡到 40 行开始把目标的脸搬回来，所以取 16（tools/_veil25.py）。\
-                        遮罩最后再乘一道收形＝min(1, 网自己的 mask ÷ 0.3)（0.31 起）。前面那几步（阈值 0.001、横 dilate 61）把遮罩撑得比网真正画过的那一片大：\
-                        本机三帧（_big_frames 的 b336／b312／b384，一个对齐像素盖 6.20／5.87／5.52 个输出像素）α>0.5 且在 224 窗口里的可见贴区占整幅 55.1 %／50.3 %／46.2 %，\
-                        其中 32.7 %／22.4 %／30.6 % 的格子网自己的 mask<0.3＝那一片它根本没重画，贴进去的是这一帧原片缩到 224 再放大回来的那一份。\
-                        乘完这三帧的可见贴区 38.6 %／40.5 %／34.2 %，「没画」那一份压到 4.0 %／3.6 %／6.3 %，\
-                        ↔源 0.787→0.786、0.790→0.790、0.743→0.745（tools/_veil23.py）。\
+                        地板＝原片自己 +0.06／−0.01／+0.03；淡到 40 行开始把目标的脸搬回来，所以取 16（tools/_veil25.py）。\
+                        0.32 那一版遮罩最后还乘一道收形＝min(1, 网自己的 mask ÷ 0.3)：前面那几步（阈值 0.001、横 dilate 61）\
+                        把遮罩撑得比网真正画过的那一片大，本机三帧量到 32.7 %／22.4 %／30.6 % 的格子网自己没重画（tools/_veil23.py）。\
+                        这一版没有这一道了：分割网给的 α 就是脸自己那一块，撑不出那一片。\
                         本机同口径对拍（tools/_swap_img.py，源＝aa/3.png 目标＝aa/4.png，20 帧）0.28 现役 A → 0.29：\
                         盖框 89.4→93.9、下巴带 84.9→93.9、侧带 67.7→79.7、顶带 53.5→65.4，\
                         硬线 21.87→4.87、缝净 25.80→5.97、肩差 0.45→−0.02，↔源 0.876 一个没动，粗糙 0.91→1.64。
@@ -330,7 +360,12 @@ struct SwapContentView: View {
                 let eng = SwapContentView.engine
                 eng.render = { img in mirror.img = img }
                 eng.onShow = { s in mirror.status = s }
-                eng.log = { line in SwapJournal.line(line) }
+                eng.log = { line in
+                    SwapJournal.line(line)
+                    if line.hasPrefix("模型") {
+                        DispatchQueue.main.async { mirror.modelText = line }
+                    }
+                }
                 eng.onProgress = { s, d in
                     mirror.dur = d
                     if !mirror.dragging { mirror.pos = s }
@@ -428,7 +463,7 @@ struct SwapContentView: View {
         let longEdge = Self.longs[longIdx]
         let beautyTxt = beautyIdx == 0 ? "开" : "关"
         if SwapContentView.engine.isActive {
-            SwapJournal.line("开始整片换脸：预览还开着，先叫停它并把三张网交出来（两条同跑＝两份足迹＋互相抢 CPU）")
+            SwapJournal.line("开始整片换脸：预览还开着，先叫停它并把四张网交出来（两条同跑＝两份足迹＋互相抢 CPU）")
         }
         SwapJournal.line("开始整片换脸 units=\(Self.units[unitIdx].0) 长边=\(longEdge) 美白=\(beautyTxt) 源=\(sourceTag) 片=\(v.lastPathComponent)")
         var args = SwapClip.Args()
@@ -436,7 +471,7 @@ struct SwapContentView: View {
         args.longEdge = longEdge
         args.whiten = beautyIdx == 0
         Task.detached {
-            // 预览还开着就先叫停，并等它把三张网＋两块整幅缓冲交出来再装自己这一份
+            // 预览还开着就先叫停，并等它把四张网＋两块整幅缓冲交出来再装自己这一份
             SwapContentView.engine.stop()
             var waited = 0.0
             while SwapContentView.engine.isActive && waited < 5.0 {
@@ -448,6 +483,11 @@ struct SwapContentView: View {
             }
             let r = SwapClip.run(person: person, video: v, args: args) { line in
                 SwapJournal.line(line)
+                // 模型下载的进度往界面上递一句：0.33 起模型不在包里，第一次跑要先下几百 MB，
+                // 不递的话界面上只有「换脸跑着…」，看着像卡死
+                if line.hasPrefix("模型") {
+                    DispatchQueue.main.async { pv.modelText = line }
+                }
             }
             // 视频那份拷贝是输入，跑完就该还掉：手机存储不许留残料（源脸那份选定时就还了）
             if !FileManager.default.fileExists(atPath: v.path) {
@@ -570,7 +610,7 @@ struct SwapContentView: View {
         pv.pos = 0
         pv.dur = 0
         pv.person = ""
-        pv.status = "预览开跑：先把三张网装好，第一格还要等它检测到位"
+        pv.status = "预览开跑：先把四张网装好，第一格还要等它检测到位"
         SwapJournal.line("开始预览 units=\(c.unitsTxt) 美白=\(whitenTxt) "
             + "人=\(SwapIdents.displayName(chosenIdent)) 片=\(v.lastPathComponent)")
     }
@@ -579,6 +619,26 @@ struct SwapContentView: View {
         guard pv.on else { return }
         SwapJournal.line(String(format: "预览 拖到 %.2f s（重开 reader 跳过去，预览不缓存画面）", sec))
         SwapContentView.engine.seek(sec)
+    }
+
+    /// 下模型：四张网合成一个 models.bin 挂在 release 上，下完 sha256 对得上才解包。
+    /// 下到 Documents/swap_models —— 程序随便换，这一份原封不动。
+    private func downloadModels() {
+        modelBusy = true
+        pv.modelText = "下模型跑着…"
+        SwapJournal.line("开始下模型")
+        Task.detached {
+            let g = SwapStore.ensure(force: true) { line in
+                SwapJournal.line(line)
+                DispatchQueue.main.async { pv.modelText = line }
+            }
+            SwapJournal.line("下模型 " + g.note)
+            DispatchQueue.main.async {
+                pv.modelText = g.note
+                modelBusy = false
+                facts = SwapFacts.lines()
+            }
+        }
     }
 
     private func runBench() {

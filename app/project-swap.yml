@@ -13,10 +13,9 @@ targets:
   SwapBench:
     type: application
     platform: iOS
-    # 只吃自己的目录。换脸网不在这里出现：由 CI 在装包阶段直接拷进 .app，
-    # 免得"xcodegen 怎么对待 mlpackage、coremlc 编不编"两件事混进上机判定。
-    # app 里 SwapBench.locate() 找到 mlpackage 后自己调 compileModel，
-    # "A13 的编译器认不认这张网"由设备本人口述。
+    # 只吃自己的目录。0.33 起模型彻底不进包：四张网由 CI 打成 models.bin 挂在 release 上，
+    # 手机第一次用时自己下到 Documents/swap_models（改了程序不用重下模型）。
+    # app 里 SwapNets.locate() 先找盘上那一份，找不到才退到包里（老 ipa 那样）。
     sources:
       - SourcesSwap
     info:
@@ -27,8 +26,8 @@ targets:
         CFBundleExecutable: SwapBench
         CFBundleIdentifier: com.qoder.swapbench
         CFBundlePackageType: APPL
-        CFBundleShortVersionString: "0.32"
-        CFBundleVersion: "32"
+        CFBundleShortVersionString: "0.33"
+        CFBundleVersion: "33"
         CFBundleInfoDictionaryVersion: "6.0"
         NSPhotoLibraryAddUsageDescription: "要把换好脸的片段存回相册"
         NSPhotoLibraryUsageDescription: "要选一张源脸照片和一条要换脸的视频"

@@ -3,13 +3,26 @@ import CoreML
 import CoreVideo
 import UIKit
 
-/// 三张 fp32 网在手机上的一次完整生命周期：找模型 → 编 → 装 → 跑。
-/// 名字全部照 CI 转出来的 CoreML 名逐字抄（app/SwapModel/out/{arcface,build_swap,mfs_unet}.mlpackage，
-/// 输出名在发布位 channel-swap 的 cv_arc.log / cv_build.log / cv_unet.log 里逐条列过）。
+/// 四张 fp32 网在手机上的一次完整生命周期：找模型 → 编 → 装 → 跑。
+/// 名字全部照 CI 转出来的 CoreML 名逐字抄（app/SwapModel/out/{arcface,build_swap,mfs_unet,faceparse}.mlpackage，
+/// 输出名在发布位 channel-swap 的 cv_arc.log / cv_build.log / cv_unet.log / cv_parse.log 里逐条列过）。
 enum SwapNets {
     static let arcResource = "arcface"
     static let buildResource = "build_swap"
     static let unetResource = "mfs_unet"
+    /// 人脸语义分割网（19 类，CelebAMask-HQ）。遮罩彻底换掉就是靠它：
+    /// 原来那张遮罩的形状＝逐帧网自己画过的那一片，目标本人的脸有大半没被换掉；
+    /// 这一张按「皮肤＋五官」分语义，贴区盖住目标脸的比例从 ~90 % 提到 ~96 %。
+    static let parseResource = "faceparse"
+
+    /// 分割网的入参尺寸。这张网只认 512×512（onnx 里是死的），所以喂进去的是
+    /// 对齐 224 那张裁片放大到 512——真机一次 parse 的钱都在这一趟上，所以按脸缓存，不逐帧跑。
+    static let parseSize = 512
+
+    /// 分割网的 19 类里哪些算「脸」：皮肤 鼻 眼镜 左右眼 眉 耳 嘴 上下唇
+    /// （头发/帽子/背景/衣服/脖子都不算，贴上去就是一团糊）
+    static let parseFaceClasses: [Int] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+    static let parseClassCount = 19
 
     /// PC 那侧是 `zip(逐帧网的输入顺序[1:], 权重生成网的输出顺序)` 硬按位置对齐的，CoreML 里没有顺序可言，
     /// 所以把这个位置关系逐条落成名字表（左右两列在 PC 上形状逐条相等，tools/mfs_swap.py 就是这么跑通的）。
@@ -76,10 +89,12 @@ enum SwapNets {
 
 /// 一个源身份的三件套：身份证（512 维嵌入）、身份包（512×7×7 特征图）、逐帧网要的 18 个权重。
 /// 每人只算一次，整片共用 ⇒ 换一个人的脸要重新走一遍身份证＋权重生成。
+/// 第四张是人脸分割网（遮罩用），它跟身份无关，整片共用。
 final class SwapRunner {
     let arc: MLModel
     let build: MLModel
     let unet: MLModel
+    let parse: MLModel
     let loadNote: String
 
     struct Contract {
@@ -91,6 +106,11 @@ final class SwapRunner {
         let attName: String
         let unetOutImage: String
         let unetOutMask: String
+        /// 逐帧网第三个出参＝没混过的 gen。补丁改用它（out 是 gen·mask+(1−mask)·att，
+        /// 带着目标本人四成，身份一格赔在那儿）
+        let unetOutGen: String
+        let parseInput: String
+        let parseOutput: String
         let weightNames: [String]
         let weightSources: [String]
     }
@@ -104,11 +124,18 @@ final class SwapRunner {
     private(set) var identityMs: [Double] = []
     private(set) var genMs: [Double] = []
     private(set) var frameMs: [Double] = []
+    private(set) var parseMs: [Double] = []
 
-    /// 找模型：包里优先是 coremlc 编好的 mlmodelc；只剩 mlpackage 的话现场 compileModel。
+    /// 找模型：先找盘上那一份（Documents/swap_models，模型单独下载到手机上的），
+    /// 再找包里已编译的 mlmodelc；只剩 mlpackage 的话现场 compileModel。
     /// 绝不在主线程调（204 MB 那张可能编几分钟），调用方必须在后台线程上。
     static func locate(_ resource: String) -> (url: URL?, note: String) {
         let fm = FileManager.default
+        // 盘上那一份（Documents/swap_models，模型单独下载到手机上的）也是 mlpackage，
+        // 同样要现场编一次：编译产物在临时目录里，编完这一趟就够用了。
+        if let p = SwapStore.local(resource) {
+            return compile(p, resource: resource, from: "盘上那一份")
+        }
         if let u = Bundle.main.url(forResource: resource, withExtension: "mlmodelc") {
             return (u, "\(resource) 包里是已编译 mlmodelc")
         }
@@ -124,22 +151,47 @@ final class SwapRunner {
             }
         }
         guard let p = pkg else {
-            return (nil, "包里没有 \(resource).mlmodelc 也没有 \(resource).mlpackage")
+            return (nil, "既没有盘上那一份，包里也没有 \(resource).mlmodelc／\(resource).mlpackage")
         }
+        return compile(p, resource: resource, from: "包里那份")
+    }
+
+    /// mlpackage → 现场编好（编出来的 mlmodelc 落在临时目录里，返回它的地址）。
+    /// 盘上那一份和包里那一份走的是同一条路：两个位置的 mlpackage 结构一样。
+    private static func compile(_ p: URL, resource: String, from where_: String) -> (url: URL?, note: String) {
         let t0 = DispatchTime.now().uptimeNanoseconds
         do {
             let c = try MLModel.compileModel(at: p)
-            return (c, "\(resource) 现场编译成功 \(SwapUtil.ms(Double(DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000))")
+            return (c, "\(resource) \(where_)的 mlpackage 现场编译成功（\(SwapUtil.ms(Double(DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000))）")
         } catch {
-            return (nil, "\(resource) 现场编译失败: \(error)")
+            return (nil, "\(resource) \(where_)的 mlpackage 现场编译失败: \(error)")
         }
     }
 
-    /// 三张都装上。凑不齐或接口对不上就把诊断文本整体带回来——不许半死不活地继续跑。
+    /// 包里四张都在（老 ipa 那样带着模型的）：这一版不用去碰网络
+    private static func bundleHasAll() -> Bool {
+        for r in [SwapNets.arcResource, SwapNets.buildResource, SwapNets.unetResource, SwapNets.parseResource] {
+            if Bundle.main.url(forResource: r, withExtension: "mlmodelc") != nil { continue }
+            if Bundle.main.url(forResource: r, withExtension: "mlpackage") != nil { continue }
+            return false
+        }
+        return true
+    }
+
+    /// 四张都装上。凑不齐或接口对不上就把诊断文本整体带回来——不许半死不活地继续跑。
     static func load(units: MLComputeUnits, onLine: (String) -> Void) -> (runner: SwapRunner?, note: String) {
         var note = ""
+        // 模型不再跟着 ipa 走（0.33 起）：盘上那一份缺了就先下一份。
+        // 下了再改程序不用重下——版本号＝四张 onnx 的 sha256，程序改了模型没变。
+        // 这一步要走网络，所以只在真缺时才走；包里有（老 ipa）就不去碰网络。
+        if !SwapStore.haveAll() && !bundleHasAll() {
+            onLine("模型 盘上那一份没有，先下一份（几百 MB，第一次要等一会儿）")
+            let g = SwapStore.ensure(force: false, onLine: onLine)
+            onLine("模型 \(g.note)")
+            if !g.ok { note += "模型 没下下来：\(g.note)\n" }
+        }
         var made: [String: MLModel] = [:]
-        for res in [SwapNets.arcResource, SwapNets.buildResource, SwapNets.unetResource] {
+        for res in [SwapNets.arcResource, SwapNets.buildResource, SwapNets.unetResource, SwapNets.parseResource] {
             let found = locate(res)
             note += "\(res): \(found.note)\n"
             onLine("\(res): \(found.note)")
@@ -160,22 +212,23 @@ final class SwapRunner {
             }
         }
         guard let a = made[SwapNets.arcResource], let b = made[SwapNets.buildResource],
-              let u = made[SwapNets.unetResource] else {
-            return (nil, note + "三张网没凑齐，这一版出不了片")
+              let u = made[SwapNets.unetResource], let p = made[SwapNets.parseResource] else {
+            let got = made.keys.sorted().joined(separator: "／")
+            return (nil, note + "四张网没凑齐（装上的是 \(got)），这一版出不了片")
         }
-        let got = SwapRunner.contract(arc: a, build: b, unet: u)
+        let got = SwapRunner.contract(arc: a, build: b, unet: u, parse: p)
         onLine("接口对账: \(got.note)")
         guard let c = got.value else {
             return (nil, note + "接口对账：\(got.note)\n")
         }
         note += "接口对账：\(got.note)\n"
-        return (SwapRunner(arc: a, build: b, unet: u, loadNote: note, contract: c), note)
+        return (SwapRunner(arc: a, build: b, unet: u, parse: p, loadNote: note, contract: c), note)
     }
 
     /// 名字先按形状认一遍（转换器改了名也能对上），18 个权重再逐条点名。
     /// 任何一条对不上就拒绝出片：w_dec_0/1 同形状，靠形状硬猜会认错，
     /// 认错了画面照样"像个人"，只是身份串了或糊了——那种错必须当场挡下来。
-    static func contract(arc: MLModel, build: MLModel, unet: MLModel) -> (value: Contract?, note: String) {
+    static func contract(arc: MLModel, build: MLModel, unet: MLModel, parse: MLModel) -> (value: Contract?, note: String) {
         var err: [String] = []
         func names(_ m: MLModel, _ inputs: Bool) -> [String] {
             let md = m.modelDescription
@@ -224,6 +277,27 @@ final class SwapRunner {
             err.append("逐帧网找不到 mask（实际出 \(names(unet, false))）")
             return (nil, err.joined(separator: "；"))
         }
+        // 没混过的 gen：逐帧网两个 [1,3,224,224] 的出参，混过的那张已经认成 unetOutImage，
+        // 剩下的那张就是 gen。认不出来就别硬跑——补丁要的就是没混的那一份。
+        let imgOuts = names(unet, false).filter { n in
+            guard let d = unet.modelDescription.outputDescriptionsByName[n] else { return false }
+            return matches(d, rank: 4, channels: 3, total: 3 * 224 * 224)
+        }
+        guard let gn = imgOuts.first(where: { $0 != gi }) else {
+            err.append("逐帧网只有一张 [1,3,224,224] 的出参（\(imgOuts)），没有没混过的 gen")
+            return (nil, err.joined(separator: "；"))
+        }
+        guard let pi = find(parse, inputs: true, rank: 4, channels: 3,
+                            total: 3 * SwapNets.parseSize * SwapNets.parseSize, prefers: ["input"]) else {
+            err.append("分割网找不到 [1,3,\(SwapNets.parseSize),\(SwapNets.parseSize)] 的输入（实际入 \(names(parse, true))）")
+            return (nil, err.joined(separator: "；"))
+        }
+        guard let po = find(parse, inputs: false, rank: 4, channels: SwapNets.parseClassCount,
+                            total: SwapNets.parseClassCount * SwapNets.parseSize * SwapNets.parseSize,
+                            prefers: ["out"]) else {
+            err.append("分割网找不到 [1,\(SwapNets.parseClassCount),\(SwapNets.parseSize),\(SwapNets.parseSize)] 的输出（实际出 \(names(parse, false))）")
+            return (nil, err.joined(separator: "；"))
+        }
 
         let uNames = names(unet, true), bNames = names(build, false)
         var missU: [String] = [], missB: [String] = []
@@ -237,10 +311,12 @@ final class SwapRunner {
         }
         let c = Contract(arcInput: ai, arcEmbOut: ae, arcFeatOut: af,
                          buildEmbIn: be, buildFeatIn: bf, attName: at,
-                         unetOutImage: gi, unetOutMask: mi,
+                         unetOutImage: gi, unetOutMask: mi, unetOutGen: gn,
+                         parseInput: pi, parseOutput: po,
                          weightNames: SwapNets.weightMap.map { $0.unet },
                          weightSources: SwapNets.weightMap.map { $0.build })
-        return (c, "全对上｜arc 入 \(ai) 出 \(ae)+\(af)｜build 入 \(be)+\(bf)｜unet 入 \(at)+18 出 \(gi)+\(mi)")
+        return (c, "全对上｜arc 入 \(ai) 出 \(ae)+\(af)｜build 入 \(be)+\(bf)"
+            + "｜unet 入 \(at)+18 出 \(gi)+\(mi)+gen(\(gn))｜分割 入 \(pi) 出 \(po)")
     }
 
     /// image 型输入的等价判定：CoreML 把 [1,C,H,W] 折成一张 w×h 的图，面积×通道对得上就算它
@@ -257,10 +333,11 @@ final class SwapRunner {
         return false
     }
 
-    init(arc: MLModel, build: MLModel, unet: MLModel, loadNote: String, contract: Contract) {
+    init(arc: MLModel, build: MLModel, unet: MLModel, parse: MLModel, loadNote: String, contract: Contract) {
         self.arc = arc
         self.build = build
         self.unet = unet
+        self.parse = parse
         self.loadNote = loadNote
         self.contract = contract
     }
@@ -545,34 +622,190 @@ final class SwapRunner {
         return (out.count, "18 个权重从存档装上，形状逐条对过")
     }
 
-    /// ③ 逐帧：224 的 0~1 planar RGB ＋ 那 18 个权重 → 换出的脸 + mask。
+    /// ③ 逐帧：224 的 0~1 planar RGB ＋ 那 18 个权重 → 换出的脸（没混过的 gen）＋ mask。
     /// PC 56 ms/帧；上一版上机实测这张网 CPU 12.00 ms/帧。
-    func frame(att224_01: [Float]) -> (out: [Float], mask: [Float], ms: Double, note: String) {
-        guard hasWeights else { return ([], [], 0, "还没算身份") }
+    /// 补丁改用 gen：out 是 gen·mask+(1−mask)·att_img，尾巴带着目标本人四成，
+    /// 身份一格就赔在那儿（本机 tools/_swap_parse.py：out 那一档 ↔源 0.738，gen 那一档 0.837）。
+    func frame(att224_01: [Float]) -> (gen: [Float], ms: Double, note: String) {
+        guard hasWeights else { return ([], 0, "还没算身份") }
         let (v, how) = feature(unet, name: contract.attName, planar01: att224_01, mean: nil, std: nil)
-        guard let av = v else { return ([], [], 0, "逐帧网喂不进：\(how)") }
+        guard let av = v else { return ([], 0, "逐帧网喂不进：\(how)") }
         var dict = weightFeed
         dict[contract.attName] = av
         guard let provider = try? MLDictionaryFeatureProvider(dictionary: dict) else {
-            return ([], [], 0, "逐帧输入字典装不起来（\(dict.count) 个键）")
+            return ([], 0, "逐帧输入字典装不起来（\(dict.count) 个键）")
         }
         let t0 = DispatchTime.now().uptimeNanoseconds
         guard let res = try? unet.prediction(from: provider) else {
             frameMs.append(Double(DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000)
-            return ([], [], 0, "逐帧 predict 抛错（\(how)）")
+            return ([], 0, "逐帧 predict 抛错（\(how)）")
         }
         let ms = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000
         frameMs.append(ms)
-        guard let gArr = res.featureValue(for: contract.unetOutImage)?.multiArrayValue,
-              let mArr = res.featureValue(for: contract.unetOutMask)?.multiArrayValue,
-              let g = SwapRunner.flatten(gArr), let m = SwapRunner.flatten(mArr) else {
-            return ([], [], ms, "逐帧输出取不出来（\(contract.unetOutImage)/\(contract.unetOutMask)）")
+        guard let gArr = res.featureValue(for: contract.unetOutGen)?.multiArrayValue,
+              let g = SwapRunner.flatten(gArr) else {
+            return ([], ms, "逐帧输出取不出来（\(contract.unetOutGen)）")
         }
-        return (g, m, ms, "")
+        return (g, ms, "")
+    }
+
+    /// ④ 分割网（遮罩用）：对齐 224 那张裁片 → 512 → 19 类语义 → 「脸」的概率图（224 空间）。
+    ///
+    /// 一张脸只跑一次，不逐帧跑：512×512 的 BiSeNet 在 A13 上是几百毫秒到一秒的量级，
+    /// 而遮罩在 224 空间里对同一张脸几乎不变（那 5 个点是对齐摆正的，语义布局跟着脸走）。
+    /// 真机那一次的钱由调用方按脸缓存（SwapMaskCache），这里只管算。
+    func parse(att224_01: [Float]) -> (prob224: [Float], ms: Double, note: String) {
+        let pc = SwapNets.parseSize, s = SwapGeo.size
+        let t0 = DispatchTime.now().uptimeNanoseconds
+        // 224 → 512 双线性放大（照 cv2.resize 的半像素口径）＋ ImageNet 归一化
+        guard let big = SwapGeo.upscalePlanar(att224_01, from: s, to: pc) else {
+            return ([], 0, "分割网：224 那张放大到 \(pc) 失败")
+        }
+        let (fv, how) = feature(self.parse, name: contract.parseInput, planar01: big,
+                                mean: SwapNets.arcMean, std: SwapNets.arcStd)
+        guard let av = fv else { return ([], 0, "分割网喂不进：\(how)") }
+        guard let provider = try? MLDictionaryFeatureProvider(dictionary: [contract.parseInput: av]) else {
+            return ([], 0, "分割网输入字典装不起来")
+        }
+        guard let res = try? self.parse.prediction(from: provider) else {
+            return ([], Double(DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000, "分割网 predict 抛错（\(how)）")
+        }
+        guard let arr = res.featureValue(for: contract.parseOutput)?.multiArrayValue else {
+            return ([], Double(DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000,
+                    "分割网输出取不出来（\(contract.parseOutput)）")
+        }
+        guard let prob512 = SwapRunner.faceProb(arr, classes: SwapNets.parseFaceClasses) else {
+            return ([], Double(DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000,
+                    "分割网输出认不出（形状 \(arr.shape.map { $0.intValue })｜类型 \(arr.dataType.rawValue)｜要 [1,19,512,512] 的 float32 且行优先连续）")
+        }
+        // 512 → 224 双线性（cv2.INTER_LINEAR 那一档）
+        let prob224 = SwapGeo.resizeBilinear(prob512, from: pc, to: s)
+        let ms = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000
+        parseMs.append(ms)
+        return (prob224, ms, "")
+    }
+
+    /// 19 类 logits → 「脸类概率图」（512×512）。
+    /// 整个 19×512×512 不摊成 Swift 数组（那是 500 万个数＝20 MB 的临时开销），
+    /// 只留最后那一张 512×512；softmax 按像素做（先减掉该像素的最大值再取 exp，数值上稳）。
+    private static func faceProb(_ arr: MLMultiArray, classes faceClasses: [Int]) -> [Float]? {
+        let dims = arr.shape.map { $0.intValue }
+        guard dims.count == 4, dims[0] == 1, dims[1] == SwapNets.parseClassCount,
+              dims[2] == dims[3] else { return nil }
+        // 下面直接按 Float 读裸指针：出参不是 float32 的话读出来是乱数（转换是 fp32，但这条得钉死）
+        guard arr.dataType == .float32 else { return nil }
+        let n = dims[2] * dims[3]
+        let cls = dims[1]
+        guard isContiguous(arr, dims: dims) else { return nil }
+        let base = arr.dataPointer.assumingMemoryBound(to: Float.self)
+        var isFace = [Bool](repeating: false, count: cls)
+        for c in faceClasses where c >= 0 && c < cls { isFace[c] = true }
+        var mx = [Float](repeating: 0, count: n)
+        var den = [Float](repeating: 0, count: n)
+        var num = [Float](repeating: 0, count: n)
+        mx.withUnsafeMutableBufferPointer { mp in
+            for c in 0..<cls {
+                let p = base + c * n
+                if c == 0 {
+                    for i in 0..<n { mp[i] = p[i] }
+                } else {
+                    for i in 0..<n { if p[i] > mp[i] { mp[i] = p[i] } }
+                }
+            }
+        }
+        den.withUnsafeMutableBufferPointer { dp in
+            num.withUnsafeMutableBufferPointer { np in
+                mx.withUnsafeBufferPointer { mp in
+                    for c in 0..<cls {
+                        let p = base + c * n
+                        let f = isFace[c]
+                        for i in 0..<n {
+                            let e = expf(p[i] - mp[i])
+                            dp[i] += e
+                            if f { np[i] += e }
+                        }
+                    }
+                }
+            }
+        }
+        var out = [Float](repeating: 0, count: n)
+        for i in 0..<n { out[i] = den[i] > 1e-20 ? num[i] / den[i] : 0 }
+        return out
     }
 
     func statsLine() -> String {
         "身份证 \(SwapUtil.stat(identityMs))｜权重生成 \(SwapUtil.stat(genMs))｜逐帧 \(SwapUtil.stat(frameMs))"
+            + "｜分割 \(SwapUtil.stat(parseMs))"
+    }
+}
+
+/// 分割网那一趟的缓存：遮罩按脸缓存，不逐帧重跑。
+///
+/// 为什么能缓存：那 5 个点是对齐摆正的，同一张脸在 224 空间里的语义布局几乎不变，
+/// 变了的那点（表情／光照）由 σ=2 那一层摊掉；真变了（转头、镜头切）由漂移那一格抓住。
+/// 钱在这儿：分割网一跑是几百毫秒到一秒（本机 PC 上 512×512 一次 0.22 s，A13 上更慢），
+/// 逐帧跑就把整片拖垮了。重跑的间隔按实测的 parse 耗时自己定：parseMs × 12 秒，
+/// 那一趟多出来的开销 ≤ 8 %，而遮罩最多旧那么久。
+final class SwapMaskCache {
+    private var alpha: [Float] = []            // 399×224 的成品 alpha
+    private var sig: [Float] = []              // 算出这一份遮罩那一帧的签名
+    private var curSig: [Float] = []           // 这一帧的签名（算一次，两处用）
+    private var lastAt: Double = -1e9          // 上一次 parse 时的素材秒数
+    private var lastParseMs: Double = 0
+    private(set) var parses = 0
+    private(set) var lastDrift: Double = 0
+
+    /// 签名漂过这一格就重跑（转头、镜头切）。表情／光照那一档动不了这么多。
+    static let driftGate = 0.05
+
+    var ready: Bool { !alpha.isEmpty }
+
+    /// 要不要为这一帧重跑分割网
+    func wantsParse(att: [Float], at sec: Double) -> Bool {
+        curSig = SwapMaskCache.signature(att)
+        guard !alpha.isEmpty else { return true }
+        var sum = 0.0
+        for i in 0..<sig.count { sum += abs(Double(sig[i] - curSig[i])) }
+        let d = sig.isEmpty ? 1.0 : sum / Double(sig.count)
+        lastDrift = d
+        let gap = max(0.5, lastParseMs / 1000)
+        if d > SwapMaskCache.driftGate, sec - lastAt > gap { return true }
+        let interval = max(3.0, lastParseMs / 1000 * 12)
+        return sec - lastAt > interval
+    }
+
+    /// 算出来的那一份收下
+    func commit(_ newAlpha: [Float], at sec: Double, ms: Double) {
+        alpha = newAlpha
+        sig = curSig.isEmpty ? [] : curSig
+        curSig = []
+        lastAt = sec
+        lastParseMs = ms
+        parses += 1
+    }
+
+    /// 这一帧用的遮罩（没算过就是空的）
+    func current() -> [Float] { alpha }
+
+    /// 对齐 224 那张的签名：16×16 的亮度块均值（照得见姿态与构图，看不见身份）
+    static func signature(_ att: [Float]) -> [Float] {
+        let s = SwapGeo.size, k = s / 16, plane = s * s
+        var out = [Float](repeating: 0, count: 256)
+        att.withUnsafeBufferPointer { p in
+            for by in 0..<16 {
+                for bx in 0..<16 {
+                    var sum: Float = 0
+                    for y in (by * k)..<((by + 1) * k) {
+                        for x in (bx * k)..<((bx + 1) * k) {
+                            let i = y * s + x
+                            sum += 0.299 * p[i] + 0.587 * p[plane + i] + 0.114 * p[2 * plane + i]
+                        }
+                    }
+                    out[by * 16 + bx] = sum / Float(k * k)
+                }
+            }
+        }
+        return out
     }
 }
 

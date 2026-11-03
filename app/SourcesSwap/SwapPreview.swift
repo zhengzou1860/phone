@@ -67,8 +67,14 @@ final class SwapPreview {
     private var work: CVPixelBuffer?
     private var held: CVPixelBuffer?
     private var frameW = 0, frameH = 0
-    private var att = [Float](), gen = [Float](), rawMask = [Float]()
-    private var m2 = [Float](), alpha = [Float]()
+    private var att = [Float](), gen = [Float]()
+    private var alpha = [Float]()
+    /// 遮罩按脸缓存：分割网一跑是几百毫秒到一秒，逐帧跑不起（详见 SwapMaskCache）
+    /// 每一趟（换素材／拖进度条重开一趟）重新起一份：拖回去那一秒的人可能换了一张脸，
+    /// 缓存里留着的遮罩属于拖之前那个人
+    private var maskCache = SwapMaskCache()
+    private var parseMsLog: [Double] = []
+    private var parseN = 0
     private var decodeMs: [Double] = [], detectMs: [Double] = [], warpMs: [Double] = []
     private var frameMs: [Double] = [], beautyMs: [Double] = [], maskMs: [Double] = []
     private var pasteMs: [Double] = [], swapMs: [Double] = [], detailMs: [Double] = []
@@ -146,7 +152,7 @@ final class SwapPreview {
 
     private func finishRun(_ r: Outcome) {
         lock.lock(); busy = false; lock.unlock()
-        // 停下来的那一刻把三张网和两块整幅缓冲交回去：出片那条自己还要装一份 runner，
+        // 停下来的那一刻把四张网和两块整幅缓冲交回去：出片那条自己还要装一份 runner，
         // 预览留着不放就是把下一次「开始换脸」顶到它自己的足迹闸门上
         runner = nil
         runnerUnits = nil
@@ -170,7 +176,7 @@ final class SwapPreview {
     private func pass(video: URL, fromSec: Double) -> Outcome {
         let c = snapCfg()
         if runner == nil || runnerUnits != c.units {
-            say("预览装三张网 units=\(c.unitsTxt)｜足迹 \(SwapFacts.footprintMB()) MB")
+            say("预览装四张网 units=\(c.unitsTxt)｜足迹 \(SwapFacts.footprintMB()) MB")
             let got = SwapRunner.load(units: c.units) { self.say($0) }
             guard let r = got.runner else {
                 say("预览装网失败：\(got.note)")
@@ -202,9 +208,10 @@ final class SwapPreview {
         held = hd
         att = [Float](repeating: 0, count: 3 * side * side)
         gen = [Float](repeating: 0, count: 3 * side * side)
-        rawMask = [Float](repeating: 0, count: side * side)
-        m2 = [Float](repeating: 0, count: side * side)
         alpha = [Float](repeating: 0, count: SwapGeo.maskRows * side)
+        maskCache = SwapMaskCache()
+        parseMsLog = []
+        parseN = 0
         decodeMs = []; detectMs = []; warpMs = []; frameMs = []
         beautyMs = []; maskMs = []; pasteMs = []; swapMs = []; detailMs = []
         nSwap = 0; nDecode = 0; noFace = 0; smallFace = 0; mirror = 0; fitFail = 0; netFail = 0
@@ -296,7 +303,7 @@ final class SwapPreview {
                                         + "｜小窗 \(frameW)x\(frameH)｜5 点 \(ptTxt)→这格不换")
                                 }
                             } else if SwapTech.copyRows(from: pb, to: hd),
-                                      compose(runner, al: al, whiten: snapCfg().whiten) {
+                                      compose(runner, al: al, whiten: snapCfg().whiten, sec: sec) {
                                 nSwap += 1
                                 let hold = sec - lastPub
                                 if hold > 0.25 { gapN += 1; gapMax = max(gapMax, hold) }
@@ -330,7 +337,8 @@ final class SwapPreview {
 
     /// 一帧的活：小窗那一幅 → 裁 224 → 逐帧网 → 高频回填 → 美白 → 遮罩 → 贴回小窗。
     /// 补丁这一段与成片同一口径（0.25 起把高频回填加回来）；省的只有回贴那一片的像素数（进链钉在 640）。
-    private func compose(_ runner: SwapRunner, al: SwapVision.Alignment, whiten: Bool) -> Bool {
+    /// 遮罩这一段也与成片同一口径（0.33 起换成人脸分割网，按脸缓存不逐帧跑）。
+    private func compose(_ runner: SwapRunner, al: SwapVision.Alignment, whiten: Bool, sec: Double) -> Bool {
         guard let dst = work, let hd = held else { return false }
         let side = SwapGeo.size
         let t0 = ns()
@@ -347,15 +355,13 @@ final class SwapPreview {
         let t1 = ns()
         let r = runner.frame(att224_01: att)
         frameMs.append(msFrom(t1))
-        if r.out.count != 3 * side * side || r.mask.count != side * side {
+        if r.gen.count != 3 * side * side {
             if netFail < 2 { say("预览 网没回话：\(r.note)") }
             return false
         }
-        gen = r.out
-        rawMask = r.mask
+        gen = r.gen
 
         let t2a = ns()
-        // 高频回填：把原帧 224 里那份高通细节加回补丁（成片同一式、同一参数）
         SwapGeo.restoreDetail(&gen, att, lam: 1.0, sigma: 0.8)
         detailMs.append(msFrom(t2a))
 
@@ -364,8 +370,25 @@ final class SwapPreview {
         beautyMs.append(msFrom(t2))
 
         let t3 = ns()
-        SwapGeo.preprocessMask(rawMask, &m2)
-        SwapGeo.featherMask(m2, &alpha)
+        // 遮罩：分割网按脸缓存算的那一份（不逐帧跑）
+        if maskCache.wantsParse(att: att, at: sec) {
+            let pr = runner.parse(att224_01: att)
+            if pr.prob224.count == side * side {
+                SwapGeo.parseMask(pr.prob224, &alpha)
+                maskCache.commit(alpha, at: sec, ms: pr.ms)
+                parseMsLog.append(pr.ms)
+                parseN += 1
+                say("预览 \(String(format: "%.2f", sec)) s 分割网算遮罩 \(SwapUtil.ms(pr.ms))"
+                    + "｜第 \(parseN) 次｜漂移 \(String(format: "%.4f", maskCache.lastDrift))")
+            } else {
+                say("预览 分割网没回话：\(pr.note)")
+            }
+        }
+        if !maskCache.ready {
+            if netFail < 2 { say("预览 还没有遮罩（分割网没出得来）") }
+            return false
+        }
+        alpha = maskCache.current()
         maskMs.append(msFrom(t3))
 
         let t4 = ns()
@@ -448,8 +471,10 @@ final class SwapPreview {
             : (need <= 1000 ? "算着够、这一趟没跑到（素材短或停在开头）" : "不够 16 帧")
         say("预览单价 每换一帧 \(String(format: "%.2f", unit)) ms＝检测 \(SwapUtil.stat(detectMs))"
             + "＋裁脸 \(SwapUtil.stat(warpMs))＋逐帧网 \(SwapUtil.stat(frameMs))"
-            + "＋高频回填 \(SwapUtil.stat(detailMs))＋美白 \(SwapUtil.stat(beautyMs))＋羽化 \(SwapUtil.stat(maskMs))"
+            + "＋高频回填 \(SwapUtil.stat(detailMs))＋美白 \(SwapUtil.stat(beautyMs))＋遮罩 \(SwapUtil.stat(maskMs))"
             + "＋画布重铺＋脸框回贴 \(SwapUtil.stat(pasteMs))")
+        say("      遮罩来源 分割网算 \(parseN) 次（\(SwapUtil.stat(parseMsLog))）｜按脸缓存，漂移 \(String(format: "%.4f", maskCache.lastDrift)) 过 \(String(format: "%.2f", SwapMaskCache.driftGate)) 才重算"
+            + "｜摊到这一趟是每帧 \(String(format: "%.2f", parseN > 0 ? parseMsLog.reduce(0, +) / Double(max(1, nSwap)) : 0)) ms")
         say("      解码 \(SwapUtil.stat(decodeMs))×\(String(format: "%.1f", fps)) 帧/秒"
             + "｜整帧含节奏 \(SwapUtil.stat(swapMs))｜美白这一趟\(c.whiten ? "开" : "关")")
         say("      这一趟 换出 \(nSwap) 格／读掉 \(nDecode) 格｜没脸 \(noFace)｜太小 \(smallFace)｜拟合没过 \(fitFail)"

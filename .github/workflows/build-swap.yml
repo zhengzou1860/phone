@@ -23,7 +23,8 @@ concurrency:
 jobs:
   swap:
     runs-on: macos-latest
-    timeout-minutes: 45
+    # 0.33 起多了一张 512×512 的分割网（转换慢），还要把四张 mlpackage 打包成 350 MB 的归档传上发布位
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
@@ -100,6 +101,36 @@ jobs:
           echo "M-VERDICT 下载 $ok 成 / $bad 败｜$(ls -l "$DST"/*.onnx 2>/dev/null | awk '{print $9"="$5}' | tr '\n' ' ')" | rec | ann "M-VERDICT "
           exit 0
 
+      # 分割网（人脸语义 19 类）：这一版整把遮罩换掉就靠它。
+      # 原来那张遮罩＝逐帧网自己画过的那一片，目标本人的脸有大半没被换掉（现役盖脸 ~90 %）。
+      # 源在 bluefoxcreation/Face_parsing_onnx（BiSeNet，CelebAMask-HQ 那套）。
+      # 字节数钉死 53201152：换源就换字节，换字节就换遮罩形状，得重新量一遍。
+      # huggingface.co 这台机器上常常连不上，所以 hf-mirror 排前面。
+      - name: 拉分割网的 onnx
+        run: |
+          set +e
+          ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=6{print "::error::" p substr($0,1,230)}'; }
+          rec() { tee -a /tmp/model.log; }
+          DST=app/SwapModel
+          mkdir -p "$DST/out"
+          F=faceparser.onnx
+          WANT=53201152
+          ok=0
+          for U in https://hf-mirror.com https://huggingface.co; do
+            code=$(curl -sS -L --retry 3 --retry-all-errors --max-time 900 \
+                   -o "$DST/$F.part" -w '%{http_code}' \
+                   "$U/bluefoxcreation/Face_parsing_onnx/resolve/main/$F?download=true" 2>/tmp/curl.err)
+            sz=$(wc -c < "$DST/$F.part" 2>/dev/null | tr -d ' ')
+            if [ "$code" = "200" ] && [ "${sz:-0}" = "$WANT" ]; then
+              mv -f "$DST/$F.part" "$DST/$F"
+              echo "PM-OK $F code=$code bytes=$sz host=$U" | rec
+              ok=1; break
+            fi
+            echo "PM-TRY $F code=${code:-?} bytes=${sz:-0} host=$U（要 $WANT）err=$(head -c 160 /tmp/curl.err 2>/dev/null)" | rec
+          done
+          [ "$ok" = 1 ] || { echo "PM-FAIL 两个源都没拿下分割网 ⇒ 这一版没有分割网，出不了片" | rec | ann "PM "; }
+          exit 0
+
       # 官方这张图只导出 out 与 mask，而尾巴是 out = gen·mask + (1−mask)·att_img，mask 最大只到 0.79
       # ⇒ 我们拿到的补丁天生是"源脸 6 成 + 他本人 4 成"（他判的「换脸不明显／那层透明感」就是这一条，
       #   本机 tools/tail_const.py 逐像素验过这条式子，最大差 0.00 灰阶）。
@@ -166,6 +197,39 @@ jobs:
           fi
           exit 0
 
+      # 分割网原生有三个出参（out / 392 / 402，都是 [1,19,512,512] 的 logits）。
+      # 只留 out：那三个是同一张图三个头的 logits，留两个只是白占转换时间与体积。
+      # 用 onnx.utils.extract_model 剪（不是只改 graph.output：那样子会留下死节点，
+      # 转换器照样编进去）。本机验过：154 节点 → 128 节点，剪完的图输出与原图逐位相同（max diff 0）。
+      - name: 剪掉分割网多出来的两个出参
+        run: |
+          set +e
+          ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=6{print "::error::" p substr($0,1,230)}'; }
+          rec() { tee -a /tmp/model.log; }
+          IN=app/SwapModel/faceparser.onnx
+          OUT=app/SwapModel/faceparser_1out.onnx
+          if [ ! -s "$IN" ]; then echo "PR-VERDICT 分割网没下到，跳过" | rec | ann "PR "; exit 0; fi
+          cat > /tmp/prune_parse.py <<'PY'
+          import sys
+          from onnx import utils
+          src, dst = sys.argv[1], sys.argv[2]
+          utils.extract_model(src, dst, ['input'], ['out'])
+          import onnx
+          m = onnx.load(dst)
+          onnx.checker.check_model(m)
+          print('PR 出参 %s｜节点 %d｜字节 %d'
+                % ([o.name for o in m.graph.output], len(m.graph.node),
+                   len(open(dst, 'rb').read())))
+          PY
+          /tmp/m2c/bin/python /tmp/prune_parse.py "$IN" "$OUT" 2>&1 | rec | ann "PR "
+          SZ=$(wc -c < "$OUT" 2>/dev/null | tr -d ' ')
+          if [ "${SZ:-0}" -gt 1000000 ]; then
+            echo "PR-VERDICT 成 剪完的分割网 $SZ 字节" | rec | ann "PR "
+          else
+            echo "PR-VERDICT 败 剪完的分割网=${SZ:-空} 字节 ⇒ 下面分割网必跳，这一版没有分割网、装了也不能出片" | rec | ann "PR "
+          fi
+          exit 0
+
       # 一张一条 step：annotation 每步只有约 10 条额度，三张挤在一起会把判定行挤掉
       # onnx2coreml 的 --precision 默认是 fp16 ⇒ 第 2 轮三张全按 fp16 编的：
       # arcface 的 512 维嵌入 max_abs=0.034（等于把人脸挪了个位置），逐帧网直接 verify 出 nan。
@@ -225,6 +289,109 @@ jobs:
             echo "CONV-SUM SwapModel 目录=$(du -sk app/SwapModel 2>/dev/null | awk '{print $1"KB"}')"; } | rec | ann "CONV-SUM "
           exit 0
 
+      # 分割网（人脸语义 19 类）：这一版新加的那张，出遮罩用的。
+      # 512×512 是死的（onnx 里写死的），所以 CoreML 那边也是固定 512 入参，手机上喂的是
+      # 对齐 224 那张放大到 512 的裁片。一次 parse 是几百毫秒，所以按脸缓存、不逐帧跑。
+      - name: 转 分割网（出遮罩的那张）
+        run: |
+          set +e
+          ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=6{print "::error::" p substr($0,1,230)}'; }
+          rec() { tee -a /tmp/model.log; }
+          IN=app/SwapModel/faceparser_1out.onnx
+          OUT=app/SwapModel/out/faceparse.mlpackage
+          rm -rf "$OUT"
+          if [ ! -s "$IN" ]; then echo "CV-VERDICT 分割网没下到／没剪成，跳过" | rec | ann "CV "; exit 0; fi
+          /tmp/m2c/bin/onnx2coreml convert "$IN" -o "$OUT" --format mlpackage --precision fp32 --verify >/tmp/cv_parse.log 2>&1
+          rc=$?
+          echo "CV-VERDICT 分割网(fp32) rc=$rc 大小=$(du -sk "$OUT" 2>/dev/null | awk '{print $1"KB"}') 文件=$(find "$OUT" -type f 2>/dev/null | wc -l | tr -d ' ') 权重=$(wc -c < "$OUT/Data/com.apple.CoreML/weights/weight.bin" 2>/dev/null | tr -d ' ')B" | rec | ann "CV "
+          grep -iE "mismatch|max_abs|psnr|error|not support|unsupported" /tmp/cv_parse.log | head -6 | rec | ann "CV-V "
+          { echo "CONV-SUM 四张 分割网=$([ -d "$OUT" ] && echo 成 || echo 败)";
+            echo "CONV-SUM 四张的体积=$(du -sk app/SwapModel/out 2>/dev/null | awk '{print $1"KB"}')"; } | rec | ann "CONV-SUM "
+          exit 0
+
+      # 四张 mlpackage 打成一个归档（models.bin）＋一份清单（models.json），当发布资产挂在 release 上。
+      # 手机第一次用时下这一份到 Documents/swap_models，sha256 对不上就不解包。
+      # 不用 zip：iOS 没有现成的解 zip，逐段 inflate 得自己写一套；存成不压缩的归档省掉那一整套，
+      # 少一个能出错的环节比省几十 MB 划算。
+      # 归档格式：头 "SWPM"＋uint32 小端头长＋JSON 头＋各文件字节依次排下去。
+      # 版本号＝四张 onnx 的 sha256 串起来（转换配方也串进去）⇒ 程序改了模型没变就是同一个版本，
+      # 手机上那一份不用重下。
+      - name: 打包 models.bin + models.json
+        run: |
+          set +e
+          ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=6{print "::error::" p substr($0,1,230)}'; }
+          rec() { tee -a /tmp/model.log; }
+          cat > /tmp/pack_models.py <<'PY'
+          import os, sys, json, hashlib, struct
+          BASE = 'app/SwapModel/out'
+          RES = ['arcface', 'build_swap', 'mfs_unet', 'faceparse']
+          ONNX = {
+              'arcface':    'app/SwapModel/arcface.onnx',
+              'build_swap': 'app/SwapModel/BuildFaceSwap.onnx',
+              'mfs_unet':   'app/SwapModel/unet_with_gen.onnx',
+              'faceparse':  'app/SwapModel/faceparser_1out.onnx',
+          }
+          files = []
+          blob = bytearray()
+          for r in RES:
+              d = os.path.join(BASE, r + '.mlpackage')
+              if not os.path.isdir(d):
+                  print('PACK-FAIL 缺 %s' % d); sys.exit(1)
+              paths = []
+              for root, dirs, fns in os.walk(d):
+                  dirs.sort()
+                  for fn in sorted(fns):
+                      paths.append(os.path.join(root, fn))
+              for p in sorted(paths):
+                  rel = os.path.relpath(p, BASE).replace(os.sep, '/')
+                  b = open(p, 'rb').read()
+                  files.append({'path': rel, 'size': len(b)})
+                  blob += b
+          vh = hashlib.sha256()
+          vh.update(b'swap-models|fp32|mlpackage|v1')
+          for r in RES:
+              p = ONNX[r]
+              if not os.path.isfile(p):
+                  print('PACK-FAIL 缺 onnx %s' % p); sys.exit(1)
+              vh.update(open(p, 'rb').read())
+          version = vh.hexdigest()
+          head = {'version': version,
+                  'sha256': hashlib.sha256(bytes(blob)).hexdigest(),
+                  'bytes': len(blob),
+                  'files': files}
+          hb = json.dumps(head, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+          arch = b'SWPM' + struct.pack('<I', len(hb)) + hb + bytes(blob)
+          open('app/SwapModel/models.bin', 'wb').write(arch)
+          man = {'version': version,
+                 'sha256': hashlib.sha256(arch).hexdigest(),
+                 'bytes': len(arch),
+                 'files': files}
+          with open('app/SwapModel/models.json', 'w', encoding='utf-8') as f:
+              f.write(json.dumps(man, ensure_ascii=False, separators=(',', ':')))
+          print('PACK 文件 %d 个｜载荷 %d 字节｜归档 %d 字节｜头 %d 字节｜版本 %s'
+                % (len(files), len(blob), len(arch), len(hb), version))
+          for f_ in files:
+              if f_['path'].endswith('Manifest.json'):
+                  print('PACK 有 %s %d 字节' % (f_['path'], f_['size']))
+          PY
+          /tmp/m2c/bin/python /tmp/pack_models.py 2>&1 | rec | ann "PACK "
+          BS=$(wc -c < app/SwapModel/models.bin 2>/dev/null | tr -d ' ')
+          # 判据不是字节数，是清单里那四个 Manifest.json 都在（app 那边 haveAll() 看的就是这个）
+          cat > /tmp/check_manifest.py <<'PY'
+          import json
+          m = json.load(open('app/SwapModel/models.json'))
+          need = {'%s.mlpackage/Manifest.json' % r for r in ['arcface', 'build_swap', 'mfs_unet', 'faceparse']}
+          have = {f['path'] for f in m['files']}
+          print('齐' if need <= have else '缺' + ','.join(sorted(need - have)))
+          PY
+          NN=$(/tmp/m2c/bin/python /tmp/check_manifest.py 2>/dev/null)
+          if [ "${BS:-0}" -gt 1000000 ] && [ "$NN" = "齐" ]; then
+            echo "PACK-VERDICT 成 models.bin $BS 字节｜清单 $(wc -c < app/SwapModel/models.json | tr -d ' ') 字节｜四张的 Manifest $NN" | rec | ann "PACK "
+          else
+            echo "PACK-VERDICT 败 models.bin=${BS:-空} 字节｜四张的 Manifest=$NN ⇒ 发布位上没有模型，手机下不到" | rec | ann "PACK "
+          fi
+          exit 0
+
       - name: install xcodegen
         run: |
           set -euo pipefail
@@ -250,9 +417,9 @@ jobs:
             CODE_SIGN_IDENTITY= EXPANDED_CODE_SIGN_IDENTITY= \
             build 2>&1 | tee /tmp/build.log
 
-      # 模型不当成工程文件交给 coremlc：直接拷进 .app，让"这张网 A13 认不认"由设备本人口述
-      # （app 里 SwapNets.locate() 找到 mlpackage 自己调 compileModel 并把耗时报出来）。
-      # 这一版三张全装：出片要身份证 + 身份包 + 逐帧三张齐，缺一张就只能自检不能出片。
+      # 0.33 起四张网不再进 ipa：它们打成 models.bin 挂在 release 上，手机第一次用时自己下到
+      # Documents/swap_models。这样改了程序不用重下模型（版本号＝四张 onnx 的 sha256）。
+      # 包里留着模型的话每装一次程序就得搬一遍几百 MB 权重，那正是这一版要消掉的事。
       - name: package ipa
         working-directory: app
         run: |
@@ -262,24 +429,17 @@ jobs:
           test -n "$APP"
           echo "built app: $APP" >> /tmp/build.log
           file "$APP/SwapBench" | tee -a /tmp/build.log
-          have=0; miss=""
-          for N in mfs_unet arcface build_swap; do
-            PKG="SwapModel/out/$N.mlpackage"
-            MAN="$PKG/Manifest.json"
-            if [ -d "$PKG" ]; then
-              echo "P-FILES $N $(find "$PKG" -type f | wc -l | tr -d ' ') 个文件｜Manifest=$([ -s "$MAN" ] && echo "在 $(wc -c < "$MAN" | tr -d ' ')B" || echo 缺/空)｜体积=$(du -sk "$PKG" | awk '{print $1"KB"}')" | rec
-            fi
-            if [ -s "$MAN" ]; then
-              rm -rf "$APP/$N.mlpackage"
-              cp -R "$PKG" "$APP"/
-              echo "P-VERDICT $N 已原样拷进包（等手机上 compileModel）" | rec
-              have=$((have+1))
-            else
-              miss="$miss $N"
-              echo "P-VERDICT $N 没转出来或 Manifest 空 → 不装包（空 mlpackage 进 .app 会让装机炸「A valid manifest does not exist」）" | rec
-            fi
+          # 包里一个模型都不该有：留着的不是"双保险"，是"改了程序还得重下几百 MB"
+          left=""
+          for N in mfs_unet arcface build_swap faceparse; do
+            if [ -d "$APP/$N.mlpackage" ] || [ -d "$APP/$N.mlmodelc" ]; then left="$left $N"; fi
           done
-          echo "P-VERDICT 装进去 $have/3 张$([ -n "$miss" ] && echo "｜缺$miss ⇒ 这一版只能自检不能出片")" | rec
+          if [ -n "$left" ]; then
+            echo "P-VERDICT 包里还有模型$left ⇒ 这一版模型没真正分离出去" | rec
+          else
+            echo "P-VERDICT 包里没有模型（四张在发布位上：models.bin）｜这一版手机上第一次用会自己下" | rec
+          fi
+          echo "P-VERDICT 四张模型在发布位上 $([ -s SwapModel/models.bin ] && echo 有 || echo 缺)｜归档 $(wc -c < SwapModel/models.bin 2>/dev/null | tr -d ' ') 字节" | rec
           rm -rf Payload swap.ipa
           mkdir Payload
           cp -R "$APP" Payload/
@@ -294,12 +454,14 @@ jobs:
           ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=5{print "::error::" p substr($0,1,230)}'; }
           APP=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' 2>/dev/null | head -1)
           { echo "app=$APP"
-            for N in mfs_unet arcface build_swap; do
+            for N in mfs_unet arcface build_swap faceparse; do
               echo "包内 $N=$([ -d "$APP/$N.mlpackage" ] && echo 在 || echo 不在) 大小=$(du -sk "$APP/$N.mlpackage" 2>/dev/null | awk '{print $1"KB"}')"
             done
             echo "mlmodelc=$(find "$APP" -maxdepth 1 -name '*.mlmodelc' 2>/dev/null | tr '\n' ' ')"
             echo "整个 app=$(du -sk "$APP" 2>/dev/null | awk '{print $1"KB"}')"
-            echo "swap.ipa=$(wc -c < swap.ipa 2>/dev/null | tr -d ' ') 字节"; } | tee -a /tmp/model.log | ann "B-VERDICT "
+            echo "swap.ipa=$(wc -c < swap.ipa 2>/dev/null | tr -d ' ') 字节"
+            echo "models.bin=$(wc -c < SwapModel/models.bin 2>/dev/null | tr -d ' ') 字节"
+            echo "models.json=$(wc -c < SwapModel/models.json 2>/dev/null | tr -d ' ') 字节"; } | tee -a /tmp/model.log | ann "B-VERDICT "
           exit 0
 
       - name: publish release
@@ -311,13 +473,30 @@ jobs:
           ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=6{print "::error::" p substr($0,1,230)}'; }
           cat /tmp/model.log /tmp/build.log > ./build.log 2>/dev/null || cp /tmp/build.log ./build.log
           # 转换器的完整日志从 /tmp 搬进来再挂：少一个文件就整条 gh 命令报错、结果一个都发不出去
-          for f in cv_unet cv_arc cv_build pip; do
+          for f in cv_unet cv_arc cv_build cv_parse pip; do
             [ -s "/tmp/$f.log" ] && cp "/tmp/$f.log" "./$f.log"
           done
           files="swap.ipa build.log"
-          for f in cv_unet.log cv_arc.log cv_build.log; do
+          for f in cv_unet.log cv_arc.log cv_build.log cv_parse.log; do
             [ -s "$f" ] && files="$files $f"
           done
+          # 模型资产只在模型真换了才重传：350 MB 每次重传既慢，又有一个「删了还没传上」的窗口
+          # （那一下窗口里手机下不到模型，整条线就废了）。版本号＝四张 onnx 的 sha256，
+          # 程序改了模型没变 ⇒ 同一个版本 ⇒ 发布位上那一份原封不动。
+          need_models=1
+          lver=$(/tmp/m2c/bin/python -c "import json;print(json.load(open('SwapModel/models.json'))['version'])" 2>/dev/null)
+          rm -rf /tmp/relmodels && mkdir -p /tmp/relmodels
+          gh release download channel-swap --pattern models.json --dir /tmp/relmodels >/dev/null 2>&1
+          rver=$(/tmp/m2c/bin/python -c "import json;print(json.load(open('/tmp/relmodels/models.json'))['version'])" 2>/dev/null)
+          if [ -n "$lver" ] && [ "$lver" = "$rver" ]; then need_models=0; fi
+          echo "REL-VERDICT 本地模型版本=${lver:-无}｜发布位上=${rver:-没有}｜要重传模型=$need_models" | ann "REL "
+          if [ "$need_models" = 1 ]; then
+            if [ -s SwapModel/models.bin ] && [ -s SwapModel/models.json ]; then
+              files="$files SwapModel/models.bin SwapModel/models.json"
+            else
+              echo "::error::REL-FAIL 模型归档没打出来（models.bin/models.json 缺）⇒ 这一版手机上没有模型可用"
+            fi
+          fi
           echo "待发文件 [$files]" | ann "REL "
           # 不删了重发：删这一下下载位就出现空窗（99ffb71 那轮 CI 成功、包也造出来了，事后匿名读回 404）。
           gh release view channel-swap >/dev/null 2>&1 || gh release create channel-swap \
@@ -337,19 +516,29 @@ jobs:
           echo "R-PATCH id=$RID 回包=$(head -c 120 /tmp/rel_patch.json | tr -d '\n')" | ann "REL "
           echo "url=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/channel-swap/swap.ipa" | ann "REL "
           # 闸门三条同时满足才算数：isDraft=false（草稿手机拉不到）＋列到 swap.ipa 及其字节数＋匿名 HEAD 回 200
+          # 0.33 起再加一条：models.json 与 models.bin 也得在发布位上且匿名可读，
+          # 否则这一版 ipa 装得上、模型下不来，手机上一步都走不了。
           hit=0
           for i in 1 2 3; do
             draft=$(gh release view channel-swap --json isDraft --jq .isDraft 2>&1)
             names=$(gh release view channel-swap --json assets --jq '.assets[] | .name + "=" + (.size|tostring)' 2>&1 | tr '\n' ' ')
             anon=$(curl -sIL -o /dev/null -w '%{http_code}' --max-time 90 \
               "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/channel-swap/swap.ipa" 2>/dev/null)
-            echo "第 $i 次：isDraft=$draft｜匿名 HEAD=$anon｜ [$names]" | ann "REL-GATE "
-            if [ "$draft" = "false" ] && [ "$anon" = 200 ]; then
-              case "$names" in *swap.ipa*) hit=1; break ;; esac
+            anonm=$(curl -sIL -o /dev/null -w '%{http_code}' --max-time 90 \
+              "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/channel-swap/models.json" 2>/dev/null)
+            anonb=$(curl -sIL -o /dev/null -w '%{http_code}' --max-time 90 \
+              "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/channel-swap/models.bin" 2>/dev/null)
+            echo "第 $i 次：isDraft=$draft｜匿名 HEAD ipa=$anon models.json=$anonm models.bin=$anonb｜ [$names]" | ann "REL-GATE "
+            if [ "$draft" = "false" ] && [ "$anon" = 200 ] && [ "$anonm" = 200 ] && [ "$anonb" = 200 ]; then
+              # 三个名字分别点一遍：资产列出来的顺序不由我定（按整体串匹配会随排序翻车）
+              case "$names" in *swap.ipa*)   ha=1 ;; *) ha=0 ;; esac
+              case "$names" in *models.bin*) hb=1 ;; *) hb=0 ;; esac
+              case "$names" in *models.json*) hc=1 ;; *) hc=0 ;; esac
+              if [ "$ha" = 1 ] && [ "$hb" = 1 ] && [ "$hc" = 1 ]; then hit=1; break; fi
             fi
             sleep 10
           done
-          [ "$hit" = 1 ] || echo "::error::REL-GATE 三次都没同时满足「isDraft=false」+「列到 swap.ipa」+「匿名 HEAD 回 200」⇒ 这一版手机上拿不到"
+          [ "$hit" = 1 ] || echo "::error::REL-GATE 三次都没同时满足「isDraft=false」+「列到 swap.ipa／models.bin／models.json」+「三个匿名 HEAD 都回 200」⇒ 这一版手机上拿不到"
           if [ "$hit" = 1 ]; then exit 0; else exit 1; fi
 
       - name: report compile errors
@@ -372,7 +561,7 @@ jobs:
           ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=6{print "::error::" p substr($0,1,230)}'; }
           cat /tmp/model.log /tmp/build.log > ./build.log 2>/dev/null || cp /tmp/build.log ./build.log 2>/dev/null || echo "no build log at all" > ./build.log
           files="build.log"
-          for f in cv_unet cv_arc cv_build pip; do
+          for f in cv_unet cv_arc cv_build cv_parse pip; do
             [ -s "/tmp/$f.log" ] && { cp "/tmp/$f.log" "./$f.log"; files="$files $f.log"; }
           done
           echo "待发文件 [$files]" | ann "GH-FAIL "
