@@ -117,7 +117,7 @@ enum SnoreAnalyze {
         var total = 0.0
         var slotDate = start
         for b in buckets {
-            let s = Int((b.t0 + intoHour) / 3600.0)
+            let s = Int((Double(b.t0) + intoHour) / 3600.0)
             if s != slot {
                 if slot >= 0 { out.append((slotDate, total > 0 ? snore / total : 0, total)) }
                 slot = s

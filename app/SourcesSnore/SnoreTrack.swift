@@ -213,7 +213,6 @@ final class SnoreTracker {
                 gapStart = lastSnoreTime
                 gapOther = voicedSinceSnore > 0
                 gapResumeMax = -120.0
-                gapCount += 1
             }
         }
         // 复鼾后满 2 s 才能量出「喘回来那一下有多响」，到点结掉这一条

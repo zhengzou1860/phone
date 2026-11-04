@@ -113,7 +113,7 @@ final class SnoreNightStore {
         var first = true
         for raw in text.split(separator: "\n") {
             if first { first = false; continue }        // 表头
-            let c = raw.split(separator: ",")
+            let c = raw.split(separator: ",").map(String.init)
             guard c.count >= 8, let t0 = Int(c[0]) else { continue }
             buckets.append(SnoreSecond(t0: t0,
                                        maxDb: Double(c[1]) ?? -120,

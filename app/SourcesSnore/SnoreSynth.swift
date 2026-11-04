@@ -216,10 +216,10 @@ enum SnoreCases {
             let srLocal = sr
             let total = 40.0
             var s = SnoreSynth.bed(count: Int(srLocal * total), level: 0.0006, seed: 31)
-            var a = SnoreSynth.snore(count: Int(srLocal * 12), sampleRate: srLocal, periodSec: 3.0,
+            let a = SnoreSynth.snore(count: Int(srLocal * 12), sampleRate: srLocal, periodSec: 3.0,
                                      f0: 140, level: 0.09)
             SnoreSynth.add(&s, pad(a, into: Int(s.count), at: 2.0))
-            var b = SnoreSynth.snore(count: Int(srLocal * 12), sampleRate: srLocal, periodSec: 3.0,
+            let b = SnoreSynth.snore(count: Int(srLocal * 12), sampleRate: srLocal, periodSec: 3.0,
                                      f0: 160, level: 0.15)
             SnoreSynth.add(&s, pad(b, into: Int(s.count), at: 30.0))
             let r = SnoreTracker(frameSec: 4096.0 / srLocal, config: config)
