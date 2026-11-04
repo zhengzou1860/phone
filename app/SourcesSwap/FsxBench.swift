@@ -69,7 +69,7 @@ enum FsxBench {
         let rest = Array(ms.dropFirst())
         guard !rest.isEmpty else { return nil }
         let avg = rest.reduce(0, +) / Double(rest.count)
-        onLine("量速 \(name)｜首次 \(SwapUtil.ms(ms[0])｜后面 \(rest.count) 格 avg \(SwapUtil.ms(avg))"
+        onLine("量速 \(name)｜首次 \(SwapUtil.ms(ms[0]))｜后面 \(rest.count) 格 avg \(SwapUtil.ms(avg))"
             + "／最快 \(SwapUtil.ms(rest.min() ?? 0))／最慢 \(SwapUtil.ms(rest.max() ?? 0))")
         return avg
     }
