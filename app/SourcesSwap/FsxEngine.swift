@@ -82,18 +82,53 @@ final class FsxEngine {
 
     /// 只用盘上那一份（Documents/swap_models，模型单独下载到手机上的那份 mlpackage，现场编译）。
     /// 这一版没有「包里还塞着老四张」那条退路：退路只会把人引回已经被否掉的那条链路。
+    ///
+    /// 编好的那一份挪进 Caches 复用：compileModel 每一趟都要把 527 MB 那一张整包重编，编完扔在临时目录里，
+    /// 跑第二次还是同样的分钟数——这一段钱跟画面质量一点关系都没有，纯是白烧。
+    /// 缓存按模型版本分目录（version.txt 那一串），重下模型版本一变，旧目录自然不再命中。
     static func locate(_ resource: String) -> (url: URL?, note: String) {
         guard let p = SwapStore.local(resource) else {
             return (nil, "\(resource) 盘上没有（Documents/swap_models 里没这一份），得先下模型")
+        }
+        if let hit = compiledDir(resource) {
+            return (hit, "\(resource) 用编好的那一份（版本 \(SwapStore.localVersion())），不重编")
         }
         let t0 = DispatchTime.now().uptimeNanoseconds
         do {
             let c = try MLModel.compileModel(at: p)
             let ms = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000
-            return (c, "\(resource) 现场编译 \(SwapUtil.ms(ms))")
+            let kept = stash(c, resource)
+            return (kept ?? c, "\(resource) 现场编译 \(SwapUtil.ms(ms))"
+                + (kept == nil ? "｜缓存没挪动，这趟先用临时那一份" : "｜已存进缓存"))
         } catch {
             return (nil, "\(resource) 现场编译失败: \(error)")
         }
+    }
+
+    /// 缓存目录的本名（还没建出来也返回路径，挪进去那一步要建）
+    private static func cacheDir(_ resource: String) -> URL? {
+        let v = SwapStore.localVersion()
+        guard !v.isEmpty,
+              let c = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
+        else { return nil }
+        return c.appendingPathComponent("compiled/\(v)/\(resource).mlmodelc", isDirectory: true)
+    }
+
+    /// 命中＝目录在且不是空的（空的可能是上一趟挪到一半被系统清了）
+    private static func compiledDir(_ resource: String) -> URL? {
+        guard let d = cacheDir(resource),
+              let e = try? FileManager.default.contentsOfDirectory(atPath: d.path), !e.isEmpty
+        else { return nil }
+        return d
+    }
+
+    private static func stash(_ url: URL, _ resource: String) -> URL? {
+        let fm = FileManager.default
+        guard let d = cacheDir(resource) else { return nil }
+        try? fm.removeItem(at: d)
+        try? fm.createDirectory(at: d.deletingLastPathComponent(), withIntermediateDirectories: true)
+        guard (try? fm.moveItem(at: url, to: d)) != nil, fm.fileExists(atPath: d.path) else { return nil }
+        return d
     }
 
     static func load(units: MLComputeUnits, onLine: @escaping (String) -> Void) -> (engine: FsxEngine?, note: String) {
@@ -106,23 +141,32 @@ final class FsxEngine {
         }
         var made: [String: MLModel] = [:]
         for res in [FsxNets.arcResource, FsxNets.swapResource] {
-            let found = locate(res)
-            note += "\(res): \(found.note)\n"
-            onLine("\(res): \(found.note)")
-            guard let url = found.url else { continue }
             let cfg = MLModelConfiguration()
             cfg.computeUnits = units
-            let t0 = DispatchTime.now().uptimeNanoseconds
-            do {
-                let m = try MLModel(contentsOf: url, configuration: cfg)
-                let ms = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000
-                let line = "  \(res) 装包 \(SwapUtil.ms(ms))｜足迹 \(SwapFacts.footprintMB()) MB｜\(FsxNets.describe(m))"
-                note += line + "\n"
-                onLine(line)
-                made[res] = m
-            } catch {
-                note += "  \(res) 装包失败: \(error)\n"
-                onLine("  \(res) 装包失败: \(error)")
+            var found = locate(res)
+            for attempt in 0..<2 {
+                note += "\(res): \(found.note)\n"
+                onLine("\(res): \(found.note)")
+                guard let url = found.url else { break }
+                let t0 = DispatchTime.now().uptimeNanoseconds
+                do {
+                    let m = try MLModel(contentsOf: url, configuration: cfg)
+                    let ms = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000
+                    let line = "  \(res) 装包 \(SwapUtil.ms(ms))｜足迹 \(SwapFacts.footprintMB()) MB｜\(FsxNets.describe(m))"
+                    note += line + "\n"
+                    onLine(line)
+                    made[res] = m
+                    break
+                } catch {
+                    note += "  \(res) 装包失败: \(error)\n"
+                    onLine("  \(res) 装包失败: \(error)")
+                    // 缓存那一份装不上＝系统升级把编好的格式换了这类事；扔掉重编一趟，
+                    // 不能让人从此每一趟都卡在这儿（手机上没有手动清缓存的入口）
+                    guard attempt == 0, let d = cacheDir(res), d.path == url.path else { break }
+                    try? FileManager.default.removeItem(at: d)
+                    onLine("  \(res) 缓存那一份装不上，删掉重编")
+                    found = locate(res)
+                }
             }
         }
         guard let a = made[FsxNets.arcResource], let s = made[FsxNets.swapResource] else {

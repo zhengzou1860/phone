@@ -100,7 +100,8 @@ enum FsxGeo {
         let dx = Float(fx - Double(x0)), dy = Float(fy - Double(y0))
         let xa = min(max(x0, 0), w - 1), xb = min(max(x0 + 1, 0), w - 1)
         let ya = min(max(y0, 0), h - 1), yb = min(max(y0 + 1, 0), h - 1)
-        func v(_ xx: Int, _ yy: Int) -> Float { Float(p[yy * rowPix * 4 + xx * 4 + ch]) }
+        // 倒着读：顺着内存序读成 BGR，网生成的整张脸偏蓝（同一份裁片还兼算身份）
+        func v(_ xx: Int, _ yy: Int) -> Float { Float(p[yy * rowPix * 4 + xx * 4 + (2 - ch)]) }
         let top = v(xa, ya) + (v(xb, ya) - v(xa, ya)) * dx
         let bot = v(xa, yb) + (v(xb, yb) - v(xa, yb)) * dx
         return (top + (bot - top) * dy) / 255.0
@@ -457,10 +458,21 @@ enum FsxGeo {
         let fadeOK = rampTap(Double(s)) == 1 && rampTap(134) == 1 && rampTap(137) == 0.4
             && rampTap(Double(s + extDown - 1)) == 0 && rampTap(Double(s + extDown)) == 0
         gate = gate && fadeOK
+        // ⑥ 裁片的通道序：内存是 BGRA、两张网都要 planar RGB，顺着内存序喂进去就是把 B 摆进 R 的位置——
+        //    网照样跑、不报错，只是生成的整张脸偏蓝（0.37 上机就是这个样）。拿一块三通道各不相同的小图验一次。
+        var pix = [UInt8](repeating: 0, count: 4 * 4 * 4)
+        for i in 0..<16 { pix[i * 4] = 10; pix[i * 4 + 1] = 110; pix[i * 4 + 2] = 210; pix[i * 4 + 3] = 255 }
+        var ch4 = [Float](repeating: 0, count: 3 * 16)
+        let idn = M23(a: 1, b: 0, c: 0, d: 0, e: 1, f: 0)
+        let chOK = pix.withUnsafeBytes { raw -> Bool in
+            warpCrop(raw.baseAddress!, bytesPerRow: 16, w: 4, h: 4, fwd: idn, size: 4, out: &ch4)
+        } && abs(ch4[0] - Float(210) / 255) < 1e-6 && abs(ch4[16] - Float(110) / 255) < 1e-6
+            && abs(ch4[32] - Float(10) / 255) < 1e-6
         return "模板 224 与官方那份最大差 \(String(format: "%.6f", worst))｜往返残差 \(String(format: "%.9f", round))"
             + "｜腐蚀糊两档 \(gate ? "对" : "错")"
             + "｜往下多贴 \(extDown) 格：带内满\(inExt ? "对" : "错") 带外零\(outExt ? "对" : "错")"
             + " 最后一行复制\(rep == 1 ? "对" : "错") 带外取样\(beyond == 0 ? "零，对" : "非零，错")"
             + "｜收口 \(fadeDown) 格\(fadeOK ? "对" : "错")（下巴那一格满、最底一格归 0）"
+            + "｜裁片通道 RGB\(chOK ? "对" : "错")（BGRA 内存序倒着读；读反了整张脸偏蓝）"
     }
 }

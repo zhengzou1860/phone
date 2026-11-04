@@ -393,6 +393,13 @@ struct SwapContentView: View {
                 if line.hasPrefix("模型") {
                     DispatchQueue.main.async { pv.modelText = line }
                 }
+                // 同一句道理用在整片跑动中：0.37 上机就被当成过死机——一趟几分钟，界面上从头到尾只有
+                // 「换脸跑着…」这一句。流水里本来就有按帧号报进度的那几行，原样递一行上来，版式不动。
+                let head = line.trimmingCharacters(in: .whitespaces)
+                if head.hasPrefix("换到第") || head.hasPrefix("预检到第") || head.hasPrefix("先跑预检")
+                    || head.contains("现场编译") || head.contains(" 装包 ") {
+                    DispatchQueue.main.async { result = head }
+                }
             }
             // 视频那份拷贝是输入，跑完就该还掉：手机存储不许留残料（源脸那份选定时就还了）
             if !FileManager.default.fileExists(atPath: v.path) {

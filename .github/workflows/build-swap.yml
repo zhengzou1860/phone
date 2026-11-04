@@ -15,6 +15,7 @@ on:
       - 'ci/fsx_pack.py'
       - 'ci/fsx_probe.py'
       - 'ci/identcodec/**'
+      - 'ci/fsxgeo_check/**'
   workflow_dispatch:
 
 permissions:
@@ -51,6 +52,19 @@ jobs:
           if [ ! -x /tmp/identtest ]; then echo "CODEC-VERDICT FAIL 测试没编出来" | rec; exit 1; fi
           /tmp/identtest 2>&1 | rec
           grep -q "^CODEC-VERDICT PASS" /tmp/model.log || { echo "上面几行就是写／读／交叉／半截／旧版的逐位结果"; exit 1; }
+
+      # FsxGeo 那一份逐式（裁片、贴回遮罩三刀、往下多贴、收口）同样从来没被真编译器跑过，而且比字节格式更隐蔽：
+      # 模型对账那三层是把 fixture 直接喂进网，绕过了手机自己裁片那一步——0.37 上机「整张脸偏蓝」就是这么漏的
+      # （BGRA 内存序顺着读成 BGR，网照样跑、一句错都不报）。这一步把 FsxGeo 单编成命令行跑 selfTest，
+      # 里面每一式都自带「对／错」，出一个错就不出包：这种错装到手机上只能靠肉眼，一趟几十分钟。
+      - name: 几何逐式自测（不过就不出包）
+        run: |
+          rec() { tee -a /tmp/model.log; }
+          touch /tmp/model.log /tmp/build.log
+          xcrun swiftc -O app/SourcesSwap/FsxGeo.swift ci/fsxgeo_check/main.swift -o /tmp/fsxgeo 2>&1 | rec
+          if [ ! -x /tmp/fsxgeo ]; then echo "GEO-VERDICT FAIL 自测没编出来" | rec; exit 1; fi
+          /tmp/fsxgeo 2>&1 | rec
+          grep -q "^GEO-VERDICT PASS" /tmp/model.log || { echo "上面那行就是 selfTest 原文，哪一格写着「错」就是哪一式断了"; exit 1; }
 
       # 必须钉 3.11：runner 默认的 python3 落在 onnx2coreml 的 Requires-Python >=3.11,<3.14 之外，
       # 第 1 轮 pip 直接回 "Could not find a version that satisfies the requirement onnx2coreml"，
