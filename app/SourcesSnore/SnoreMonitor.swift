@@ -383,10 +383,12 @@ final class SnoreMonitor: NSObject, ObservableObject {
             "\(snoreWallClock(nightStart, e.t0)) \(e.kind == .bout ? "发作" : e.kind == .gap ? "停住" : "发声")"
                 + " \(snoreDurText(e.dur)) 峰值 \(String(format: "%.1f", e.peakDb)) dBFS"
         }.joined(separator: "\n")
+        // 账目就地取一份：拼串在后台线程跑，那一份要在这条线还看得见 core 的时候拿
+        let judge = core.judgeNote
         sendToPC("执行日志") {
             var s = "====== SnoreBench 执行日志（\(snoreDateText(Date()))）======\n"
             s += "这一晚 \(nightId.isEmpty ? "还没开" : nightId)｜\(cfg)\n实时：\(rt)\n"
-            s += "判定账目：\(core.judgeNote)\n"
+            s += "判定账目：\(judge)\n"
             s += "内存压力喊过：\(SnorePressureWatch.sawPressure ? "一声（系统确实给过压力，往「被杀」方向查）" : "零声（被杀别怪内存）")\n"
             s += "\n------ 现场读数 ------\n" + SnoreFacts.lines().joined(separator: "\n")
             s += "\n------ 磁盘流水（全量，上限 900 行；每行开头带当时的足迹/驻留）------\n"
