@@ -80,7 +80,10 @@ print("CODEC 读 SwapIdents 写→SwapIdents 读：身份证 \(e2.count) 维／�
     + "｜第 1 个数 \(f3(e2))｜逐位相同=\(readOk)")
 
 // ③ 拿参照写出的整份字节喂给 SwapIdents 读（把写这一头先排除掉）
-var refPack = Data("SWID".utf8) + refU32(2) + refU32(UInt32(emb.count)) + refEmbBytes
+// 版本号从参照自己摆（和上面那 12 个字节的偏移同一条式子）：这一版是 3＝「裁片通道序修好之后算的那一份」，
+// 0.37 及以前那几份（版本 2）是喂错颜色算出来的身份证，留着只会让人以为换得不像是模型的错。
+// 把数字写死在这儿，下一次 bump 就会像 0.15 那次一样静默断在这里。
+var refPack = Data("SWID".utf8) + packed.subdata(in: 4 ..< 12) + refEmbBytes
 let e3 = SwapIdents.decode(refPack) ?? []
 let refReadOk = same(e3, emb)
 print("CODEC 交叉 参照写→SwapIdents 读：身份证 \(e3.count) 维／第 1 个数 \(f3(e3))｜逐位相同=\(refReadOk)")

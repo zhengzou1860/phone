@@ -23,7 +23,9 @@ enum SwapIdents {
     }
 
     /// 版本 2＝只装身份证。旧那版（版本 1，带 18 个权重）整份判读失败，界面上走「重选一张源脸照片」。
-    private static let version: UInt32 = 2
+    /// 版本 3＝裁片的通道序修好之后算的那一份：0.36/0.37 把 BGRA 内存序顺着读成 BGR 喂进向量网，
+    /// 那几份身份证是喂错颜色算出来的（上机那趟模长 22.2，PC 同一步 2.84~3.72），留着只会让人以为「换得不像」是模型的错。
+    private static let version: UInt32 = 3
 
     static var dir: URL? {
         guard let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else {
@@ -245,7 +247,7 @@ enum SwapIdents {
         return d
     }
 
-    /// 版本对不上（旧那版带 18 个权重的是 1）整份判读失败：不许拿半截身份出片。
+    /// 版本对不上就整份判读失败：0.37 及以前那几份是喂错颜色算的身份证（版本 2），带 18 个权重的是版本 1。
     static func decode(_ d: Data) -> [Float]? {
         var p = Cursor(d)
         guard p.take(4) == Data("SWID".utf8), let v = p.u32(), v == version else { return nil }

@@ -54,6 +54,9 @@ struct SwapContentView: View {
     @State private var longIdx = 0                   // 默认 1920（长边上限）
     @State private var result = ""
     @State private var outURL: URL?
+    /// 一按量四档算力：这一趟几十秒（每档重新装一次两张网），只在后台跑，最后一句留在界面上
+    @State private var benchBusy = false
+    @State private var benchText = ""
 
     @State private var idents: [SwapIdents.Item] = []
     @State private var chosenIdent: String = ""      // 已存的人：非空就跳过算身份证那一步（源脸照片那一次前向）
@@ -176,6 +179,18 @@ struct SwapContentView: View {
                         }
                         .pickerStyle(.segmented)
                         .disabled(running)
+
+                        // 量速不动开始换脸那一步：只把上面那格「算力单元」该点哪一个量出来。
+                        // 0.38 上机每帧 1230 ms，钱全在换脸网一次前向，四档各装各跑一遍才知道
+                        // CoreML 在 A13 上给这一档挑的是哪块硬件。
+                        Button(benchBusy ? "量四档算力跑着…（一行一行出数，几十秒）" : "量一下这四档算力（几十秒，不换脸）") {
+                            startBench()
+                        }
+                        .buttonStyle(.bordered)
+                        .disabled(running || pv.on || benchBusy)
+                        if !benchText.isEmpty {
+                            Text(benchText).font(.caption).textSelection(.enabled)
+                        }
 
                         // 点下去立刻置灰 + 改文案：界面上没有流水，这一下的反馈就在按钮自己身上
                         Button(running ? "换脸跑着…（跑完这里给一句话）" : "开始换脸") {
@@ -416,6 +431,33 @@ struct SwapContentView: View {
                 videoURL = nil
                 facts = SwapFacts.lines()
                 idents = SwapIdents.list()
+            }
+        }
+    }
+
+    /// 一按量四档算力：整张换脸网在每一档上各装各跑 5 格。跑的时候不许同时开换脸／预览
+    /// （两份 726 MB 的换脸网同时在手里会被系统当场杀掉），所以先把预览叫停。
+    private func startBench() {
+        benchBusy = true
+        benchText = "量速 第一档正在装两张网（换脸网单张装包 5～6.5 s）"
+        SwapJournal.line("开始量四档算力（每档 5 格）")
+        Task.detached {
+            SwapContentView.engine.stop()
+            var waited = 0.0
+            while SwapContentView.engine.isActive && waited < 5.0 {
+                Thread.sleep(forTimeInterval: 0.2)
+                waited += 0.2
+            }
+            FsxBench.run { line in
+                SwapJournal.line(line)
+                let head = line.trimmingCharacters(in: .whitespaces)
+                if head.hasPrefix("量速") {
+                    DispatchQueue.main.async { benchText = head }
+                }
+            }
+            DispatchQueue.main.async {
+                benchBusy = false
+                facts = SwapFacts.lines()
             }
         }
     }
