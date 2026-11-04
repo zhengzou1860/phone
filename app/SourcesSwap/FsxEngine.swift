@@ -328,7 +328,7 @@ final class FsxEngine {
         @unknown default:
             return ([], "\(name) 的类型 \(arr.dataType.rawValue) 还不会读")
         }
-        return (out, "\(name) 回来 \(dims.joined(separator: "x"))/\(FsxNets.dtypeName(arr.dataType))")
+        return (out, "\(name) 回来 \(dims.map { String($0) }.joined(separator: "x"))/\(FsxNets.dtypeName(arr.dataType))")
     }
 
     // MARK: - 三步
@@ -351,7 +351,7 @@ final class FsxEngine {
             let r = readOut(arc, name: contract.arcOutput, feat: out.featureValue(for: contract.arcOutput))
             guard r.v.count >= FsxNets.embDim else { return ([], 0, ms, r.note) }
             var e = Array(r.v[0..<FsxNets.embDim])
-            let raw = norm(e)
+            let raw = FsxEngine.norm(e)
             if raw > 1e-9 {
                 let sc = Float(1.0 / raw)
                 for i in 0..<e.count { e[i] *= sc }
@@ -375,7 +375,7 @@ final class FsxEngine {
             let b = i * FsxNets.embDim
             for j in 0..<FsxNets.embDim { o[j] += ei * emap[b + j] }
         }
-        let n = norm(o)
+        let n = FsxEngine.norm(o)
         guard n > 1e-9 else { return [] }
         let sc = Float(1.0 / n)
         for j in 0..<FsxNets.embDim { o[j] *= sc }
