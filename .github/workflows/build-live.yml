@@ -173,8 +173,13 @@ jobs:
           cat /tmp/selftest.log /tmp/build.log > ./build.log 2>/dev/null || cp /tmp/build.log ./build.log 2>/dev/null || echo "no build log at all" > ./build.log
           echo "待发文件 [build.log]" | ann "GH-FAIL "
           gh release delete channel-live-fail --cleanup-tag -y >/dev/null 2>&1 || true
+          # 上一轮删失败、或 release 还在但 asset 没了，create 会报 tag 已存在。
+          # 看的是 gh 自己的退出码（PIPESTATUS[0]），不是 ann 的——ann 永远回 0。
           gh release create channel-live-fail build.log \
             --title "LiveSwap CI failed log" \
             --prerelease \
             --notes "no ipa this round" 2>&1 | ann "GH-FAIL "
+          if [ "${PIPESTATUS[0]}" != "0" ]; then
+            gh release upload channel-live-fail build.log --clobber 2>&1 | ann "GH-FAIL "
+          fi
           exit 0

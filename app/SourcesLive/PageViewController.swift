@@ -314,7 +314,7 @@ final class PageViewController: UIViewController {
         }
     }
 
-    private func stopPush(note: String) {
+    private func stopPush(_ note: String) {
         pushGen += 1
         video.stop()
         resumeSeconds = clampSeconds(CMTimeGetSeconds(video.currentPTS))
@@ -486,7 +486,8 @@ final class PageViewController: UIViewController {
 
     private func movieIdentifier(in provider: NSItemProvider) -> String {
         for id in provider.registeredTypeIdentifiers {
-            if let t = UTType(identifier: id), t.conforms(to: .movie) { return id }
+            // UTType(identifier:) 这个标签不存在，正确的初始化器是 UTType("public.movie") 这种
+            if let t = UTType(id), t.conforms(to: .movie) { return id }
         }
         return UTType.movie.identifier
     }
@@ -626,7 +627,7 @@ extension PageViewController: PHPickerViewControllerDelegate {
 
 // MARK: - SwiftUI 入口
 
-struct RootView: UIViewRepresentable {
+struct RootView: UIViewControllerRepresentable {
     func makeUIViewController(context: Context) -> PageViewController {
         PageViewController()
     }
