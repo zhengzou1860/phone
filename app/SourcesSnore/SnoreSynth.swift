@@ -8,13 +8,17 @@ import Foundation
 
 enum SnoreSynth {
     /// 一次性伪随机（不用系统 rand：两边要给出同一个数）
+    ///
+    /// 出来的是 [-1, 1) 的零均值数：本底是「围绕静音抖」，不是「顶着某个正偏压抖」。
+    /// 拿 0xFFFFFFF（而不是 0xFFFFFFF0）当除数就是这一条：除错了范围只剩 0…0.0625，
+    /// 合成出来的本底比标称的 level 轻二十来 dB，「比本底响多少才算有声音」那把尺子就没得验了。
     static func noiseSource(seed: UInt64) -> (Int) -> Double {
         var state = seed &+ 0x9E3779B97F4A7C15
         return { (n: Int) -> Double in
             var v = 0.0
             for _ in 0..<n {
                 state = state &* 6364136223846793005 &+ 1442695040888963407
-                let x = Double((state >> 11) & 0xFFFFFFF) / Double(0xFFFFFFF0)
+                let x = Double((state >> 11) & 0xFFFFFFF) / Double(0x10000000) * 2.0 - 1.0
                 v = v * 0.35 + x * 0.65        // 一阶平滑：白噪声太尖，本底应该是连续的能量
             }
             return v
@@ -42,18 +46,21 @@ enum SnoreSynth {
                       level: Double, duty: Double = 0.45, startAt: Double = 0.0,
                       wobble: Double = 0.05, seed: UInt64 = 7) -> [Double] {
         var out = [Double](repeating: 0.0, count: count)
-        let period = max(0.4, periodSec) * sampleRate
+        // 呼吸周期按「秒」摆：下面拿 rel（秒）去模它。早先写成 ×sampleRate 换样本数，
+        // 模出来的 cycle 恒等于 0.0002 量级，包络 sin(πu)^0.8 ≈ 0.005——合成鼾只剩 −77 dBFS，
+        // 比门限还低 20 dB，于是所有带鼾的用例一条事件都判不出来（判据看着全灭，其实是信号没生成）。
+        let per = max(0.4, periodSec)
         let rnd = noiseSource(seed: seed)
         var ph = [Double](repeating: 0.0, count: 10)
         for i in 0..<count {
             let t = Double(i) / sampleRate
             guard t >= startAt else { continue }
             let rel = t - startAt
-            let cycle = rel.truncatingRemainder(dividingBy: period) / period
+            let cycle = rel.truncatingRemainder(dividingBy: per) / per
             if cycle > duty { continue }
             let u = cycle / duty                          // 0…1 在这一鼾里的位置
             let env = pow(sin(Double.pi * u), 0.8)
-            let f = f0 * (1.0 + wobble * sin(2.0 * Double.pi * rel / (period * 2.5)))
+            let f = f0 * (1.0 + wobble * sin(2.0 * Double.pi * rel / (per * 2.5)))
             var s = 0.0
             for h in 1...9 {
                 let amp = 1.0 / pow(Double(h), 0.95)
@@ -70,7 +77,8 @@ enum SnoreSynth {
     }
 
     /// 说话样：基频 180 但共振峰在 700/1300/2600 上来回扫，音节率 3–4 Hz。
-    /// 低频占比、稳定度、起伏深度三个尺子都会偏，正好拿来验「不把说话当鼾」。
+    /// 频谱那几把尺子（低频占比、稳定度）会偏，音节率 3.3 Hz 也过不了「一鼾 0.4–0.8 s、
+    /// 间隔 1–6 s」的呼吸节律门——两层都拿来验「不把说话当鼾」。
     static func speech(count: Int, sampleRate: Double, level: Double, startAt: Double = 0.0,
                        seed: UInt64 = 11) -> [Double] {
         var out = [Double](repeating: 0.0, count: count)
@@ -103,7 +111,8 @@ enum SnoreSynth {
         return out
     }
 
-    /// 恒定单音：振幅一直不动。冰箱/风扇嗡鸣一类——起伏深度这一关就该把它挡掉。
+    /// 恒定单音：振幅一直不动。冰箱/风扇嗡鸣一类——频谱看着挺像鼾（低频、谐波、稳），
+    /// 挡它的是呼吸节律那一关：一整段只有一个「一直响着」的开，数不出一鼾一鼾。
     static func tone(count: Int, sampleRate: Double, freq: Double, level: Double,
                      startAt: Double = 0.0) -> [Double] {
         var out = [Double](repeating: 0.0, count: count)
@@ -179,7 +188,8 @@ enum SnoreCases {
         var out: [SnoreCaseResult] = []
         let sr = rate
 
-        // ① 数值：150 Hz 单音的谱峰要落在 150±12 Hz，RMS 要对得上
+        // ① 数值：150 Hz 单音的谱峰要落在 150±14 Hz，RMS 要对得上
+        //    （0.1 幅度的正弦 RMS=0.0707 ⇒ −23 dBFS，不是 −20：满量程 dBFS 吃的是 RMS）
         do {
             let a = SnoreAnalyzer(sampleRate: sr, config: config)
             var peakHz = 0.0
@@ -187,9 +197,9 @@ enum SnoreCases {
             let tone = SnoreSynth.tone(count: Int(sr * 2), sampleRate: sr, freq: 150, level: 0.1)
             a.feed(tone, endTime: 2.0) { f in peakHz = f.peakHz; level = f.level }
             let okHz = abs(peakHz - 150.0) <= 14.0
-            let okDb = abs(level - (-20.0)) <= 2.0
+            let okDb = abs(level - (-23.0)) <= 2.0
             out.append(SnoreCaseResult(name: "谱峰与电平刻度", ok: okHz && okDb,
-                                       detail: String(format: "峰值 %.1f Hz（要 150±14）／电平 %.2f dBFS（0.1 幅度的正弦要 -20±2）",
+                                       detail: String(format: "峰值 %.1f Hz（要 150±14）／电平 %.2f dBFS（0.1 幅度的正弦要 −23±2）",
                                                       peakHz, level)))
         }
 
@@ -211,7 +221,8 @@ enum SnoreCases {
                                                       bouts.count, gaps.count, med)))
         }
 
-        // ③ 停住再回来：12 s 鼾 → 14 s 静 → 12 s 鼾 ⇒ 至少一条疑似中断，且时长挨着 14 s
+        // ③ 停住再回来：12 s 鼾 → 14 s 静（中间夹 4 s 说话）→ 12 s 鼾
+        //    ⇒ 至少一条疑似中断、时长挨着 14 s，且这条中断要带上「停的这一阵里有别的发声」
         do {
             let srLocal = sr
             let total = 40.0
@@ -219,6 +230,8 @@ enum SnoreCases {
             let a = SnoreSynth.snore(count: Int(srLocal * 12), sampleRate: srLocal, periodSec: 3.0,
                                      f0: 140, level: 0.09)
             SnoreSynth.add(&s, pad(a, into: Int(s.count), at: 2.0))
+            let sp = SnoreSynth.speech(count: Int(srLocal * 4), sampleRate: srLocal, level: 0.06)
+            SnoreSynth.add(&s, pad(sp, into: Int(s.count), at: 20.0))
             let b = SnoreSynth.snore(count: Int(srLocal * 12), sampleRate: srLocal, periodSec: 3.0,
                                      f0: 160, level: 0.15)
             SnoreSynth.add(&s, pad(b, into: Int(s.count), at: 30.0))
@@ -227,9 +240,10 @@ enum SnoreCases {
             let gaps = got.events.filter { $0.kind == .gap }
             let bouts = got.events.filter { $0.kind == .bout }
             let longest = gaps.map { $0.dur }.max() ?? 0
-            let ok = bouts.count >= 2 && gaps.count >= 1 && longest >= 11.0 && longest <= 20.0
+            let otherDuring = gaps.contains { $0.otherDuring }
+            let ok = bouts.count >= 2 && gaps.count >= 1 && longest >= 11.0 && longest <= 20.0 && otherDuring
             out.append(SnoreCaseResult(name: "鼾声停住要记成疑似中断", ok: ok,
-                                       detail: "发作 \(bouts.count) 段（要 ≥2）／中断 \(gaps.count) 条（要 ≥1）／最长停 \(String(format: "%.1f", longest)) s（要 11–20）"))
+                                       detail: "发作 \(bouts.count) 段（要 ≥2）／中断 \(gaps.count) 条（要 ≥1）／最长停 \(String(format: "%.1f", longest)) s（要 11–20）／停里夹着说话 \(otherDuring ? "是" : "否")（要 是）"))
         }
 
         // ④ 说话样：不该判成鼾，但该记「其他发声」
@@ -246,7 +260,7 @@ enum SnoreCases {
                                        detail: "鼾 \(bouts.count) 段（要 0）／鼾声占比 \(String(format: "%.0f", cov * 100))%（要 0）／其他发声 \(vocals.count) 条（要 ≥1）"))
         }
 
-        // ⑤ 恒定低频单音：起伏深度这一关挡掉
+        // ⑤ 恒定低频单音：频谱那一套给它打高分，靠呼吸节律门挡掉
         do {
             var s = SnoreSynth.bed(count: Int(sr * 30), level: 0.0006, seed: 51)
             SnoreSynth.add(&s, SnoreSynth.tone(count: s.count, sampleRate: sr, freq: 120, level: 0.05))

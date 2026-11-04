@@ -29,7 +29,7 @@ struct SnoreSummary {
 
     /// 界面上那两格的字：拿不到节律的时候说人话，别显示「nil」或「0 次/分」。
     var rateText: String {
-        guard let r = ratePerMin else { return "样本不够" }
+        guard let r = ratePerMin else { return "鼾太密，数不清" }
         return String(format: "%.1f 次/分", r)
     }
 
@@ -150,7 +150,7 @@ enum SnoreAnalyze {
         if let r = s.ratePerMin {
             lines.append("【鼾声节律】发作内 \(String(format: "%.1f", r)) 次/分（约每 \(String(format: "%.1f", 60.0 / r)) 秒一鼾）")
         } else {
-            lines.append("【鼾声节律】样本不够，没算出稳定周期（发作太短或太碎）")
+            lines.append("【鼾声节律】没数出稳定的鼾间隔（发作太短或鼾太密，间隔不足 1 s）")
         }
         lines.append("【响度】峰值 \(SnoreCalib.text(s.peakDb, config))｜鼾声期均值 \(SnoreCalib.text(s.snoreMeanDb, config))"
                      + "｜本底中位 \(SnoreCalib.text(s.floorMedianDb, config))")
@@ -198,6 +198,8 @@ enum SnoreAnalyze {
                      + "不等于呼吸暂停，更不能当诊断。")
         lines.append("  · 响度是手机麦克风的相对刻度 dBFS；不接声级计换算就不是 dB(A) SPL，"
                      + "跨设备比较要留意。")
+        lines.append("  · 判鼾要过两关：声音的频谱形状，加上「一开一合」跟着呼吸的节律（一鼾 0.4–0.8 s、"
+                     + "间隔 1–6 s）。数不出节律的持续声（嗡鸣、说话）不算鼾；反过来说，极轻或隔着被子的鼾可能整段漏判。")
         lines.append("  · 距离、枕头、体位、同床者翻身都会改变读数；本 App 统计的是「采到的声音」，不是「你打得多厉害」的绝对量。")
         lines.append("  · 真要看有没有睡眠呼吸暂停，去做多导睡眠监测（PSG）或医生开的便携睡眠呼吸监测。")
         if !facts.isEmpty {

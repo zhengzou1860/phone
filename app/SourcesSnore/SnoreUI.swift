@@ -107,7 +107,7 @@ struct TonightView: View {
                     .font(.caption)
                     .foregroundColor(mon.live.snoring ? .orange : .secondary)
                 Spacer()
-                Text(String(format: "算鼾分 %.2f（进门 %.2f）", mon.live.score, mon.config.enterScore))
+                Text(String(format: "像鼾分 %.2f／进门 %.2f", mon.live.score, mon.config.enterScore))
                     .font(.system(size: 11, design: .monospaced)).foregroundColor(.secondary)
                 if mon.live.gapSec > 1 {
                     Text(String(format: "已停 %.0f s", mon.live.gapSec))

@@ -96,13 +96,11 @@ struct SnoreFeature {
     var floor: Double        // 本底 dBFS（慢跟）
     var lowRatio: Double     // 30–400 Hz 占 30–6000 Hz 的能量比
     var hiRatio: Double      // 1000–6000 Hz 占比（说话/摩擦音靠它区分）
-    var centroid: Double     // 谱心 Hz
     var peakHz: Double       // 45–350 Hz 里最强的那一根
     var tonality: Double     // dB：最低频那一带的峰/均，鼾声是谐波堆⇒高
     var stability: Double    // 与上一帧五个频带向量的余弦相似（说话共振峰在跑⇒低）
-    var envLow: Double       // 30–400 Hz 能量 dB（鼾声节律的自相关就吃这一路）
-    var modDepth: Double     // 最近 4 s 的 envLow 起伏（dB）： steady 的冰箱嗡鸣靠它筛掉
-    var score: Double        // 0…1 像鼾程度
+    var modDepth: Double     // 最近 4 s 低频能量的起伏（dB）：steady 的冰箱嗡鸣靠它筛掉
+    var score: Double        // 0…1「频谱像鼾」的程度；进门还要过 SnoreTracker 的呼吸节律门
     var voiced: Bool         // 高于本底门限的任何声音（鼾、说话、咳嗽都算）
 }
 
@@ -241,19 +239,7 @@ final class SnoreAnalyzer {
         }
         let peakHz = Double(peakBin) * sampleRate / Double(n)
 
-        // ④ 谱心
-        var cNum = 0.0
-        var cDen = 0.0
-        k = bandBins[0]
-        while k < bandBins[5] && k <= half {
-            let m = sqrt(re[k] * re[k] + im[k] * im[k])
-            cNum += Double(k) * m
-            cDen += m
-            k += 1
-        }
-        let centroid = cDen > 1e-18 ? (cNum / cDen) * sampleRate / Double(n) : 0.0
-
-        // ⑤ 与上一帧的频带向量余弦相似（鼾声稳、说话共振峰在跑）
+        // ④ 与上一帧的频带向量余弦相似（鼾声稳、说话共振峰在跑）
         var stability = 1.0
         if let prev = prevBand {
             var dot = 0.0
@@ -272,7 +258,7 @@ final class SnoreAnalyzer {
         let hiRatio = (bandE[3] + bandE[4]) / totalE
         let envLow = 10.0 * log10(bandE[0] + bandE[1] + 1e-24)
 
-        // ⑥ 本底：往下跟得快、往上爬得慢。整晚开着不能把鼾声本身学成本底。
+        // ⑤ 本底：往下跟得快、往上爬得慢。整晚开着不能把鼾声本身学成本底。
         if !floorReady {
             floorDb = level
             floorReady = true
@@ -284,7 +270,7 @@ final class SnoreAnalyzer {
         if floorDb < -95 { floorDb = -95 }
         if floorDb > level { floorDb = level }
 
-        // ⑦ 起伏深度：最近 4 s 的 envLow 标准差（鼾随呼吸一起一落）
+        // ⑥ 起伏深度：最近 4 s 低频能量的标准差（鼾随呼吸一起一落）
         envRing.append(envLow)
         if envRing.count > envRingMax { envRing.removeFirst(envRing.count - envRingMax) }
         var modDepth = 0.0
@@ -295,7 +281,7 @@ final class SnoreAnalyzer {
             modDepth = sqrt(v / Double(envRing.count))
         }
 
-        // ⑧ 门限与打分
+        // ⑦ 门限与打分（频谱像不像鼾；「一开一合」的形状由 SnoreTracker 的节律门管）
         let gate = max(floorDb + 4.0, config.absGateDb)
         let voiced = level > gate
         let score: Double
@@ -325,8 +311,8 @@ final class SnoreAnalyzer {
         }
 
         return SnoreFeature(t: t, level: level, peak: peakDb, floor: floorDb, lowRatio: lowRatio,
-                            hiRatio: hiRatio, centroid: centroid, peakHz: peakHz, tonality: tonality,
-                            stability: stability, envLow: envLow, modDepth: modDepth,
+                            hiRatio: hiRatio, peakHz: peakHz, tonality: tonality,
+                            stability: stability, modDepth: modDepth,
                             score: score, voiced: voiced)
     }
 }

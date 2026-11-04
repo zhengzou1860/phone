@@ -17,6 +17,7 @@ for r in results {
     if !r.ok { bad += 1 }
     print("CASE \(r.ok ? "OK  " : "FAIL") \(r.name)｜\(r.detail)")
 }
+let badCases = bad     // 九个用例的；合成夜那几条另加，别把「8/9」这种数字打错
 
 // 把一份完整报告打进 CI 日志：文案（口径、限度、分级那几行）改错了，这里当场就能看见，
 // 不必等第二天早上在手机上调出来。起点钉死，日志才可重复比对。
@@ -66,8 +67,19 @@ do {
         bad += 1
         print("CASE FAIL 合成样例里鼾发作或停住没判出来（发作 \(summary.boutCount)／停 \(summary.gapCount)）")
     }
+    // 说话夹在 169→260 那道空档里 ⇒ 至少一条中断要带「期间有别的发声」；不带就说明记账时机写回了「开停时看一眼」
+    if !got.events.contains(where: { $0.kind == .gap && $0.otherDuring }) {
+        bad += 1
+        print("CASE FAIL 合成样例里没有一条中断带「期间有别的发声」")
+    }
+    // 一晚只有一段说话：敲击三下都不该各记一条，鼾段开头那半秒更不该（旧写法一晚能凭空多出五六条假梦话）
+    if summary.vocalCount > 3 {
+        bad += 1
+        print("CASE FAIL 合成样例里「其他发声」出了 \(summary.vocalCount) 条（只摆了一段说话，要 ≤3）")
+    }
 }
 
-print("SNORE-VERDICT \(bad == 0 ? "PASS" : "FAIL") \(results.count - bad)/\(results.count) 通过"
+print("SNORE-VERDICT \(bad == 0 ? "PASS" : "FAIL") 用例 \(results.count - badCases)/\(results.count)"
+    + "／合成夜 \(bad == badCases ? "OK" : "FAIL")"
     + "｜耗时 \(String(format: "%.0f", elapsedMs)) ms")
 exit(bad == 0 ? 0 : 1)
