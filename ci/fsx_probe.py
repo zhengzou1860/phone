@@ -155,7 +155,37 @@ def pick_out(res, want):
                        % (want, {k: np.asarray(v).size for k, v in res.items()}))
 
 
-def convert(onnx_path, out_pkg, fp16, ios16=True):
+def load_onnx_fixed(path):
+    """载入 onnx 并把任何符号维（batch=None 那种）钉成 1。
+
+    两件事都是这一版探针自己踩出来的：
+    ① coremltools 9 的 ct.convert 收文件路径时认不出来源框架（"Unable to determine the type of the model"），
+       onnx 这一路必须把 onnx.ModelProto 对象递进去；
+    ② w600k_r50 是 pytorch 1.8 导出的，batch 维留成了符号 None，转换器不欢迎符号维。
+       钉成 1 之后必须重新跑一遍对账（这一式的判据就在 embedding 那一步的 cos 上）。
+    """
+    import onnx
+    m = onnx.load(path)
+
+    def dims(inp):
+        return [d.dim_value if d.HasField('dim_value') else d.dim_param
+                for d in inp.type.tensor_type.shape.dim]
+
+    before = [(i.name, dims(i)) for i in m.graph.input]
+    n = 0
+    for i in m.graph.input:
+        for d in i.type.tensor_type.shape.dim:
+            if d.HasField('dim_param') or d.dim_value == 0:
+                d.ClearField('dim_param')
+                d.dim_value = 1
+                n += 1
+    if n:
+        onnx.checker.check_model(m)
+    log('FSX-ONNX', path, '钉掉的符号维', n, '|改前', before, '|改后', [(i.name, dims(i)) for i in m.graph.input])
+    return m
+
+
+def convert(model, out_pkg, fp16, ios16=True):
     """转 → 存包 → 再从存下来的包读回来预测。
 
     手机上用的是那份包（compileModel 之后加载），内存里那个转换对象不算数：
@@ -170,7 +200,7 @@ def convert(onnx_path, out_pkg, fp16, ios16=True):
             pass
     prec = ct.precision.FLOAT16 if fp16 else ct.precision.FLOAT32
     t0 = time.time()
-    m = ct.convert(onnx_path, compute_precision=prec, **kw)
+    m = ct.convert(model, compute_precision=prec, **kw)
     m.save(out_pkg)
     el = time.time() - t0
     t1 = time.time()
@@ -254,6 +284,10 @@ def main():
 
     # ---- ③ 向量网转 CoreML：身份最敏感，fp16 掉多少要看清楚
     rec = {}
+    arc_model = sw_model = None
+    if has_coreml:
+        arc_model = load_onnx_fixed(arc_onnx)
+        sw_model = load_onnx_fixed(sw_onnx)
     for fp16 in (True, False):
         tag = 'fp16' if fp16 else 'fp32'
         pkg = os.path.join(a.out_dir, 'fsx_arc_%s.mlpackage' % tag)
@@ -261,7 +295,7 @@ def main():
             log('FSX-SKIP', 'arc(%s) 没有 coremltools，跳过' % tag)
             break
         try:
-            m, el, rel = convert(arc_onnx, pkg, fp16)
+            m, el, rel = convert(arc_model, pkg, fp16)
             ins, outs = coreml_io(m)
             x112 = ((src112.astype(np.float32) - 127.5) / 127.5)
             feed = feed_coreml(ins, [(x112.transpose(2, 0, 1)[None], x112)])
@@ -292,7 +326,7 @@ def main():
             import shutil
             shutil.rmtree(pkg)
         try:
-            m, el, rel = convert(sw_onnx, pkg, fp16)
+            m, el, rel = convert(sw_model, pkg, fp16)
             ins, outs = coreml_io(m)
             rgb = tgt128.astype(np.float32) / 255.0
             lat = ref_lat.astype(np.float32)
@@ -331,7 +365,8 @@ def main():
     with open(os.path.join(a.out_dir, 'fsx_summary.json'), 'w', encoding='utf-8') as f:
         json.dump(rec, f, ensure_ascii=False, indent=1)
     flush(logfile)
-    return 0
+    # 一张都没转成就退出码非 0：判据在日志里，但 job 绿着没人会去翻日志（上一轮就是这么过去的）
+    return 0 if (arc_ok and swap_ok) else 1
 
 
 if __name__ == '__main__':

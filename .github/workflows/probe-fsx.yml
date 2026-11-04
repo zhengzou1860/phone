@@ -73,7 +73,12 @@ jobs:
           code=$(curl -sS -L --retry 3 --retry-all-errors --max-time 1200 -o /tmp/fm/inswapper_128.onnx -w '%{http_code}' "$U")
           sz=$(wc -c < /tmp/fm/inswapper_128.onnx 2>/dev/null | tr -d ' ')
           echo "DL-VERDICT inswapper http=$code bytes=${sz:-0}（要 $WANT）" | rec
-          [ "${sz:-0}" = "$WANT" ] || { echo "DL-VERDICT inswapper 字节对不上，这一轮没得对账" | rec | ann "DL "; exit 1; }
+          # exit 1 不能写在管道尾巴上：{ ... | ann; exit 1; } 那个 exit 只出到 ann 那个子 shell，
+          # step 照样绿——上一轮就是这么把「下载没成」报成成功的。判据先落盘，退出单独一句。
+          if [ "${sz:-0}" != "$WANT" ]; then
+            echo "DL-VERDICT inswapper 字节对不上，这一轮没得对账" | rec | ann "DL "
+            exit 1
+          fi
           shasum -a 256 /tmp/fm/inswapper_128.onnx | rec | ann "DL "
           exit 0
 
