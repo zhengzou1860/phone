@@ -46,7 +46,10 @@ enum FrameCodec {
             free(dstBase)
             return nil
         }
-        let length = Int(dst.bytesPerRow) * Int(dst.height)
+        // vImage_Buffer 的字段叫 rowBytes（不是 bytesPerRow）；它可能比 dstW*4 大，
+        // 后面建 CGImage 必须用同一个数，不然每行错位、图像斜掉。
+        let rowBytes = Int(dst.rowBytes)
+        let length = rowBytes * Int(dst.height)
         // 拷一份而不是 bytesNoCopy 接管：所有权只有一条路，免得 Data 和 free 抢同一块内存。
         // 一帧 640×360 是 0.9MB，15fps 拷 13MB/s，跟解码编码本身的开销比可以忽略。
         let bytes = Data(bytes: dstBase, count: length)
@@ -56,7 +59,7 @@ enum FrameCodec {
               let cs = CGColorSpace(name: CGColorSpace.sRGB) else { return nil }
         guard let img = CGImage(width: dstW, height: dstH,
                                 bitsPerComponent: 8, bitsPerPixel: 32,
-                                bytesPerRow: dst.bytesPerRow,
+                                bytesPerRow: rowBytes,
                                 space: cs,
                                 bitmapInfo: CGBitmapInfo(rawValue:
                                     CGImageAlphaInfo.premultipliedFirst.rawValue
