@@ -858,7 +858,10 @@ enum SwapClip {
             + "｜贴回 \(SwapUtil.stat(pasteMs))｜提交 \(SwapUtil.stat(appendMs))"
             + "｜这一条链路逐帧只有这三刀：裁 128→一次前向→按官方那三刀贴回（没有分割网、没有高频回填、没有美白）")
         say("      注：换脸网＝只有 predict 那一句；逐帧整次＝整趟调用（建输入数组＋装字典＋predict＋取输出摊平＋量化到 8 位），两栏之差＝搬运")
-        say("      \(engine.statsLine())")
+        say("      贴回底边：方块往下多贴 \(FsxGeo.extDown) 格、最下面 \(FsxGeo.fadeDown) 格把 alpha 收到 0"
+            + "（官方四边同宽那一刀没动：遮罩底落在 128 框第 120 格，下巴在 134 格——差的是方块自己没装进下巴；"
+            + "PC 上四臂并排量过、看过片定的这一档：第 20 帧中心列 alpha 过半到 y=1337，下巴实测 1338）")
+        say("      \(engine.statsLine())｜几何自测 \(FsxGeo.selfTest())")
         say("总耗时 \(String(format: "%.1f", wall)) s（素材实到 \(String(format: "%.1f", madeSec)) s）"
             + "＝\(String(format: "%.2f", wall / max(madeSec, 0.01)))× 实时｜每帧合计 \(String(format: "%.1f", perFrame)) ms"
             + "｜身份复测每次 \(SwapUtil.stat(sampleMs))")

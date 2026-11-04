@@ -108,21 +108,34 @@ enum FsxGeo {
 
     // MARK: - 反向：128 的补丁贴回整幅
 
-    /// 官方 inswapper 的贴回，三刀一刀不减：
-    /// ① 白图随 128 方块投回帧空间，>20 的格子拉成 255＝贴区就是这个平行四边形自己；
-    /// ② 按这块贴区量出的边长腐蚀 k＝max(mask_size//10,10)，把插值糊出去的那一圈收回来；
+    /// 贴回往下多贴几格（128 口径）。官方那三刀之后遮罩的底边落在 128 框的第 120 格上下，
+    /// 而这一档人脸的下巴在 128 框的第 134 格（PC 上拿检测框底量的：嘴角 1175、框底 1338、
+    /// 官方遮罩底 1252，帧像素，1 格 128＝5.9 帧像素）——连方块自己的底（127.9）都还差 39 帧像素，
+    /// 所以「够不着下巴」不是那把刀收错了，是官方那个方块本来就没把下巴装进来：四边的腐蚀照旧，只往下多贴。
+    /// 多贴出去那一带没有网络生成的内容，取方块最后一行复制填上（跟 PC 那边 np.repeat(fake[-1:]) 同式）。
+    static let extDown = 12
+    /// 延出去那一带最下面几格把 alpha 线性收到 0（0＝硬边，PC 上量过：硬边就在脖子上切出一条横线）。
+    /// 12 格／收 6 格这一档＝PC 上四臂并排比出来、看过片定的 C 档：第 20 帧中心列 alpha 过半落在 y=1337，下巴实测 1338。
+    static let fadeDown = 6
+
+    /// 官方 inswapper 的贴回，三刀一刀不减，只在底边加一截多贴：
+    /// ① 白图随 128 方块投回帧空间（往下带 extDown 格），>20 的格子拉成 255＝贴区就是这个平行四边形自己；
+    /// ② 按这块贴区量出的边长腐蚀 k＝max(mask_size//10,10)，四边同宽（官方那颗 k×k 方核）；
     /// ③ 再糊一刀，核长 2*max(mask_size//20,5)+1、σ 由核长现算（cv2 传 sigma=0 就是这个口径）。
+    /// 多贴那一带的收口夹在②③中间（PC 是腐蚀完乘那张带 alpha 的斜坡图，再糊），顺序换了就不是同一条边。
     /// 全程只在外接框（再加腐蚀与糊的半径）里做，框外一像素不碰。
     /// face 必须是已经量化到 8 位那一份（PC 是 uint8 转 float 再 warp 的，跳过这步差半格）。
     static func pasteBack(_ base: UnsafeMutableRawPointer, bytesPerRow: Int, w: Int, h: Int,
                           face: [Float], fwd: M23) -> Bool {
         let s = side128
+        let ext = extDown
         guard face.count == 3 * s * s, let im = inverse(fwd) else { return false }
         let q = base.assumingMemoryBound(to: UInt8.self)
         let rowPix = bytesPerRow / 4
         let last = Double(s - 1)
+        let lastY = Double(s - 1 + ext)          // 外接框要连多贴那一带一起圈，不然带子被框切掉
         var xs: [Double] = [], ys: [Double] = []
-        for (u, v) in [(0.0, 0.0), (last, 0.0), (0.0, last), (last, last)] {
+        for (u, v) in [(0.0, 0.0), (last, 0.0), (0.0, lastY), (last, lastY)] {
             xs.append(im.a * u + im.b * v + im.c)
             ys.append(im.d * u + im.e * v + im.f)
         }
@@ -139,7 +152,7 @@ enum FsxGeo {
             for ox in 0..<r1w {
                 let fx = fwd.a * Double(r1x0 + ox) + fwd.b * Double(r1y0 + oy) + fwd.c
                 let fy = fwd.d * Double(r1x0 + ox) + fwd.e * Double(r1y0 + oy) + fwd.f
-                if whiteTap(fx, fy) > 20 {
+                if whiteTap(fx, fy, ext: ext) > 20 {
                     bin[oy * r1w + ox] = 255
                     if ox < minX { minX = ox }
                     if ox > maxX { maxX = ox }
@@ -152,10 +165,14 @@ enum FsxGeo {
         let maskSize = Int(((Double(maxY - minY) * Double(maxX - minX)).squareRoot()))
         let k = max(maskSize / 10, 10)
         let kb = max(maskSize / 20, 5)
+        let kTop = k / 2
+        let kBot = k - kTop                       // 四边同宽＝官方那颗 k×k（奇数 k 时多出来那一行落在下面，cv2 锚点就是这么放的）
+        let ky = kTop + kBot
 
-        // ② 腐蚀。方核 k×k、cv2 的默认锚点 (k/2, k/2)，所以核覆盖 x+[-k/2, k/2-1]
-        //（k 是偶数时这一串不对称，照它的样，别自作聪明居中）。
-        // 二值方核腐蚀＝这一块窗口全白才留：用积分图把每格 k² 次比较降成一次求和。
+        // ② 腐蚀。核是长方形：宽 k（左右各收 k/2）、高 ky＝上收 k/2、下收 k−k/2，合起来就是官方那颗 k×k 方核。
+        // 这一档动的是「往下多贴 extDown 格＋带子底部 fadeDown 格收口」，刀本身没改口径；
+        // 要试底边不收那一刀：kBot＝1（PC 上量过，那样遮罩底会多压到脖子下面一截，片子里看是糊的）。
+        // 二值长方核腐蚀＝这一块窗口全白才留：用积分图把每格 k×ky 次比较降成一次求和。
         // 窗口越出画面那几格按 cv2 形态学的边框＝最大值（所以贴着画面边的脸不会被这一刀再收一圈）；
         // 越出外接框但还在画面里的，遮罩本来就是 0。
         let padE = k + kb + 8
@@ -178,22 +195,25 @@ enum FsxGeo {
             }
         }
         func allWhite(_ X: Int, _ Y: Int) -> Bool {
-            // 窗口 [X-k/2, X+k/2-1]×[Y-k/2, Y+k/2-1] 换成积分图的下标
-            let gx0 = X - r1x0 + padE - k / 2, gy0 = Y - r1y0 + padE - k / 2
-            let s0 = integ[gy0 * (gw + 1) + gx0] + integ[(gy0 + k) * (gw + 1) + gx0 + k]
-                - integ[gy0 * (gw + 1) + gx0 + k] - integ[(gy0 + k) * (gw + 1) + gx0]
-            return s0 == k * k
+            // 窗口 [X-k/2, X+k/2-1]×[Y-k/2, Y+kBot-1] 换成积分图的下标
+            let gx0 = X - r1x0 + padE - k / 2, gy0 = Y - r1y0 + padE - kTop
+            let s0 = integ[gy0 * (gw + 1) + gx0] + integ[(gy0 + ky) * (gw + 1) + gx0 + k]
+                - integ[gy0 * (gw + 1) + gx0 + k] - integ[(gy0 + ky) * (gw + 1) + gx0]
+            return s0 == k * ky
         }
 
-        let pad = k / 2 + kb + 4
+        let pad = max(k / 2, kBot) + kb + 4
         let r2x0 = max(0, r1x0 + minX - pad), r2y0 = max(0, r1y0 + minY - pad)
         let r2x1 = min(w - 1, r1x0 + maxX + pad), r2y1 = min(h - 1, r1y0 + maxY + pad)
         guard r2x1 >= r2x0, r2y1 >= r2y0 else { return false }
         let r2w = r2x1 - r2x0 + 1, r2h = r2y1 - r2y0 + 1
         var ero = [Float](repeating: 0, count: r2w * r2h)
         for oy in 0..<r2h {
+            let Y = r2y0 + oy
             for ox in 0..<r2w {
-                ero[oy * r2w + ox] = allWhite(r2x0 + ox, r2y0 + oy) ? 255 : 0
+                guard allWhite(r2x0 + ox, Y) else { continue }
+                let fy = fwd.d * Double(r2x0 + ox) + fwd.e * Double(Y) + fwd.f
+                ero[oy * r2w + ox] = Float(255.0 * rampTap(fy))
             }
         }
 
@@ -211,7 +231,7 @@ enum FsxGeo {
                 let o = Y * rowPix * 4 + X * 4
                 for ch in 0..<3 {
                     // 内存是 BGRA，模型的 planar 是 RGB：第 0 通道 R 落在内存的第 2 格
-                    let fake = Double(planarTap(face, plane, s, fx, fy, 2 - ch))
+                    let fake = Double(planarTap(face, plane, s, fx, fy, 2 - ch, ext: ext))
                     let mix = al * fake * 255.0 + (1 - al) * Double(q[o + ch])
                     // PC 收的是 np.clip(out,0,255).astype(np.uint8)＝截断不是四舍五入，照它的来
                     q[o + ch] = UInt8(max(0.0, min(255.0, mix)).rounded(.down))
@@ -221,29 +241,50 @@ enum FsxGeo {
         return true
     }
 
-    /// 白图投回来：落在 128 方块里的邻按双线性权重相加再乘 255（方块外那一份就是 borderValue=0）
-    private static func whiteTap(_ fx: Double, _ fy: Double) -> Double {
-        let lim = Double(side128) - 1
+    /// 延出去那一带每一行的 alpha：方块里 1，带里最下面 fadeDown 格线性收到 0，带外 0（＝cv2 borderValue）。
+    /// PC 那边是把这一串行权拼成 (128+ext)×128 的图再 warpAffine 回帧空间；因为每行是常数，
+    /// 双线性在 x 方向拿到的还是同一个数，只剩 y 方向那一插，所以这里按 fy 一维插值就是同一份数。
+    private static func rowWeight(_ row: Int) -> Double {
+        let s = side128
+        if row < 0 || row >= s + extDown { return 0 }
+        if row < s { return 1 }
+        let j = (s + extDown - 1) - row
+        if j >= fadeDown { return 1 }
+        return Double(j) / Double(max(fadeDown - 1, 1))
+    }
+
+    private static func rampTap(_ fy: Double) -> Double {
+        let y0 = Int(fy.rounded(.down))
+        guard y0 >= 0 else { return 0 }
+        let dy = fy - Double(y0)
+        return rowWeight(y0) * (1 - dy) + rowWeight(y0 + 1) * dy
+    }
+
+    /// 白图投回来：落在 128 方块（往下带 ext 格）里的邻按双线性权重相加再乘 255，外面那一份就是 borderValue=0
+    private static func whiteTap(_ fx: Double, _ fy: Double, ext: Int) -> Double {
+        let limX = Double(side128) - 1
+        let limY = Double(side128 - 1 + ext)
         let x0 = Int(fx.rounded(.down)), y0 = Int(fy.rounded(.down))
         let dx = fx - Double(x0), dy = fy - Double(y0)
         var sum = 0.0
         for (ox, wx) in [(x0, 1 - dx), (x0 + 1, dx)] {
             for (oy, wy) in [(y0, 1 - dy), (y0 + 1, dy)] {
-                if ox >= 0 && oy >= 0 && Double(ox) <= lim && Double(oy) <= lim { sum += wx * wy }
+                if ox >= 0 && oy >= 0 && Double(ox) <= limX && Double(oy) <= limY { sum += wx * wy }
             }
         }
         return sum * 255.0
     }
 
-    /// 补丁 planar 数组的双线性取样，越界那一邻补 0（＝cv2 的 borderValue=0）
+    /// 补丁 planar 数组的双线性取样：左右上越界那一邻补 0（＝cv2 的 borderValue=0），
+    /// 往下那 ext 格取方块最后一行复制（PC 是 np.vstack([fake, np.repeat(fake[-1:], ext)]) 再 warp，同式）。
     private static func planarTap(_ f: [Float], _ plane: Int, _ s: Int, _ fx: Double, _ fy: Double,
-                                  _ ch: Int) -> Float {
+                                  _ ch: Int, ext: Int) -> Float {
         let x0 = Int(fx.rounded(.down)), y0 = Int(fy.rounded(.down))
         let dx = Float(fx - Double(x0)), dy = Float(fy - Double(y0))
         let b = ch * plane
         func v(_ xx: Int, _ yy: Int) -> Float {
-            guard xx >= 0, yy >= 0, xx < s, yy < s else { return 0 }
-            return f[b + yy * s + xx]
+            guard xx >= 0, yy >= 0, xx < s, yy < s + ext else { return 0 }
+            return f[b + min(yy, s - 1) * s + xx]
         }
         let top = v(x0, y0) + (v(x0 + 1, y0) - v(x0, y0)) * dx
         let bot = v(x0, y0 + 1) + (v(x0 + 1, y0 + 1) - v(x0, y0 + 1)) * dx
@@ -381,7 +422,11 @@ enum FsxGeo {
     /// ① 这一份模板必须逐点等于 insightface 官方 REFERENCE_FACIAL_POINTS（x 各 +8 是官方 preprocess 那一格）
     ///    ×size/112——旧那条线在手机上验过的就是这一组点，同一个模板才对得上同一套 Vision 点位；
     /// ② 映出去再映回来必须回到原地（逆矩阵那式没写反）；
-    /// ③ 腐蚀/糊那两档的取整口径（mask_size 100 时 k=10、kb=5）钉住，改式子就会被这里抓到。
+    /// ③ 腐蚀/糊那两档的取整口径（mask_size 100 时 k=10、kb=5）钉住，改式子就会被这里抓到；
+    /// ④ 往下多贴 extDown 格这一档：延伸带里白图该满、出了带该归 0，补丁取样在带里该拿到最后一行（复制）、
+    ///    带外该拿到 0——这两条一错，贴回去的下巴就是一片黑或者一层膜；
+    /// ⑤ 带子底部的收口：方块底边和下巴那一格（128 口径第 134 格）都得是满的，最底一格归 0、带外归 0，
+    ///    中间按 fadeDown 线性——收口接错就是脖子上那条硬边或者下巴盖上一层膜。
     static func selfTest() -> String {
         let official: [(Double, Double)] = [(30.29459953, 51.69630051), (65.53179932, 51.50139999),
                                             (48.02519989, 71.73660278), (33.54930115, 92.3655014),
@@ -398,8 +443,24 @@ enum FsxGeo {
         let bx = im.a * u + im.b * v + im.c, by = im.d * u + im.e * v + im.f
         let round = max(abs(bx - 50), abs(by - 60))
         let ms = 100
-        let gate = (max(ms / 10, 10) == 10 && max(ms / 20, 5) == 5 && gauss1d(11).count == 11)
+        var gate = (max(ms / 10, 10) == 10 && max(ms / 20, 5) == 5 && gauss1d(11).count == 11)
+        let s = side128
+        let inExt = whiteTap(64, Double(s - 1 + extDown / 2), ext: extDown) > 20
+        let outExt = whiteTap(64, Double(s + extDown), ext: extDown) == 0
+        var pf = [Float](repeating: 0, count: 3 * s * s)
+        for j in 0..<s { pf[(s - 1) * s + j] = 1 }                    // 只有 R 平面最后一行是 1
+        let rep = planarTap(pf, s * s, s, 64, Double(s + 1), 0, ext: extDown)
+        let beyond = planarTap(pf, s * s, s, 64, Double(s + extDown), 0, ext: extDown)
+        gate = gate && inExt && outExt && rep == 1 && beyond == 0
+        // 收口那一段：方块底边还是满的，下巴那一格（128 口径第 134 格）也必须满，最底一格归 0、带外归 0，
+        // 中间那一格按 fadeDown 线性（137 行＝离底 2 格／收 6 格＝0.4）
+        let fadeOK = rampTap(Double(s)) == 1 && rampTap(134) == 1 && rampTap(137) == 0.4
+            && rampTap(Double(s + extDown - 1)) == 0 && rampTap(Double(s + extDown)) == 0
+        gate = gate && fadeOK
         return "模板 224 与官方那份最大差 \(String(format: "%.6f", worst))｜往返残差 \(String(format: "%.9f", round))"
             + "｜腐蚀糊两档 \(gate ? "对" : "错")"
+            + "｜往下多贴 \(extDown) 格：带内满\(inExt ? "对" : "错") 带外零\(outExt ? "对" : "错")"
+            + " 最后一行复制\(rep == 1 ? "对" : "错") 带外取样\(beyond == 0 ? "零，对" : "非零，错")"
+            + "｜收口 \(fadeDown) 格\(fadeOK ? "对" : "错")（下巴那一格满、最底一格归 0）"
     }
 }

@@ -100,7 +100,7 @@ def pack_archive(base, emap_bin, files_order, out_bin, out_json, version):
     P.log('FXP-PACK', '文件 %d 个｜载荷 %d 字节｜归档 %d 字节｜头 %d 字节｜emap=%d 字节'
           % (len(files), len(blob), len(arch), len(hb), os.path.getsize(emap_bin)))
     for f_ in files:
-        if f_.path.endswith('Manifest.json') or f_.path == 'emap.bin':
+        if f_['path'].endswith('Manifest.json') or f_['path'] == 'emap.bin':
             P.log('FXP-PACK', '有 %s %d 字节' % (f_['path'], f_['size']))
     return man
 
@@ -187,8 +187,12 @@ def main():
                 res, ms = P.coreml_predict(m, P.feed_coreml(ins, [(x112.transpose(2, 0, 1)[None], x112)]))
                 oname, got = P.pick_out(res, 512)
                 e = got.reshape(-1)
-                c = P.cos(e / np.linalg.norm(e), ref_emb)
-                mdelta = float(np.abs(e - ref_emb).max())
+                # max|Δ| 必须两边都归一化后再比：CoreML 回来的那一份模长≈3，PC 存的那份是归一化过的，
+                # 直接相减会报出 2.9 这种吓人的数，而同一行的 cos 却是 1.000000——差的就是这层缩放。
+                en = e / max(float(np.linalg.norm(e)), 1e-12)
+                rn = ref_emb / max(float(np.linalg.norm(ref_emb)), 1e-12)
+                c = P.cos(en, rn)
+                mdelta = float(np.abs(en - rn).max())
                 rec['arc'] = {'cos': c, 'max_abs': mdelta, 'mb': round(P.pkg_mb(pkg), 1),
                               'convert_s': round(el, 1), 'infer_ms': round(ms, 1)}
                 P.log('FXP-VERDICT', 'arc(fp32) 成 转换 %.0f s 读回 %.1f s 包 %.1f MB 一次推理 %.1f ms'
