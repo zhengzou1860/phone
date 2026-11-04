@@ -1,0 +1,165 @@
+name: probe-fsx-coreml
+
+# 手机只能跑 CoreML，而这台 Windows 转不了 CoreML ⇒ 能不能转、转完掉不掉身份，只能在 CI 那台 mac 上问。
+# 这一条 job 不出包，只回答四个问题：
+#   ① inswapper_128（200 GMAC／1.386 亿参数）coremltools 认不认，fp16 会不会出 NaN；
+#   ② w600k_r50 转 CoreML 之后那 512 维嵌入和 PC 还差多少（余弦掉到 0.999 以下就是换人了）；
+#   ③ 包多大、装包要多久、手机上一次推理是几毫秒的量级；
+#   ④ emap（onnx 里那张 512×512 的 latent 映射）能不能单独抽出来给手机用。
+# 判据全部写进文件发到发布位 channel-fsx-probe：annotation 我这边匿名读不到，日志才是凭据。
+# 触发：push 到 swap 分支且改到这三个路径之一，或者在仓库页上手动 workflow_dispatch。
+on:
+  push:
+    branches: [swap]
+    paths:
+      - '.github/workflows/probe-fsx.yml'
+      - 'ci/fsx_probe.py'
+      - 'ci/fsx_fixtures/**'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: probe-fsx
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    runs-on: macos-latest
+    # 554 MB 那张网要转 fp16／fp32 两遍，每张还要落盘再读回来预测：给足 90 分钟
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: show toolchain
+        run: |
+          set +e
+          sw_vers
+          xcodebuild -version
+          uname -m
+          sysctl -n hw.memsize | awk '{print "物理内存 " $1/1073741824 " GB"}'
+          df -h / | tail -1
+
+      - name: 装 python 3.11 + 转换器
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 装 coremltools 那套
+        run: |
+          set +e
+          rec() { tee -a /tmp/probe_env.log; }
+          python -m pip install --quiet --no-cache-dir --upgrade pip >>/tmp/pip.log 2>&1
+          python -m pip install --quiet --no-cache-dir coremltools onnx onnxruntime numpy opencv-python-headless >>/tmp/pip.log 2>&1
+          rc=$?
+          python -c "import coremltools as ct,onnx,onnxruntime as ort,cv2,numpy;print('ENV-VERDICT 装好 ct=%s onnx=%s ort=%s cv2=%s np=%s'%(ct.__version__,onnx.__version__,ort.__version__,cv2.__version__,numpy.__version__))" 2>&1 | rec
+          if [ $rc -ne 0 ] || ! grep -q "ENV-VERDICT 装好" /tmp/probe_env.log; then
+            echo "ENV-VERDICT 装失败 rc=$rc" | rec
+            tail -8 /tmp/pip.log | rec
+            exit 1
+          fi
+
+      # 权重不进了 git（728 MB），只在 CI 上下一次，字节数钉死：换源就换字节，换字节就换画面。
+      # inswapper_128.onnx = 554253681，w600k_r50.onnx = 174383860（本机 PC 上验通的那两份，逐字节同一个）。
+      - name: 下 inswapper_128（554 MB）
+        run: |
+          set +e
+          ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=6{print "::error::" p substr($0,1,230)}'; }
+          rec() { tee -a /tmp/probe_env.log; }
+          mkdir -p /tmp/fm
+          WANT=554253681
+          U=https://github.com/deepinsight/insightface/releases/download/model-zoo/inswapper_128.onnx
+          code=$(curl -sS -L --retry 3 --retry-all-errors --max-time 1200 -o /tmp/fm/inswapper_128.onnx -w '%{http_code}' "$U")
+          sz=$(wc -c < /tmp/fm/inswapper_128.onnx 2>/dev/null | tr -d ' ')
+          echo "DL-VERDICT inswapper http=$code bytes=${sz:-0}（要 $WANT）" | rec
+          [ "${sz:-0}" = "$WANT" ] || { echo "DL-VERDICT inswapper 字节对不上，这一轮没得对账" | rec | ann "DL "; exit 1; }
+          shasum -a 256 /tmp/fm/inswapper_128.onnx | rec | ann "DL "
+          exit 0
+
+      - name: 下 buffalo_l 取 w600k_r50（人脸向量网）
+        run: |
+          set +e
+          ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=6{print "::error::" p substr($0,1,230)}'; }
+          rec() { tee -a /tmp/probe_env.log; }
+          WANT=174383860
+          U=https://github.com/deepinsight/insightface/releases/download/model-zoo/buffalo_l.zip
+          code=$(curl -sS -L --retry 3 --retry-all-errors --max-time 900 -o /tmp/fm/buffalo_l.zip -w '%{http_code}' "$U")
+          echo "DL-VERDICT zip http=$code bytes=$(wc -c < /tmp/fm/buffalo_l.zip 2>/dev/null | tr -d ' ')" | rec
+          unzip -o -q /tmp/fm/buffalo_l.zip -d /tmp/fm/blk 2>&1 | head -3 | rec
+          find /tmp/fm/blk -name 'w600k_r50.onnx' -exec cp {} /tmp/fm/w600k_r50.onnx \;
+          rm -rf /tmp/fm/buffalo_l.zip /tmp/fm/blk
+          sz=$(wc -c < /tmp/fm/w600k_r50.onnx 2>/dev/null | tr -d ' ')
+          echo "DL-VERDICT w600k_r50 bytes=${sz:-0}（要 $WANT）" | rec | ann "DL "
+          [ "${sz:-0}" = "$WANT" ] || exit 1
+          ls -l /tmp/fm | rec | ann "DL-LS "
+          exit 0
+
+      # 真正干活的一趟：/usr/bin/time -l 把峰值内存也留下（手机上装不装得下，看的就是这个数）
+      - name: 转 CoreML 并与 PC 的标准答案逐位对账
+        run: |
+          set +e
+          ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=10{print "::error::" p substr($0,1,230)}'; }
+          rec() { tee -a /tmp/probe_run.log; }
+          rm -rf /tmp/fxout && mkdir -p /tmp/fxout
+          /usr/bin/time -l python ci/fsx_probe.py --onnx-dir /tmp/fm --fixtures ci/fsx_fixtures \
+            --out-dir /tmp/fxout >/tmp/probe_out.log 2>&1
+          rc=$?
+          # 先把要补进去的行落成一个独立文件再往另一份日志上接：
+          # 边 grep 一个文件边往同一个文件里写，grep 会把自己刚写进去的那几行又读一遍，越写越长。
+          # fsx_probe.log 里本来就有这些 FSX- 行，所以只往 probe_run.log 上汇一份，不往它自己身上叠。
+          grep "^FSX-" /tmp/fxout/fsx_probe.log > /tmp/probe_fsx.txt || true
+          { echo "PROBE rc=$rc"; cat /tmp/probe_fsx.txt; } | rec
+          echo "PROBE rc=$rc" >> /tmp/fxout/fsx_probe.log
+          grep -E "maximum resident|real +[0-9]|wall clock" /tmp/probe_out.log | tr -s ' ' | rec
+          tail -6 /tmp/probe_out.log | rec
+          echo "---- 判定 ----" | rec
+          grep "^FSX-VERDICT" /tmp/fxout/fsx_probe.log | rec | ann "FSX "
+          grep "^FSX-SUM" /tmp/fxout/fsx_probe.log | rec | ann "SUM "
+          df -h / | tail -1 | rec | ann "DF "
+          exit 0
+
+      - name: publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set +e
+          ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=6{print "::error::" p substr($0,1,230)}'; }
+          cat /tmp/probe_env.log /tmp/probe_run.log > ./probe.log 2>/dev/null || cp /tmp/probe_run.log ./probe.log
+          files="probe.log"
+          for f in fsx_probe.log fsx_summary.json emap.bin fsx_coreml_fp16.png fsx_diff_fp16.png \
+                   fsx_coreml_fp32.png fsx_diff_fp32.png; do
+            [ -s "/tmp/fxout/$f" ] && cp "/tmp/fxout/$f" "./$f" && files="$files $f"
+          done
+          echo "待发 [$files]" | ann "REL "
+          gh release view channel-fsx-probe >/dev/null 2>&1 || gh release create channel-fsx-probe \
+            --title "fsx CoreML 探针" --prerelease --notes "转CoreML与PC标准答案的对账（占位，等 asset 上传）" 2>&1 | ann "REL "
+          gh release upload channel-fsx-probe $files --clobber 2>&1 | ann "REL "
+          gh release edit channel-fsx-probe --draft=false --prerelease >/dev/null 2>&1
+          RID=$(gh release view channel-fsx-probe --json id --jq .id 2>/dev/null)
+          curl -sS -X PATCH -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/$RID" \
+            -d '{"draft":false,"prerelease":true,"tag_name":"channel-fsx-probe","name":"fsx CoreML 探针"}' \
+            >/tmp/rel_patch.json 2>&1
+          # 发没发出去只认匿名能不能读回来（上一轮那条线就是栽在 step 绿但发布位 404）
+          curl -fsSL -o /tmp/relcheck.json -w "%{http_code}\n" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/channel-fsx-probe" >>/tmp/relcheck.json 2>&1
+          if grep -q '"tag_name": *"channel-fsx-probe"' /tmp/relcheck.json; then
+            echo "REL-VERDICT 探针日志已发到 channel-fsx-probe，匿名可读" | ann "REL "
+            grep -oE '"name": *"[^"]*"' /tmp/relcheck.json | head -10 | ann "REL-ASSET "
+          else
+            echo "REL-VERDICT 日志没发出去" | ann "REL "
+            head -c 200 /tmp/relcheck.json | ann "REL-RAW "
+          fi
+          exit 0
+
+      - name: keep artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fsx-probe
+          path: |
+            /tmp/fxout
+            /tmp/probe_env.log
+            /tmp/probe_run.log
+          if-no-files-found: ignore
