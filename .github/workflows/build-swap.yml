@@ -243,7 +243,7 @@ jobs:
           for f in fsx_pack_out pip; do
             [ -s "/tmp/$f.log" ] && cp "/tmp/$f.log" "./$f.log"
           done
-          files="swap.ipa build.log"
+          files="build.log"          # swap.ipa 不在这一串里：它单独传、传完当场验（见下面 IPA-UPLOAD 那一趟）
           for f in fsx_pack.log fsx_summary.json; do
             [ -s "SwapModel/$f" ] && files="$files SwapModel/$f"
           done
@@ -276,6 +276,16 @@ jobs:
           # （99ffb71 就是这样：事件里 swap.ipa=272620931 三张网全在，但 draft=true，匿名 HEAD 回 404）。
           # 所以 asset 一律用 upload --clobber 传进这条已发布的 release。
           gh release upload channel-swap $files --clobber 2>&1 | ann "REL "
+          # swap.ipa 单独一趟一趟传，每趟完事当场看发布位上列没列到它：
+          # --clobber 是先删后传，一次网络打嗝就能把发布位上那一份删没（run 41810625790 就这样——
+          # build.log／fsx_summary.json／models.* 全传上去了，swap.ipa 不见了，匿名 HEAD 回 404，闸门判死）。
+          for i in 1 2 3; do
+            gh release upload channel-swap swap.ipa --clobber 2>&1 | ann "REL-IPA "
+            listed=$(gh release view channel-swap --json assets --jq '.assets[] | .name' 2>/dev/null | grep -c '^swap\.ipa$')
+            echo "IPA-UPLOAD 第 $i 趟｜发布位列到 swap.ipa=$listed" | ann "REL-IPA "
+            [ "$listed" = 1 ] && break
+            sleep 15
+          done
           gh release edit channel-swap --draft=false --prerelease >/dev/null 2>&1
           RID=$(gh release view channel-swap --json id --jq .id 2>/dev/null)
           curl -sS -X PATCH \
