@@ -152,7 +152,8 @@ final class PageViewController: UIViewController {
 
     private func loadPage() {
         guard let text = storedHost(), let base = LiveHost.base(text) else {
-            openAddress(nil)
+            // 第一次启动预填 PC 现在那台（只当默认值，照样能改）
+            openAddress(LiveConfig.suggestedHost)
             return
         }
         connect(to: base)
@@ -279,9 +280,10 @@ final class PageViewController: UIViewController {
         readPath { [weak self] raw in
             guard let self = self else { return }
             guard let text = raw, let seconds = LiveTime.parse(text) else {
-                // 那一格里不是时间（是把 PC 的文件路径粘过来了）：原样交回页面处理
-                self.webView.evaluateJavaScript("typeof setVideoPath==='function' && setVideoPath()",
-                                               completionHandler: nil)
+                // 这一格在 PC 上是「视频路径」，在手机上只是跳转输入：手机上片子是本地挑的，
+                // 把名字当路径发回 PC 只会吃一次 409/400，所以不代跑页面那个 setVideoPath()
+                self.status("手机上这一格只当跳转输入用：填 秒数或 mm:ss 再点它＝跳到那儿；"
+                            + "换一段片子点「选择视频文件」", "error")
                 return
             }
             guard self.phase != .none else {
@@ -386,7 +388,10 @@ final class PageViewController: UIViewController {
         }
         // 冷启动预热期 PC 入口队列会一次性丢一大批帧，那不是故障，所以只进这一行账目、不报警
         if warnOnce("fps", every: 10.0) {
-            status("手机 \(String(format: "%.1f", fps))fps｜本地丢帧 \(client.framesDroppedLocal)"
+            // 模型还没加载完时 PC 一帧输出都没有（frames_in 在涨、output 是 null）：
+            // 空着不说明，手机上看到的就是「点了没画面」，最容易当成连坏了。
+            let warm = client.pcHasOutput ? "" : "PC 还在加载模型（冷启动约 17 秒）｜"
+            status(warm + "手机 \(String(format: "%.1f", fps))fps｜本地丢帧 \(client.framesDroppedLocal)"
                     + "｜PC 拒 \(client.framesRejected)｜PC 收到 \(client.pcFramesIn)、"
                     + "预热丢 \(client.pcFramesDropped)"
                     + "｜屏幕长按 1.5 秒改 PC 地址")
@@ -416,11 +421,12 @@ final class PageViewController: UIViewController {
 
     private func openAddress(_ prefill: String?) {
         let alert = UIAlertController(title: "PC 地址",
-                                      message: "局域网里那台跑换脸的电脑，例：192.168.1.20:5000",
+                                      message: "局域网里那台跑换脸的电脑，例："
+                                             + LiveConfig.suggestedHost,
                                       preferredStyle: .alert)
         alert.addTextField { tf in
-            tf.text = prefill
-            tf.placeholder = "192.168.1.20:5000"
+            tf.text = prefill ?? LiveConfig.suggestedHost
+            tf.placeholder = LiveConfig.suggestedHost
             tf.keyboardType = .URL
             tf.autocorrectionType = .no
         }

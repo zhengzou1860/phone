@@ -31,6 +31,7 @@ final class SwapClient: ObservableObject {
     @Published var pcFramesDropped = 0
     @Published var outputAgeMs: Int?           // PC 最近一帧输出的年龄；超阈值说明流水线停了
     @Published var inputAgeMs: Int?
+    @Published var pcHasOutput = false         // PC 一帧输出都还没有＝还在加载模型（冷启动约 17 秒）
     @Published var pcLiveMode = false          // PC 静默 10 秒会自己退出推流模式，手机靠这个知道要重来
     @Published var saw409 = 0                  // 被 PC 判「不在推流模式」的次数，恢复逻辑的触发信号
     @Published var sessionLost = false          // cookie 失效：PC 把请求弹回登录页，这边只有重登一条路
@@ -157,6 +158,7 @@ final class SwapClient: ObservableObject {
         pcFramesDropped = snap.framesDropped
         outputAgeMs = snap.outputAgeMs
         inputAgeMs = snap.inputAgeMs
+        pcHasOutput = snap.hasOutput
         pcLiveMode = snap.liveMode
     }
 

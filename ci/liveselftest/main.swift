@@ -176,6 +176,8 @@ ck("契约 封顶宽640", LiveConfig.fallbackMaxWidth == 640)
 ck("契约 质量0.7", LiveConfig.jpegQuality == 0.7)
 ck("契约 看门狗1500ms", LiveConfig.watchdogMs == 1500)
 ck("契约 PC默认端口5000", LiveConfig.defaultPort == 5000)
+ck("契约 预填那台能解析成地址", LiveHost.base(LiveConfig.suggestedHost) != nil,
+   LiveConfig.suggestedHost)
 
 // 客户端默认值与地址解析共用一条路
 ck("客户端 坏地址建不出来", SwapClient(hostText: "192.168.1.20/login") == nil)
@@ -196,6 +198,9 @@ ck("会话 200+HTML 判丢", LiveAuth.lostSession(statusCode: 200, path: "/live_
 ck("会话 200+空body的登录页跳转判丢", LiveAuth.lostSession(statusCode: 200, path: "/login",
                                                            contentType: "text/html"))
 ck("会话 401 判丢", LiveAuth.lostSession(statusCode: 401, path: "/live_frame", contentType: nil))
+ck("会话 非 /live_ 的 200+HTML 不算丢",
+   !LiveAuth.lostSession(statusCode: 200, path: "/uploads/nope", contentType: "text/html"),
+   "别处回 HTML 是 404 那一类，不是被弹回登录页")
 ck("会话 403 判丢", LiveAuth.lostSession(statusCode: 403, path: "/live_frame", contentType: nil))
 ck("会话 204 正常收帧不判丢", !LiveAuth.lostSession(statusCode: 204, path: "/live_frame",
                                                     contentType: nil))

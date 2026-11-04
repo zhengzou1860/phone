@@ -39,6 +39,11 @@ enum LiveConfig {
     /// 追加到 WKWebView 默认 UA 末尾：PC 那边看 access log 就知道是手机 app 在访问，
     /// 而不是有人在浏览器里手点。
     static let userAgentSuffix = "LiveSwap/0.1"
+
+    /// 第一次启动时地址栏里预填的这台：PC 侧现在监听的就是它。
+    /// 只当预填和提示用，不当写死的配置——PC 重连 WiFi 以后 IP 会变，
+    /// 长按改地址那条路必须一直留着。
+    static let suggestedHost = "192.168.31.100:5000"
 }
 
 // MARK: - PC 地址
@@ -112,6 +117,10 @@ enum LiveAuth {
         // 状态码是什么不重要（跟随重定向以后可能是 200 的页面，也可能是 415）。
         if let p = path, p.hasPrefix("/login") { return true }
         guard statusCode == 200 else { return false }
+        // PC 修掉 /login 闪现那个 bug 以前，任何不存在的路径都回「200 + 登录页 HTML」，
+        // 所以这条只认 /live_*：那几个口按契约要么是 204 要么是 JSON，回 HTML 就是被弹走了；
+        // 别处（比如 404 页）回 HTML 不该算掉登录。
+        guard let p = path, p.hasPrefix("/live_") else { return false }
         if let ct = contentType?.lowercased(), ct.contains("text/html") { return true }
         return false
     }
@@ -134,15 +143,17 @@ enum LiveAuth {
         return .rejected(statusCode)
     }
 
-    /// 上面两条的 HTTPURLResponse 外壳。expectedURL 是跟随重定向以后真正取到的地址。
+    /// 上面两条的 HTTPURLResponse 外壳。
+    /// resp.url 就是跟随重定向以后真正取到那一页的地址（登录页时为 /login）；
+    /// expectedURL 是缓存用的、iOS 18 起才有，别在这儿用它。
     static func lost(_ resp: HTTPURLResponse) -> Bool {
-        let path = (resp.expectedURL ?? resp.url)?.path
+        let path = resp.url?.path
         let type = resp.value(forHTTPHeaderField: "Content-Type")
         return lostSession(statusCode: resp.statusCode, path: path, contentType: type)
     }
 
     static func judge(_ resp: HTTPURLResponse) -> FrameVerdict {
-        let path = (resp.expectedURL ?? resp.url)?.path
+        let path = resp.url?.path
         let type = resp.value(forHTTPHeaderField: "Content-Type")
         return judge(statusCode: resp.statusCode, path: path, contentType: type)
     }
