@@ -10,6 +10,9 @@ app/HelloLC.xcodeproj/
 app/build/
 app/Payload/
 app/hello.ipa
+# CI 在 mac 上现下现转的东西，一个字节都不进 git：两张 onnx 728 MB、两份 mlpackage 694 MB、归档又是 694 MB。
+# （上面 *.png/*.json 已经挡住了大半，这一条是把 .onnx／.mlpackage／models.bin 一并钉死）
+app/SwapModel/
 # 对账 fixture 得跟着仓库走（CI 那台 mac 靠它判断转出来的包跟 PC 是不是同一套答案），
 # 上面 *.png/*.json 是为了不把手里的调试图往仓库里带，这一条是给 fixture 开的口子
 !ci/fsx_fixtures/

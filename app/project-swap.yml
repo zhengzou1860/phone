@@ -13,9 +13,9 @@ targets:
   SwapBench:
     type: application
     platform: iOS
-    # 只吃自己的目录。0.33 起模型彻底不进包：四张网由 CI 打成 models.bin 挂在 release 上，
-    # 手机第一次用时自己下到 Documents/swap_models（改了程序不用重下模型）。
-    # app 里 SwapNets.locate() 先找盘上那一份，找不到才退到包里（老 ipa 那样）。
+    # 只吃自己的目录。模型彻底不进包：两张网＋emap.bin 由 CI 打成 models.bin 挂在 release 上，
+    # 手机第一次用时自己下到 Documents/swap_models（改了程序不用重下模型，版本号＝两张 onnx 的 sha256）。
+    # app 那边 FsxEngine.locate() 只认盘上那一份，没有「包里再塞一份」的退路。
     sources:
       - SourcesSwap
     info:
@@ -26,8 +26,8 @@ targets:
         CFBundleExecutable: SwapBench
         CFBundleIdentifier: com.qoder.swapbench
         CFBundlePackageType: APPL
-        CFBundleShortVersionString: "0.35"
-        CFBundleVersion: "35"
+        CFBundleShortVersionString: "0.36"
+        CFBundleVersion: "36"
         CFBundleInfoDictionaryVersion: "6.0"
         NSPhotoLibraryAddUsageDescription: "要把换好脸的片段存回相册"
         NSPhotoLibraryUsageDescription: "要选一张源脸照片和一条要换脸的视频"

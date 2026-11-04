@@ -22,33 +22,21 @@ enum SwapFacts {
         ]
     }
 
-    /// 四张网逐个报。0.33 起模型不再跟着 ipa 走：一行说盘上那一份（Documents/swap_models），
-    /// 一行说包里那份（老 ipa 才有）。绝不在主线程调 compileModel——那可能现场编几分钟。
-    /// CI 是把 mlpackage 当普通目录拷进 .app 的，所以除了 Bundle.url 还要直接按路径摸。
+    /// 这一条链路要的那两张网＋那张 512×512 的 latent 映射逐个报，只认盘上那一份（Documents/swap_models）。
+    /// 不看包里那份、也不留「包里还塞着老的」那条退路：FsxEngine.locate 只从盘上装，
+    /// 界面上报一条引擎根本不走的路径，只会把「装得上但用的是哪一份」这件事搅浑。
+    /// 这里只看文件在不在，一个字节都不读，更不碰 compileModel（那可能现场编几分钟，绝不在主线程）。
     static func modelNote() -> String {
-        let names = [SwapNets.arcResource, SwapNets.buildResource, SwapNets.unetResource, SwapNets.parseResource]
         var parts: [String] = []
-        for res in names {
+        var miss = 0
+        for res in [FsxNets.arcResource, FsxNets.swapResource] {
             if SwapStore.local(res) != nil { parts.append("\(res)✓盘") }
-            else if Bundle.main.url(forResource: res, withExtension: "mlmodelc") != nil { parts.append("\(res)✓编") }
-            else if hasDir("\(res).mlpackage") { parts.append("\(res)✓待编") }
-            else { parts.append("\(res)✗") }
+            else { parts.append("\(res)✗"); miss += 1 }
         }
-        let miss = parts.filter { $0.contains("✗") }.count
-        let store = SwapStore.statusLine()
-        return parts.joined(separator: " ") + "｜" + store
-            + (miss == 0 ? "｜四张齐，能出片" : "｜缺 \(miss) 张：先点「下模型」下齐（或直接开始换脸会自动下），出不了片")
-    }
-
-    private static func hasDir(_ name: String) -> Bool {
-        let fm = FileManager.default
-        for base in [Bundle.main.bundleURL, Bundle.main.resourceURL].compactMap({ $0 }) {
-            var isDir: ObjCBool = false
-            if fm.fileExists(atPath: base.appendingPathComponent(name).path, isDirectory: &isDir), isDir.boolValue {
-                return true
-            }
-        }
-        return false
+        if SwapStore.haveEmap() { parts.append("emap✓盘") } else { parts.append("emap✗"); miss += 1 }
+        return parts.joined(separator: " ") + "｜" + SwapStore.statusLine()
+            + (miss == 0 ? "｜两张网＋emap 齐，能出片"
+                         : "｜缺东西：先点「下模型」下齐（或直接开始换脸会自动下），出不了片")
     }
 
     static func diskFreeGB() -> String {
@@ -146,7 +134,7 @@ enum SwapJournal {
     }
 
     private static let digestHeads = [
-        "开始整片换脸", "源脸：", "源脸对齐", "用已存的人", "① 身份证", "② 身份包", "③ 身份存档", "接口对账",
+        "开始整片换脸", "源脸：", "源脸对齐", "用已存的人", "① 身份证", "② 身份证×emap", "③ 身份存档", "接口对账",
         "补丁口径", "磁盘闸门", "原样搬运", "y 原点", "画面这条结束", "读到比预估少", "头一块进去",
         "块原样搬过去", "换上人 ", "总耗时", "脸短边", "本次峰值", "存相册", "沙盒那份已删", "本地还留着", "身份复测",
     ]

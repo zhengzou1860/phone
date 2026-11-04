@@ -10,26 +10,21 @@ import Vision
 
 /// 预览档：把「已存的人」逐个贴进小窗看效果。只看、不导出，手机侧一个字节的文件都不写。
 ///
-/// 为什么这一条能实时、出片那条不能：身份全在 ② 烘出来的那 18 个权重里、与帧无关，
-/// 换一个人只要读盘把权重装上（0.22 上机实测 0.29~0.85 ms），所以一帧都不必缓存
-/// ⇒ 长度上没有「超过 3 分钟就不行」那道墙，足迹还是日志里那 25~100 MB 的量级。
+/// 这一条为什么能一帧一帧地过：身份全在 ② 那一步乘出来的 512 维 latent 里、与帧无关，
+/// 换一个人只要读盘把身份证取回来重乘一次（几毫秒），所以一帧都不必缓存
+/// ⇒ 长度上没有「超过 3 分钟就不行」那道墙。
 ///
-/// 每帧省下来的钱来自 0.22 量出的两处（那一版预览试算 73.6 ms/帧，过不了 16 fps 的 62.5 ms 门槛）：
-///   ① 进链钉死 640 那一档，交出去的是这条小链的整幅画面：回贴的像素数随尺寸平方缩
-///      （整片 1920 那一格实测 16.85 ms）。0.23 上机两档都量过：640 档每换一帧 53.34 ms＝每播 1 s 素材
-///      要 909 ms，960 档 63.45 ms＝1105 ms 已经过不了 16 帧那一头 ⇒ 脸小也不再自己抬尺寸
-///   ② 逐帧网那趟调用里的搬运（实测 8.49 ms，改在 SwapModels 那两处 memcpy，出片那条一起省）
-/// 高频回填（σ＝0.8 高通，实测 2.60 ms）0.25 起跟成片同一口径：0.23 砍它省下的 2.6 ms
-/// 顶不住「皮肤比成片软一档」，加回来是 53.34＋2.60→每播 1 s 素材约 951 ms，还在 1000 ms 以内。
+/// 每一帧的钱几乎全在那一张 200 GMAC 的换脸网上：其余各步（检测、裁 128、贴回）合起来只有几毫秒，
+/// 而这一张按 CPU 跑是一秒到几秒一格 ⇒ 这一条链路的算力单元默认给「all」，让 CoreML 自己挑 ANE／GPU。
+/// 进链仍钉在 640 那一档：取样与回贴都按像素数走，小窗比成片便宜的就是这一截。
 ///
-/// 减帧口径：解码不跳（3.9 ms/帧），只有每 1/16 秒挑最贴近的那一帧真换，其余帧沿用上一格画面。
-/// 这一条是当场检测、没有整片对称平滑：边上会比成片抖（成片平滑后 0.94 px，这一路借成片口径约 1.9 px）。
+/// 减帧口径：解码不跳，只有每 1/16 秒挑最贴近的那一帧真换，其余帧沿用上一格画面。
+/// 这一条是当场检测、没有整片对称平滑：边上会比成片抖。
 final class SwapPreview {
 
     struct Cfg {
-        var units: MLComputeUnits = .cpuOnly
-        var unitsTxt = "CPU(cpuOnly)"
-        var whiten = true
+        var units: MLComputeUnits = .all
+        var unitsTxt = "all"
         var fpsTarget: Double = 16
         var minFacePx: Double = 40
         var longEdge = 640
@@ -60,24 +55,16 @@ final class SwapPreview {
     private var busy = false
 
     // 下面这些只在 q 那条线程上读写，界面不许碰
-    private var runner: SwapRunner?
-    private var runnerUnits: MLComputeUnits?
+    private var engine: FsxEngine?
+    private var engineUnits: MLComputeUnits?
     private var person = ""
     private var rep: [String] = []
     private var work: CVPixelBuffer?
     private var held: CVPixelBuffer?
     private var frameW = 0, frameH = 0
-    private var att = [Float](), gen = [Float]()
-    private var alpha = [Float]()
-    /// 遮罩按脸缓存：分割网一跑是几百毫秒到一秒，逐帧跑不起（详见 SwapMaskCache）
-    /// 每一趟（换素材／拖进度条重开一趟）重新起一份：拖回去那一秒的人可能换了一张脸，
-    /// 缓存里留着的遮罩属于拖之前那个人
-    private var maskCache = SwapMaskCache()
-    private var parseMsLog: [Double] = []
-    private var parseN = 0
+    private var att = [Float](), face = [Float]()
     private var decodeMs: [Double] = [], detectMs: [Double] = [], warpMs: [Double] = []
-    private var frameMs: [Double] = [], beautyMs: [Double] = [], maskMs: [Double] = []
-    private var pasteMs: [Double] = [], swapMs: [Double] = [], detailMs: [Double] = []
+    private var frameMs: [Double] = [], pasteMs: [Double] = [], swapMs: [Double] = []
     private var nSwap = 0, nDecode = 0, noFace = 0, smallFace = 0, mirror = 0, fitFail = 0, netFail = 0
     /// 被手性闸门挡下的帧分两拨：点是从 Vision 五官来的、还是只按脸框猜的
     private var mirrorReal = 0, mirrorGuess = 0
@@ -152,10 +139,10 @@ final class SwapPreview {
 
     private func finishRun(_ r: Outcome) {
         lock.lock(); busy = false; lock.unlock()
-        // 停下来的那一刻把四张网和两块整幅缓冲交回去：出片那条自己还要装一份 runner，
+        // 停下来的那一刻把两张网和两块整幅缓冲交回去：出片那条自己还要装一份引擎，
         // 预览留着不放就是把下一次「开始换脸」顶到它自己的足迹闸门上
-        runner = nil
-        runnerUnits = nil
+        engine = nil
+        engineUnits = nil
         person = ""
         work = nil
         held = nil
@@ -175,20 +162,20 @@ final class SwapPreview {
 
     private func pass(video: URL, fromSec: Double) -> Outcome {
         let c = snapCfg()
-        if runner == nil || runnerUnits != c.units {
-            say("预览装四张网 units=\(c.unitsTxt)｜足迹 \(SwapFacts.footprintMB()) MB")
-            let got = SwapRunner.load(units: c.units) { self.say($0) }
-            guard let r = got.runner else {
+        if engine == nil || engineUnits != c.units {
+            say("预览装两张网 units=\(c.unitsTxt)｜足迹 \(SwapFacts.footprintMB()) MB")
+            let got = FsxEngine.load(units: c.units) { self.say($0) }
+            guard let e = got.engine else {
                 say("预览装网失败：\(got.note)")
                 return .stop
             }
-            runner = r
-            runnerUnits = c.units
-            // 新建的那张 runner 身上没带任何身份权重，而 person 还记着上一个人：
-            // 不清零的话 applyPending 会以为「还是他」而跳过装权重，每一帧都画不出
+            engine = e
+            engineUnits = c.units
+            // 新装的那份引擎身上没带身份，而 person 还记着上一个人：
+            // 不清零的话 applyPending 会以为「还是他」而跳过装 latent，每一帧都画不出
             person = ""
         }
-        guard let runner = runner else { return .stop }
+        guard let engine = engine else { return .stop }
         guard let src = SwapSource(url: video, longEdge: c.longEdge, onLine: { self.say($0) }) else {
             say("预览 这条片子读不出（见上面几行）")
             return .stop
@@ -198,7 +185,7 @@ final class SwapPreview {
         progress(min(max(0, fromSec), dur), dur)
         frameW = src.outW
         frameH = src.outH
-        let side = SwapGeo.size
+        let side = FsxGeo.side128
         guard let dst = SwapTech.pixelBuffer(src.outW, src.outH).pb,
               let hd = SwapTech.pixelBuffer(src.outW, src.outH).pb else {
             say("预览 建不出 \(src.outW)x\(src.outH) 的小窗缓冲")
@@ -207,13 +194,9 @@ final class SwapPreview {
         work = dst
         held = hd
         att = [Float](repeating: 0, count: 3 * side * side)
-        gen = [Float](repeating: 0, count: 3 * side * side)
-        alpha = [Float](repeating: 0, count: SwapGeo.maskRows * side)
-        maskCache = SwapMaskCache()
-        parseMsLog = []
-        parseN = 0
+        face = [Float](repeating: 0, count: 3 * side * side)
         decodeMs = []; detectMs = []; warpMs = []; frameMs = []
-        beautyMs = []; maskMs = []; pasteMs = []; swapMs = []; detailMs = []
+        pasteMs = []; swapMs = []
         nSwap = 0; nDecode = 0; noFace = 0; smallFace = 0; mirror = 0; fitFail = 0; netFail = 0
         mirrorReal = 0; mirrorGuess = 0; gapN = 0; gapMax = 0
 
@@ -255,7 +238,7 @@ final class SwapPreview {
             autoreleasepool {
                 if pollStop() { outcome = .stop; done = true; return }
                 if let s = pollSeek() { outcome = .seek(s); done = true; return }
-                applyPending(runner)
+                applyPending(engine)
 
                 let td = ns()
                 guard let sb = vOut.copyNextSampleBuffer() else { outcome = .ended; done = true; return }
@@ -290,20 +273,20 @@ final class SwapPreview {
                         pointSrc = pn
                         if l.shortSide < c.minFacePx {
                             smallFace += 1
-                        } else if p.count == 5, let al = SwapVision.align(pts: p, src: pn, shortSide: l.shortSide) {
-                            if al.mirrored {
+                        } else if p.count == 5, let pl = FsxGeo.place(pts: p, src: pn, shortSide: l.shortSide) {
+                            if pl.mirrored {
                                 mirror += 1
-                                if al.src == "框猜" { mirrorGuess += 1 } else { mirrorReal += 1 }
+                                if pl.src == "框猜" { mirrorGuess += 1 } else { mirrorReal += 1 }
                                 // 这一格挡掉的到底是些什么点：把原值写进报告，下一轮判镜像这条闸门就不用再猜
                                 if mirror <= 5 {
-                                    let ptTxt = al.pts.map { String(format: "%.0f,%.0f", $0.x, $0.y) }.joined(separator: " ")
+                                    let ptTxt = pl.pts.map { String(format: "%.0f,%.0f", $0.x, $0.y) }.joined(separator: " ")
                                     say("预览 \(String(format: "%.2f", sec)) s 这帧手性与模板相反（y 口径判反）"
-                                        + "｜叉 \(String(format: "%.0f", al.chir.nose))／\(String(format: "%.0f", al.chir.mouth))"
-                                        + "｜点位 \(al.src)｜短边 \(String(format: "%.0f", al.shortSide)) px"
+                                        + "｜叉 \(String(format: "%.0f", pl.chir.nose))／\(String(format: "%.0f", pl.chir.mouth))"
+                                        + "｜点位 \(pl.src)｜短边 \(String(format: "%.0f", pl.shortSide)) px"
                                         + "｜小窗 \(frameW)x\(frameH)｜5 点 \(ptTxt)→这格不换")
                                 }
                             } else if SwapTech.copyRows(from: pb, to: hd),
-                                      compose(runner, al: al, whiten: snapCfg().whiten, sec: sec) {
+                                      compose(engine, pl: pl) {
                                 nSwap += 1
                                 let hold = sec - lastPub
                                 if hold > 0.25 { gapN += 1; gapMax = max(gapMax, hold) }
@@ -335,63 +318,30 @@ final class SwapPreview {
         return outcome
     }
 
-    /// 一帧的活：小窗那一幅 → 裁 224 → 逐帧网 → 高频回填 → 美白 → 遮罩 → 贴回小窗。
-    /// 补丁这一段与成片同一口径（0.25 起把高频回填加回来）；省的只有回贴那一片的像素数（进链钉在 640）。
-    /// 遮罩这一段也与成片同一口径（0.33 起换成人脸分割网，按脸缓存不逐帧跑）。
-    private func compose(_ runner: SwapRunner, al: SwapVision.Alignment, whiten: Bool, sec: Double) -> Bool {
+    /// 一帧的活：小窗那一幅 → 裁 128 → 一次前向 → 按官方那三刀贴回小窗。
+    /// 与成片同一条链路、同一组数：预览只是进链尺寸小，没有另配一档算法。
+    private func compose(_ engine: FsxEngine, pl: FsxGeo.Placed) -> Bool {
         guard let dst = work, let hd = held else { return false }
-        let side = SwapGeo.size
+        let side = FsxGeo.side128
         let t0 = ns()
         if CVPixelBufferLockBaseAddress(hd, .readOnly) != kCVReturnSuccess { return false }
         var got = true
         if let base = CVPixelBufferGetBaseAddress(hd) {
-            SwapGeo.warpToCrop(UnsafeRawPointer(base), bytesPerRow: CVPixelBufferGetBytesPerRow(hd),
-                               w: frameW, h: frameH, fwd: al.fwd, side: side, out: &att)
+            got = FsxGeo.warpCrop(UnsafeRawPointer(base), bytesPerRow: CVPixelBufferGetBytesPerRow(hd),
+                                  w: frameW, h: frameH, fwd: pl.fwd128, size: side, out: &att)
         } else { got = false }
         CVPixelBufferUnlockBaseAddress(hd, .readOnly)
         if !got { return false }
         warpMs.append(msFrom(t0))
 
         let t1 = ns()
-        let r = runner.frame(att224_01: att)
+        let r = engine.swap(crop128_01: att)
         frameMs.append(msFrom(t1))
-        if r.gen.count != 3 * side * side {
+        if r.face.count != 3 * side * side {
             if netFail < 2 { say("预览 网没回话：\(r.note)") }
             return false
         }
-        gen = r.gen
-
-        let t2a = ns()
-        SwapGeo.restoreDetail(&gen, att, lam: 1.0, sigma: 0.8)
-        detailMs.append(msFrom(t2a))
-
-        SwapGeo.vetoGreen(&gen, att)
-
-        let t2 = ns()
-        if whiten { SwapGeo.whiten(&gen, side: side) }
-        beautyMs.append(msFrom(t2))
-
-        let t3 = ns()
-        // 遮罩：分割网按脸缓存算的那一份（不逐帧跑）
-        if maskCache.wantsParse(att: att, at: sec) {
-            let pr = runner.parse(att224_01: att)
-            if pr.prob224.count == side * side {
-                SwapGeo.parseMask(pr.prob224, &alpha)
-                maskCache.commit(alpha, at: sec, ms: pr.ms)
-                parseMsLog.append(pr.ms)
-                parseN += 1
-                say("预览 \(String(format: "%.2f", sec)) s 分割网算遮罩 \(SwapUtil.ms(pr.ms))"
-                    + "｜第 \(parseN) 次｜漂移 \(String(format: "%.4f", maskCache.lastDrift))")
-            } else {
-                say("预览 分割网没回话：\(pr.note)")
-            }
-        }
-        if !maskCache.ready {
-            if netFail < 2 { say("预览 还没有遮罩（分割网没出得来）") }
-            return false
-        }
-        alpha = maskCache.current()
-        maskMs.append(msFrom(t3))
+        face = r.face
 
         let t4 = ns()
         // 画布每一格先从原帧重铺：不铺就只有脸框那一片有像素、其余整幅是空的，界面上看着＝黑底上一小块脸。
@@ -403,17 +353,16 @@ final class SwapPreview {
         if CVPixelBufferLockBaseAddress(dst, []) != kCVReturnSuccess { return false }
         var pasted = false
         if let base = CVPixelBufferGetBaseAddress(dst) {
-            SwapGeo.pasteBack(base, bytesPerRow: CVPixelBufferGetBytesPerRow(dst), w: frameW, h: frameH,
-                              gen: gen, mask: alpha, att: att, fwd: al.fwd, back: al.back)
-            pasted = true
+            pasted = FsxGeo.pasteBack(base, bytesPerRow: CVPixelBufferGetBytesPerRow(dst),
+                                      w: frameW, h: frameH, face: face, fwd: pl.fwd128)
         }
         CVPixelBufferUnlockBaseAddress(dst, [])
         pasteMs.append(msFrom(t4))
         return pasted
     }
 
-    /// 「开始预览」定下那个人挂进来的那一步：读盘装权重。一整趟只在这里装一次，装完不再换人。
-    private func applyPending(_ runner: SwapRunner) {
+    /// 「开始预览」定下那个人挂进来的那一步：读盘取身份证、乘出 latent。一整趟只在这里装一次，装完不再换人。
+    private func applyPending(_ engine: FsxEngine) {
         lock.lock()
         let pid = wantPerson
         wantPerson = nil
@@ -423,23 +372,24 @@ final class SwapPreview {
             refuse("预览开不起来：「\(SwapIdents.displayName(pid))」的存档读不出来，先停预览换一个人")
             return
         }
-        let eNorm = SwapIdents.norm(one.emb), wNorm = SwapIdents.weightsNorm(one.weights)
-        guard eNorm > 0.5, wNorm > 1e-6 else {
-            refuse("预览开不起来：「\(one.name)」这份包里的数是空的（身份证模长 \(String(format: "%.4f", eNorm))"
-                + "／权重合起来模长 \(String(format: "%.3f", wNorm))），先停预览换一个人")
+        let eNorm = FsxEngine.norm(one.emb)
+        guard eNorm > 0.5 else {
+            refuse("预览开不起来：「\(one.name)」这份包里的身份证是空的或不是这一版写的"
+                + "（\(one.emb.count) 维／模长 \(String(format: "%.4f", eNorm))，这一版要 \(FsxNets.embDim) 维单位向量），先停预览换一个人")
             return
         }
         let t0 = ns()
-        let put = runner.useWeights(one.weights)
+        let put = engine.useIdentity(emb: one.emb)
         let ms = msFrom(t0)
-        guard put.count == 18 else {
-            refuse("预览开不起来：\(put.note)，先停预览换一个人")
+        guard put else {
+            refuse("预览开不起来：「\(one.name)」的身份证乘不出 latent"
+                + "（\(one.emb.count) 维／emap \(engine.emap.count) 个数），先停预览换一个人")
             return
         }
         person = pid
         confirm(pid)
-        say("预览 装到人「\(one.name)」：读盘＋装权重 \(SwapUtil.ms(ms))｜\(put.note)"
-            + "｜跳过 ①②（上机实测这两步 70.61 + 18.27 ms）｜足迹 \(SwapFacts.footprintMB()) MB")
+        say("预览 装到人「\(one.name)」：读盘＋乘 latent \(SwapUtil.ms(ms))"
+            + "｜跳过 ①（每人一次的那一步）｜足迹 \(SwapFacts.footprintMB()) MB")
     }
 
     /// 开不起来：这句既进流水（发电脑要看的那份），也当场顶到界面那一行——点了「开始预览」总得有个说法
@@ -450,7 +400,7 @@ final class SwapPreview {
         refuseRun()
     }
 
-    /// 身份权重装不上就别跑了：那张 runner 身上没身份，逐帧网只会凑出一张不认识的脸
+    /// 身份装不上就别跑了：那份引擎身上没 latent，换脸网只会凑出一张不认识的脸
     private func refuseRun() {
         lock.lock(); stopping = true; lock.unlock()
     }
@@ -466,19 +416,17 @@ final class SwapPreview {
     }
 
     private func reportPrice(c: Cfg, wall: Double, play: Double, fps: Double) {
-        let unit = avg(detectMs) + avg(warpMs) + avg(frameMs) + avg(detailMs) + avg(beautyMs) + avg(maskMs) + avg(pasteMs)
+        let unit = avg(detectMs) + avg(warpMs) + avg(frameMs) + avg(pasteMs)
         let need = unit * c.fpsTarget + avg(decodeMs) * fps
         let rate = wall > 0.1 ? Double(nSwap) / wall : 0
         let verdict = rate >= c.fpsTarget - 0.6 ? "够 16 帧"
             : (need <= 1000 ? "算着够、这一趟没跑到（素材短或停在开头）" : "不够 16 帧")
         say("预览单价 每换一帧 \(String(format: "%.2f", unit)) ms＝检测 \(SwapUtil.stat(detectMs))"
-            + "＋裁脸 \(SwapUtil.stat(warpMs))＋逐帧网 \(SwapUtil.stat(frameMs))"
-            + "＋高频回填 \(SwapUtil.stat(detailMs))＋美白 \(SwapUtil.stat(beautyMs))＋遮罩 \(SwapUtil.stat(maskMs))"
-            + "＋画布重铺＋脸框回贴 \(SwapUtil.stat(pasteMs))")
-        say("      遮罩来源 分割网算 \(parseN) 次（\(SwapUtil.stat(parseMsLog))）｜按脸缓存，漂移 \(String(format: "%.4f", maskCache.lastDrift)) 过 \(String(format: "%.2f", SwapMaskCache.driftGate)) 才重算"
-            + "｜摊到这一趟是每帧 \(String(format: "%.2f", parseN > 0 ? parseMsLog.reduce(0, +) / Double(max(1, nSwap)) : 0)) ms")
+            + "＋裁 128 \(SwapUtil.stat(warpMs))＋换脸网整次 \(SwapUtil.stat(frameMs))"
+            + "＋画布重铺＋贴回 \(SwapUtil.stat(pasteMs))")
+        say("      \(engine?.statsLine() ?? "网没装上（这一趟没跑到）")")
         say("      解码 \(SwapUtil.stat(decodeMs))×\(String(format: "%.1f", fps)) 帧/秒"
-            + "｜整帧含节奏 \(SwapUtil.stat(swapMs))｜美白这一趟\(c.whiten ? "开" : "关")")
+            + "｜整帧含节奏 \(SwapUtil.stat(swapMs))")
         say("      这一趟 换出 \(nSwap) 格／读掉 \(nDecode) 格｜没脸 \(noFace)｜太小 \(smallFace)｜拟合没过 \(fitFail)"
             + "｜镜像 \(mirror)（真点位 \(mirrorReal)／框猜 \(mirrorGuess)）｜画不出 \(netFail)｜点位 \(pointSrc)")
         say("      画面停住 超过 0.25 s 素材 \(gapN) 次｜最长 \(String(format: "%.2f", gapMax)) s"

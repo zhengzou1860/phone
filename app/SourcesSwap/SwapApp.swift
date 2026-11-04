@@ -49,14 +49,14 @@ struct SwapContentView: View {
     @State private var videoURL: URL?
     @State private var picking: String = ""          // "face" / "video"：谁的选片器开着
     @State private var running = false
-    @State private var unitIdx = 0                   // 默认 units[0] = cpuOnly
+    @State private var unitIdx = 2                   // 默认 units[2] = all：那一张换脸网 200 GMAC，纯 CPU 是一秒到几秒一格，
+                                                     // 交给 CoreML 自己挑 ANE／GPU
     @State private var longIdx = 0                   // 默认 1920（长边上限）
-    @State private var beautyIdx = 1                 // 0＝美白开，1＝关；10-22 起默认关（他肉眼判：关比开好）
     @State private var result = ""
     @State private var outURL: URL?
 
     @State private var idents: [SwapIdents.Item] = []
-    @State private var chosenIdent: String = ""      // 已存的人：非空就跳过身份证＋身份包那两步
+    @State private var chosenIdent: String = ""      // 已存的人：非空就跳过算身份证那一步（源脸照片那一次前向）
     @State private var identNote = ""
     @State private var renaming = false
     @State private var renameId = ""
@@ -108,7 +108,7 @@ struct SwapContentView: View {
 
                     VStack(alignment: .leading, spacing: 6) {
                         Text("已存的人").font(.headline)
-                        Text("一人一份身份；点名字选中，跑片时跳过算身份那两步。")
+                        Text("一人一份身份；点名字选中，跑片时跳过算身份证那一步（换人只要从盘上把身份证取回来重乘）。")
                             .font(.caption2)
                         if idents.isEmpty {
                             Text("（列表空着。①选一张源脸照片跑一次，跑的时候自动存进来）").font(.caption)
@@ -118,7 +118,9 @@ struct SwapContentView: View {
                                 Button((chosenIdent == it.id ? "◉ " : "○ ") + it.name) { pickIdent(it) }
                                     .buttonStyle(.borderless)
                                     .disabled(running)
-                                Text(String(format: "%.2f MB", Double(it.bytes) / 1_048_576))
+                                Text(it.bytes >= 1_048_576
+                                    ? String(format: "%.2f MB", Double(it.bytes) / 1_048_576)
+                                    : String(format: "%.1f KB", Double(it.bytes) / 1024))
                                     .font(.caption2)
                                 Spacer(minLength: 4)
                                 Button("改名") { startRename(it) }
@@ -174,14 +176,6 @@ struct SwapContentView: View {
                         }
                         .pickerStyle(.segmented)
                         .disabled(running)
-                        Picker("补丁美白", selection: $beautyIdx) {
-                            Text("开").tag(0)
-                            Text("关").tag(1)
-                        }
-                        .pickerStyle(.segmented)
-                        .disabled(running)
-                        Text("默认关。开＝在补丁上做一档提亮。")
-                            .font(.caption2)
 
                         // 点下去立刻置灰 + 改文案：界面上没有流水，这一下的反馈就在按钮自己身上
                         Button(running ? "换脸跑着…（跑完这里给一句话）" : "开始换脸") {
@@ -216,7 +210,7 @@ struct SwapContentView: View {
                             if let im = pv.img {
                                 Image(uiImage: im).resizable().scaledToFit()
                             } else {
-                                Text(pv.on ? "开跑了，第一格要等四张网装好" : "（还没开）")
+                                Text(pv.on ? "开跑了，第一格要等两张网装好" : "（还没开）")
                                     .font(.caption).foregroundColor(.gray)
                             }
                         }
@@ -374,17 +368,15 @@ struct SwapContentView: View {
         outURL = nil
         let units = Self.units[unitIdx].1
         let longEdge = Self.longs[longIdx]
-        let beautyTxt = beautyIdx == 0 ? "开" : "关"
         if SwapContentView.engine.isActive {
-            SwapJournal.line("开始整片换脸：预览还开着，先叫停它并把四张网交出来（两条同跑＝两份足迹＋互相抢 CPU）")
+            SwapJournal.line("开始整片换脸：预览还开着，先叫停它并把两张网交出来（两条同跑＝两份足迹＋互相抢算力）")
         }
-        SwapJournal.line("开始整片换脸 units=\(Self.units[unitIdx].0) 长边=\(longEdge) 美白=\(beautyTxt) 源=\(sourceTag) 片=\(v.lastPathComponent)")
+        SwapJournal.line("开始整片换脸 units=\(Self.units[unitIdx].0) 长边=\(longEdge) 源=\(sourceTag) 片=\(v.lastPathComponent)")
         var args = SwapClip.Args()
         args.units = units
         args.longEdge = longEdge
-        args.whiten = beautyIdx == 0
         Task.detached {
-            // 预览还开着就先叫停，并等它把四张网＋两块整幅缓冲交出来再装自己这一份
+            // 预览还开着就先叫停，并等它把两张网＋两块整幅缓冲交出来再装自己这一份
             SwapContentView.engine.stop()
             var waited = 0.0
             while SwapContentView.engine.isActive && waited < 5.0 {
@@ -425,8 +417,8 @@ struct SwapContentView: View {
 
     /// 这一趟的源身份是谁：界面贴在 ① 下面，日志里同一句话进流水。
     private var sourceLine: String {
-        if !chosenIdent.isEmpty { return "源身份：已存的人「\(SwapIdents.displayName(chosenIdent))」，跑的时候跳过身份证＋身份包" }
-        if faceImg != nil { return "源身份：刚选的这张照片，要跑身份证＋身份包那两步" }
+        if !chosenIdent.isEmpty { return "源身份：已存的人「\(SwapIdents.displayName(chosenIdent))」，跑的时候跳过算身份证那一步" }
+        if faceImg != nil { return "源身份：刚选的这张照片，要跑算身份证那一步（几百毫秒）" }
         return "源身份：还没定——在「已存的人」里点一个，或①选一张源脸照片"
     }
 
@@ -508,22 +500,20 @@ struct SwapContentView: View {
         var c = SwapPreview.Cfg()
         c.units = Self.units[unitIdx].1
         c.unitsTxt = Self.units[unitIdx].0
-        c.whiten = beautyIdx == 0
         let reject = eng.start(video: v, personId: chosenIdent, cfg: c)
         if !reject.isEmpty {
             pv.status = reject
             SwapJournal.line("预览 开始被挡：\(reject)")
             return
         }
-        let whitenTxt = c.whiten ? "开" : "关"
         pv.on = true
         pv.img = nil
         pv.report = ""
         pv.pos = 0
         pv.dur = 0
         pv.person = ""
-        pv.status = "预览开跑：先把四张网装好，第一格还要等它检测到位"
-        SwapJournal.line("开始预览 units=\(c.unitsTxt) 美白=\(whitenTxt) "
+        pv.status = "预览开跑：先把两张网装好，第一格还要等它检测到位"
+        SwapJournal.line("开始预览 units=\(c.unitsTxt) "
             + "人=\(SwapIdents.displayName(chosenIdent)) 片=\(v.lastPathComponent)")
     }
 
@@ -533,7 +523,7 @@ struct SwapContentView: View {
         SwapContentView.engine.seek(sec)
     }
 
-    /// 下模型：四张网合成一个 models.bin 挂在 release 上，下完 sha256 对得上才解包。
+    /// 下模型：两张网＋emap.bin 合成一个 models.bin 挂在 release 上，下完 sha256 对得上才解包。
     /// 下到 Documents/swap_models —— 程序随便换，这一份原封不动。
     private func downloadModels() {
         modelBusy = true
