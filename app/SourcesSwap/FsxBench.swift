@@ -17,12 +17,16 @@ enum FsxBench {
     ]
     /// 每档跑 5 格：第一格单独报（ANE 现编、GPU 首次调度那类钱都在第一格上），后面取均速
     static let passes = 5
+    /// CPU 那一档的最后一格留在这儿当参照：CoreML 在 CPU 上走的就是 CI 转换时跟 onnxruntime 对过账的那条 fp32 路，
+    /// 其余三档离它几灰阶，就是那一档硬件（ANE 内部按 fp16 摆这一类）赔掉的精度——快多少值不值，看这一格。
+    private static var refOut: [Float]?
 
     static func run(onLine: @escaping (String) -> Void) {
         guard SwapStore.haveAll() else {
             onLine("量速 没跑：盘上没有那两张网（先点「下模型」）")
             return
         }
+        refOut = nil
         var best = (name: "", avg: Double.infinity)
         var allAvg: [String: Double] = [:]
         for arm in arms {
@@ -33,10 +37,13 @@ enum FsxBench {
             }
             waitRelease()
         }
-        let mine = allAvg["all"]
-        if best.avg.isFinite, let m = mine {
+        // 基准用 CPU 那一档：0.40 起默认就钉在 CPU（CI 转换对账走的那条 fp32 路也是 CPU）
+        let base = allAvg["CPU(cpuOnly)"]
+        let allTxt = allAvg["all"].map { "；点 all 那档 \(SwapUtil.ms($0))＝CoreML 自己挑的其实是 GPU" } ?? ""
+        if best.avg.isFinite, let b = base {
             onLine("量速 判决 最快是「\(best.name)」avg \(SwapUtil.ms(best.avg))"
-                + (m > 1 ? "＝现在这一档（all \(SwapUtil.ms(m))）的 \(String(format: "%.1f", m / max(best.avg, 0.001))) 倍快" : "（和 all 同档）"))
+                + "＝这一版默认那档（CPU \(SwapUtil.ms(b))）的 \(String(format: "%.1f", b / max(best.avg, 0.001))) 倍快"
+                + allTxt)
         } else {
             onLine("量速 判决 四档里没有一档跑出数来（上面每档那句就是原因）")
         }
@@ -57,6 +64,7 @@ enum FsxBench {
         let side = FsxGeo.side128
         let crop = fakeCrop()
         var ms: [Double] = []
+        var last: [Float]?
         for i in 0..<passes {
             let r = e.swap(crop128_01: crop)
             if r.face.count != 3 * side * side {
@@ -64,6 +72,7 @@ enum FsxBench {
                 return nil
             }
             ms.append(r.ms)
+            last = r.face
             onLine("量速 \(name) 第 \(i + 1) 格 \(SwapUtil.ms(r.ms))｜足迹 \(SwapFacts.footprintMB()) MB")
         }
         let rest = Array(ms.dropFirst())
@@ -71,6 +80,20 @@ enum FsxBench {
         let avg = rest.reduce(0, +) / Double(rest.count)
         onLine("量速 \(name)｜首次 \(SwapUtil.ms(ms[0]))｜后面 \(rest.count) 格 avg \(SwapUtil.ms(avg))"
             + "／最快 \(SwapUtil.ms(rest.min() ?? 0))／最慢 \(SwapUtil.ms(rest.max() ?? 0))")
+        // 同一张裁片、同一个身份，各档出来的那一张脸该是同一份数：差几灰阶就是这一档硬件赔掉的精度
+        if let ref = refOut, let o = last {
+            var mx: Float = 0, sum: Float = 0
+            for k in 0 ..< min(ref.count, o.count) {
+                let d = abs(ref[k] - o[k])
+                if d > mx { mx = d }
+                sum += d
+            }
+            onLine("量速 \(name) 离 CPU 那一份 最坏 \(String(format: "%.1f", Double(mx) * 255))"
+                + "／平均 \(String(format: "%.2f", Double(sum) / Double(o.count) * 255)) 灰阶（n=\(o.count)）")
+        } else if last != nil {
+            refOut = last
+            onLine("量速 \(name) 这一份留作参照，后面三档都跟它比灰阶差")
+        }
         return avg
     }
 

@@ -49,8 +49,11 @@ struct SwapContentView: View {
     @State private var videoURL: URL?
     @State private var picking: String = ""          // "face" / "video"：谁的选片器开着
     @State private var running = false
-    @State private var unitIdx = 2                   // 默认 units[2] = all：那一张换脸网 200 GMAC，纯 CPU 是一秒到几秒一格，
-                                                     // 交给 CoreML 自己挑 ANE／GPU
+    @State private var unitIdx = 0                   // 默认 units[0] = cpuOnly：0.39 上机四档实测
+                                                     // CPU 890／GPU 1043／all 1045／ANE 815（每档 5 格均速），
+                                                     // all 那一格跟 GPU 一模一样＝CoreML 自己挑的是 GPU，比纯 CPU 还慢 18 %，
+                                                     // 而且两份网的足迹要到 854 MB；CPU 那一档全程 44 MB。
+                                                     // ANE 只快 8 %，而它内部按 fp16 摆，赔多少精度等量速那一句「离 CPU 那一份几灰阶」说了再定。
     @State private var longIdx = 0                   // 默认 1920（长边上限）
     @State private var result = ""
     @State private var outURL: URL?
@@ -381,6 +384,7 @@ struct SwapContentView: View {
         running = true
         result = ""
         outURL = nil
+        SwapUtil.keepScreenAwake(true)
         let units = Self.units[unitIdx].1
         let longEdge = Self.longs[longIdx]
         if SwapContentView.engine.isActive {
@@ -429,6 +433,7 @@ struct SwapContentView: View {
                     : (r.note.split(separator: "\n").last.map(String.init) ?? "换脸没成")
                 running = false
                 videoURL = nil
+                SwapUtil.keepScreenAwake(false)
                 facts = SwapFacts.lines()
                 idents = SwapIdents.list()
             }
@@ -439,8 +444,9 @@ struct SwapContentView: View {
     /// （两份 726 MB 的换脸网同时在手里会被系统当场杀掉），所以先把预览叫停。
     private func startBench() {
         benchBusy = true
-        benchText = "量速 第一档正在装两张网（换脸网单张装包 5～6.5 s）"
+        benchText = "量速 第一档正在装两张网（用回上回编好的那一份，不重编）"
         SwapJournal.line("开始量四档算力（每档 5 格）")
+        SwapUtil.keepScreenAwake(true)
         Task.detached {
             SwapContentView.engine.stop()
             var waited = 0.0
@@ -457,6 +463,7 @@ struct SwapContentView: View {
             }
             DispatchQueue.main.async {
                 benchBusy = false
+                SwapUtil.keepScreenAwake(false)
                 facts = SwapFacts.lines()
             }
         }

@@ -174,7 +174,9 @@ final class SwapSource {
 /// 逐帧的钱全在那一张 200 GMAC 的换脸网上，其余每一步都是几十字节的算术。
 enum SwapClip {
     struct Args {
-        var units: MLComputeUnits = .all      // 200 GMAC 那一张交给 CoreML 自己挑；界面那格能换
+        var units: MLComputeUnits = .cpuOnly  // 0.39 上机四档实测：CPU 890／GPU 1043／all 1045／ANE 815 ms 一格，
+                                              // all 落回的就是 GPU（比纯 CPU 慢 18 %，足迹还要 854 MB），所以默认按 CPU 钉住；
+                                              // CPU 这一档也正是 CI 转换时对账用的那条 fp32 路。界面那格能换
         var longEdge: Int = 1920
         var minFacePx: Double = 40
         var sampleEvery: Int = 30
@@ -514,6 +516,7 @@ enum SwapClip {
         let mem0 = SwapFacts.footprintMB()
         var memMax = mem0
         let wall0 = DispatchTime.now().uptimeNanoseconds
+        var lastMark = wall0
 
         // 音频跟画面在同一趟里交替喂，绝不等到整条画面跑完才开始搬音轨：
         // 挂着一条音轨输入却一块不喂，编码队列中途就不收画面了（第 9 轮 418 帧只走到 30 帧，随后闪退）。
@@ -777,7 +780,13 @@ enum SwapClip {
                 while !adaptor.append(dst, withPresentationTime: rel) {
                     tries += 1
                     if writer.status == .failed {
-                        ended = "append 失败，writer failed: \(writer.error?.localizedDescription ?? "-")"; return
+                        // -11846 operationInterrupted 是 iOS 把进程冻住时写盘那头的回话：锁屏或切后台就这个。
+                        // 上机 22:33 那一趟就是这么停在第 26 帧的（墙钟 9.5 分钟只走 26 帧），
+                        // 不点名就会被当成「换脸慢」。
+                        let iv = (writer.error as? AVError)?.code == .operationInterrupted
+                        ended = "append 失败，writer failed: \(writer.error?.localizedDescription ?? "-")"
+                            + (iv ? "｜这趟中途被系统冻住了（锁屏／切后台）：出片要亮屏在前台跑完" : "")
+                        return
                     }
                     if tries > 400 { ended = "append 连续失败 400 轮"; return }
                     Thread.sleep(forTimeInterval: 0.005)
@@ -793,8 +802,12 @@ enum SwapClip {
                 if made % 60 == 0 {
                     let el = Double(DispatchTime.now().uptimeNanoseconds - wall0) / 1_000_000_000
                     let per = el / Double(max(1, made))
+                    // 近 60 帧那一格的均速单独报：A13 跑五分钟会热降频，只看整趟均速看不出来
+                    let win = Double(DispatchTime.now().uptimeNanoseconds - lastMark) / 1_000_000_000 / 60.0
+                    lastMark = DispatchTime.now().uptimeNanoseconds
                     say("换到第 \(made)/\(estFrames) 帧｜已用 \(String(format: "%.1f", el)) s"
                         + "｜约还需 \(String(format: "%.1f", per * Double(max(0, estFrames - made)))) s｜足迹 \(now) MB"
+                        + "｜近 60 帧每帧 \(String(format: "%.0f", win)) ms"
                         + "｜音频 \(aOK) 块")
                 }
             }
@@ -835,7 +848,9 @@ enum SwapClip {
         sem.wait()
         let tailMs = Double(DispatchTime.now().uptimeNanoseconds - tail0) / 1_000_000
         guard writer.status == .completed else {
-            return fail("writer 没收尾 status=\(writer.status.rawValue): \(writer.error?.localizedDescription ?? "-")")
+            let iv = (writer.error as? AVError)?.code == .operationInterrupted
+            return fail("writer 没收尾 status=\(writer.status.rawValue): \(writer.error?.localizedDescription ?? "-")"
+                + (iv ? "（这一趟中途被系统冻住了：锁屏或切后台；出片要亮屏在前台跑完）" : ""))
         }
         let attrsOfOut = try? fm.attributesOfItem(atPath: out.path)
         let size = (attrsOfOut?[.size] as? NSNumber)?.int64Value ?? 0

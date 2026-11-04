@@ -208,4 +208,16 @@ enum SwapUtil {
         return String(format: "avg %.2f / 中位 %.2f / max %.2f", avg, sorted[sorted.count / 2],
                       sorted.last ?? 0) + " ms（n=\(values.count)）"
     }
+
+    /// 出片这一趟按几分钟算：屏幕自己暗下去锁上，iOS 当场把进程冻住，写盘那头回 -11846
+    /// （上机 22:33 那一趟就是这么只走到第 26 帧）。跑的时候钉住屏幕，跑完放开；
+    /// 计数是为了量速／换脸叠着按的时候，先结束那一趟不许把另一趟的钉给松开。
+    private static var awakeHolders = 0
+
+    static func keepScreenAwake(_ on: Bool) {
+        DispatchQueue.main.async {
+            awakeHolders = max(0, awakeHolders + (on ? 1 : -1))
+            UIApplication.shared.isIdleTimerDisabled = awakeHolders > 0
+        }
+    }
 }
