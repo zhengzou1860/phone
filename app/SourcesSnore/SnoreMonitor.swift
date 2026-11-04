@@ -109,11 +109,11 @@ final class SnoreMonitor: NSObject, ObservableObject {
     /// 电量与屏幕常亮：只有主线程读得到，读到就塞进缓存给后台的报表用。
     static func feedEnv() {
         let d = UIDevice.current
-        let wasOn = d.isMonitoringEnabled
-        if !wasOn { d.isMonitoringEnabled = true }
+        let wasOn = d.isBatteryMonitoringEnabled
+        if !wasOn { d.isBatteryMonitoringEnabled = true }
         let level = d.batteryLevel
         let state = d.batteryState
-        if !wasOn { d.isMonitoringEnabled = false }
+        if !wasOn { d.isBatteryMonitoringEnabled = false }
         let stateText: String
         switch state {
         case .full: stateText = "满"

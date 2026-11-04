@@ -38,7 +38,7 @@ struct SnoreChart: View {
                 let x = CGFloat(t) * secPerPt
                 var line = Path()
                 line.move(to: CGPoint(x: x, y: 0))
-                line.lineTo(to: CGPoint(x: x, y: size.height))
+                line.addLine(to: CGPoint(x: x, y: size.height))
                 ctx.stroke(line, with: .color(.secondary.opacity(0.25)), lineWidth: 0.5)
                 let label = DateFormatter()
                 label.dateFormat = span > 3600 ? "HH" : "HH:mm"
@@ -68,7 +68,7 @@ struct SnoreChart: View {
                 if p.hasGap {
                     var line = Path()
                     line.move(to: CGPoint(x: x, y: 0))
-                    line.lineTo(to: CGPoint(x: x, y: size.height))
+                    line.addLine(to: CGPoint(x: x, y: size.height))
                     ctx.stroke(line, with: .color(.red), lineWidth: 1.6)
                 }
             }
