@@ -90,10 +90,21 @@ jobs:
           echo "built app: $APP" >> /tmp/build.log
           file "$APP/SnoreBench" | tee -a /tmp/build.log
           plutil -p "$APP/Info.plist" > /tmp/infoplist.txt 2>&1
+          # 不用 `sed … | head -1`：pipefail 下 head 提前收管会给 sed 记一个 SIGPIPE 退出码，
+          # 整条 step 就这么死在检查上。awk 自己 exit，单命令没有管子。
+          pid=$(awk -F' => ' '/"CFBundleIdentifier"/{gsub(/"/,"",$2); print $2; exit}' /tmp/infoplist.txt)
+          pver=$(awk -F' => ' '/"CFBundleShortVersionString"/{gsub(/"/,"",$2); print $2; exit}' /tmp/infoplist.txt)
+          # 前三行读同一个文件（plutil 已经把包里的 plist 打回文本），这里也从这份读：
+          # 用 defaults read "$APP/Info" 时三回都是空——空值既不算失败也没人看得见，等于没验。
+          echo "I-VERDICT 包 id=$pid 版本=$pver" | rec
           { echo "I-VERDICT 后台模式=$(grep -c audio /tmp/infoplist.txt) 处（要 ≥1，熄屏接着录靠它）"
             echo "I-VERDICT 麦克风描述=$(grep -c NSMicrophoneUsageDescription /tmp/infoplist.txt)"
-            echo "I-VERDICT 本地网描述=$(grep -c NSLocalNetworkUsageDescription /tmp/infoplist.txt)"
-            echo "I-VERDICT 包 id=$(defaults read "$APP/Info" CFBundleIdentifier 2>/dev/null) 版本=$(defaults read "$APP/Info" CFBundleShortVersionString 2>/dev/null)"; } | rec | ann "I-VERDICT "
+            echo "I-VERDICT 本地网描述=$(grep -c NSLocalNetworkUsageDescription /tmp/infoplist.txt)"; } | rec | ann "I-VERDICT "
+          # 包 id 缺了手机装不上、版本缺了分不清装的是哪一轮，所以这两条是闸门，不是日志。
+          if [ -z "$pid" ] || [ -z "$pver" ]; then
+            echo "::error::I-VERDICT 包里的 Info.plist 读不出包 id 或版本（id=[$pid] 版本=[$pver]）——这包手机装不上，不出"
+            exit 1
+          fi
           rm -rf Payload snore.ipa
           mkdir Payload
           cp -R "$APP" Payload/
