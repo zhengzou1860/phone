@@ -108,7 +108,7 @@ func makeBuffer(w: Int, h: Int) -> CVPixelBuffer? {
     var pb: CVPixelBuffer?
     let err = CVPixelBufferCreate(kCFAllocatorDefault, w, h,
                                   kCVPixelFormatType_32BGRA, nil, &pb)
-    guard err == kCVSuccess, let buf = pb else { return nil }
+    guard err == kCVReturnSuccess, let buf = pb else { return nil }
     CVPixelBufferLockBaseAddress(buf, [])
     defer { CVPixelBufferUnlockBaseAddress(buf, []) }
     guard let base = CVPixelBufferGetBaseAddress(buf) else { return nil }
