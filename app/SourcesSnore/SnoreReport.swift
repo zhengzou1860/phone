@@ -26,6 +26,8 @@ struct SnoreSummary {
     var floorMedianDb: Double = -120
     var staleSec: Int = 0               // 没数据的秒（引擎断过、被系统暂停过）
     var grade: String = "—"
+    var tooShort = false                // 不足 1 分钟的场次：占比和分级不给（试录半分钟不该被判成「中度鼾」，
+                                        // 更不该反过来被读成「没检测到鼾声」）
 
     /// 界面上那两格的字：拿不到节律的时候说人话，别显示「nil」或「0 次/分」。
     var rateText: String {
@@ -33,7 +35,7 @@ struct SnoreSummary {
         return String(format: "%.1f 次/分", r)
     }
 
-    var coverageText: String { String(format: "%.1f%%", coverage * 100) }
+    var coverageText: String { tooShort ? "太短，不分级" : String(format: "%.1f%%", coverage * 100) }
     var boutsText: String { "\(boutCount) 次（\(String(format: "%.1f", boutsPerHour)) 每时）" }
     var gapsText: String { "\(gapCount) 次（\(String(format: "%.1f", gapsPerHour)) 每时）" }
 }
@@ -59,10 +61,11 @@ enum SnoreAnalyze {
         }
         s.staleSec = stale
         s.snoreSec = snoreSec
-        s.coverage = s.totalSec > 60 ? snoreSec / max(1.0, Double(buckets.count - stale)) : 0
+        s.tooShort = s.totalSec <= 60
+        s.coverage = s.tooShort ? 0 : snoreSec / max(1.0, Double(buckets.count - stale))
         s.peakDb = peak
         s.floorMedianDb = snorePercentile(floors, 0.5) ?? -120
-        s.grade = gradeText(s.coverage)
+        s.grade = s.tooShort ? "" : gradeText(s.coverage)
 
         // 鼾声期间的响度：只取那些确有鼾的秒，本底和翻身不该拉低这个数
         let snoreLevels = buckets.filter { !$0.stale && $0.snoreSec > 0.3 }.map { $0.maxDb }
@@ -144,7 +147,13 @@ enum SnoreAnalyze {
         lines.append("====== \(title) ======")
         lines.append("时段     \(df.string(from: start)) → \(df.string(from: end))（\(snoreDurText(s.totalSec))）")
         lines.append("")
-        lines.append("【鼾声占比】\(String(format: "%.1f", s.coverage * 100))%（\(snoreDurText(s.snoreSec))）→ \(s.grade)")
+        if s.tooShort {
+            lines.append("【鼾声占比】这一场只采了 \(snoreDurText(s.totalSec))，不到 1 分钟 ⇒ 不给占比和分级。"
+                         + "判定本身照做：判成鼾 \(snoreDurText(s.snoreSec))、发作 \(s.boutCount) 段、"
+                         + "疑似中断 \(s.gapCount) 次——别把这一场读成「没检测到鼾声」。")
+        } else {
+            lines.append("【鼾声占比】\(String(format: "%.1f", s.coverage * 100))%（\(snoreDurText(s.snoreSec))）→ \(s.grade)")
+        }
         lines.append("【发作次数】\(s.boutCount) 次，每小时 \(String(format: "%.1f", s.boutsPerHour)) 次；"
                      + "最长一次 \(snoreDurText(s.longestBout))，平均 \(snoreDurText(s.meanBout))")
         if let r = s.ratePerMin {
@@ -217,6 +226,16 @@ enum SnoreAnalyze {
     /// 阈值挑的是筛查里常用的那几条口径的影子（次数/小时、占比、复鼾是否更响），
     /// 但只凭音频绝不写「你有睡眠呼吸暂停」这种话。
     static func advice(_ s: SnoreSummary, _ config: SnoreConfig) -> String {
+        if s.tooShort {
+            // 试录半分钟就收尾：占比那一格本来就是空的，直接走到底下的「几乎没采到鼾声」，
+            // 于是「判出来 8 声鼾、2 段发作」的一场测试也会写成「没检测到鼾」——正是用户盯的那句话。
+            if s.boutCount == 0 && s.snoreSec < 0.5 {
+                return "这一场只采了 \(snoreDurText(s.totalSec))，一件鼾都没判出来。这场太短，说明不了有没有鼾："
+                    + "手机离嘴 30–60 cm、连着录满 1 分钟再看（判定账目在「发到电脑 → 执行日志」最上面一行）。"
+            }
+            return "这一场只采了 \(snoreDurText(s.totalSec))：判成鼾 \(snoreDurText(s.snoreSec))、发作 \(s.boutCount) 段、"
+                + "停住 \(s.gapCount) 次——判定在起作用。占比和分级要录满 1 分钟才给，整夜记录才看得出趋势。"
+        }
         let gapHot = s.gapsPerHour >= 5.0 || (s.gapsPerHour >= 3.0 && s.arousalCount >= 2)
         if gapHot && s.coverage >= 0.10 {
             return "鼾声停住 \(String(format: "%.1f", s.gapsPerHour)) 次/小时、最长 \(snoreDurText(s.longestGap))，"

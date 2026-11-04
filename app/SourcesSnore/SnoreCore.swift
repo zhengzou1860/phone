@@ -56,6 +56,8 @@ final class SnoreCore {
     private var analyzer: SnoreAnalyzer?
     private var tracker: SnoreTracker?
     private var store: SnoreNightStore?
+    /// 收尾那一刻的判定账目：tracker 收尾以后就放了，之后再发执行日志得有这份才不至于只写「没起来」
+    private var judgeSnapshot = ""
 
     private var config = SnoreConfig()
     private var running = false
@@ -113,6 +115,7 @@ final class SnoreCore {
             running = false
             let t = lastEndTime
             tracker?.finish(at: t + 0.1)
+            judgeSnapshot = tracker.map { Self.judgeLine($0) } ?? ""
             if let store = store {
                 store.meta.endMs = Date().timeIntervalSince1970 * 1000.0
                 store.meta.restarts = audio.restarts
@@ -125,9 +128,7 @@ final class SnoreCore {
                 let removed = SnoreArchive.prune(keepNights: config.keepNights)
                 SnoreJournal.line("收尾 \(store.meta.id)：录了 \(snoreDurText(t))，格 \(store.buckets.count)，"
                                   + "事件 \(store.events.count)，重连 \(audio.restarts) 次"
-                                  + "｜" + (tracker?.judgeSummary ?? "判定账目没了")
-                                  + (tracker?.loudestRejectedNote.isEmpty == false
-                                     ? "｜" + (tracker?.loudestRejectedNote ?? "") : "")
+                                  + "｜" + judgeSnapshot
                                   + (removed.isEmpty ? "" : "｜顺手清掉旧晚 " + removed.joined(separator: ",")))
                 post("今晚的记录收在 \(store.dir.lastPathComponent)，报告已生成")
             }
@@ -158,10 +159,17 @@ final class SnoreCore {
         var v = "分析器还没起来（没开始录，或第一块音频没到手）"
         queue.sync {
             if let t = tracker {
-                v = t.judgeSummary + (t.loudestRejectedNote.isEmpty ? "" : "｜" + t.loudestRejectedNote)
+                v = Self.judgeLine(t)
+            } else if !judgeSnapshot.isEmpty {
+                // 收尾以后 tracker 已经放了：这时候发日志，读的是收尾那一刻留下的那份
+                v = "上一场收尾时：" + judgeSnapshot
             }
         }
         return v
+    }
+
+    private static func judgeLine(_ t: SnoreTracker) -> String {
+        return t.judgeSummary + (t.loudestRejectedNote.isEmpty ? "" : "｜" + t.loudestRejectedNote)
     }
 
     // MARK: 处理一块

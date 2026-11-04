@@ -24,7 +24,7 @@ struct SnoreNightRow: Identifiable {
     var dayText: String       // 「11月04日 周三」
     var clockText: String      // 「23:12 → 06:40」
     var totalText: String
-    var coverage: Double
+    var covText: String        // 「12%」或「太短」：不足 1 分钟的那场不给百分比
     var grade: String
     var boutCount: Int
     var gapCount: Int
@@ -210,7 +210,7 @@ final class SnoreMonitor: NSObject, ObservableObject {
                                          dayText: dayFmt.string(from: n.meta.startDate),
                                          clockText: "\(snoreClockText(n.meta.startDate)) → \(snoreClockText(n.meta.endDate))",
                                          totalText: snoreDurText(total),
-                                         coverage: s.coverage, grade: s.grade,
+                                         covText: s.coverageText, grade: s.grade,
                                          boutCount: s.boutCount, gapCount: s.gapCount,
                                          vocalCount: s.vocalCount, longestGap: s.longestGap,
                                          peakText: SnoreCalib.text(s.peakDb, n.meta.config),

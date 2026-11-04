@@ -125,7 +125,9 @@ struct TonightView: View {
         VStack(spacing: 10) {
             HStack {
                 SnoreStat(title: "已录", value: snoreDurText(mon.live.elapsed))
-                SnoreStat(title: "鼾声占比", value: String(format: "%.0f%%", mon.live.elapsed > 60 ? mon.live.snoreSec / mon.live.elapsed * 100 : 0),
+                SnoreStat(title: "鼾声占比", value: mon.live.elapsed > 60
+                                    ? String(format: "%.0f%%", mon.live.snoreSec / mon.live.elapsed * 100)
+                                    : "满 1 分钟后",
                           tint: .orange)
                 SnoreStat(title: "发作", value: "\(mon.live.bouts) 次")
                 SnoreStat(title: "疑似中断", value: "\(mon.live.gaps) 次",
@@ -295,7 +297,7 @@ struct HistoryView: View {
                                     VStack(alignment: .leading, spacing: 3) {
                                         Text(r.dayText + "  " + r.clockText)
                                             .font(.system(size: 13, weight: .semibold, design: .rounded))
-                                        Text("录 \(r.totalText)｜鼾 \(String(format: "%.0f%%", r.coverage * 100)) \(r.grade)"
+                                        Text("录 \(r.totalText)｜鼾 \(r.covText) \(r.grade)"
                                              + "｜发作 \(r.boutCount)｜停 \(r.gapCount)｜发声 \(r.vocalCount)")
                                             .font(.system(size: 11)).foregroundColor(.secondary)
                                         if !r.meta.ended {
