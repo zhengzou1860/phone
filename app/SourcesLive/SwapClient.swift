@@ -26,6 +26,7 @@ struct LiveSnapshot {
 final class SwapClient: ObservableObject {
     @Published var framesSent = 0
     @Published var framesDroppedLocal = 0      // 在途满了被手机自己丢掉的帧
+    @Published var framesRejected = 0          // PC 回了非 2xx（400/413/503/405……）的帧数
     @Published var pcFramesIn = 0
     @Published var pcFramesDropped = 0
     @Published var outputAgeMs: Int?           // PC 最近一帧输出的年龄；超阈值说明流水线停了
@@ -186,24 +187,28 @@ final class SwapClient: ObservableObject {
                 return
             }
             guard let http = resp as? HTTPURLResponse else { return }
-            // 会话丢了：POST 跟着 302 变成 GET、拿回来是 200 的登录页 HTML，
-            // 光看状态码就是「这一帧被收了」，实际 PC 一帧没进——必须在计数之前拦掉。
-            if LiveAuth.lost(http) {
+            switch LiveAuth.judge(http) {
+            case .sessionLost:
+                // 跟着 302 拿回来的是登录页：光看状态码像「这一帧被收了」，实际一帧没进
                 DispatchQueue.main.async {
                     self.sessionLost = true
                     self.lastError = LiveAuth.lostMessage
                 }
-                return
-            }
-            // 409 = PC 已退出推流模式（10 秒空闲看门狗或那边重启），必须重新 /live_start
-            if http.statusCode == 409 {
+            case .notLive:
+                // 409 = PC 已退出推流模式（10 秒空闲看门狗或那边重启），必须重新 /live_start
                 DispatchQueue.main.async {
                     self.saw409 += 1
                     self.lastError = "PC 已退出推流模式（静默超时或重启）"
                 }
-                return
+            case .rejected(let code):
+                // 400 解不开、413 超 2MB、503 流水线没起、405 方法不对：这些都不算送到
+                DispatchQueue.main.async {
+                    self.framesRejected += 1
+                    self.lastError = "PC 拒了这一帧：HTTP \(code)"
+                }
+            case .accepted:
+                DispatchQueue.main.async { self.framesSent += 1 }
             }
-            DispatchQueue.main.async { self.framesSent += 1 }
         }.resume()
     }
 

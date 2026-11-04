@@ -387,7 +387,8 @@ final class PageViewController: UIViewController {
         // 冷启动预热期 PC 入口队列会一次性丢一大批帧，那不是故障，所以只进这一行账目、不报警
         if warnOnce("fps", every: 10.0) {
             status("手机 \(String(format: "%.1f", fps))fps｜本地丢帧 \(client.framesDroppedLocal)"
-                    + "｜PC 收到 \(client.pcFramesIn)、预热丢 \(client.pcFramesDropped)"
+                    + "｜PC 拒 \(client.framesRejected)｜PC 收到 \(client.pcFramesIn)、"
+                    + "预热丢 \(client.pcFramesDropped)"
                     + "｜屏幕长按 1.5 秒改 PC 地址")
         }
     }

@@ -209,6 +209,22 @@ ck("会话 503 不算掉登录", !LiveAuth.lostSession(statusCode: 503, path: "/
 ck("会话 413 不算掉登录", !LiveAuth.lostSession(statusCode: 413, path: "/live_frame",
                                                 contentType: "application/json"))
 
+// 一帧的归类：非 2xx 一律不算「送到」，不然 fps 账目会骗人
+typealias V = LiveAuth.FrameVerdict
+func jd(_ code: Int, _ path: String = "/live_frame", _ ct: String? = nil) -> V {
+    LiveAuth.judge(statusCode: code, path: path, contentType: ct)
+}
+ck("归类 204 算送到", jd(204) == .accepted)
+ck("归类 200+json 算送到", jd(200, "/live_frame", "application/json") == .accepted)
+ck("归类 409 算退出推流", jd(409) == .notLive)
+ck("归类 400 解不开算拒", jd(400, "/live_frame", "application/json") == .rejected(400))
+ck("归类 413 超上限算拒", jd(413) == .rejected(413))
+ck("归类 503 没起流水线算拒", jd(503) == .rejected(503))
+ck("归类 415 算拒不算送到", jd(415, "/login") == .sessionLost,
+   "落到 /login 就是被弹走了，跟着重定向拿回来的 415 也算会话丢")
+ck("归类 405 算拒", jd(405, "/live_stop", "text/html") == .rejected(405))
+ck("归类 500 算拒", jd(500) == .rejected(500))
+
 // MARK: - 判定
 
 if fails == 0 {

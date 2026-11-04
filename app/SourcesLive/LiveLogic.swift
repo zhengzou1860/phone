@@ -108,17 +108,43 @@ enum LiveAuth {
     /// 409（未进推流模式）和 405（方法不对）都不算会话丢：那是另外两条恢复路径的事。
     static func lostSession(statusCode: Int, path: String?, contentType: String?) -> Bool {
         if statusCode == 401 || statusCode == 403 { return true }
-        guard statusCode == 200 else { return false }
+        // 原生这边只打 /live_*，落到 /login 就说明被 login_required 弹走了——
+        // 状态码是什么不重要（跟随重定向以后可能是 200 的页面，也可能是 415）。
         if let p = path, p.hasPrefix("/login") { return true }
+        guard statusCode == 200 else { return false }
         if let ct = contentType?.lowercased(), ct.contains("text/html") { return true }
         return false
     }
 
-    /// 上面那条的 HTTPURLResponse 外壳。expectedURL 是跟随重定向以后真正取到的地址。
+    /// 一帧的读数归类。四个出口对应四条不同的处置，混在「2xx 就算发出去了」里会看错账：
+    /// 400 解不开、413 超 2MB、503 流水线没起、405 方法不对——这些都不算 PC 收到了一帧。
+    enum FrameVerdict: Equatable {
+        case accepted
+        case notLive          // 409：PC 不在推流模式，走重新 /live_start 那条恢复路径
+        case sessionLost      // 被弹回登录页，只有重登一条路
+        case rejected(Int)    // 其余非 2xx，带上码
+    }
+
+    static func judge(statusCode: Int, path: String?, contentType: String?) -> FrameVerdict {
+        if lostSession(statusCode: statusCode, path: path, contentType: contentType) {
+            return .sessionLost
+        }
+        if statusCode == 409 { return .notLive }
+        if (200..<300).contains(statusCode) { return .accepted }
+        return .rejected(statusCode)
+    }
+
+    /// 上面两条的 HTTPURLResponse 外壳。expectedURL 是跟随重定向以后真正取到的地址。
     static func lost(_ resp: HTTPURLResponse) -> Bool {
         let path = (resp.expectedURL ?? resp.url)?.path
         let type = resp.value(forHTTPHeaderField: "Content-Type")
         return lostSession(statusCode: resp.statusCode, path: path, contentType: type)
+    }
+
+    static func judge(_ resp: HTTPURLResponse) -> FrameVerdict {
+        let path = (resp.expectedURL ?? resp.url)?.path
+        let type = resp.value(forHTTPHeaderField: "Content-Type")
+        return judge(statusCode: resp.statusCode, path: path, contentType: type)
     }
 
     /// 给用户看的那一句：会话丢了下一步只有重登，手机这边没什么可重试的。
