@@ -37,6 +37,9 @@ final class PageViewController: UIViewController {
     private var lastSentTick: TimeInterval = 0
     private var lastWarnKey = ""
     private var lastWarnTick: TimeInterval = 0
+    /// 没存过地址时要在界面出现以后才能弹框：viewDidLoad 里 present 会被系统
+    /// 静默拒绝（那时还没进窗口），表现就是一片黑、连填地址的输入框都看不到。
+    private var pendingAddressPrompt = false
 
     // PC 掉出推流模式（10 秒空闲看门狗、重启服务）后的重连计数
     private var restartTries = 0
@@ -67,6 +70,22 @@ final class PageViewController: UIViewController {
             name: UIApplication.didBecomeActiveNotification, object: nil)
 
         loadPage()
+    }
+
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        if pendingAddressPrompt {
+            pendingAddressPrompt = false
+            openAddress(storedHost())
+        }
+        // 兜底：2.5 秒后页面仍然一个 URL 都没加载、也没东西在弹，说明卡在了空白态，
+        // 直接把地址框顶上来——总比让人对着一片黑不知道点哪儿好。
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
+            guard let self = self,
+                  self.webView.url == nil,
+                  self.presentedViewController == nil else { return }
+            self.openAddress(self.storedHost())
+        }
     }
 
     deinit {
@@ -119,13 +138,21 @@ final class PageViewController: UIViewController {
                          injectionTime: .atDocumentEnd,
                          forMainFrameOnly: true))
 
-        let web = WKWebView(frame: view.bounds, configuration: cfg)
-        web.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        // 用约束钉四边而不是拿 view.bounds 当初始 frame：viewDidLoad 时 bounds 可能是 0，
+        // 靠 autoresizing 要等父视图尺寸变化那一下才跟着变，万一没变就是个永远 0×0 的空白页。
+        let web = WKWebView(frame: .zero, configuration: cfg)
+        web.translatesAutoresizingMaskIntoConstraints = false
         web.navigationDelegate = self
         web.uiDelegate = self
         web.allowsBackForwardNavigationGestures = false
         web.scrollView.contentInsetAdjustmentBehavior = .never
         view.addSubview(web)
+        NSLayoutConstraint.activate([
+            web.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            web.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            web.topAnchor.constraint(equalTo: view.topAnchor),
+            web.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+        ])
         webView = web
     }
 
@@ -152,8 +179,8 @@ final class PageViewController: UIViewController {
 
     private func loadPage() {
         guard let text = storedHost(), let base = LiveHost.base(text) else {
-            // 第一次启动预填 PC 现在那台（只当默认值，照样能改）
-            openAddress(LiveConfig.suggestedHost)
+            // 第一次启动：等 viewDidAppear 再弹，这时才进得了窗口
+            pendingAddressPrompt = true
             return
         }
         connect(to: base)
@@ -420,6 +447,8 @@ final class PageViewController: UIViewController {
     }
 
     private func openAddress(_ prefill: String?) {
+        // 已经有东西在弹（比如连不上又弹一次）就不叠第二个，否则 iOS 会拒绝并且什么都不显示
+        guard presentedViewController == nil else { return }
         let alert = UIAlertController(title: "PC 地址",
                                       message: "局域网里那台跑换脸的电脑，例："
                                              + LiveConfig.suggestedHost,
@@ -435,7 +464,9 @@ final class PageViewController: UIViewController {
             let text = alert.textFields?.first?.text ?? ""
             guard let base = LiveHost.base(text) else {
                 self.status("地址读不出：[\(text)]", "error")
-                self.openAddress(text)
+                // 这个回调里弹窗还在退场，直接 present 会被上面那条 guard 挡掉；
+                // 挪到主队列下一拍，等它真的退干净
+                DispatchQueue.main.async { self.openAddress(text) }
                 return
             }
             UserDefaults.standard.set(base.absoluteString, forKey: "pcBase")
