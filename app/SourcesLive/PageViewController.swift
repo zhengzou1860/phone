@@ -261,7 +261,7 @@ final class PageViewController: UIViewController {
         let now = CFAbsoluteTimeGetCurrent()
         if needStart && !manual && restartTries >= LiveConfig.maxRestartTries {
             status("自动重连试到 \(restartTries) 次都没进得去：查那台电脑的换脸服务在不在跑"
-                   + "（冷启动加载模型约 17 秒），好了再点「播放」", "error")
+                   + "（刚重启后模型加载要等一会儿），好了再点「播放」", "error")
             restartTries = 0
             return
         }
@@ -420,8 +420,10 @@ final class PageViewController: UIViewController {
         if warnOnce("fps", every: 10.0) {
             // 模型还没加载完时 PC 一帧输出都没有（frames_in 在涨、output 是 null）：
             // 空着不说明，手机上看到的就是「点了没画面」，最容易当成连坏了。
-            // 这句只是说明，不是超时：刚起的服务器约十几秒，跑过一阵的十几秒内也能出首帧。
-            let warm = client.pcHasOutput ? "" : "PC 还在加载模型（刚启动时约十几秒）｜"
+            // 判据是 output_age_ms：has_output 热态下一直为 true（上一轮的 latest_frame 还挂着），
+            // 拿它判首帧会得出「0.0s」这种假读数。这句只是说明，不是超时。
+            let warm = LiveWatch.warm(outputAgeMs: client.outputAgeMs)
+                ? "" : "PC 这会儿没出帧（刚起播、刚跳转或模型还没加载完）｜"
             status(warm + "手机 \(String(format: "%.1f", fps))fps｜本地丢帧 \(client.framesDroppedLocal)"
                     + "｜PC 拒 \(client.framesRejected)｜PC 收到 \(client.pcFramesIn)、"
                     + "预热丢 \(client.pcFramesDropped)"

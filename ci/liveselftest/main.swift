@@ -175,6 +175,18 @@ ck("契约 推送15fps", LiveConfig.pushFPS == 15.0)
 ck("契约 封顶宽640", LiveConfig.fallbackMaxWidth == 640)
 ck("契约 质量0.7", LiveConfig.jpegQuality == 0.7)
 ck("契约 看门狗2500ms", LiveConfig.watchdogMs == 2500, "1500 太紧：收尾那一秒实测到过 1489")
+ck("契约 出帧判据500ms", LiveConfig.warmAgeMs == 500,
+   "PC 要求用 output_age_ms<500 判首帧，不能用 has_output（热态下一直是 true）")
+
+// 预热/首帧判据：只认 output_age_ms。PC 热态实测 5–26ms，冷启动首帧前是 null。
+ck("预热 热态5ms 算出帧", LiveWatch.warm(outputAgeMs: 5))
+ck("预热 26ms 算出帧", LiveWatch.warm(outputAgeMs: 26))
+ck("预热 499ms 算出帧", LiveWatch.warm(outputAgeMs: 499))
+ck("预热 500ms 边界算出帧", !LiveWatch.warm(outputAgeMs: 500),
+   "500 本身不算「刚出过帧」，要更严一点")
+ck("预热 1489ms 算没出帧", !LiveWatch.warm(outputAgeMs: 1489))
+ck("预热 无读数(null)算没出帧", !LiveWatch.warm(outputAgeMs: nil),
+   "冷启动一帧未出时 output_age_ms 是 null")
 
 // 停帧报警的前提：手机这一秒确实在发帧（PC 实测 398 帧全 204、稳定约 13fps）
 ck("看门狗 1489ms+13fps 不报", !LiveWatch.stalled(outputAgeMs: 1489, localFPS: 13))

@@ -33,6 +33,11 @@ enum LiveConfig {
     /// 可那是手机自己停的手。正常出帧时 age 只有几十毫秒，2500 留得出余量。
     static let watchdogMs = 2500
 
+    /// 判「PC 已经出帧」只看最近一帧有多新。不能用 has_output：
+    /// 热态下上一轮留下的 latest_frame 还挂在服务器上，has_output 从第一秒就是 true，
+    /// 拿它当预热结束会得出「首帧 0.0s」这种假读数。
+    static let warmAgeMs = 500
+
     /// 自动重连的节奏：两次之间至少隔这么久，最多试这几次就交回用户处理。
     /// PC 有 10 秒空闲看门狗，掉出推流模式是常事，不试不行；无脑重试会变成打转。
     static let restartGapSeconds: Double = 3.0
@@ -40,7 +45,7 @@ enum LiveConfig {
 
     /// 追加到 WKWebView 默认 UA 末尾：PC 那边看 access log 就知道是手机 app 在访问，
     /// 而不是有人在浏览器里手点。
-    static let userAgentSuffix = "LiveSwap/0.3"
+    static let userAgentSuffix = "LiveSwap/0.4"
 
     /// 第一次启动时地址栏里预填的这台：PC 侧现在监听的就是它。
     /// 只当预填和提示用，不当写死的配置——PC 重连 WiFi 以后 IP 会变，
@@ -236,6 +241,12 @@ enum LiveWatch {
                         thresholdMs: Int = LiveConfig.watchdogMs) -> Bool {
         guard let age = outputAgeMs, age > thresholdMs else { return false }
         return localFPS >= 0.5
+    }
+
+    /// PC 真的在出帧：最近一帧在 warmAgeMs 以内。没读数（null）也算还没出。
+    static func warm(outputAgeMs: Int?, maxAgeMs: Int = LiveConfig.warmAgeMs) -> Bool {
+        guard let age = outputAgeMs else { return false }
+        return age < maxAgeMs
     }
 }
 
