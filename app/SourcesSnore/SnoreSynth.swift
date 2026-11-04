@@ -76,9 +76,56 @@ enum SnoreSynth {
         return out
     }
 
+    /// 不规则鼾：真人的形状。每一口气的长短、间隔、音高、轻重都在一个范围里摇，
+    /// 不像上面那份「3 s 一鼾、duty 恒 0.45」那么整齐。
+    /// 节律门的段长门槛就是被整齐那份带偏过（真人段长中位 0.43 s，旧门槛 0.4 起分只给 0.075 分，
+    /// 整晚真鼾全记成「其他发声」），所以这一份是专门拿来验门的，界面上的自检和 CI 都跑它。
+    static func snoreRagged(count: Int, sampleRate: Double, level: Double,
+                            durLo: Double = 0.35, durHi: Double = 0.75,
+                            perLo: Double = 2.4, perHi: Double = 3.6,
+                            fLo: Double = 120.0, fHi: Double = 170.0,
+                            ampLo: Double = 0.55, seed: UInt64 = 3) -> [Double] {
+        var out = [Double](repeating: 0.0, count: count)
+        var state = seed &+ 0x9E3779B97F4A7C15
+        /// [0,1)：自己走一条流，不用 noiseSource——那个是一阶平滑过的，摇不出均匀的长度
+        func unit() -> Double {
+            state = state &* 6364136223846793005 &+ 1442695040888963407
+            return Double((state >> 11) & 0xFFFFFFF) / Double(0x10000000)
+        }
+        func span(_ lo: Double, _ hi: Double) -> Double { lo + (hi - lo) * unit() }
+        var ph = [Double](repeating: 0.0, count: 10)
+        var t = 0.0
+        let total = Double(count) / sampleRate
+        while t < total {
+            let len = span(durLo, durHi)
+            let per = max(0.5, span(perLo, perHi))
+            let f0 = span(fLo, fHi)
+            let amp = level * span(ampLo, 1.0)
+            let i0 = Int(t * sampleRate)
+            if i0 >= 0 && i0 < count {
+                let n = min(Int(len * sampleRate), count - i0)
+                for k in 0..<n {
+                    let u = Double(k) / Double(max(1, n))
+                    let env = pow(max(0.0, sin(Double.pi * u)), 0.8)
+                    let f = f0 * (1.0 + 0.06 * sin(2.0 * Double.pi * Double(k) / (sampleRate * per * 2.5)))
+                    var s = 0.0
+                    for h in 1...9 {
+                        ph[h] += 2.0 * Double.pi * f * Double(h) / sampleRate
+                        if ph[h] > 2.0 * Double.pi { ph[h] -= 2.0 * Double.pi }
+                        s += (1.0 / pow(Double(h), 0.95)) * sin(ph[h])
+                    }
+                    s += 0.5 * sin(2.0 * Double.pi * 55.0 * Double(i0 + k) / sampleRate)
+                    out[i0 + k] += s * env * amp / 3.2
+                }
+            }
+            t += per
+        }
+        return out
+    }
+
     /// 说话样：基频 180 但共振峰在 700/1300/2600 上来回扫，音节率 3–4 Hz。
-    /// 频谱那几把尺子（低频占比、稳定度）会偏，音节率 3.3 Hz 也过不了「一鼾 0.4–0.8 s、
-    /// 间隔 1–6 s」的呼吸节律门——两层都拿来验「不把说话当鼾」。
+    /// 频谱那几把尺子（低频占比、稳定度）会偏，一整段连响、数不出一鼾一鼾，
+    /// 呼吸节律门也给 0——两层都拿来验「不把说话当鼾」。
     static func speech(count: Int, sampleRate: Double, level: Double, startAt: Double = 0.0,
                        seed: UInt64 = 11) -> [Double] {
         var out = [Double](repeating: 0.0, count: count)
@@ -323,6 +370,26 @@ enum SnoreCases {
             }
             out.append(SnoreCaseResult(name: "中断两头接得上发作", ok: consistent,
                                        detail: "发作 \(bouts.count)／中断 \(gaps.count)；每条中断的起点都该压着上一段的末尾、终点顶着复鼾的开头"))
+        }
+
+        // ⑩ 不规则鼾（真人的形状）：段长 0.35–0.75 s、间隔 2.4–3.6 s、轻重都在摇
+        //    ⇒ 必须判成鼾。这一条是节律门的「别把门关上」守卫：
+        //    旧门槛按整齐合成鼾定成 0.4 s 起分，这种形状的段长中位 0.43 只拿 0.075 分，
+        //    一晚真鼾会全数记成「其他发声」——用户最核心的那件事就没了。
+        do {
+            var s = SnoreSynth.bed(count: Int(sr * 30), level: 0.0006, seed: 901)
+            SnoreSynth.add(&s, SnoreSynth.snoreRagged(count: s.count, sampleRate: sr, level: 0.10,
+                                                      seed: 7))
+            let r = SnoreTracker(frameSec: 4096.0 / sr, config: config)
+            let got = run(samples: s, sampleRate: sr, config: config, into: r)
+            let bouts = got.events.filter { $0.kind == .bout }
+            let gaps = got.events.filter { $0.kind == .gap }
+            let cov = got.seconds.reduce(0.0) { $0 + $1.snoreSec } / 30.0
+            let med = snoreMedian(bouts.compactMap { $0.ratePerMin }) ?? 0
+            let ok = bouts.count >= 2 && cov > 0.04 && gaps.isEmpty && abs(med - 20.0) <= 8.0
+            out.append(SnoreCaseResult(name: "不规则鼾要判成鼾", ok: ok,
+                                       detail: String(format: "发作 %d 段（要 ≥2）／鼾声占 %.0f%%（要 >4%%）／中断 %d（要 0）／节律 %.1f 次/分（要 20±8）",
+                                                      bouts.count, cov * 100, gaps.count, med)))
         }
         return out
     }

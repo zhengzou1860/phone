@@ -43,7 +43,7 @@ struct SnoreSecond: Codable {
 //
 // 频谱打分回答的是「这一段声音像不像鼾」，回答不了「它是不是跟着呼吸一开一合」。
 // 冰箱嗡鸣、电视低音、隔墙说话，频谱都能拿高分（低频、有谐波、稳）；
-// 鼾独有的形状是：一段一段地响，每段 0.4–0.8 s，段与段隔 1–6 s。这一门就把形状数出来。
+// 鼾独有的形状是：一段一段地响，每段零点几秒到一两秒，段与段隔 1–6 s。这一门就把形状数出来。
 
 enum SnoreRhythm {
     /// 一鼾的收尾：声音停了这么久就不再续着算（一次吸气的量级，比 boutGapSec 短得多）
@@ -52,9 +52,15 @@ enum SnoreRhythm {
     static let dutyWindowSec = 8.0
     /// 节律吃的窗：只数「这一段声音自己」的鼾，最多往回看 20 s
     static let rhythmWindowSec = 20.0
-    /// 一鼾该有的长度：短于它是咳嗽／关门，长于它是持续的嗡鸣
-    static let burstDurLo = 0.4
-    static let burstDurHi = 0.8
+    /// 一鼾的段长中位数：burstDurLo…burstDurHi 之间满分。
+    /// 两头都留斜坡：短于 burstDurRise 是敲击／关门（实测敲击段长中位 0.09 s），
+    /// 长于 burstDurFall 就不像一次吸气了（循环启停的嗡鸣会在这里被压下去）。
+    /// 早先按「干净的合成鼾」定成 0.4→0.8 起分，真人那种一顿一顿的鼾段长 0.26–0.5、
+    /// 中位 0.43 只拿到 0.075 分，门自己关死——整晚真鼾全记成「其他发声」。
+    static let burstDurRise = 0.10
+    static let burstDurLo = 0.30
+    static let burstDurHi = 2.0
+    static let burstDurFall = 4.0
     /// 鼾与鼾的间隔：1–6 s 是呼吸的量级；0.4–1 s 线性给分，再密就不算呼吸了
     static let intervalLo = 1.0
     static let intervalHi = 6.0
@@ -89,7 +95,8 @@ enum SnoreRhythm {
         guard !items.isEmpty else { return (0.0, nil) }
         let d = dutyScore(voicedFrames: voicedFrames, frameSec: frameSec)
         let meanDur = snoreMedian(items.map { $0.dur }) ?? 0.0
-        let ds = snoreClamp01((meanDur - burstDurLo) / (burstDurHi - burstDurLo))
+        let ds = snoreClamp01((meanDur - burstDurRise) / (burstDurLo - burstDurRise))
+            * snoreClamp01((burstDurFall - meanDur) / (burstDurFall - burstDurHi))
         let onsets = items.map { $0.t0 }
         // 只有一段声音：既谈不上「间隔」，也无从分辨是鼾还是一声长响——门归零。
         // 这一条给 0.66 之类的宽容值试过：突起的嗡鸣能在灵敏度「高」那档撑出 20 多秒的发作。
