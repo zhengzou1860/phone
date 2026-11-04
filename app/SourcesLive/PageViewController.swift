@@ -409,15 +409,19 @@ final class PageViewController: UIViewController {
         if let err = client.lastError, warnOnce("err:" + err) {
             status(err, "error")
         }
-        // 手机在推、PC 不出帧：那边进程崩了或还在加载模型（这条只报警，不停手——停手是上面那条的事）
-        if let age = client.outputAgeMs, age > LiveConfig.watchdogMs, warnOnce("age") {
+        // 手机在推、PC 不出帧：那边进程崩了（这条只报警，不停手——停手是上面那条的事）。
+        // 前提是这一秒手机确实在发帧：自己刚停手、刚拖完进度条重建 reader 的那一秒不出帧，
+        // 不该报成 PC 挂了。
+        if LiveWatch.stalled(outputAgeMs: client.outputAgeMs, localFPS: fps),
+           let age = client.outputAgeMs, warnOnce("age") {
             status("手机在推、PC 有 \(age)ms 没出帧了：查那台电脑的换脸进程还在不在", "error")
         }
         // 冷启动预热期 PC 入口队列会一次性丢一大批帧，那不是故障，所以只进这一行账目、不报警
         if warnOnce("fps", every: 10.0) {
             // 模型还没加载完时 PC 一帧输出都没有（frames_in 在涨、output 是 null）：
             // 空着不说明，手机上看到的就是「点了没画面」，最容易当成连坏了。
-            let warm = client.pcHasOutput ? "" : "PC 还在加载模型（冷启动约 17 秒）｜"
+            // 这句只是说明，不是超时：刚起的服务器约十几秒，跑过一阵的十几秒内也能出首帧。
+            let warm = client.pcHasOutput ? "" : "PC 还在加载模型（刚启动时约十几秒）｜"
             status(warm + "手机 \(String(format: "%.1f", fps))fps｜本地丢帧 \(client.framesDroppedLocal)"
                     + "｜PC 拒 \(client.framesRejected)｜PC 收到 \(client.pcFramesIn)、"
                     + "预热丢 \(client.pcFramesDropped)"

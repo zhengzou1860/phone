@@ -174,7 +174,17 @@ ck("契约 在途上限3", LiveConfig.inflightLimit == 3)
 ck("契约 推送15fps", LiveConfig.pushFPS == 15.0)
 ck("契约 封顶宽640", LiveConfig.fallbackMaxWidth == 640)
 ck("契约 质量0.7", LiveConfig.jpegQuality == 0.7)
-ck("契约 看门狗1500ms", LiveConfig.watchdogMs == 1500)
+ck("契约 看门狗2500ms", LiveConfig.watchdogMs == 2500, "1500 太紧：收尾那一秒实测到过 1489")
+
+// 停帧报警的前提：手机这一秒确实在发帧（PC 实测 398 帧全 204、稳定约 13fps）
+ck("看门狗 1489ms+13fps 不报", !LiveWatch.stalled(outputAgeMs: 1489, localFPS: 13))
+ck("看门狗 2600ms+13fps 报", LiveWatch.stalled(outputAgeMs: 2600, localFPS: 13))
+ck("看门狗 2600ms+0fps 不报", !LiveWatch.stalled(outputAgeMs: 2600, localFPS: 0),
+   "自己停手/拖进度条重建 reader 的那一秒不出帧，不是 PC 挂了")
+ck("看门狗 没出过帧(null)不报", !LiveWatch.stalled(outputAgeMs: nil, localFPS: 13),
+   "预热期 output_age_ms 是 null，不能当 PC 挂了")
+ck("看门狗 2500ms 边界", !LiveWatch.stalled(outputAgeMs: 2500, localFPS: 13),
+   "阈值本身不算超")
 ck("契约 PC默认端口5000", LiveConfig.defaultPort == 5000)
 ck("契约 预填那台能解析成地址", LiveHost.base(LiveConfig.suggestedHost) != nil,
    LiveConfig.suggestedHost)

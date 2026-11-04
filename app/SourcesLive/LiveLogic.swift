@@ -28,8 +28,10 @@ enum LiveConfig {
     /// 注入脚本里 messageHandlers 的名字；Swift 侧注册和脚本发送共用这一条。
     static let bridgeName = "livebridge"
 
-    /// PC 输出帧 age 超过这个数就认定流水线停了（它那边 21fps 上限，正常 age 约 50ms）。
-    static let watchdogMs = 1500
+    /// PC 输出帧 age 超过这个数、并且手机这一秒确实还在发帧，才认定流水线停了。
+    /// 1500 太紧：实测推流收尾那一秒 age 到过 1489，再晚 0.2 秒就报「PC 没出帧」，
+    /// 可那是手机自己停的手。正常出帧时 age 只有几十毫秒，2500 留得出余量。
+    static let watchdogMs = 2500
 
     /// 自动重连的节奏：两次之间至少隔这么久，最多试这几次就交回用户处理。
     /// PC 有 10 秒空闲看门狗，掉出推流模式是常事，不试不行；无脑重试会变成打转。
@@ -38,7 +40,7 @@ enum LiveConfig {
 
     /// 追加到 WKWebView 默认 UA 末尾：PC 那边看 access log 就知道是手机 app 在访问，
     /// 而不是有人在浏览器里手点。
-    static let userAgentSuffix = "LiveSwap/0.2"
+    static let userAgentSuffix = "LiveSwap/0.3"
 
     /// 第一次启动时地址栏里预填的这台：PC 侧现在监听的就是它。
     /// 只当预填和提示用，不当写死的配置——PC 重连 WiFi 以后 IP 会变，
@@ -221,6 +223,19 @@ enum LivePace {
         guard ptsSeconds.isFinite, interval > 0 else { return (false, nextEmitSeconds) }
         if let ne = nextEmitSeconds, ptsSeconds < ne { return (false, ne) }
         return (true, ptsSeconds + interval)
+    }
+}
+
+// MARK: - 流水线停了的判定
+
+enum LiveWatch {
+    /// 只有「手机这一秒确实还在发帧」时，PC 输出超龄才算 PC 那边停了。
+    /// 手机自己停手、或者拖进度条重建 reader（那一下本来就有近一秒不出帧）时不该报，
+    /// 否则用户刚松手就看到「PC 有 Nms 没出帧」，会去查一台根本没问题的电脑。
+    static func stalled(outputAgeMs: Int?, localFPS: Double,
+                        thresholdMs: Int = LiveConfig.watchdogMs) -> Bool {
+        guard let age = outputAgeMs, age > thresholdMs else { return false }
+        return localFPS >= 0.5
     }
 }
 
