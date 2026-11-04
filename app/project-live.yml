@@ -1,0 +1,49 @@
+name: LiveSwap
+options:
+  createIntermediateGroups: true
+  deploymentTarget:
+    # PC 侧契约要求部署目标 iOS 15+：URLSession.data(for:) 是 15 起的。
+    iOS: "15.0"
+settings:
+  base:
+    CODE_SIGNING_ALLOWED: "NO"
+    CODE_SIGNING_REQUIRED: "NO"
+    CODE_SIGN_IDENTITY: ""
+    IPHONEOS_DEPLOYMENT_TARGET: "15.0"
+targets:
+  LiveSwap:
+    type: application
+    platform: iOS
+    sources:
+      - SourcesLive
+    info:
+      path: Info-Live.plist
+      properties:
+        CFBundleDisplayName: 换脸推流
+        CFBundleName: LiveSwap
+        CFBundleExecutable: LiveSwap
+        CFBundleIdentifier: com.qoder.liveswap
+        CFBundlePackageType: APPL
+        CFBundleShortVersionString: "0.1"
+        CFBundleVersion: "1"
+        CFBundleInfoDictionaryVersion: "6.0"
+        NSAppTransportSecurity:
+          # 局域网那台电脑是 http://192.168.x.x，这道闸不放行的话 WKWebView 和原生推流一起被杀
+          NSAllowsArbitraryLoads: true
+        # iOS 14 起连自己局域网里的地址要先过这道授权。描述写不对，弹窗只有英文键名，
+        # 用户按了拒绝以后手机上只会看到「连不上」，查不到原因。
+        NSLocalNetworkUsageDescription: "要把手机里那段视频的画面逐帧发到你同一张网里的电脑上算换脸，再把结果取回来显示"
+        LSRequiresIPhoneOS: true
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.qoder.liveswap
+        PRODUCT_NAME: LiveSwap
+        TARGETED_DEVICE_FAMILY: "1"
+        ARCHS: arm64
+        SWIFT_VERSION: "5.0"
+        SWIFT_STRICT_CONCURRENCY: minimal
+        ENABLE_BITCODE: "NO"
+        GENERATE_INFOPLIST_FILE: "NO"
