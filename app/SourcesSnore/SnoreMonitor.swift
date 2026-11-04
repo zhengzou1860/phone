@@ -148,7 +148,7 @@ final class SnoreMonitor: NSObject, ObservableObject {
         statusLine = "在录。熄屏也接着录，明早点「停止」出报告。"
         // 目录名由 core 在开那一晚生成，这里回读最新的一晚拿到它（别自己再拼一次时间，差一秒就对不上）
         work.async {
-            let id = SnoreArchive.list().first?.meta.id ?? ""
+            let id = SnoreArchive.latestId() ?? ""
             DispatchQueue.main.async { self.currentNightId = id }
         }
         SnoreJournal.line("开始一晚：灵敏度 \(config.sensitivity)｜中断阈值 \(Int(config.interruptGapSec)) s"
@@ -327,8 +327,10 @@ final class SnoreMonitor: NSObject, ObservableObject {
             return
         }
         work.async {
-            let latest = SnoreArchive.list().first
-            guard let n = latest else {
+            // 只读最新的那一晚：以前先 SnoreArchive.list() 把 14 晚的 curve.csv 全解析一遍，
+            // 就为了取第一行，历史页划一下等好几秒。
+            guard let id = SnoreArchive.latestId(), let root = SnoreArchive.root,
+                  let n = SnoreNightStore.load(dir: root.appendingPathComponent(id)) else {
                 DispatchQueue.main.async { self.report = "还没有任何一晚。回「今晚」点开始按钮。" }
                 return
             }
@@ -344,17 +346,21 @@ final class SnoreMonitor: NSObject, ObservableObject {
         facts = SnoreFacts.lines()
     }
 
-    // MARK: 发到电脑
+    // MARK: 发到电脑（两条口，各发各的）
+    //
+    // 「程序怎么跑成这样」看执行日志；「这一晚到底打了没有」看打鼾记录。
+    // 混在一发里的时候，电脑上那份 txt 前面全是文案、要找的数字淹在下面两 MB，
+    // 而只想看崩溃前那几行的时候又得等整晚曲线传完。
 
-    /// 报告＋磁盘日志尾巴＋现场读数一起发：连不上线的时候这几行就是唯一能看见的东西。
-    func sendToPC() {
+    /// 拼串和发送都在 work 上（curve.csv 上 MB，别占主线程），只有 @Published 的回执回主线程改。
+    private func sendToPC(_ what: String, build: @escaping () -> String) {
         guard !uploading else { return }
         uploading = true
-        uploadReply = "正在发往 \(SnoreUploader.endpoint) ……"
-        let body = buildUploadText()
+        uploadReply = "正在发\(what)……"
         work.async {
+            let body = build()
             let reply = SnoreUploader.send(body)
-            SnoreJournal.line(reply)
+            SnoreJournal.line("\(what) \(reply)")
             DispatchQueue.main.async {
                 self.uploadReply = reply
                 self.uploading = false
@@ -362,17 +368,65 @@ final class SnoreMonitor: NSObject, ObservableObject {
         }
     }
 
-    private func buildUploadText() -> String {
-        var parts: [String] = []
-        parts.append(report.isEmpty ? "（报告还没生成）" : report)
-        parts.append("\n------ 磁盘日志（尾 200 行）------\n" + SnoreJournal.tail(200))
-        parts.append("\n------ 现场读数 ------\n" + SnoreFacts.lines().joined(separator: "\n"))
-        if running {
-            parts.append("\n------ 实时 ------\n已录 \(snoreDurText(live.elapsed))｜鼾 \(live.bouts)｜停 \(live.gaps)"
-                + "｜说话 \(live.vocals)｜电平 \(String(format: "%.1f", live.level)) dBFS"
-                + "｜本底 \(String(format: "%.1f", live.floor)) dBFS｜重连 \(live.restarts) 次")
+    /// 执行日志：现场读数、档位、磁盘流水全量、此刻的实时水位。查错就发这条，几 KB。
+    func sendLogToPC() {
+        let cfg = "灵敏度 \(config.sensitivity)／中断阈值 \(Int(config.interruptGapSec)) s／发作间隔 \(config.boutGapSec) s"
+            + "／绝对门限 \(config.absGateDb) dBFS／留片段 \(config.keepSnippets)／保留 \(config.keepNights) 晚"
+        let rt = running
+            ? "在录 \(snoreDurText(live.elapsed))｜鼾 \(live.bouts)｜停 \(live.gaps)｜说话 \(live.vocals)"
+                + "｜电平 \(String(format: "%.1f", live.level)) dBFS｜本底 \(String(format: "%.1f", live.floor)) dBFS"
+                + "｜块 \(live.blocks)｜重连 \(live.restarts) 次"
+            : "没在录"
+        let nightId = currentNightId
+        let eventTail = events.suffix(40).map { e in
+            "\(snoreWallClock(nightStart, e.t0)) \(e.kind == .bout ? "发作" : e.kind == .gap ? "停住" : "发声")"
+                + " \(snoreDurText(e.dur)) 峰值 \(String(format: "%.1f", e.peakDb)) dBFS"
+        }.joined(separator: "\n")
+        sendToPC("执行日志") {
+            var s = "====== SnoreBench 执行日志（\(snoreDateText(Date()))）======\n"
+            s += "这一晚 \(nightId.isEmpty ? "还没开" : nightId)｜\(cfg)\n实时：\(rt)\n"
+            s += "内存压力喊过：\(SnorePressureWatch.sawPressure ? "一声（系统确实给过压力，往「被杀」方向查）" : "零声（被杀别怪内存）")\n"
+            s += "\n------ 现场读数 ------\n" + SnoreFacts.lines().joined(separator: "\n")
+            s += "\n------ 磁盘流水（全量，上限 900 行；每行开头带当时的足迹/驻留）------\n"
+            s += SnoreJournal.tail(900)
+            s += "\n------ 今晚最后 40 条事件 ------\n" + (eventTail.isEmpty ? "还没有事件" : eventTail)
+            return s
         }
-        return parts.joined(separator: "\n")
+    }
+
+    /// 打鼾记录：那一晚的原始数据整包（meta＋报告＋events.jsonl＋curve.csv 逐秒）。
+    /// 电脑上要重算、画图、数次数都靠这个，不必再拿数据线进「文件」app 拷。
+    /// 发哪一晚：点开的那一晚 > 正在录的这一晚 > 最新的一晚。
+    func sendRecordsToPC() {
+        let chosen = detail?.id ?? (running ? currentNightId : "")
+        sendToPC("打鼾记录") {
+            guard let root = SnoreArchive.root else { return "读不到记录目录（Documents/nights）" }
+            let id: String
+            if !chosen.isEmpty {
+                id = chosen
+            } else if let latest = SnoreArchive.latestId() {
+                id = latest
+            } else {
+                return "====== SnoreBench 打鼾记录 ======\n本地一晚记录都还没有：先在「今晚」点开始，或者把这一晚收尾。"
+            }
+            let dir = root.appendingPathComponent(id)
+            func read(_ name: String) -> String {
+                (try? String(contentsOf: dir.appendingPathComponent(name), encoding: .utf8)) ?? ""
+            }
+            let meta = read("meta.json")
+            let reportText = read("report.txt")
+            let eventsText = read("events.jsonl")
+            let curve = read("curve.csv")
+            let rows = curve.isEmpty ? 0 : max(0, curve.split(separator: "\n").count - 1)
+            var s = "====== SnoreBench 打鼾记录 \(id)（\(snoreDateText(Date())) 发出）======\n"
+            s += "curve.csv \(rows) 行（逐秒一格）｜events.jsonl \(eventsText.split(separator: "\n").count) 条"
+              + "｜整包 \(curve.count + eventsText.count + meta.count + reportText.count) 字符\n"
+            s += "【meta.json】\n" + (meta.isEmpty ? "（读不到）\n" : meta)
+            s += "\n【report.txt】\n" + (reportText.isEmpty ? "（这一晚没报告文本；数字看下面两份原始数据）\n" : reportText)
+            s += "\n【events.jsonl】一行一个事件，t0/t1 是会话内第几秒\n" + (eventsText.isEmpty ? "（没有事件）\n" : eventsText)
+            s += "\n【curve.csv】t0,maxDb,meanDb,snoreSec,vocalSec,maxScore,floorDb,stale\n" + curve
+            return s
+        }
     }
 
     // MARK: 算法自检

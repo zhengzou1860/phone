@@ -312,6 +312,9 @@ struct HistoryView: View {
                                 Button("删", role: .destructive) { mon.deleteNight(r.id) }
                             }
                         }
+                        Text("左滑一行＝删掉那一晚（曲线、事件、音频片段一起没）；点开一行里也有「删掉这一晚」和「发这一晚的记录」。"
+                             + "留 \(mon.config.keepNights) 晚，多了从最旧的开始自动清。")
+                            .font(.system(size: 10)).foregroundColor(.secondary)
                     }
                 }
             }
@@ -334,6 +337,7 @@ struct NightDetailView: View {
     @ObservedObject var mon: SnoreMonitor
     let detail: SnoreNightDetail
     @Environment(\.dismiss) private var dismiss
+    @State private var confirmDelete = false
 
     var body: some View {
         NavigationStack {
@@ -401,13 +405,31 @@ struct NightDetailView: View {
                     HStack(spacing: 10) {
                         Button("重算报告") { mon.refreshReport() }
                             .buttonStyle(.bordered)
-                        Button(mon.uploading ? "发送中……" : "发到电脑") { mon.sendToPC() }
-                            .buttonStyle(.borderedProminent)
-                            .disabled(mon.uploading)
                         ShareLink(item: mon.report.isEmpty ? "（还没报告）" : mon.report) {
                             Label("分享", systemImage: "square.and.arrow.up")
                         }
                         .buttonStyle(.bordered)
+                    }
+                    HStack(spacing: 10) {
+                        Button {
+                            mon.sendLogToPC()
+                        } label: {
+                            Label(mon.uploading ? "发送中……" : "发执行日志",
+                                  systemImage: "doc.text.magnifyingglass")
+                        }
+                        .buttonStyle(.bordered)
+                        .disabled(mon.uploading)
+                        Button {
+                            mon.sendRecordsToPC()
+                        } label: {
+                            Label(mon.uploading ? "发送中……" : "发这一晚的记录",
+                                  systemImage: "waveform.path.ecg")
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(mon.uploading)
+                        Button("删掉这一晚", role: .destructive) { confirmDelete = true }
+                            .buttonStyle(.bordered)
+                            .tint(.red)
                     }
                     if !mon.uploadReply.isEmpty {
                         Text(mon.uploadReply).font(.system(size: 10, design: .monospaced))
@@ -423,8 +445,23 @@ struct NightDetailView: View {
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) { Button("关闭") { dismiss() } }
             }
+            .confirmationDialog("删掉 \(detail.id)？曲线、事件、音频片段一起没。\n要留的先按「发这一晚的记录」发到电脑，或者用「分享」。",
+                                isPresented: $confirmDelete, titleVisibility: .visible) {
+                Button("删掉这一晚", role: .destructive) {
+                    mon.deleteNight(detail.id)
+                    dismiss()
+                }
+                Button("算了", role: .cancel) {}
+            }
         }
     }
+}
+
+/// 「发打鼾记录」这一发会带走哪一晚——口径和 SnoreMonitor.sendRecordsToPC 里挑的那条一致。
+private func sendTargetText(_ mon: SnoreMonitor) -> String {
+    if let d = mon.detail { return "发的是点开的那一晚 \(d.id)" }
+    if mon.running { return "发的是正在录的这一晚 \(mon.currentNightId)" }
+    return "发的是最新的一晚"
 }
 
 // MARK: - 报告
@@ -441,14 +478,6 @@ struct ReportView: View {
                         Button("刷新") { mon.refreshReport() }
                             .buttonStyle(.bordered)
                         Button {
-                            mon.sendToPC()
-                        } label: {
-                            Label(mon.uploading ? "发送中……" : "发到电脑",
-                                  systemImage: "cable.connector")
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .disabled(mon.uploading)
-                        Button {
                             UIPasteboard.general.string = mon.report
                         } label: {
                             Label("复制", systemImage: "doc.on.doc")
@@ -459,6 +488,27 @@ struct ReportView: View {
                         }
                         .buttonStyle(.bordered)
                     }
+                    // 两条口分开：日志几 KB、是给查程序的人看的；记录上 MB、是给分析的人看的。
+                    HStack(spacing: 10) {
+                        Button {
+                            mon.sendLogToPC()
+                        } label: {
+                            Label(mon.uploading ? "发送中……" : "发执行日志",
+                                  systemImage: "doc.text.magnifyingglass")
+                        }
+                        .buttonStyle(.bordered)
+                        .disabled(mon.uploading)
+                        Button {
+                            mon.sendRecordsToPC()
+                        } label: {
+                            Label(mon.uploading ? "发送中……" : "发打鼾记录",
+                                  systemImage: "waveform.path.ecg")
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(mon.uploading)
+                    }
+                    Text("发到 \(SnoreUploader.endpoint)：日志＝现场读数＋磁盘流水全量；记录＝这一晚的 meta、报告、events、逐秒 curve（\(sendTargetText(mon))）")
+                        .font(.system(size: 10)).foregroundColor(.secondary)
                     if !mon.uploadReply.isEmpty {
                         Text(mon.uploadReply)
                             .font(.system(size: 11, design: .monospaced))
@@ -612,6 +662,48 @@ struct SettingsView: View {
                         }
                     }
                     Text("改过阈值以后按一次：拿合成鼾声喂进真分析器和真状态机，看事件表的数字还对不对。")
+                        .font(.system(size: 10)).foregroundColor(.secondary)
+                }
+
+                Section("发到电脑") {
+                    Button {
+                        mon.sendLogToPC()
+                    } label: {
+                        HStack {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("发执行日志").font(.system(size: 13, weight: .semibold))
+                                Text("现场读数＋磁盘流水全量＋档位＋此刻水位：查「程序哪儿出错／为什么被杀」走这条，几 KB")
+                                    .font(.system(size: 10)).foregroundColor(.secondary)
+                            }
+                            Spacer()
+                            Image(systemName: "doc.text.magnifyingglass").foregroundColor(.secondary)
+                        }
+                    }
+                    .disabled(mon.uploading)
+                    Button {
+                        mon.sendRecordsToPC()
+                    } label: {
+                        HStack {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("发打鼾记录").font(.system(size: 13, weight: .semibold))
+                                Text("那一晚的 meta、报告、events、逐秒 curve 整包：电脑上要重算、画图、数次数走这条，约 1 MB")
+                                    .font(.system(size: 10)).foregroundColor(.secondary)
+                            }
+                            Spacer()
+                            Image(systemName: "waveform.path.ecg").foregroundColor(.secondary)
+                        }
+                    }
+                    .disabled(mon.uploading)
+                    HStack {
+                        Text("目标").font(.system(size: 12))
+                        Spacer()
+                        Text(SnoreUploader.endpoint)
+                            .font(.system(size: 10, design: .monospaced)).foregroundColor(.secondary)
+                    }
+                    Text(mon.uploadReply.isEmpty ? "还没发过" : mon.uploadReply)
+                        .font(.system(size: 10, design: .monospaced)).foregroundColor(.secondary)
+                    Text((mon.uploading ? "正发着……" : sendTargetText(mon))
+                         + "。手机和电脑得在同一个 Wi-Fi，电脑上先起 tools/report_server_snore.py（8717）。")
                         .font(.system(size: 10)).foregroundColor(.secondary)
                 }
 

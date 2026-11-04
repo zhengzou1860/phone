@@ -204,6 +204,16 @@ enum SnoreArchive {
         return out
     }
 
+    /// 最新一晚的目录名，只翻目录不读 curve.csv。
+    /// 「开一晚想知道自己落在哪个目录」这种事别拿 list()：那是把每一晚的逐秒表全解析一遍。
+    static func latestId() -> String? {
+        guard let root = root,
+              let names = try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: [.isDirectoryKey]) else {
+            return nil
+        }
+        return names.map { $0.lastPathComponent }.sorted(by: >).first
+    }
+
     static func delete(_ night: SnoreNightStore) {
         try? fm.removeItem(at: night.dir)
     }
