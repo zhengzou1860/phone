@@ -77,12 +77,12 @@ enum FrameCodec {
     }
 
     /// 解回来验尺寸，自测用它判「编码通路真的通了」。
+    /// 直接解成 CGImage 读宽高，不走属性字典：CFDictionary 桥回 Swift 是 [String: Any]，
+    /// 当 [CFString: Any] 取键一只拿不到，判据就变成假的 nil（CI 第一轮就是这么报的）。
     static func decodedSize(_ jpeg: Data) -> CGSize? {
-        guard let src = CGImageSourceCreateWithData(jpeg as CFData, nil) else { return nil }
-        guard let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any] else { return nil }
-        guard let w = (props[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue,
-              let h = (props[kCGImagePropertyHeight] as? NSNumber)?.intValue else { return nil }
-        return CGSize(width: w, height: h)
+        guard let src = CGImageSourceCreateWithData(jpeg as CFData, nil),
+              let img = CGImageSourceCreateImageAtIndex(src, 0, nil) else { return nil }
+        return CGSize(width: img.width, height: img.height)
     }
 }
 

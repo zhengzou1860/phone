@@ -13,6 +13,7 @@ import CoreGraphics
 import Foundation
 import PhotosUI
 import SwiftUI
+import UIKit
 import UniformTypeIdentifiers
 import WebKit
 
@@ -135,7 +136,7 @@ final class PageViewController: UIViewController {
             self?.client?.push(jpeg)
         }
         video.onError = { [weak self] msg in
-            DispatchQueue.main.async { self?.status(msg, kind: "error") }
+            DispatchQueue.main.async { self?.status(msg, "error") }
         }
         video.onSegmentEnd = { [weak self] in
             guard let self = self else { return }
@@ -170,7 +171,7 @@ final class PageViewController: UIViewController {
 
     // MARK: - 状态写回页面
 
-    private func status(_ msg: String, kind: String = "success") {
+    private func status(_ msg: String, _ kind: String = "success") {
         let js = "window.LiveUI && window.LiveUI.status(\(LiveShim.jsLiteral(msg)), "
             + "\(LiveShim.jsLiteral(kind)))"
         webView.evaluateJavaScript(js, completionHandler: nil)
@@ -232,7 +233,7 @@ final class PageViewController: UIViewController {
         let now = CFAbsoluteTimeGetCurrent()
         if needStart && !manual && restartTries >= LiveConfig.maxRestartTries {
             status("自动重连试到 \(restartTries) 次都没进得去：查那台电脑的换脸服务在不在跑"
-                   + "（冷启动加载模型约 17 秒），好了再点「播放」", kind: "error")
+                   + "（冷启动加载模型约 17 秒），好了再点「播放」", "error")
             restartTries = 0
             return
         }
@@ -290,7 +291,7 @@ final class PageViewController: UIViewController {
             let dur = CMTimeGetSeconds(self.video.duration)
             if dur.isFinite, seconds >= dur {
                 self.status("跳到 \(LiveTime.clock(seconds)) 超出这一片长度 \(LiveTime.clock(dur))",
-                            kind: "error")
+                            "error")
                 return
             }
             self.resumeSeconds = seconds
@@ -354,6 +355,18 @@ final class PageViewController: UIViewController {
         lastSentTick = now
         if fps > 0.5 { restartTries = 0 }        // 帧在走就算连上了，重连计数归零
 
+        // 会话失效：PC 把每一帧都弹回登录页，跟随后拿到的是 200 的 HTML，
+        // 光看状态码就是「帧在走」。这条得排在重连前面——重连也进不去，只会白试三轮。
+        if client.sessionLost {
+            video.stop()
+            resumeSeconds = clampSeconds(CMTimeGetSeconds(video.currentPTS))
+            stopMeter()
+            phase = .loaded
+            let c = client
+            Task { await c.stopLive() }
+            status(LiveAuth.lostMessage, "error")
+            return
+        }
         // 恢复路径①：PC 判了 409 或 /live_status 报 live_mode=false，都意味着必须重新 /live_start
         if client.saw409 != lastSeen409 || !client.pcLiveMode {
             lastSeen409 = client.saw409
@@ -365,7 +378,7 @@ final class PageViewController: UIViewController {
             return
         }
         if let err = client.lastError, warnOnce("err:" + err) {
-            status(err, kind: "error")
+            status(err, "error")
         }
         // 手机在推、PC 不出帧：那边进程崩了或还在加载模型（这条只报警，不停手——停手是上面那条的事）
         if let age = client.outputAgeMs, age > LiveConfig.watchdogMs, warnOnce("age") {
@@ -552,7 +565,7 @@ extension PageViewController: WKNavigationDelegate {
         guard ns.code != NSURLErrorCancelled else { return }
         let host = client.map { LiveHost.display($0.baseURL) } ?? "（没地址）"
         status("连不上 \(host)：\(ns.localizedDescription)｜确认手机和电脑在同一张网，"
-               + "并且这台手机的「本地网络」权限是开的", kind: "error")
+               + "并且这台手机的「本地网络」权限是开的", "error")
         openAddress(storedHost())
     }
 }

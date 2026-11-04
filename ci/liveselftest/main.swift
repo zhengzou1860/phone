@@ -185,6 +185,30 @@ ck("客户端 首页URL", c.pageURL.absoluteString == "http://192.168.1.9:5000")
 ck("客户端 结果流URL", c.feedURL.absoluteString == "http://192.168.1.9:5000/video_feed")
 ck("客户端 本地计数从0", c.framesSent == 0 && c.framesDroppedLocal == 0)
 
+// MARK: - 会话失效的判定（PC 的 login_required 对 POST 也是 302→200 登录页）
+
+ck("会话 200+登录页路径判丢", LiveAuth.lostSession(statusCode: 200, path: "/login",
+                                                   contentType: "text/html"))
+ck("会话 200+带子路径的登录页", LiveAuth.lostSession(statusCode: 200, path: "/login?next=1",
+                                                     contentType: nil))
+ck("会话 200+HTML 判丢", LiveAuth.lostSession(statusCode: 200, path: "/live_frame",
+                                              contentType: "text/html; charset=utf-8"))
+ck("会话 200+空body的登录页跳转判丢", LiveAuth.lostSession(statusCode: 200, path: "/login",
+                                                           contentType: "text/html"))
+ck("会话 401 判丢", LiveAuth.lostSession(statusCode: 401, path: "/live_frame", contentType: nil))
+ck("会话 403 判丢", LiveAuth.lostSession(statusCode: 403, path: "/live_frame", contentType: nil))
+ck("会话 204 正常收帧不判丢", !LiveAuth.lostSession(statusCode: 204, path: "/live_frame",
+                                                    contentType: nil))
+ck("会话 409 不算掉登录", !LiveAuth.lostSession(statusCode: 409, path: "/live_frame",
+                                                contentType: "application/json"))
+ck("会话 405 不算掉登录", !LiveAuth.lostSession(statusCode: 405, path: "/live_stop",
+                                                contentType: "text/html"),
+   "PC 那 405 回的是 HTML：错方法不该被归成「会话丢了」")
+ck("会话 503 不算掉登录", !LiveAuth.lostSession(statusCode: 503, path: "/live_frame",
+                                                contentType: "application/json"))
+ck("会话 413 不算掉登录", !LiveAuth.lostSession(statusCode: 413, path: "/live_frame",
+                                                contentType: "application/json"))
+
 // MARK: - 判定
 
 if fails == 0 {

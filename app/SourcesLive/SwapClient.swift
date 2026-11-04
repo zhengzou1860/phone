@@ -32,6 +32,7 @@ final class SwapClient: ObservableObject {
     @Published var inputAgeMs: Int?
     @Published var pcLiveMode = false          // PC 静默 10 秒会自己退出推流模式，手机靠这个知道要重来
     @Published var saw409 = 0                  // 被 PC 判「不在推流模式」的次数，恢复逻辑的触发信号
+    @Published var sessionLost = false          // cookie 失效：PC 把请求弹回登录页，这边只有重登一条路
     @Published var lastError: String?
 
     let baseURL: URL
@@ -68,11 +69,15 @@ final class SwapClient: ObservableObject {
 
     /// WKWebView 用自己的 cookie 存储，不搬一次的话原生 /live_frame 会被 302 弹回登录页。
     /// 方向是 页面 → 原生：登录用的是 PC 自己的登录页，界面因此和 PC 完全一致。
+    /// 每加载完一页都搬一次：用户在这一页重新登录以后，这一搬就是「会话续上了」的信号。
     func importCookies(from store: WKHTTPCookieStore, then: @escaping () -> Void) {
         store.getAllCookies { cookies in
             let jar = HTTPCookieStorage.shared
             for c in cookies { jar.setCookie(c) }
-            DispatchQueue.main.async { then() }
+            DispatchQueue.main.async {
+                self.sessionLost = false
+                then()
+            }
         }
     }
 
@@ -84,6 +89,10 @@ final class SwapClient: ObservableObject {
         let body = try JSONSerialization.data(withJSONObject: ["max_width": LiveConfig.fallbackMaxWidth])
         let (data, resp) = try await call("/live_start", body: body, contentType: "application/json")
         let code = (resp as? HTTPURLResponse)?.statusCode ?? -1
+        if let http = resp as? HTTPURLResponse, LiveAuth.lost(http) {
+            await MainActor.run { self.sessionLost = true }
+            throw SwapError(message: LiveAuth.lostMessage)
+        }
         let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         guard code == 200, let j = j, (j["status"] as? String) == "success" else {
             // @login_required 会把未登录的 POST 重定向到登录页，跟随后拿回来的是 200 的 HTML：
@@ -95,7 +104,10 @@ final class SwapClient: ObservableObject {
         if let w = (j["max_width"] as? NSNumber)?.intValue, w > 0 {
             liveWidth = w
         }
-        await MainActor.run { self.pcLiveMode = true }
+        await MainActor.run {
+            self.pcLiveMode = true
+            self.sessionLost = false        // 能进得推流模式就说明 cookie 是好用的
+        }
         beginStatusPolling()
         return liveWidth
     }
@@ -174,6 +186,15 @@ final class SwapClient: ObservableObject {
                 return
             }
             guard let http = resp as? HTTPURLResponse else { return }
+            // 会话丢了：POST 跟着 302 变成 GET、拿回来是 200 的登录页 HTML，
+            // 光看状态码就是「这一帧被收了」，实际 PC 一帧没进——必须在计数之前拦掉。
+            if LiveAuth.lost(http) {
+                DispatchQueue.main.async {
+                    self.sessionLost = true
+                    self.lastError = LiveAuth.lostMessage
+                }
+                return
+            }
             // 409 = PC 已退出推流模式（10 秒空闲看门狗或那边重启），必须重新 /live_start
             if http.statusCode == 409 {
                 DispatchQueue.main.async {

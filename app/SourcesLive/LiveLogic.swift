@@ -98,6 +98,33 @@ enum LiveHost {
     }
 }
 
+// MARK: - 会话失效的判定
+
+enum LiveAuth {
+    /// PC 的 login_required 对 GET 和 POST 一律 redirect('/login')，不区分方法；
+    /// URLSession 默认跟随 302 并把 POST 降级成 GET，于是 cookie 一失效
+    /// /live_frame 就回「200 + 登录页 HTML」——看着像这一帧被收了，实际 PC 一帧没收到，
+    /// 盯着一个永远不涨的 fps 找不出原因。所以 200 也要验一下到底是谁回的。
+    /// 409（未进推流模式）和 405（方法不对）都不算会话丢：那是另外两条恢复路径的事。
+    static func lostSession(statusCode: Int, path: String?, contentType: String?) -> Bool {
+        if statusCode == 401 || statusCode == 403 { return true }
+        guard statusCode == 200 else { return false }
+        if let p = path, p.hasPrefix("/login") { return true }
+        if let ct = contentType?.lowercased(), ct.contains("text/html") { return true }
+        return false
+    }
+
+    /// 上面那条的 HTTPURLResponse 外壳。expectedURL 是跟随重定向以后真正取到的地址。
+    static func lost(_ resp: HTTPURLResponse) -> Bool {
+        let path = (resp.expectedURL ?? resp.url)?.path
+        let type = resp.value(forHTTPHeaderField: "Content-Type")
+        return lostSession(statusCode: resp.statusCode, path: path, contentType: type)
+    }
+
+    /// 给用户看的那一句：会话丢了下一步只有重登，手机这边没什么可重试的。
+    static let lostMessage = "登录失效了（PC 把请求弹回登录页）：在这一页重新登录，再点「播放」接着推"
+}
+
 // MARK: - 跳转输入
 
 enum LiveTime {
