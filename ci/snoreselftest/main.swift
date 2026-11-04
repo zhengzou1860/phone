@@ -2,7 +2,7 @@ import Foundation
 
 // MARK: - 出包前的算法闸门（在 CI 那台 mac 上跑，不是手机上跑）
 //
-// 本机是 Windows，没有 Swift 工具链；判定这一整套（FFT → 逐帧特征 → 迟滞状态机 → 事件表）
+// 本机是 Windows，没有 Swift 工具链；判定这一整套（FFT → 逐帧特征 → 「一次发声」收口判定 → 事件表）
 // 从来没被真编译器跑过，更没被验过数。所以出包前在 mac 上拿合成信号跑一遍真通路：
 // 判据不看「听着像不像」，看事件表里的数字落在不在该在的区间。
 // 手机上「设置 → 算法自检」跑的是同一份 SnoreCases.all，两边不可能各说一套。
@@ -17,7 +17,7 @@ for r in results {
     if !r.ok { bad += 1 }
     print("CASE \(r.ok ? "OK  " : "FAIL") \(r.name)｜\(r.detail)")
 }
-let badCases = bad     // 九个用例的；合成夜那几条另加，别把「8/9」这种数字打错
+let badCases = bad     // 这批用例的；合成夜那几条另加，别把「10/11」这种数字打错
 
 // 把一份完整报告打进 CI 日志：文案（口径、限度、分级那几行）改错了，这里当场就能看见，
 // 不必等第二天早上在手机上调出来。起点钉死，日志才可重复比对。
@@ -33,20 +33,24 @@ do {
             i += 1
         }
     }
-    func snorePiece(_ dur: Double, period: Double, f0: Double, level: Double, seed: UInt64) -> [Double] {
+    func snorePiece(_ dur: Double, period: Double, f0: Double, level: Double, seed: UInt64,
+                    duty: Double = 0.45) -> [Double] {
         SnoreSynth.snore(count: Int(sr * dur), sampleRate: sr, periodSec: period, f0: f0,
-                         level: level, seed: seed)
+                         level: level, duty: duty, seed: seed)
     }
 
     var s = SnoreSynth.bed(count: Int(sr * 900), level: 0.0006, seed: 31)
     // 六段鼾，段间的空档都明显长于 10 s 阈值 ⇒ 每道空档该出一条「疑似中断」；
     // 说话放在 170→260 那一道空档里 ⇒ 那一条要带「期间有别的发声」；
     // 敲击三下 ⇒ 不该变成发作，也不该变成中断。
+    // 420 s 那一段刻意摆成「一鼾一口气」（周期 7 s、一声只 0.45 s、还偏轻）：
+    // 用户手机那一晚就是这个形状，旧写法整晚一件鼾都没判出来，而其余五段周期都在 4 s 内，
+    // 天生照不出这条——所以稀疏那段必须由这里钉住。
     lay(snorePiece(40, period: 3.0, f0: 130, level: 0.10, seed: 5), into: &s, at: 30)
     lay(snorePiece(60, period: 3.4, f0: 145, level: 0.12, seed: 6), into: &s, at: 110)
     lay(SnoreSynth.speech(count: Int(sr * 25), sampleRate: sr, level: 0.09, seed: 11), into: &s, at: 180)
     lay(snorePiece(90, period: 2.8, f0: 120, level: 0.14, seed: 7), into: &s, at: 260)
-    lay(snorePiece(100, period: 4.0, f0: 160, level: 0.08, seed: 8), into: &s, at: 420)
+    lay(snorePiece(100, period: 7.0, f0: 160, level: 0.08, seed: 8, duty: 0.45 / 7.0), into: &s, at: 420)
     lay(snorePiece(160, period: 3.1, f0: 135, level: 0.11, seed: 9), into: &s, at: 700)
     lay(SnoreSynth.clicks(count: s.count, sampleRate: sr, level: 0.25, at: [400, 650, 660]), into: &s, at: 0)
 
@@ -76,6 +80,14 @@ do {
     if summary.vocalCount > 3 {
         bad += 1
         print("CASE FAIL 合成样例里「其他发声」出了 \(summary.vocalCount) 条（只摆了一段说话，要 ≤3）")
+    }
+    // 420–520 那段稀疏鼾：要判成一段发作，且节律数得出 6–12 次/分（一口气 5–10 s）。
+    // 这一条就是 0.4 那晚的守门员：旧写法在这里是「发作 0 段、鼾声占 0.0%」。
+    let sparse = got.events.filter { $0.kind == .bout && $0.t0 >= 400 && $0.t1 <= 560 }
+    let sparseRates = sparse.compactMap { $0.ratePerMin }
+    if sparse.count != 1 || !sparseRates.contains(where: { $0 >= 6.0 && $0 <= 12.0 }) {
+        bad += 1
+        print("CASE FAIL 稀疏鼾那段判成 \(sparse.count) 段（要 1）／节律 \(sparseRates)（要有一段落在 6–12）")
     }
 }
 

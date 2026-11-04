@@ -125,6 +125,9 @@ final class SnoreCore {
                 let removed = SnoreArchive.prune(keepNights: config.keepNights)
                 SnoreJournal.line("收尾 \(store.meta.id)：录了 \(snoreDurText(t))，格 \(store.buckets.count)，"
                                   + "事件 \(store.events.count)，重连 \(audio.restarts) 次"
+                                  + "｜" + (tracker?.judgeSummary ?? "判定账目没了")
+                                  + (tracker?.loudestRejectedNote.isEmpty == false
+                                     ? "｜" + (tracker?.loudestRejectedNote ?? "") : "")
                                   + (removed.isEmpty ? "" : "｜顺手清掉旧晚 " + removed.joined(separator: ",")))
                 post("今晚的记录收在 \(store.dir.lastPathComponent)，报告已生成")
             }
@@ -147,6 +150,17 @@ final class SnoreCore {
     var isRunning: Bool {
         var v = false
         queue.sync { v = running }
+        return v
+    }
+
+    /// 「为什么一件鼾都没判出来」的一行账：发执行日志时挂在最上面，不必 guess
+    var judgeNote: String {
+        var v = "分析器还没起来（没开始录，或第一块音频没到手）"
+        queue.sync {
+            if let t = tracker {
+                v = t.judgeSummary + (t.loudestRejectedNote.isEmpty ? "" : "｜" + t.loudestRejectedNote)
+            }
+        }
         return v
     }
 
@@ -182,6 +196,7 @@ final class SnoreCore {
             lastHeartbeat = endTime
             SnoreJournal.line("心跳 \(snoreDurText(endTime))：本底 \(String(format: "%.1f", tracker.liveFloor)) dBFS"
                               + "｜鼾 \(tracker.boutCount)｜停 \(tracker.gapCount)｜说话 \(tracker.vocalCount)"
+                              + "｜" + tracker.judgeSummary
                               + "｜块 \(audio.blocksDelivered)｜重连 \(audio.restarts)"
                               + "｜足迹 \(SnoreFacts.footprintMB()) MB")
         }
@@ -194,6 +209,9 @@ final class SnoreCore {
     private func wireTracker() {
         tracker?.onSecond = { [weak self] b in
             self?.store?.add(b)
+        }
+        tracker?.onSecondAmend = { [weak self] b in
+            self?.store?.amend(b)
         }
         tracker?.onEvent = { [weak self] e in
             guard let self = self, let store = self.store else { return }

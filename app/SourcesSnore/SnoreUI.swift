@@ -103,11 +103,12 @@ struct TonightView: View {
             }
             SnoreLevelBar(level: mon.live.level, floorDb: mon.live.floor)
             HStack {
-                Text(mon.live.snoring ? "判为：在打鼾" : "判为：没鼾")
+                Text(mon.live.score <= 0 ? "此刻没声音在响"
+                     : mon.live.snoring ? "这一声：像鼾" : "这一声：不像鼾")
                     .font(.caption)
                     .foregroundColor(mon.live.snoring ? .orange : .secondary)
                 Spacer()
-                Text(String(format: "够鼾分 %.2f／进门 %.2f", mon.live.score, mon.config.enterScore))
+                Text(String(format: "频谱 %.2f／线 %.2f", mon.live.score, mon.config.enterScore))
                     .font(.system(size: 11, design: .monospaced)).foregroundColor(.secondary)
                 if mon.live.gapSec > 1 {
                     Text(String(format: "已停 %.0f s", mon.live.gapSec))
@@ -570,7 +571,7 @@ struct SettingsView: View {
                         Text("中（推荐）").tag(1)
                         Text("高（轻鼾也收）").tag(2)
                     }
-                    Text("进门分 \(String(format: "%.2f", mon.config.enterScore))／出门分 \(String(format: "%.2f", mon.config.exitScore))：比这两条线高就算鼾，中间晃不算断。")
+                    Text("判定分 \(String(format: "%.2f", mon.config.enterScore))：一段声音响完后算总账，频谱像鼾要过这条线，还要「够一口气的长短」＋帧间稳定，再配上邻鼾（1–10 秒一鼾）才算鼾。")
                         .font(.system(size: 10)).foregroundColor(.secondary)
 
                     Picker("鼾声停多久算一次「疑似中断」", selection: $mon.config.interruptGapSec) {
@@ -580,11 +581,11 @@ struct SettingsView: View {
                         Text("20 秒（只报很长的）").tag(20.0)
                     }
                     Picker("一次发作允许的最大间隔", selection: $mon.config.boutGapSec) {
-                        Text("2.0 秒（分得细）").tag(2.0)
-                        Text("2.5 秒（呼吸均匀的人）").tag(2.5)
-                        Text("4.0 秒（推荐）").tag(4.0)
+                        Text("5 秒（分得细）").tag(5.0)
+                        Text("8 秒（推荐）").tag(8.0)
+                        Text("12 秒（并成大段）").tag(12.0)
                     }
-                    Text("鼾本来就是一鼾一鼾跳的：真人的空档能量到 3 秒多，设小了会把一整段连续鼾劈成十几次「发作」，次/小时就成了废数；设大了则几段真分开的可能被并成一段。")
+                    Text("真人是一口气一鼾，两声鼾之间空 5–8 秒很常见：设成 4 秒会把「一鼾一口气」那种鼾每一声劈成一次发作，次/小时就成了废数；设大了则几段真分开的可能被并成一段。")
                         .font(.system(size: 10)).foregroundColor(.secondary)
 
                     Picker("绝对门限", selection: $mon.config.absGateDb) {
@@ -592,10 +593,10 @@ struct SettingsView: View {
                         Text("-58 dBFS（推荐）").tag(-58.0)
                         Text("-65 dBFS（连很轻的）").tag(-65.0)
                     }
-                    Picker("多短算瞬发（咳嗽/关门）", selection: $mon.config.minBoutSec) {
-                        Text("0.4 秒").tag(0.4)
-                        Text("0.5 秒（推荐）").tag(0.5)
-                        Text("0.8 秒").tag(0.8)
+                    Picker("发作最短要多长", selection: $mon.config.minBoutSec) {
+                        Text("0.35 秒（推荐）").tag(0.35)
+                        Text("0.6 秒").tag(0.6)
+                        Text("1.0 秒（只算成段的）").tag(1.0)
                     }
                 }
 

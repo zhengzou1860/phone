@@ -22,7 +22,7 @@ struct SnoreEvent: Codable, Identifiable {
     var ratePerMin: Double?    // 发作内的鼾声节律（次/分）：这一段数不出「两次以上的鼾间隔」就 nil
     var peakHz: Double?        // 基频那一根的中位
     var preDb: Double?         // 中断前那次发作的均值（gap）
-    var resumeDb: Double?      // 复鼾后 2 s 的峰值（gap）
+    var resumeDb: Double?      // 复鼾那一声的峰值（gap）
     var arousal: Bool          // 复鼾比中断前响 3 dB 以上：更像暂停过后那口气喘回来
     var otherDuring: Bool      // 停的这一阵里夹着别的发声（翻身、梦话、咳嗽）
     var unresolved: Bool       // 到收尾还没复鼾（不打了／人走了／手机断气）
@@ -34,90 +34,52 @@ struct SnoreSecond: Codable {
     var meanDb: Double
     var snoreSec: Double
     var vocalSec: Double     // 有声音但没成鼾的时长（说话、咳、翻身响动都算）
-    var maxScore: Double     // 这一秒里最高的那次「像鼾分」（频谱×节律门，就是判进门的那个数）
+    var maxScore: Double     // 这一秒里最高的那次「逐帧频谱像鼾分」（0…1，不含节律：判定在收口时做）
     var floorDb: Double
     var stale: Bool          // 这一秒一个分析帧都没等到：引擎断了/被系统暂停，图上留白
 }
 
-// MARK: - 呼吸节律门
+// MARK: - 判定单位是「一次发声」，不是「一帧」
 //
-// 频谱打分回答的是「这一段声音像不像鼾」，回答不了「它是不是跟着呼吸一开一合」。
-// 冰箱嗡鸣、电视低音、隔墙说话，频谱都能拿高分（低频、有谐波、稳）；
-// 鼾独有的形状是：一段一段地响，每段零点几秒到一两秒，段与段隔 1–6 s。这一门就把形状数出来。
+// 老写法是逐帧迟滞：像鼾分连续过线 0.25 s 才进门。真鼾不吃这一套，两处都亏：
+//   ① 一声鼾只有 0.3–0.5 s，证据还没攒够（要 ≥0.4 s）它就响完了；
+//   ② 真鼾一口气只响一声（隔 5–8 s 才来下一声），而往回的节律门在静默超过 boutGapSec
+//      时把上一鼾清零 ⇒ 永远数不出第二个开声 ⇒ 门恒 0 ⇒ 频谱再像也要被砍一半，进不了门。
+// 用户手机上「离得很近却一件鼾都没判出来」就是这条：日志里逐帧频谱分 0.9 上下、电平比本底高
+// 20 多 dB，可【鼾声占比】0.0%、事件表里全是「其他发声」。合成用例也全用 2.8–4.0 s 的周期，
+// 比 boutGapSec 短 ⇒ 这套写法在自检里天生就是对的，抓不到。
+//
+// 现在：响完（停了 holdSec 以上）再算总账。那时段长、频谱中位、帧间稳定中位三样都齐了，
+// 拿这三样判「像不像一次吸气里的鼾」，再要求它跟邻鼾配成一次呼吸的量级（1–10 s）；
+// 一晚的头几声没有邻鼾，就要求频谱自己高过「判定分＋单独余量」才敢单判。
+// 判完才把一声一声串成发作，所以「鼾次/分」这种数是从收口的时刻表里来的，不是逐帧凑的。
 
-enum SnoreRhythm {
-    /// 一鼾的收尾：声音停了这么久就不再续着算（一次吸气的量级，比 boutGapSec 短得多）
-    static let burstHoldSec = 0.30
-    /// 占空比吃的窗：最近 8 s 里有多少时间是响着的
-    static let dutyWindowSec = 8.0
-    /// 节律吃的窗：只数「这一段声音自己」的鼾，最多往回看 20 s
-    static let rhythmWindowSec = 20.0
-    /// 一鼾的段长中位数：burstDurLo…burstDurHi 之间满分。
-    /// 两头都留斜坡：短于 burstDurRise 是敲击／关门（实测敲击段长中位 0.09 s），
-    /// 长于 burstDurFall 就不像一次吸气了（循环启停的嗡鸣会在这里被压下去）。
-    /// 早先按「干净的合成鼾」定成 0.4→0.8 起分，真人那种一顿一顿的鼾段长 0.26–0.5、
-    /// 中位 0.43 只拿到 0.075 分，门自己关死——整晚真鼾全记成「其他发声」。
-    static let burstDurRise = 0.10
-    static let burstDurLo = 0.30
-    static let burstDurHi = 2.0
-    static let burstDurFall = 4.0
-    /// 鼾与鼾的间隔：1–6 s 是呼吸的量级；0.4–1 s 线性给分，再密就不算呼吸了
+enum SnoreSound {
+    /// 声音停了这么久就不再续着算同一声
+    static let holdSec = 0.30
+    /// 段长的形状分：0.10 起分、0.30 满分、2.0 以后往下掉、4.0 归零——一次吸气的量级
+    static let durRise = 0.10
+    static let durLo = 0.30
+    static let durHi = 2.0
+    static let durFall = 4.0
+    /// 形状分要够这一条才算「够一次吸气」
+    static let shapeBar = 0.60
+    /// 鼾与鼾的间隔：1–10 s（一口气 6–10 s，浅睡期更密）；再密是颤音／咳嗽连环，不算呼吸
     static let intervalLo = 1.0
-    static let intervalHi = 6.0
-    static let intervalFloor = 0.4
-    /// 节律数不出来时把频谱压到多少：0.45 意味着「再像也砍一半以上」。
-    /// 不能压到 0——刚开口的头几个鼾、隔着枕头听不清的那些，形状本来就数不出来。
-    static let gateFloor = 0.45
+    static let intervalHi = 10.0
+    /// 帧间频谱稳定度的中位低于这个就当「在说话」：说话共振峰一直在跑（实测 0.51–0.55），
+    /// 鼾不管密集还是稀疏都是同一姿势在震（实测 1.00）。这一条是早点「识破说话」的那关，
+    /// 少了它，说话会借隔壁鼾段的呼吸间隔混成一次发作——把真中断抹平。
+    static let stabLo = 0.72
+    /// 没有邻鼾可配时（一晚的头几声）频谱中位要额外高这么多才敢单判
+    static let soloMargin = 0.30
+    /// 邻鼾配对最多往回看这么久
+    static let pairWindowSec = 12.0
 
-    /// 一次「连续响着」的声音，即一鼾
-    struct Burst {
-        var t0: Double
-        var t1: Double
-        var dur: Double { t1 - t0 }
-    }
-
-    /// 响着的时长占最近 8 s 的比例。鼾是「一开一合」，一直响着的不是。
-    /// 不到 0.10 是刚开口，线性给；0.85–0.95 收口；占满就是持续声，0 分。
-    static func dutyScore(voicedFrames: Int, frameSec: Double) -> Double {
-        let frac = Double(voicedFrames) * frameSec / dutyWindowSec
-        if frac < 0.10 { return frac / 0.10 }
-        if frac <= 0.85 { return 1.0 }
-        if frac >= 0.95 { return 0.0 }
-        return (0.95 - frac) / 0.10
-    }
-
-    /// 门 = 一开一合（占空）× 每鼾够长（时长）× 间隔像呼吸；顺带报出节律（次/分）。
-    /// bursts 按时间先后排，inProgress 是还没停的那一声。
-    static func gate(bursts: [Burst], inProgress: Burst?, voicedFrames: Int,
-                     frameSec: Double) -> (gate: Double, ratePerMin: Double?) {
-        var items = bursts
-        if let p = inProgress { items.append(p) }
-        guard !items.isEmpty else { return (0.0, nil) }
-        let d = dutyScore(voicedFrames: voicedFrames, frameSec: frameSec)
-        let meanDur = snoreMedian(items.map { $0.dur }) ?? 0.0
-        let ds = snoreClamp01((meanDur - burstDurRise) / (burstDurLo - burstDurRise))
-            * snoreClamp01((burstDurFall - meanDur) / (burstDurFall - burstDurHi))
-        let onsets = items.map { $0.t0 }
-        // 只有一段声音：既谈不上「间隔」，也无从分辨是鼾还是一声长响——门归零。
-        // 这一条给 0.66 之类的宽容值试过：突起的嗡鸣能在灵敏度「高」那档撑出 20 多秒的发作。
-        guard onsets.count >= 2 else { return (0.0, nil) }
-        var diffs: [Double] = []
-        for i in 1..<onsets.count { diffs.append(onsets[i] - onsets[i - 1]) }
-        let iv = snoreMedian(diffs) ?? 0.0
-        let isr: Double
-        if iv < intervalFloor {
-            isr = 0.0
-        } else if iv < intervalLo {
-            isr = (iv - intervalFloor) / (intervalLo - intervalFloor)
-        } else if iv <= intervalHi {
-            isr = 1.0
-        } else if iv <= intervalHi + 2.0 {
-            isr = (intervalHi + 2.0 - iv) / 2.0
-        } else {
-            isr = 0.0
-        }
-        let rate: Double? = iv >= intervalLo ? 60.0 / iv : nil
-        return (d * ds * isr, rate)
+    /// 0…1：这一段声音的长度像不像一次吸气
+    static func shapeOf(dur: Double) -> Double {
+        return snoreClamp01((dur - durRise) / (durLo - durRise))
+            * snoreClamp01((durFall - dur) / (durFall - durHi))
     }
 }
 
@@ -129,6 +91,9 @@ final class SnoreTracker {
 
     var onEvent: ((SnoreEvent) -> Void)?
     var onSecond: ((SnoreSecond) -> Void)?
+    /// 一声收口后回头补的那几秒格子。判定要等响完，格子却已经先发出去了（图上先画响度、
+    /// 鼾色随后补上）；SnoreStore 按 t0 原位改一格，盘上还是 30 s 一重写。
+    var onSecondAmend: ((SnoreSecond) -> Void)?
 
     /// 下一件事件的编号：界面上「听片段」按 id 找 snippets/s_12.wav，两头都用它。
     private(set) var nextId = 1
@@ -139,6 +104,7 @@ final class SnoreTracker {
     private(set) var liveLevel = -120.0
     private(set) var liveFloor = -75.0
     private(set) var liveOpenGapSec = 0.0
+    private(set) var liveSoundDur = 0.0
     private(set) var boutCount = 0
     private(set) var gapCount = 0
     private(set) var vocalCount = 0
@@ -146,46 +112,86 @@ final class SnoreTracker {
     private(set) var longestBout = 0.0
     private(set) var longestGap = 0.0
 
-    // 迟滞与发作
-    private var snoreOn = false
-    private var overEnterStart: Double?
-    private var lastSnoreTime = -1_000_000.0
-    private var lastBoutEnd = -1_000_000.0
-    private var boutStart = 0.0
-    private var boutFrames = 0
-    private var boutLevelSum = 0.0
-    private var boutLevelMax = -120.0
-    private var boutPeakHz: [Double] = []
+    // 发给日志的账：「为什么没判成鼾」靠这几个数分流，不用猜
+    private(set) var soundTotal = 0        // 收口的声音一共多少
+    private(set) var soundShaped = 0       // 段长＋频谱＋稳定三样都过关的
+    private(set) var soundSnore = 0        // 判成鼾的
+    private(set) var soundLonely = 0       // 三样过关、却没配上邻鼾也没高到能单判的（线上那次漏判就卡这）
+    private(set) var loudestRejected = ""  // 最响的那一声「不是鼾」的完整数字，收尾时一行日志
 
-    // 上一次刚收尾的发作（判「复鼾比中断前响」要跟它比）
-    private var lastClosedBoutMean = -120.0
+    /// 正在响的这一声
+    private struct Draft {
+        var t0 = 0.0
+        var t1 = 0.0
+        var raws: [Double] = []
+        var stabs: [Double] = []
+        var lvSum = 0.0
+        var frames = 0
+        var pk = -120.0
+        var hz: [Double] = []
+    }
+    private var draft: Draft?
+    /// 频谱／稳定度最多各攒这么多帧（约一分钟的量）：再长的声音靠形状分那一关就否掉了，
+    /// 不值得为一整晚不响的循环嗡鸣养着一条长数组。
+    private static let draftCap = 600
 
-    // 鼾帧时刻：判「刚才确实在打」用，只留最近 4 分钟
+    /// 一声收口之后的账（留着给后面的鼾配对，只保最近 pairWindowSec）
+    private final class Closed {
+        let t0: Double
+        let t1: Double
+        let dur: Double
+        let raw: Double
+        let stab: Double
+        let pk: Double
+        let mean: Double
+        let hz: Double?
+        let shapeOk: Bool
+        var snore = false
+        init(t0: Double, t1: Double, dur: Double, raw: Double, stab: Double, pk: Double,
+             mean: Double, hz: Double?, shapeOk: Bool) {
+            self.t0 = t0; self.t1 = t1; self.dur = dur; self.raw = raw; self.stab = stab
+            self.pk = pk; self.mean = mean; self.hz = hz; self.shapeOk = shapeOk
+        }
+    }
+    private var closed: [Closed] = []
+
+    /// 逐秒用的记账：一段声音从收口起才知道算鼾还是算别的发声
+    private struct Mark {
+        var t0: Double
+        var t1: Double
+        var snore: Bool
+    }
+    private var marks: [Mark] = []
+
+    /// 已经发出去的秒格子（回填用）。只留最近这些秒：判成鼾的一声最长 2.8 s（形状分那关卡的），
+    /// 加上一句「孤单的声被后面的鼾认下来」要往回照应的 12 s，留 24 s 足够。
+    private var recent: [Int: SnoreSecond] = [:]
+    private static let amendWindowSec = 24.0
+
+    /// 发作：把一鼾一鼾串成「这一段在打」
+    private struct Run {
+        var t0: Double
+        var t1: Double
+        var n = 0
+        var pk = -120.0
+        var lvSum = 0.0
+        var lvN = 0
+        var hz: [Double] = []
+    }
+    private var run: Run?
+    private var runOnsets: [Double] = []
+    private var lastSnoreEnd = -1_000_000.0
+    private var lastRunMean = -120.0
+
+    /// 鼾帧时刻：判「刚才确实在打」用，只留最近 4 分钟
     private var snoreTimes: [Double] = []
+    private static let activityWindowSec = 240.0
+    /// 判定「这次中断」需要的前置活动：最近 4 分钟里至少打了 3 秒鼾。
+    /// 3 秒≈两口气的鼾——再高，入睡初期那种十几秒的短鼾段里停住就报不出来，
+    /// 而那正是最该报的时段；再低，两声咳嗽之间的空白会被当成一次中断。
+    private static let activityMinSec = 3.0
 
-    // 呼吸节律：把有声帧串成一鼾一鼾
-    private var bursts: [SnoreRhythm.Burst] = []
-    private var voicedTimes: [Double] = []
-    private var soundStart: Double?
-    private var soundLast = -1_000_000.0
-    private var lastBurstEnd = -1_000_000.0
-    /// 本段连续有声的开口时刻：发作的起点往回钉到这里
-    private var episodeStart: Double?
-    private var burstRate: Double?
-
-    // 「一段声音」：从有声到拖过 boutGap。收尾时才决定记不记成其他发声。
-    private var epOpen = false
-    private var epT0 = 0.0
-    private var epT1 = -1_000_000.0
-    private var epFrames = 0
-    private var epLevelSum = 0.0
-    private var epLevelMax = -120.0
-    private var epHadBout = false
-
-    // 疑似中断
-    private var gapStart: Double?
-    private var gapClosingAt: Double?
-    private var gapResumeMax = -120.0
+    /// 中断那一阵里有没有夹着别的发声（梦话、翻身、咳）
     private var gapOther = false
 
     // 逐秒
@@ -193,236 +199,280 @@ final class SnoreTracker {
     private var secFrames = 0
     private var secLevelSum = 0.0
     private var secLevelMax = -120.0
-    private var secSnore = 0.0
-    private var secVocal = 0.0
     private var secScoreMax = 0.0
     private var secFloor = -75.0
-
-    /// 判定「这次中断」需要的前置活动：最近 4 分钟里至少打了 3 秒鼾。
-    /// 3 秒≈两个呼吸周期的鼾——再高，入睡初期那种十几秒的短鼾段里停住就报不出来，
-    /// 而那正是最该报的时段；再低，两声咳嗽之间的空白会被当成一次中断。
-    private static let activityWindowSec = 240.0
-    private static let activityMinSec = 3.0
 
     init(frameSec: Double, config: SnoreConfig) {
         self.frameSec = frameSec > 0.005 ? frameSec : 0.085
         self.config = config
     }
 
-    /// 会话收尾：结掉还挂着的发作／发声／秒格，够长的未复鼾中断也留一条。
-    func finish(at t: Double) {
-        if snoreOn {
-            closeBout(at: max(boutStart, min(lastSnoreTime, t)))
-            snoreOn = false
-            liveSnoring = false
-        }
-        if epOpen {
-            commitEpisode(at: min(epT1, t))
-            epOpen = false
-        }
-        if secFrames > 0 {
-            emitSecond(index: secIdx, stale: false)
-            secFrames = 0
-        }
-        if gapClosingAt == nil, let gs = gapStart, (t - gs) >= 30.0 {
-            emitGap(t0: gs, t1: t, resumeDb: nil, otherDuring: gapOther, unresolved: true)
-        }
-        gapStart = nil
-        gapClosingAt = nil
-        liveOpenGapSec = 0
-    }
+    // MARK: 逐帧
 
     func accept(_ f: SnoreFeature) {
-        let enter = config.enterScore
-        let exit = config.exitScore
-
         liveLevel = f.level
         liveFloor = f.floor
-        if let gs = gapStart { liveOpenGapSec = max(0, f.t - gs) }
 
-        let rhythm = updateRhythm(f)
-        // 进门的那把尺子：频谱 × 节律门。门数不出形状时也不是 0，还有 gateFloor 那一份。
-        let eff = f.score * (SnoreRhythm.gateFloor + (1.0 - SnoreRhythm.gateFloor) * rhythm.gate)
-        liveScore = eff
-
-        var snoreFrame = false
-
-        // ① 鼾的迟滞：进门要连续够 0.25 s 达 enter，出门是「低于 exit 且拖过 boutGap」
-        if snoreOn {
-            if eff >= exit {
-                snoreFrame = true
-                lastSnoreTime = f.t
-                accumulateBout(f)
-                snoreTimes.append(f.t)
-            } else if f.t - lastSnoreTime > config.boutGapSec {
-                closeBout(at: lastSnoreTime)
-                snoreOn = false
-            }
-        }
-        if !snoreOn {
-            if eff >= enter {
-                if overEnterStart == nil { overEnterStart = f.t }
-                if f.t - (overEnterStart ?? f.t) >= 0.25 {
-                    // 起点往回钉到这一段声音开口那一帧：确认节律花掉的 0.25 s 本该算在发作里，
-                    // 不然每段发作的头都被削掉一块，跟着算的中断时长也跟着失真。
-                    // 但不能钉到上一段发作之前——那等于把中断自己抹掉一截。
-                    let raw = episodeStart ?? f.t
-                    let start = min(max(raw, lastBoutEnd), f.t)
-                    overEnterStart = nil
-                    snoreOn = true
-                    snoreFrame = true
-                    lastSnoreTime = f.t
-                    openBout(start: start, f: f)
-                    snoreTimes.append(f.t)
-                    beginGapCloseIfNeeded(boutStart: start, f: f)
-                }
+        if f.voiced {
+            var d: Draft
+            if let cur = draft {
+                d = cur
             } else {
-                overEnterStart = nil
+                d = Draft()
+                d.t0 = f.t
+                d.t1 = f.t
+                d.pk = f.peak
             }
-        }
-        if gapClosingAt != nil && f.peak > gapResumeMax { gapResumeMax = f.peak }
-        liveSnoring = snoreOn
-
-        // ② 一段声音（有声、还没成鼾）先攒着；成过鼾的那一段收尾时不记「其他发声」
-        if f.voiced && eff < enter { accumulateEpisode(f) }
-        if snoreFrame { epHadBout = true }
-        if epOpen && f.t - epT1 > config.boutGapSec {
-            commitEpisode(at: epT1)
-            epOpen = false
-        }
-
-        // ③ 疑似中断：停够了、刚才确实在打、当前不在中断里
-        if gapStart == nil && gapClosingAt == nil && !snoreOn && lastSnoreTime > 0 {
-            let idle = f.t - lastSnoreTime
-            if idle >= config.interruptGapSec && recentSnoreSec() >= Self.activityMinSec {
-                gapStart = lastSnoreTime
-                gapOther = false
-                gapResumeMax = -120.0
+            d.t1 = f.t
+            if d.raws.count < Self.draftCap {
+                d.raws.append(f.score)
+                d.stabs.append(f.stability)
             }
-        }
-        // 中断开着的那一阵里只要有过声音就记账（在起点看一眼不够：梦话常在停住之后才来）
-        if gapStart != nil && gapClosingAt == nil && f.voiced { gapOther = true }
-        // 复鼾后满 2 s 才能量出「喘回来那一下有多响」，到点结掉这一条
-        if let closing = gapClosingAt, f.t >= closing + 2.0 {
-            if let gs = gapStart {
-                emitGap(t0: gs, t1: closing, resumeDb: gapResumeMax, otherDuring: gapOther,
-                        unresolved: false)
-            }
-            gapStart = nil
-            gapClosingAt = nil
-            gapOther = false
-            gapResumeMax = -120.0
-            liveOpenGapSec = 0
+            d.lvSum += f.level
+            d.frames += 1
+            if f.peak > d.pk { d.pk = f.peak }
+            // 基频逐 4 帧取一个就够算中位，别把长声音撑大
+            if d.frames % 4 == 1 { d.hz.append(f.peakHz) }
+            draft = d
+        } else if let d = draft, f.t - d.t1 >= SnoreSound.holdSec {
+            closeSound(at: f.t)
         }
 
+        // 实时读数：正在响的这一声此刻像不像鼾（判定仍然等收口，这里只给「像不像」）
+        if let d = draft {
+            liveSoundDur = d.t1 - d.t0
+            liveScore = snoreMedian(d.raws) ?? 0.0
+            let stabMed = snoreMedian(d.stabs)
+            liveSnoring = liveScore >= config.enterScore
+                && (d.stabs.count < 2 || (stabMed ?? 0.0) >= SnoreSound.stabLo)
+        } else {
+            liveSoundDur = 0
+            liveSnoring = false
+        }
+        if lastSnoreEnd > 0 { liveOpenGapSec = max(0, f.t - lastSnoreEnd) }
+
+        rollSeconds(to: f.t, f: f)
         trimSnoreTimes(floor: f.t - Self.activityWindowSec)
-        rollSeconds(to: f.t, f: f, eff: eff, snoreFrame: snoreFrame, vocalFrame: f.voiced && eff < enter)
     }
 
-    // MARK: 呼吸节律
+    // MARK: 一声收口 ⇒ 判它是不是鼾
 
-    /// 把逐帧的「有没有声音」串成一鼾一鼾，交给 SnoreRhythm 打分；同时维护「一段声音」的边界。
-    private func updateRhythm(_ f: SnoreFeature) -> (gate: Double, ratePerMin: Double?) {
-        if f.voiced {
-            voicedTimes.append(f.t)
-            if soundStart == nil {
-                soundStart = f.t
-                // 离上一鼾够远 ⇒ 是新的一段声音：节律从零数起，别拿上一段的旧鼾替它作保
-                // （不然说话挨着鼾声会借隔壁的呼吸节律混成一次发作）。
-                if episodeStart == nil || f.t - lastBurstEnd > config.boutGapSec {
-                    episodeStart = f.t
-                    bursts = []
-                    openEpisode(at: f.t)
+    /// 三样都过关：够一次吸气的段长、频谱够像、帧间稳（不跑共振峰）
+    private func shaped(dur: Double, raw: Double, stab: Double) -> Bool {
+        return SnoreSound.shapeOf(dur: dur) >= SnoreSound.shapeBar
+            && raw >= config.enterScore
+            && stab >= SnoreSound.stabLo
+    }
+
+    private func closeSound(at t: Double) {
+        guard let d = draft else { return }
+        draft = nil
+        let dur = d.t1 - d.t0
+        let raw = snoreMedian(d.raws) ?? 0.0
+        let stab = snoreMedian(d.stabs) ?? 0.0
+        let okShape = shaped(dur: dur, raw: raw, stab: stab)
+        let rec = Closed(t0: d.t0, t1: d.t1, dur: dur, raw: raw, stab: stab, pk: d.pk,
+                         mean: d.lvSum / Double(max(1, d.frames)), hz: snoreMedian(d.hz),
+                         shapeOk: okShape)
+        closed.append(rec)
+        soundTotal += 1
+        if okShape { soundShaped += 1 }
+        let cut = t - SnoreSound.pairWindowSec
+        closed = closed.filter { $0.t1 >= cut }
+
+        // 邻鼾：往回找最近的一声，开口间隔要在一次呼吸的量级，而且它自己三样过关
+        var partner: Closed?
+        for c in closed.dropLast().reversed() {
+            let iv = rec.t0 - c.t0
+            if iv > SnoreSound.intervalHi { break }
+            if iv >= SnoreSound.intervalLo && c.shapeOk {
+                partner = c
+                break
+            }
+        }
+        let judged: Bool
+        if okShape && partner != nil {
+            judged = true
+        } else if okShape && raw >= config.enterScore + SnoreSound.soloMargin {
+            judged = true          // 一晚的头一声：没有邻鼾，只能靠频谱自己过硬
+        } else {
+            judged = false
+            if okShape && partner == nil { soundLonely += 1 }
+        }
+        rec.snore = judged
+        let mark = Mark(t0: rec.t0, t1: rec.t1, snore: judged)
+        marks.append(mark)
+        if judged {
+            soundSnore += 1
+            // 配对成功就把邻鼾也认下来：它当时只是「还没伙伴」，被暂记成别的发声了
+            if let p = partner, !p.snore { flip(p) }
+            addSnoreTime(rec)
+            updateRun(rec)
+        } else {
+            if rec.pk > lastRejectedPeak {
+                lastRejectedPeak = rec.pk
+                loudestRejected = "最响的一声没判成鼾：\(String(format: "%.2f", rec.pk)) dBFS 峰"
+                    + "／段长 \(String(format: "%.2f", rec.dur)) s（形状分 \(String(format: "%.2f", SnoreSound.shapeOf(dur: rec.dur)))）"
+                    + "／频谱中位 \(String(format: "%.2f", rec.raw))（判定线 \(String(format: "%.2f", config.enterScore))）"
+                    + "／稳定中位 \(String(format: "%.2f", rec.stab))（要 ≥\(String(format: "%.2f", SnoreSound.stabLo))）"
+                    + "／邻鼾 \(partner == nil ? "无" : "有")"
+            }
+            if rec.dur >= 0.4 {
+                vocalCount += 1
+                emitEvent(kind: .vocal, t0: rec.t0, t1: rec.t1, dur: rec.dur,
+                          peakDb: rec.pk, meanDb: rec.mean)
+            }
+            // 停住的那一阵里有过「别的发声」：只有收口时判成非鼾的声音才算，
+            // 逐帧的「有声音」不算——复鼾那一声自己的帧先响起来，那样每条中断都会被自己标上这条。
+            if lastSnoreEnd > 0 && t - lastSnoreEnd >= config.interruptGapSec {
+                gapOther = true
+            }
+        }
+        account(mark)
+    }
+
+    private var lastRejectedPeak = -120.0
+
+    /// 一行「为什么没判成鼾」：这四个数就能分流——
+    /// 过关数为 0 ⇒ 频谱/门限那一头（灵敏度、绝对门限、麦克风距离）；
+    /// 过关了却全卡在「配不上邻鼾」⇒ 间隔那一档（0.4 那晚真鼾就是这样全灭的）；
+    /// 判成鼾却一段发作都没有 ⇒ 发作串不起来（boutGapSec／minBoutSec）。
+    var judgeSummary: String {
+        return "发声 \(soundTotal) 声｜过关 \(soundShaped)｜判鼾 \(soundSnore)｜配不上邻鼾 \(soundLonely)"
+    }
+
+    /// 最响的那一声「不是鼾」的完整数字：整晚一件鼾都没判出来时，日志里靠这一行定位
+    var loudestRejectedNote: String { loudestRejected }
+
+    /// 邻鼾改判：把已经发出去的那几秒格子从「别的发声」挪到「鼾」
+    private func flip(_ s: Closed) {
+        if let i = marks.firstIndex(where: { $0.t0 == s.t0 && $0.t1 == s.t1 }) {
+            marks[i].snore = true
+        }
+        s.snore = true
+        soundSnore += 1
+        var k = Int(floor(s.t0))
+        let hi = Int(floor(s.t1))
+        while k <= hi {
+            if var b = recent[k] {
+                let ov = Self.overlap(t0: s.t0, t1: s.t1, index: k)
+                if ov > 0 {
+                    b.vocalSec = max(0.0, b.vocalSec - ov)
+                    b.snoreSec = min(1.0, b.snoreSec + ov)
+                    recent[k] = b
+                    onSecondAmend?(b)
                 }
             }
-            soundLast = f.t
+            k += 1
         }
-        if f.voiced && f.t > epT1 {
-            epT1 = f.t
-        } else if let s0 = soundStart, f.t - soundLast >= SnoreRhythm.burstHoldSec {
-            bursts.append(SnoreRhythm.Burst(t0: s0, t1: soundLast))
-            lastBurstEnd = soundLast
-            soundStart = nil
+        addSnoreTime(s)
+    }
+
+    /// 补记：这一声覆盖的、已经发出去的那几秒格子。还没发出去的等它自己发时从 marks 里算，
+    /// 所以一格只会把一声算一次。
+    private func account(_ m: Mark) {
+        let lo = Int(floor(m.t0))
+        let hi = Int(floor(m.t1))
+        var k = lo
+        while k <= hi {
+            if var b = recent[k] {
+                let ov = Self.overlap(t0: m.t0, t1: m.t1, index: k)
+                if ov > 0 {
+                    if m.snore {
+                        b.snoreSec = min(1.0, b.snoreSec + ov)
+                    } else {
+                        b.vocalSec = min(1.0, b.vocalSec + ov)
+                    }
+                    recent[k] = b
+                    onSecondAmend?(b)
+                }
+            }
+            k += 1
         }
+    }
 
-        var dropB = 0
-        let cutB = f.t - SnoreRhythm.rhythmWindowSec
-        while dropB < bursts.count && bursts[dropB].t1 < cutB { dropB += 1 }
-        if dropB > 0 { bursts.removeFirst(dropB) }
-        var dropV = 0
-        let cutV = f.t - SnoreRhythm.dutyWindowSec
-        while dropV < voicedTimes.count && voicedTimes[dropV] < cutV { dropV += 1 }
-        if dropV > 0 { voicedTimes.removeFirst(dropV) }
+    private static func overlap(t0: Double, t1: Double, index: Int) -> Double {
+        let lo = Double(index)
+        return max(0.0, min(t1, lo + 1.0) - max(t0, lo))
+    }
 
-        let inProgress: SnoreRhythm.Burst? = soundStart.map { SnoreRhythm.Burst(t0: $0, t1: soundLast) }
-        let g = SnoreRhythm.gate(bursts: bursts, inProgress: inProgress,
-                                 voicedFrames: voicedTimes.count, frameSec: frameSec)
-        burstRate = g.ratePerMin
-        return g
+    /// 鼾帧的时长记账：判「刚才确实在打」用
+    private func addSnoreTime(_ s: Closed) {
+        let n = max(1, Int(((s.t1 - s.t0) / frameSec).rounded()))
+        var k = 0
+        while k < n {
+            snoreTimes.append(s.t0 + Double(k) * frameSec)
+            k += 1
+        }
     }
 
     // MARK: 发作
 
-    private func openBout(start: Double, f: SnoreFeature) {
-        boutStart = start
-        boutFrames = 1
-        boutLevelSum = f.level
-        boutLevelMax = f.peak
-        boutPeakHz = [f.peakHz]
-    }
-
-    private func accumulateBout(_ f: SnoreFeature) {
-        boutFrames += 1
-        boutLevelSum += f.level
-        if f.peak > boutLevelMax { boutLevelMax = f.peak }
-        // 基频逐 4 帧取一个就够算中位，别把长发作撑大
-        if boutFrames % 4 == 1 { boutPeakHz.append(f.peakHz) }
-    }
-
-    private func closeBout(at endT: Double) {
-        let dur = max(0, endT - boutStart)
-        let frames = boutFrames
-        let mean = frames > 0 ? boutLevelSum / Double(frames) : -120.0
-        let maxDb = boutLevelMax
-        let hz = boutPeakHz
-        let start = boutStart
-        let rate = burstRate
-        defer {
-            boutFrames = 0
-            boutLevelSum = 0
-            boutLevelMax = -120.0
-            boutPeakHz = []
-            if dur > 0 {
-                lastClosedBoutMean = mean
-            }
+    private func updateRun(_ s: Closed) {
+        // 停够了才算「一次疑似中断」：起点是上一鼾结束，终点是这一鼾开始
+        if lastSnoreEnd > 0 && s.t0 - lastSnoreEnd >= config.interruptGapSec
+            && recentSnoreSec() >= Self.activityMinSec {
+            emitGap(t0: lastSnoreEnd, t1: s.t0, resumeDb: s.pk, otherDuring: gapOther,
+                    unresolved: false)
         }
-        guard dur >= config.minBoutSec else { return }
-        lastBoutEnd = endT
-        boutCount += 1
-        if dur > longestBout { longestBout = dur }
-        snoreSecTotal += dur
-        let e = SnoreEvent(id: nextId, kind: .bout, t0: start, t1: endT, dur: dur,
-                           peakDb: maxDb, meanDb: mean, ratePerMin: rate,
-                           peakHz: snoreMedian(hz), preDb: nil, resumeDb: nil,
-                           arousal: false, otherDuring: false, unresolved: false)
-        nextId += 1
-        onEvent?(e)
+        if let r = run, s.t0 - r.t1 > config.boutGapSec { closeRun() }
+        if run == nil {
+            var r = Run(t0: s.t0, t1: s.t1)
+            r.n = 1
+            r.pk = s.pk
+            r.lvSum = s.mean
+            r.lvN = 1
+            if let hz = s.hz { r.hz.append(hz) }
+            run = r
+            runOnsets = [s.t0]
+        } else if var r = run {
+            r.t1 = s.t1
+            r.n += 1
+            r.pk = max(r.pk, s.pk)
+            r.lvSum += s.mean
+            r.lvN += 1
+            if let hz = s.hz { r.hz.append(hz) }
+            run = r
+            runOnsets.append(s.t0)
+        }
+        snoreSecTotal += s.t1 - s.t0
+        lastSnoreEnd = s.t1
+        gapOther = false
+    }
+
+    private func closeRun() {
+        guard let r = run else { return }
+        run = nil
+        var ivs: [Double] = []
+        if runOnsets.count >= 2 {
+            for i in 1..<runOnsets.count { ivs.append(runOnsets[i] - runOnsets[i - 1]) }
+        }
+        let mid = snoreMedian(ivs)
+        let rate = (mid ?? 0) >= SnoreSound.intervalLo ? 60.0 / (mid ?? 0) : nil
+        let dur = max(0, r.t1 - r.t0)
+        let mean = r.lvN > 0 ? r.lvSum / Double(r.lvN) : -120.0
+        if dur >= config.minBoutSec {
+            boutCount += 1
+            if dur > longestBout { longestBout = dur }
+            lastRunMean = mean
+            let e = SnoreEvent(id: nextId, kind: .bout, t0: r.t0, t1: r.t1, dur: dur,
+                               peakDb: r.pk, meanDb: mean, ratePerMin: rate,
+                               peakHz: snoreMedian(r.hz), preDb: nil, resumeDb: nil,
+                               arousal: false, otherDuring: false, unresolved: false)
+            nextId += 1
+            onEvent?(e)
+        }
+        runOnsets = []
     }
 
     // MARK: 疑似中断
-
-    private func beginGapCloseIfNeeded(boutStart: Double, f: SnoreFeature) {
-        guard gapStart != nil && gapClosingAt == nil else { return }
-        gapClosingAt = boutStart
-        gapResumeMax = f.peak
-    }
 
     private func emitGap(t0: Double, t1: Double, resumeDb: Double?, otherDuring: Bool,
                          unresolved: Bool) {
         let dur = max(0, t1 - t0)
         guard dur >= config.interruptGapSec else { return }
         if dur > longestGap { longestGap = dur }
-        let pre = lastClosedBoutMean > -119 ? lastClosedBoutMean : nil
+        let pre = lastRunMean > -119 ? lastRunMean : nil
         let arous = (resumeDb ?? -120.0) > (pre ?? -120.0) + 3.0
         gapCount += 1
         let e = SnoreEvent(id: nextId, kind: .gap, t0: t0, t1: t1, dur: dur,
@@ -431,6 +481,7 @@ final class SnoreTracker {
                            otherDuring: otherDuring, unresolved: unresolved)
         nextId += 1
         onEvent?(e)
+        gapOther = false
     }
 
     /// 「刚才确实在打」：否则半夜安静躺着、或整晚根本没鼾，都不该报中断。
@@ -444,51 +495,18 @@ final class SnoreTracker {
         if drop > 0 { snoreTimes.removeFirst(drop) }
     }
 
-    // MARK: 其他发声
-
-    private func openEpisode(at t: Double) {
-        epOpen = true
-        epT0 = t
-        epT1 = t
-        epFrames = 0
-        epLevelSum = 0.0
-        epLevelMax = -120.0
-        epHadBout = false
-    }
-
-    private func accumulateEpisode(_ f: SnoreFeature) {
-        epFrames += 1
-        epLevelSum += f.level
-        if f.peak > epLevelMax { epLevelMax = f.peak }
-    }
-
-    /// 一段声音收尾才记账：够长、且这一段里一次鼾都没判出来，才是「其他发声」。
-    /// 不在中途记——鼾的确认要晚 0.25 s，先把开头那半秒记成梦话、再把它改判成鼾，
-    /// 界面上就成了「刚睡着就说梦话」的假事（一晚能凭空多出五六条）。
-    private func commitEpisode(at endT: Double) {
-        let dur = max(0, endT - epT0)
-        let frames = epFrames
-        let mean = frames > 0 ? epLevelSum / Double(frames) : -120.0
-        let maxDb = epLevelMax
-        let hadBout = epHadBout
-        let start = epT0
-        epFrames = 0
-        epLevelSum = 0.0
-        epLevelMax = -120.0
-        guard !hadBout, dur >= 0.4 else { return }
-        vocalCount += 1
-        let e = SnoreEvent(id: nextId, kind: .vocal, t0: start, t1: endT, dur: dur,
-                           peakDb: maxDb, meanDb: mean, ratePerMin: nil, peakHz: nil,
-                           preDb: nil, resumeDb: nil, arousal: false, otherDuring: false,
-                           unresolved: false)
+    private func emitEvent(kind: SnoreEventKind, t0: Double, t1: Double, dur: Double,
+                           peakDb: Double, meanDb: Double) {
+        let e = SnoreEvent(id: nextId, kind: kind, t0: t0, t1: t1, dur: dur, peakDb: peakDb,
+                           meanDb: meanDb, ratePerMin: nil, peakHz: nil, preDb: nil,
+                           resumeDb: nil, arousal: false, otherDuring: false, unresolved: false)
         nextId += 1
         onEvent?(e)
     }
 
     // MARK: 逐秒曲线
 
-    private func rollSeconds(to t: Double, f: SnoreFeature, eff: Double,
-                             snoreFrame: Bool, vocalFrame: Bool) {
+    private func rollSeconds(to t: Double, f: SnoreFeature) {
         let idx = Int(floor(t))
         if secIdx < 0 {
             secIdx = idx
@@ -506,38 +524,61 @@ final class SnoreTracker {
         secFrames += 1
         secLevelSum += f.level
         if f.peak > secLevelMax { secLevelMax = f.peak }
-        if snoreFrame { secSnore += frameSec }
-        if vocalFrame { secVocal += frameSec }
-        if eff > secScoreMax { secScoreMax = eff }
+        if f.score > secScoreMax { secScoreMax = f.score }
         secFloor = f.floor
+        // 回填窗口之外的格子丢掉：再晚收口的声音也照不到它们（除非一整段十几秒的长响，
+        // 那种判不成鼾，形状分先否了）
+        let keep = idx - Int(Self.amendWindowSec)
+        if !recent.isEmpty { recent = recent.filter { $0.key >= keep } }
     }
 
     private func clearSecond() {
         secFrames = 0
         secLevelSum = 0.0
         secLevelMax = -120.0
-        secSnore = 0.0
-        secVocal = 0.0
         secScoreMax = 0.0
     }
 
     private func emitSecond(index: Int, stale: Bool) {
         guard index >= 0 else { return }
-        let b: SnoreSecond
-        if stale {
-            b = SnoreSecond(t0: index, maxDb: -120, meanDb: -120, snoreSec: 0, vocalSec: 0,
-                            maxScore: 0, floorDb: secFloor, stale: true)
-        } else {
-            b = SnoreSecond(t0: index,
-                            maxDb: secLevelMax,
-                            meanDb: secFrames > 0 ? secLevelSum / Double(secFrames) : -120,
-                            snoreSec: min(1.0, secSnore),
-                            vocalSec: min(1.0, secVocal),
+        var sn = 0.0
+        var vc = 0.0
+        for m in marks {
+            let ov = Self.overlap(t0: m.t0, t1: m.t1, index: index)
+            if ov <= 0 { continue }
+            if m.snore { sn += ov } else { vc += ov }
+        }
+        let b = SnoreSecond(t0: index,
+                            maxDb: stale ? -120 : secLevelMax,
+                            meanDb: stale ? -120 : (secFrames > 0 ? secLevelSum / Double(secFrames) : -120),
+                            snoreSec: min(1.0, sn),
+                            vocalSec: min(1.0, vc),
                             maxScore: secScoreMax,
                             floorDb: secFloor,
-                            stale: false)
-        }
+                            stale: stale)
+        // 整段都在这一格以前的，后面再没有格子会叠到它，扔了
+        marks = marks.filter { $0.t1 > Double(index + 1) }
+        recent[index] = b
         clearSecond()
         onSecond?(b)
+    }
+
+    // MARK: 收尾
+
+    /// 会话收尾：结掉还在响的那一声／还挂着的发作／最后那一格秒，够长的未复鼾中断也留一条。
+    func finish(at t: Double) {
+        if draft != nil {
+            closeSound(at: t)
+        }
+        if run != nil { closeRun() }
+        if secFrames > 0 {
+            emitSecond(index: secIdx, stale: false)
+            secFrames = 0
+        }
+        if lastSnoreEnd > 0 && (t - lastSnoreEnd) >= 30.0 {
+            emitGap(t0: lastSnoreEnd, t1: t, resumeDb: nil, otherDuring: gapOther, unresolved: true)
+        }
+        liveOpenGapSec = 0
+        liveSnoring = false
     }
 }

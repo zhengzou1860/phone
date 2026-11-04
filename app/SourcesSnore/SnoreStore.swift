@@ -53,6 +53,17 @@ final class SnoreNightStore {
     func add(_ b: SnoreSecond) { buckets.append(b) }
     func add(_ e: SnoreEvent) { events.append(e) }
 
+    /// 一声收口后回填的那一格（判定要等响完，格子先发）。整晚的格子按整秒密排——缺的秒也会补
+    /// 一格 stale，所以 t0 就是下标；对不上就倒着找一次，再找不到就放弃（那格少涂一点鼾色，
+    /// 事件表里的数不受影响）。
+    func amend(_ b: SnoreSecond) {
+        if b.t0 >= 0, b.t0 < buckets.count, buckets[b.t0].t0 == b.t0 {
+            buckets[b.t0] = b
+            return
+        }
+        if let i = buckets.lastIndex(where: { $0.t0 == b.t0 }) { buckets[i] = b }
+    }
+
     /// 每 30 s 落一次盘：整份重写。字符串就 1 MB 量级，比重开 FileHandle _seek 一趟少一处能错的地方，
     /// 而且被系统杀掉时盘上最多丢 30 s——重启后 recover 那条会把起点标出来。
     func flush() {

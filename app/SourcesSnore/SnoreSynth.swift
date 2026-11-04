@@ -124,8 +124,8 @@ enum SnoreSynth {
     }
 
     /// 说话样：基频 180 但共振峰在 700/1300/2600 上来回扫，音节率 3–4 Hz。
-    /// 频谱那几把尺子（低频占比、稳定度）会偏，一整段连响、数不出一鼾一鼾，
-    /// 呼吸节律门也给 0——两层都拿来验「不把说话当鼾」。
+    /// 挡它的是帧间稳定度（共振峰在跑，实测中位 0.51–0.55，鼾是 1.00）＋一整段连响、
+    /// 数不出一鼾一鼾的形状——两层都拿来验「不把说话当鼾」。
     static func speech(count: Int, sampleRate: Double, level: Double, startAt: Double = 0.0,
                        seed: UInt64 = 11) -> [Double] {
         var out = [Double](repeating: 0.0, count: count)
@@ -159,7 +159,7 @@ enum SnoreSynth {
     }
 
     /// 恒定单音：振幅一直不动。冰箱/风扇嗡鸣一类——频谱看着挺像鼾（低频、谐波、稳），
-    /// 挡它的是呼吸节律那一关：一整段只有一个「一直响着」的开，数不出一鼾一鼾。
+    /// 挡它的是形状那一关：一整段只有一个「一直响着」的开（30 s），不是一口气的量级。
     static func tone(count: Int, sampleRate: Double, freq: Double, level: Double,
                      startAt: Double = 0.0) -> [Double] {
         var out = [Double](repeating: 0.0, count: count)
@@ -216,7 +216,13 @@ enum SnoreCases {
         var events: [SnoreEvent] = []
         var seconds: [SnoreSecond] = []
         tracker.onEvent = { events.append($0) }
-        tracker.onSecond = { seconds.append($0) }
+        tracker.onSecond = { b in
+            seconds.append(b)
+        }
+        // 鼾色是「一声响完」之后回填的：这里也得跟着改，否则用例算出来的鼾声占比只有尾巴那截
+        tracker.onSecondAmend = { b in
+            if let i = amendIndex(of: b, in: seconds) { seconds[i] = b }
+        }
         let n = analyzer.n
         var i = 0
         var delivered = 0
@@ -229,6 +235,17 @@ enum SnoreCases {
         }
         tracker.finish(at: Double(samples.count) / sampleRate)
         return (events, seconds, delivered)
+    }
+
+    /// 跟 SnoreStore.amend 同一份道理：格子按整秒密排，t0 就是下标；对不上再往回找
+    static func amendIndex(of b: SnoreSecond, in seconds: [SnoreSecond]) -> Int? {
+        if b.t0 >= 0, b.t0 < seconds.count, seconds[b.t0].t0 == b.t0 { return b.t0 }
+        return seconds.lastIndex(where: { $0.t0 == b.t0 })
+    }
+
+    /// 鼾声占比：格子已经回填过，所以这里就是「判成鼾的那几秒加起来」
+    static func coverage(_ seconds: [SnoreSecond], span: Double) -> Double {
+        return seconds.reduce(0.0) { $0 + $1.snoreSec } / max(1.0, span)
     }
 
     static func all(config: SnoreConfig) -> [SnoreCaseResult] {
@@ -307,7 +324,8 @@ enum SnoreCases {
                                        detail: "鼾 \(bouts.count) 段（要 0）／鼾声占比 \(String(format: "%.0f", cov * 100))%（要 0）／其他发声 \(vocals.count) 条（要 ≥1）"))
         }
 
-        // ⑤ 恒定低频单音：频谱那一套给它打高分，靠呼吸节律门挡掉
+        // ⑤ 恒定低频单音：频谱那一套给它打高分，挡它的是形状——一整段只有一个 30 s 的「开」，
+        //    不是一口气零点几秒的量级
         do {
             var s = SnoreSynth.bed(count: Int(sr * 30), level: 0.0006, seed: 51)
             SnoreSynth.add(&s, SnoreSynth.tone(count: s.count, sampleRate: sr, freq: 120, level: 0.05))
@@ -373,7 +391,7 @@ enum SnoreCases {
         }
 
         // ⑩ 不规则鼾（真人的形状）：段长 0.35–0.75 s、间隔 2.4–3.6 s、轻重都在摇
-        //    ⇒ 必须判成鼾。这一条是节律门的「别把门关上」守卫：
+        //    ⇒ 必须判成鼾。这一条管住「形状那关别把门关上」：
         //    旧门槛按整齐合成鼾定成 0.4 s 起分，这种形状的段长中位 0.43 只拿 0.075 分，
         //    一晚真鼾会全数记成「其他发声」——用户最核心的那件事就没了。
         do {
@@ -392,6 +410,29 @@ enum SnoreCases {
                 && abs(med - 20.0) <= 8.0
             out.append(SnoreCaseResult(name: "不规则鼾要判成鼾", ok: ok,
                                        detail: String(format: "发作 %d 段（要 1–3）／鼾声占 %.0f%%（要 >10%%）／中断 %d（要 0）／节律 %.1f 次/分（要 20±8）",
+                                                      bouts.count, cov * 100, gaps.count, med)))
+        }
+
+        // ⑪ 稀疏鼾（一鼾一口气）：周期 7 s、一声只响 0.45 s，音量还轻（0.02）
+        //    ⇒ 这一条复现用户 0.4 那晚：逐帧频谱分 0.9 上下、电平比本底高 20 多 dB，
+        //    可【鼾声占比】0.0%、事件表里全是「其他发声」。旧写法两头都亏——
+        //    0.25 s 的确认窗口比一整声还长，而节律门在静默超过 boutGapSec（那时默认 4 s）
+        //    就把上一鼾清零，永远数不出第二个开声 ⇒ 门恒 0 ⇒ 频谱再像也进不了门。
+        //    ②③⑩ 那些用例的周期全在 2.8–4.0 s，比 boutGapSec 短 ⇒ 天生照不出这条，所以补这一条。
+        do {
+            var s = SnoreSynth.bed(count: Int(sr * 60), level: 0.0006, seed: 101)
+            SnoreSynth.add(&s, SnoreSynth.snore(count: s.count, sampleRate: sr, periodSec: 7.0,
+                                                f0: 130, level: 0.02, duty: 0.45 / 7.0,
+                                                startAt: 1.0, seed: 7))
+            let r = SnoreTracker(frameSec: 4096.0 / sr, config: config)
+            let got = run(samples: s, sampleRate: sr, config: config, into: r)
+            let bouts = got.events.filter { $0.kind == .bout }
+            let gaps = got.events.filter { $0.kind == .gap }
+            let cov = coverage(got.seconds, span: 60.0)
+            let med = snoreMedian(bouts.compactMap { $0.ratePerMin }) ?? 0
+            let ok = !bouts.isEmpty && cov > 0.03 && gaps.isEmpty && med >= 5.0 && med <= 12.0
+            out.append(SnoreCaseResult(name: "稀疏鼾（一鼾一口气）要判成鼾", ok: ok,
+                                       detail: String(format: "发作 %d 段（要 ≥1）／鼾声占 %.1f%%（要 >3%%）／中断 %d（要 0）／节律 %.1f 次/分（7 s 一鼾＝8.6）",
                                                       bouts.count, cov * 100, gaps.count, med)))
         }
         return out

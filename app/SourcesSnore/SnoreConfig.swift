@@ -3,25 +3,27 @@ import Foundation
 // MARK: - 界面上能改的那几档
 //
 // 整份 JSON 存在 UserDefaults 的一个键里：加了新字段也不影响老存档（decode 用默认值兜）。
+// 但「同一个字段换了口径」兜不住——老存档里钉着旧数，那种要在 load 后 migrate() 挪一格。
 // 这一层和 SnoreDetect/SnoreTrack 都不许碰 UIKit/AVFoundation——同一份代码要在 CI 那台 mac 上
 // 拿合成信号跑自检（见 ci/snoreselftest/main.swift），那边没有模拟器也没有麦克风。
 
 struct SnoreConfig: Codable, Equatable {
-    /// 灵敏度：0 低 1 中 2 高。只挪「逐帧算鼾」的进门线，出门线跟着低 0.16（迟滞，防抖）。
+    /// 灵敏度：0 低 1 中 2 高。挪的是「一次发声像不像鼾」那条判定线（频谱分 0…1）。
     var sensitivity: Int = 1
     /// 鼾声停了多久算一次「疑似中断」（秒）。8 / 10 / 15 三档。
     var interruptGapSec: Double = 10
-    /// 一次发作中间允许的短停（秒）：超过它就不算同一次发作。2.0 / 2.5 / 4.0。
-    /// 这一档不能图小：鼾本身按呼吸周期一鼾一鼾地跳，两三秒的空是同一觉里的正常间隔，
-    /// 设成 1 秒会把一晚连续打鼾劈成上千次「发作」，【发作次数/小时】就成了废数。
-    /// 默认从 2.5 提到 4.0：拿「每口气都不一样」的不规则鼾压过一遍，它的空档实测 1.7–3.3 s，
-    /// 2.5 会把一整段 100 s 的连续鼾劈成 9 次「发作」（次数/小时虚高 3 倍、节律也被打断）；
-    /// 4.0 那边同一晚只出 1 段 98 s、节律 19.4 次/分。
-    var boutGapSec: Double = 4
+    /// 一次发作中间允许的最大间隔（秒）：超过它就不算同一次发作。5 / 8 / 12。
+    /// 这一档不能图小：真人鼾是「一口气一鼾」，两声鼾之间空 5–8 s 是同一觉里的正常间隔。
+    /// 4.0 会把一鼾一口气那种鼾每一声劈成一次「发作」，【发作次数/小时】成了废数；
+    /// 默认 8：拿周期 7 s 的稀疏鼾压过一遍，8 那边一整段连成一段、节律 8.6 次/分（＝60/7）。
+    /// 它只管「串不串得成一段」，不再管节律门——判定单位是收口的一次发声，见 SnoreTrack。
+    var boutGapSec: Double = 8
     /// 绝对门限（dBFS）：比本底高、但整晚其实听不见的极轻声音不算数。
     var absGateDb: Double = -58
-    /// 短于这个时长的「鼾」当咳嗽／关门一类瞬发，不计入发作。
-    var minBoutSec: Double = 0.5
+    /// 短于这个时长的「发作」当咳嗽／关门一类瞬发，不计入发作。
+    /// 0.35：一整段鼾串出来的发作本来就长，这一条只挡「一声都不成段」的那种；
+    /// 段长本身有形状分把关（0.10 s 起分、0.30 s 满分、4.0 s 归零）。
+    var minBoutSec: Double = 0.35
     /// 事件要不要留 6 秒音频片段（能回放给医生听）。
     var keepSnippets: Bool = true
     /// 本地保留多少个晚上，超出的从旧到新删。
@@ -31,7 +33,7 @@ struct SnoreConfig: Codable, Equatable {
 
     static let defaultsKey = "snore.config.v1"
 
-    /// 三档灵敏度对应的进门分。
+    /// 三档灵敏度对应的判定分：一次发声收口后，频谱中位要过这条线才可能被算成鼾。
     var enterScore: Double {
         switch sensitivityClamped {
         case 0: return 0.68
@@ -40,14 +42,21 @@ struct SnoreConfig: Codable, Equatable {
         }
     }
 
-    /// 出门线：比进门线低一档，声音在两条线之间晃时不会一次发作被劈成两半。
-    var exitScore: Double { max(0.05, enterScore - 0.16) }
-
     var sensitivityClamped: Int { min(2, max(0, sensitivity)) }
 
     static func load() -> SnoreConfig {
         guard let data = UserDefaults.standard.data(forKey: defaultsKey) else { return SnoreConfig() }
-        return (try? JSONDecoder().decode(SnoreConfig.self, from: data)) ?? SnoreConfig()
+        var c = (try? JSONDecoder().decode(SnoreConfig.self, from: data)) ?? SnoreConfig()
+        c.migrate()
+        return c
+    }
+
+    /// 老存档里钉着旧口径的数：0.4 那版把「发作允许间隔」当逐帧迟滞的出门拖尾用，
+    /// 默认 4 秒——按「一鼾一口气」的真鼾就是每一声都超 4 秒，会把一晚劈成上千次发作。
+    /// 判定单位换了，这几个旧值不能接着生效；界面上也没有这两档了，留着还会让 Picker 空选。
+    private mutating func migrate() {
+        if boutGapSec < 5 { boutGapSec = 8 }
+        if minBoutSec > 0.4 { minBoutSec = 0.35 }
     }
 
     func save() {

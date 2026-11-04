@@ -370,8 +370,9 @@ final class SnoreMonitor: NSObject, ObservableObject {
 
     /// 执行日志：现场读数、档位、磁盘流水全量、此刻的实时水位。查错就发这条，几 KB。
     func sendLogToPC() {
-        let cfg = "灵敏度 \(config.sensitivity)／中断阈值 \(Int(config.interruptGapSec)) s／发作间隔 \(config.boutGapSec) s"
-            + "／绝对门限 \(config.absGateDb) dBFS／留片段 \(config.keepSnippets)／保留 \(config.keepNights) 晚"
+        let cfg = "灵敏度 \(config.sensitivity)／判定分 \(String(format: "%.2f", config.enterScore))"
+            + "／中断阈值 \(Int(config.interruptGapSec)) s／发作间隔 \(config.boutGapSec) s"
+            + "／发作最短 \(config.minBoutSec) s／绝对门限 \(config.absGateDb) dBFS／留片段 \(config.keepSnippets)／保留 \(config.keepNights) 晚"
         let rt = running
             ? "在录 \(snoreDurText(live.elapsed))｜鼾 \(live.bouts)｜停 \(live.gaps)｜说话 \(live.vocals)"
                 + "｜电平 \(String(format: "%.1f", live.level)) dBFS｜本底 \(String(format: "%.1f", live.floor)) dBFS"
@@ -385,6 +386,7 @@ final class SnoreMonitor: NSObject, ObservableObject {
         sendToPC("执行日志") {
             var s = "====== SnoreBench 执行日志（\(snoreDateText(Date()))）======\n"
             s += "这一晚 \(nightId.isEmpty ? "还没开" : nightId)｜\(cfg)\n实时：\(rt)\n"
+            s += "判定账目：\(core.judgeNote)\n"
             s += "内存压力喊过：\(SnorePressureWatch.sawPressure ? "一声（系统确实给过压力，往「被杀」方向查）" : "零声（被杀别怪内存）")\n"
             s += "\n------ 现场读数 ------\n" + SnoreFacts.lines().joined(separator: "\n")
             s += "\n------ 磁盘流水（全量，上限 900 行；每行开头带当时的足迹/驻留）------\n"
@@ -424,7 +426,8 @@ final class SnoreMonitor: NSObject, ObservableObject {
             s += "【meta.json】\n" + (meta.isEmpty ? "（读不到）\n" : meta)
             s += "\n【report.txt】\n" + (reportText.isEmpty ? "（这一晚没报告文本；数字看下面两份原始数据）\n" : reportText)
             s += "\n【events.jsonl】一行一个事件，t0/t1 是会话内第几秒\n" + (eventsText.isEmpty ? "（没有事件）\n" : eventsText)
-            s += "\n【curve.csv】t0,maxDb,meanDb,snoreSec,vocalSec,maxScore,floorDb,stale\n" + curve
+            s += "\n【curve.csv】t0,maxDb,meanDb,snoreSec,vocalSec,maxScore,floorDb,stale"
+              + "（maxScore＝这一秒里最高的逐帧频谱像鼾分，不含形状/邻鼾那两关；判定在一声响完后才做）\n" + curve
             return s
         }
     }

@@ -100,7 +100,7 @@ struct SnoreFeature {
     var tonality: Double     // dB：最低频那一带的峰/均，鼾声是谐波堆⇒高
     var stability: Double    // 与上一帧五个频带向量的余弦相似（说话共振峰在跑⇒低）
     var modDepth: Double     // 最近 4 s 低频能量的起伏（dB）：steady 的冰箱嗡鸣靠它筛掉
-    var score: Double        // 0…1「频谱像鼾」的程度；进门还要过 SnoreTracker 的呼吸节律门
+    var score: Double        // 0…1「频谱像鼾」的程度；是不是鼾要等 SnoreTracker 在那声响完后一起算（段长＋稳定＋邻鼾）
     var voiced: Bool         // 高于本底门限的任何声音（鼾、说话、咳嗽都算）
 }
 
@@ -281,7 +281,7 @@ final class SnoreAnalyzer {
             modDepth = sqrt(v / Double(envRing.count))
         }
 
-        // ⑦ 门限与打分（频谱像不像鼾；「一开一合」的形状由 SnoreTracker 的节律门管）
+        // ⑦ 门限与打分（频谱像不像鼾；「够不够一口气的长短」由 SnoreTracker 在那一声响完后算）
         let gate = max(floorDb + 4.0, config.absGateDb)
         let voiced = level > gate
         let score: Double
