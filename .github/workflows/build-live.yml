@@ -127,7 +127,8 @@ jobs:
           # 所以 asset 一律用 upload --clobber 传进这条已发布的 release。
           gh release upload channel-live live.ipa build.log --clobber 2>&1 | ann "REL "
           gh release edit channel-live --draft=false --prerelease >/dev/null 2>&1
-          RID=$(gh release view channel-live --json id --jq .id 2>/dev/null)
+          # REST 那条 PATCH 认数字 id；gh --json id 给的是 node_id（RE_kwDO…），拿它去 PATCH 是 404
+          RID=$(gh release view channel-live --json databaseId --jq .databaseId 2>/dev/null)
           curl -sS -X PATCH \
             -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/$RID" \
