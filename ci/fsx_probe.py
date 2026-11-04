@@ -185,19 +185,52 @@ def load_onnx_fixed(path):
     return m
 
 
-def convert(model, out_pkg, fp16, ios16=True):
+def convert_cli(onnx_path, out_pkg, fp16, cli):
+    """按这个仓库已经验通的那条路转：onnx2coreml 命令行。
+
+    第一轮探针就是栽在这儿：coremltools 9 的 ct.convert 不管递文件路径还是递 ModelProto，
+    都回一句 "Unable to determine the type of the model"（它认的来源只有 tensorflow/pytorch/milinternal）。
+    而 app 里现在装在手机上跑得好的那四张包，全是 build-swap.yml 里 onnx2coreml convert 出来的，
+    所以这里不再跟 ct.convert 较劲，直接走那条已验通的路。
+    转完照样从盘上把包读回来——手机上用的就是那份落盘的包。
+    """
+    import shutil
+    import subprocess
+    import coremltools as ct
+    if os.path.isdir(out_pkg):
+        shutil.rmtree(out_pkg)
+    cmd = [cli, 'convert', onnx_path, '-o', out_pkg, '--format', 'mlpackage',
+           '--precision', 'fp16' if fp16 else 'fp32', '--verify']
+    t0 = time.time()
+    p = subprocess.run(cmd, capture_output=True, text=True)
+    el = time.time() - t0
+    lines = ((p.stdout or '') + '\n' + (p.stderr or '')).splitlines()
+    pat = ('mismatch', 'max_abs', 'psnr', 'verify', 'error', 'not support',
+           'unsupported', 'renamed', 'fail')
+    hits = [l.strip() for l in lines if any(k in l.lower() for k in pat)]
+    log('FSX-CVI', '%s rc=%s 输出 %d 行' % (os.path.basename(out_pkg), p.returncode, len(lines)),
+        '|挑出来的判据', ' ⏎ '.join(hits[:6])[:400] or '无')
+    if p.returncode != 0 or not os.path.isdir(out_pkg):
+        raise RuntimeError('onnx2coreml rc=%s 尾部=%s' % (p.returncode, ' ⏎ '.join(lines[-6:])[:300]))
+    t1 = time.time()
+    re = ct.models.MLModel(out_pkg)
+    return re, el, (time.time() - t1)
+
+
+def convert(model, out_pkg, fp16, onnx_path=None, cli=None):
     """转 → 存包 → 再从存下来的包读回来预测。
 
     手机上用的是那份包（compileModel 之后加载），内存里那个转换对象不算数：
     包读不回来、或者读回来接口名变了，装了也白装，所以这里必须走一遍落盘再加载。
     """
     import coremltools as ct
+    if cli and onnx_path:
+        return convert_cli(onnx_path, out_pkg, fp16, cli)
     kw = {}
-    if ios16:
-        try:
-            kw['minimum_deployment_target'] = ct.target.iOS16
-        except Exception:
-            pass
+    try:
+        kw['minimum_deployment_target'] = ct.target.iOS16
+    except Exception:
+        pass
     prec = ct.precision.FLOAT16 if fp16 else ct.precision.FLOAT32
     t0 = time.time()
     m = ct.convert(model, compute_precision=prec, **kw)
@@ -285,9 +318,22 @@ def main():
     # ---- ③ 向量网转 CoreML：身份最敏感，fp16 掉多少要看清楚
     rec = {}
     arc_model = sw_model = None
+    arc_fixed = sw_fixed = None
+    cli = None
     if has_coreml:
+        import shutil
+        cli = shutil.which('onnx2coreml')
+        log('FSX-CONV', 'onnx2coreml=%s' % (cli or '不在（只能退回 ct.convert，第一轮就是这么失败的）'))
         arc_model = load_onnx_fixed(arc_onnx)
         sw_model = load_onnx_fixed(sw_onnx)
+        # 钉过符号维的那份要落成文件：命令行转换器只认文件
+        arc_fixed = os.path.join(a.out_dir, 'fsx_arc_fixed.onnx')
+        sw_fixed = os.path.join(a.out_dir, 'fsx_swap_fixed.onnx')
+        import onnx
+        onnx.save(arc_model, arc_fixed)
+        onnx.save(sw_model, sw_fixed)
+        log('FSX-CONV', '钉维后落盘 arc=%d MB swap=%d MB' %
+            (os.path.getsize(arc_fixed) // 1048576, os.path.getsize(sw_fixed) // 1048576))
     for fp16 in (True, False):
         tag = 'fp16' if fp16 else 'fp32'
         pkg = os.path.join(a.out_dir, 'fsx_arc_%s.mlpackage' % tag)
@@ -295,7 +341,7 @@ def main():
             log('FSX-SKIP', 'arc(%s) 没有 coremltools，跳过' % tag)
             break
         try:
-            m, el, rel = convert(arc_model, pkg, fp16)
+            m, el, rel = convert(arc_model, pkg, fp16, arc_fixed, cli)
             ins, outs = coreml_io(m)
             x112 = ((src112.astype(np.float32) - 127.5) / 127.5)
             feed = feed_coreml(ins, [(x112.transpose(2, 0, 1)[None], x112)])
@@ -326,7 +372,7 @@ def main():
             import shutil
             shutil.rmtree(pkg)
         try:
-            m, el, rel = convert(sw_model, pkg, fp16)
+            m, el, rel = convert(sw_model, pkg, fp16, sw_fixed, cli)
             ins, outs = coreml_io(m)
             rgb = tgt128.astype(np.float32) / 255.0
             lat = ref_lat.astype(np.float32)

@@ -27,8 +27,9 @@ concurrency:
 jobs:
   probe:
     runs-on: macos-latest
-    # 554 MB 那张网要转 fp16／fp32 两遍，每张还要落盘再读回来预测：给足 90 分钟
-    timeout-minutes: 90
+    # 554 MB 那张网要转 fp16／fp32 两遍，每张还要 --verify（转换器自己再跑一遍逐层比对）再落盘读回来预测：
+    # 上一轮 90 分钟是照「ct.convert 几秒钟就失败」估的，改成真转换后这个数不成立了。
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@v4
 
@@ -51,9 +52,12 @@ jobs:
           set +e
           rec() { tee -a /tmp/probe_env.log; }
           python -m pip install --quiet --no-cache-dir --upgrade pip >>/tmp/pip.log 2>&1
-          python -m pip install --quiet --no-cache-dir coremltools onnx onnxruntime numpy opencv-python-headless >>/tmp/pip.log 2>&1
+          # onnx2coreml 是必须的那个：coremltools 9 的 ct.convert 不认 onnx（第一轮四条转换全败在这上面），
+          # 而 app 里现在这四张能跑的包全是 onnx2coreml 转的 ⇒ 探针要跟「将来真装到手机上的那条路」一致，不是跟 ct.convert 一致。
+          python -m pip install --quiet --no-cache-dir coremltools onnx2coreml onnx onnxruntime numpy opencv-python-headless >>/tmp/pip.log 2>&1
           rc=$?
           python -c "import coremltools as ct,onnx,onnxruntime as ort,cv2,numpy;print('ENV-VERDICT 装好 ct=%s onnx=%s ort=%s cv2=%s np=%s'%(ct.__version__,onnx.__version__,ort.__version__,cv2.__version__,numpy.__version__))" 2>&1 | rec
+          echo "ENV-VERDICT 转换器=$([ -x "$(dirname "$(python -c 'import sys;print(sys.executable)')")"/onnx2coreml ] && echo 在 || echo 不在)" | rec
           if [ $rc -ne 0 ] || ! grep -q "ENV-VERDICT 装好" /tmp/probe_env.log; then
             echo "ENV-VERDICT 装失败 rc=$rc" | rec
             tail -8 /tmp/pip.log | rec
