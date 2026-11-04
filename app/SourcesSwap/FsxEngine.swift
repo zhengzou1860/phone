@@ -168,6 +168,7 @@ final class FsxEngine {
         func findOut(_ m: MLModel, want: Int) -> String? {
             let d = m.modelDescription.outputDescriptionsByName
             for n in d.keys.sorted() where tot(d[n]!) == want { return n }
+            return nil
         }
         let arcTot = 3 * FsxNets.side112 * FsxNets.side112
         let swTot = 3 * FsxNets.side128 * FsxNets.side128
