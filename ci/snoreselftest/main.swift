@@ -1,0 +1,73 @@
+import Foundation
+
+// MARK: - 出包前的算法闸门（在 CI 那台 mac 上跑，不是手机上跑）
+//
+// 本机是 Windows，没有 Swift 工具链；判定这一整套（FFT → 逐帧特征 → 迟滞状态机 → 事件表）
+// 从来没被真编译器跑过，更没被验过数。所以出包前在 mac 上拿合成信号跑一遍真通路：
+// 判据不看「听着像不像」，看事件表里的数字落在不在该在的区间。
+// 手机上「设置 → 算法自检」跑的是同一份 SnoreCases.all，两边不可能各说一套。
+
+let config = SnoreConfig()
+let t0 = DispatchTime.now().uptimeNanoseconds
+let results = SnoreCases.all(config: config)
+let elapsedMs = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000.0
+
+var bad = 0
+for r in results {
+    if !r.ok { bad += 1 }
+    print("CASE \(r.ok ? "OK  " : "FAIL") \(r.name)｜\(r.detail)")
+}
+
+// 把一份完整报告打进 CI 日志：文案（口径、限度、分级那几行）改错了，这里当场就能看见，
+// 不必等第二天早上在手机上调出来。起点钉死，日志才可重复比对。
+do {
+    let sr = SnoreCases.rate
+    /// 把一小段信号叠进整晚的底子里（合成鼾是一段一段的，不是从某点开始一直响到底）
+    func lay(_ piece: [Double], into target: inout [Double], at sec: Double) {
+        let i0 = Int(sec * sr)
+        guard i0 >= 0 else { return }
+        var i = 0
+        while i < piece.count && i0 + i < target.count {
+            target[i0 + i] += piece[i]
+            i += 1
+        }
+    }
+    func snorePiece(_ dur: Double, period: Double, f0: Double, level: Double, seed: UInt64) -> [Double] {
+        SnoreSynth.snore(count: Int(sr * dur), sampleRate: sr, periodSec: period, f0: f0,
+                         level: level, seed: seed)
+    }
+
+    var s = SnoreSynth.bed(count: Int(sr * 900), level: 0.0006, seed: 31)
+    // 六段鼾，段间的空档都明显长于 10 s 阈值 ⇒ 每道空档该出一条「疑似中断」；
+    // 说话放在 170→260 那一道空档里 ⇒ 那一条要带「期间有别的发声」；
+    // 敲击三下 ⇒ 不该变成发作，也不该变成中断。
+    lay(snorePiece(40, period: 3.0, f0: 130, level: 0.10, seed: 5), into: &s, at: 30)
+    lay(snorePiece(60, period: 3.4, f0: 145, level: 0.12, seed: 6), into: &s, at: 110)
+    lay(SnoreSynth.speech(count: Int(sr * 25), sampleRate: sr, level: 0.09, seed: 11), into: &s, at: 180)
+    lay(snorePiece(90, period: 2.8, f0: 120, level: 0.14, seed: 7), into: &s, at: 260)
+    lay(snorePiece(100, period: 4.0, f0: 160, level: 0.08, seed: 8), into: &s, at: 420)
+    lay(snorePiece(160, period: 3.1, f0: 135, level: 0.11, seed: 9), into: &s, at: 700)
+    lay(SnoreSynth.clicks(count: s.count, sampleRate: sr, level: 0.25, at: [400, 650, 660]), into: &s, at: 0)
+
+    let tr = SnoreTracker(frameSec: Double(SnoreAnalyzer.defaultWindow) / sr, config: config)
+    let got = SnoreCases.run(samples: s, sampleRate: sr, config: config, into: tr)
+    let summary = SnoreAnalyze.summarize(buckets: got.seconds, events: got.events, config: config)
+    let start = Date(timeIntervalSince1970: 1_760_000_000)
+    let text = SnoreAnalyze.reportText(summary: summary, start: start,
+                                       end: start.addingTimeInterval(900),
+                                       events: got.events, buckets: got.seconds, config: config,
+                                       facts: [], title: "鼾声监测报告（CI 合成样例）")
+    print("------ 合成样例报告 ------")
+    print(text)
+    print("------ 样例账目：事件 \(got.events.count) 条（发作 \(summary.boutCount)／停 \(summary.gapCount)／发声 \(summary.vocalCount)）"
+        + "／逐秒 \(got.seconds.count) 格／帧 \(got.frames) ------")
+    // 这一晚是「该看见东西的一晚」：一件都没判出来就说明通路断了（比如喂块尺寸变了、门限写反了）
+    if summary.boutCount == 0 || summary.gapCount == 0 {
+        bad += 1
+        print("CASE FAIL 合成样例里鼾发作或停住没判出来（发作 \(summary.boutCount)／停 \(summary.gapCount)）")
+    }
+}
+
+print("SNORE-VERDICT \(bad == 0 ? "PASS" : "FAIL") \(results.count - bad)/\(results.count) 通过"
+    + "｜耗时 \(String(format: "%.0f", elapsedMs)) ms")
+exit(bad == 0 ? 0 : 1)

@@ -1,0 +1,55 @@
+name: SnoreBench
+options:
+  createIntermediateGroups: true
+  deploymentTarget:
+    iOS: "18.0"
+settings:
+  base:
+    CODE_SIGNING_ALLOWED: "NO"
+    CODE_SIGNING_REQUIRED: "NO"
+    CODE_SIGN_IDENTITY: ""
+    IPHONEOS_DEPLOYMENT_TARGET: "18.0"
+targets:
+  SnoreBench:
+    type: application
+    platform: iOS
+    sources:
+      - SourcesSnore
+    info:
+      path: Info-Snore.plist
+      properties:
+        CFBundleDisplayName: 鼾声监测
+        CFBundleName: SnoreBench
+        CFBundleExecutable: SnoreBench
+        CFBundleIdentifier: com.qoder.snorebench
+        CFBundlePackageType: APPL
+        CFBundleShortVersionString: "0.1"
+        CFBundleVersion: "1"
+        CFBundleInfoDictionaryVersion: "6.0"
+        NSMicrophoneUsageDescription: "整晚只在手机自己这儿判定鼾声和鼾声停住，声音不上传；只有你按「发到电脑」或事件片段才落在这台手机上。"
+        # 「发到电脑」是往同一张网里的电脑 POST 日志，iOS 14 起连本地地址要先过这道授权，
+        # 描述没写对的话弹窗只显示英文键名、用户一头雾水点拒绝，那条调试路就断了。
+        NSLocalNetworkUsageDescription: "要把整晚的日志和报告发到你自己的电脑上，方便调这台手机上的判定"
+        # 开这两个键以后 Documents 整个出现在「文件」app 里：curve.csv、events.jsonl、
+        # 片段 wav、snore_log.txt 都能就地拷出来，不必每条都点一次分享面板。
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
+        LSRequiresIPhoneOS: true
+        UILaunchScreen: {}
+        # 没这一条，熄屏两分钟系统就把音频停了，整晚的记录只剩前几分钟。
+        UIBackgroundModes:
+          - audio
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.qoder.snorebench
+        PRODUCT_NAME: SnoreBench
+        TARGETED_DEVICE_FAMILY: "1"
+        ARCHS: arm64
+        SWIFT_VERSION: "5.0"
+        SWIFT_STRICT_CONCURRENCY: minimal
+        ENABLE_BITCODE: "NO"
+        GENERATE_INFOPLIST_FILE: "NO"

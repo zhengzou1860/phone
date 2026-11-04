@@ -1,0 +1,170 @@
+name: build-snore-ipa
+
+# 鼾声监测这条线（第六个 app）自己的分支、自己的发布位，不碰别人的 channel。
+# 剪辑那份 build.yml 是「push 到 main 就触发」且没有 paths 过滤 ⇒ 任何东西都不往 main 推。
+# 要重跑：本机 gh 没登录，走 git push。空提交不算——下面有 paths 过滤，一个文件都没改就不匹配；
+# 要么改这四条路径里的任一个（在本文件加一行注释也算），要么在仓库页上手动 workflow_dispatch。
+on:
+  push:
+    branches: [snore]
+    paths:
+      - 'app/SourcesSnore/**'
+      - 'app/project-snore.yml'
+      - 'ci/snoreselftest/**'
+      - '.github/workflows/build-snore.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: snore
+  cancel-in-progress: true
+
+jobs:
+  snore:
+    runs-on: macos-latest
+    # 没有模型要转，只有 FFT 用例要跑：20 分钟够到顶了
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: show toolchain
+        run: sw_vers && xcodebuild -version && xcodebuild -showsdks | grep -i ios
+
+      # 本机是 Windows，没有 Swift 工具链：自写的 FFT、迟滞状态机、报告文案一次都没被真编译器跑过，
+      # 也没被验过数。出包前在 mac 上拿合成鼾声喂进真通路，判据看事件表的数字。
+      # 跑不出 SNORE-VERDICT PASS 就不出包——那种包装到手机上只会整晚记下一堆错的数。
+      - name: 鼾声判定自检（不过就不出包）
+        run: |
+          set -o pipefail
+          rec() { tee -a /tmp/selftest.log; }
+          touch /tmp/selftest.log /tmp/build.log
+          xcrun swiftc -O \
+            app/SourcesSnore/SnoreConfig.swift \
+            app/SourcesSnore/SnoreDetect.swift \
+            app/SourcesSnore/SnoreTrack.swift \
+            app/SourcesSnore/SnoreReport.swift \
+            app/SourcesSnore/SnoreSynth.swift \
+            ci/snoreselftest/main.swift \
+            -o /tmp/snoretest 2>&1 | rec
+          if [ ! -x /tmp/snoretest ]; then echo "SNORE-VERDICT FAIL 自检没编出来，见上面编译错" | rec; exit 1; fi
+          /tmp/snoretest 2>&1 | rec
+          grep -q "^SNORE-VERDICT PASS" /tmp/selftest.log || { echo "上面每一条 CASE 就是没过的判据" | rec; exit 1; }
+
+      - name: install xcodegen
+        run: |
+          set -euo pipefail
+          curl -sL -o /tmp/xg.zip https://github.com/yonaskolb/XcodeGen/releases/download/2.46.0/xcodegen.zip
+          rm -rf /tmp/xg && unzip -q /tmp/xg.zip -d /tmp/xg
+          sudo /tmp/xg/xcodegen/install.sh
+          xcodegen --version
+
+      - name: generate project
+        working-directory: app
+        run: xcodegen --spec project-snore.yml
+
+      - name: build
+        working-directory: app
+        run: |
+          set -euo pipefail
+          rm -rf build
+          xcodebuild -project SnoreBench.xcodeproj -scheme SnoreBench \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY= EXPANDED_CODE_SIGN_IDENTITY= \
+            build 2>&1 | tee -a /tmp/build.log
+
+      # 后台模式那一条没进 Info.plist，整晚就只剩熄屏前那几分钟——所以这里把 plist 读回来验一次，
+      # 不看 yml 写了什么，看包里真正带上了什么。
+      - name: package ipa
+        working-directory: app
+        run: |
+          set -euo pipefail
+          ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=8{print "::error::" p substr($0,1,230)}'; }
+          rec() { tee -a /tmp/selftest.log; }
+          APP=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' | head -1)
+          test -n "$APP"
+          echo "built app: $APP" >> /tmp/build.log
+          file "$APP/SnoreBench" | tee -a /tmp/build.log
+          plutil -p "$APP/Info.plist" > /tmp/infoplist.txt 2>&1
+          { echo "I-VERDICT 后台模式=$(grep -c audio /tmp/infoplist.txt) 处（要 ≥1，熄屏接着录靠它）"
+            echo "I-VERDICT 麦克风描述=$(grep -c NSMicrophoneUsageDescription /tmp/infoplist.txt)"
+            echo "I-VERDICT 本地网描述=$(grep -c NSLocalNetworkUsageDescription /tmp/infoplist.txt)"
+            echo "I-VERDICT 包 id=$(defaults read "$APP/Info" CFBundleIdentifier 2>/dev/null) 版本=$(defaults read "$APP/Info" CFBundleShortVersionString 2>/dev/null)"; } | rec | ann "I-VERDICT "
+          rm -rf Payload snore.ipa
+          mkdir Payload
+          cp -R "$APP" Payload/
+          ditto -c -k --keepParent Payload snore.ipa
+          ls -la snore.ipa | tee -a /tmp/build.log
+
+      - name: publish release
+        working-directory: app
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set +e
+          ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=6{print "::error::" p substr($0,1,230)}'; }
+          cat /tmp/selftest.log /tmp/build.log > ./build.log 2>/dev/null || cp /tmp/build.log ./build.log
+          echo "待发文件 [snore.ipa build.log]" | ann "REL "
+          # 不删了重发：删这一下下载位就出现空窗（99ffb71 那轮 CI 成功、包也造出来了，事后匿名读回 404）。
+          gh release view channel-snore >/dev/null 2>&1 || gh release create channel-snore \
+            --title "SnoreBench build" --prerelease --notes "CI artifact（占位，等 asset 上传）" 2>&1 | ann "REL "
+          # 关键顺序：建 release 时一个文件都不带 ⇒ 建完就是已发布状态。
+          # gh release create 带文件时是先建草稿、传完才发布，中途没走完就永久卡在草稿里。
+          # 所以 asset 一律用 upload --clobber 传进这条已发布的 release。
+          gh release upload channel-snore snore.ipa build.log --clobber 2>&1 | ann "REL "
+          gh release edit channel-snore --draft=false --prerelease >/dev/null 2>&1
+          RID=$(gh release view channel-snore --json id --jq .id 2>/dev/null)
+          curl -sS -X PATCH \
+            -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/$RID" \
+            -d '{"draft":false,"prerelease":true,"tag_name":"channel-snore","name":"SnoreBench build","body":"CI artifact for commit '"$GITHUB_SHA"'"}' \
+            >/tmp/rel_patch.json 2>&1
+          echo "R-PATCH id=$RID 回包=$(head -c 120 /tmp/rel_patch.json | tr -d '\n')" | ann "REL "
+          echo "url=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/channel-snore/snore.ipa" | ann "REL "
+          # 闸门三条同时满足才算数：isDraft=false（草稿 SideStore 拉不到）＋列到 snore.ipa＋匿名 HEAD 回 200
+          hit=0
+          for i in 1 2 3; do
+            draft=$(gh release view channel-snore --json isDraft --jq .isDraft 2>&1)
+            names=$(gh release view channel-snore --json assets --jq '.assets[] | .name + "=" + (.size|tostring)' 2>&1 | tr '\n' ' ')
+            anon=$(curl -sIL -o /dev/null -w '%{http_code}' --max-time 90 \
+              "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/channel-snore/snore.ipa" 2>/dev/null)
+            echo "第 $i 次：isDraft=$draft｜匿名 HEAD ipa=$anon｜ [$names]" | ann "REL-GATE "
+            if [ "$draft" = "false" ] && [ "$anon" = 200 ]; then
+              case "$names" in *snore.ipa*) hit=1 ;; esac
+              [ "$hit" = 1 ] && break
+            fi
+            sleep 10
+          done
+          [ "$hit" = 1 ] || echo "::error::REL-GATE 三次都没同时满足「isDraft=false」+「列到 snore.ipa」+「匿名 HEAD 回 200」⇒ 这一版手机上拿不到"
+          if [ "$hit" = 1 ]; then exit 0; else exit 1; fi
+
+      - name: report compile errors
+        if: failure()
+        working-directory: app
+        run: |
+          set +e
+          ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=8{print "::error::" p substr($0,1,230)}'; }
+          cat /tmp/selftest.log /tmp/build.log > ./build.log 2>/dev/null || cp /tmp/build.log ./build.log 2>/dev/null || echo "no build log at all" > ./build.log
+          grep -nE "error:|fatal error:" ./build.log | ann "ERR "
+          exit 0
+
+      - name: report failure log
+        if: failure()
+        working-directory: app
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set +e
+          ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=6{print "::error::" p substr($0,1,230)}'; }
+          cat /tmp/selftest.log /tmp/build.log > ./build.log 2>/dev/null || cp /tmp/build.log ./build.log 2>/dev/null || echo "no build log at all" > ./build.log
+          echo "待发文件 [build.log]" | ann "GH-FAIL "
+          gh release delete channel-snore-fail --cleanup-tag -y >/dev/null 2>&1 || true
+          gh release create channel-snore-fail build.log \
+            --title "SnoreBench CI failed log" \
+            --prerelease \
+            --notes "no ipa this round" 2>&1 | ann "GH-FAIL "
+          exit 0
