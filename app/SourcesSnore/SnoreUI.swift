@@ -531,10 +531,10 @@ struct SettingsView: View {
                     }
                     Picker("一次发作允许的最大间隔", selection: $mon.config.boutGapSec) {
                         Text("2.0 秒（分得细）").tag(2.0)
-                        Text("2.5 秒（推荐）").tag(2.5)
-                        Text("4.0 秒（并成大段）").tag(4.0)
+                        Text("2.5 秒（呼吸均匀的人）").tag(2.5)
+                        Text("4.0 秒（推荐）").tag(4.0)
                     }
-                    Text("鼾本来就是一鼾一鼾跳的：这一档设到 1 秒以下，一晚连续鼾会被劈成上千次「发作」，次/小时就成了废数。")
+                    Text("鼾本来就是一鼾一鼾跳的：真人的空档能量到 3 秒多，设小了会把一整段连续鼾劈成十几次「发作」，次/小时就成了废数；设大了则几段真分开的可能被并成一段。")
                         .font(.system(size: 10)).foregroundColor(.secondary)
 
                     Picker("绝对门限", selection: $mon.config.absGateDb) {

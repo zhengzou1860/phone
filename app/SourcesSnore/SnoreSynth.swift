@@ -386,9 +386,12 @@ enum SnoreCases {
             let gaps = got.events.filter { $0.kind == .gap }
             let cov = got.seconds.reduce(0.0) { $0 + $1.snoreSec } / 30.0
             let med = snoreMedian(bouts.compactMap { $0.ratePerMin }) ?? 0
-            let ok = bouts.count >= 2 && cov > 0.04 && gaps.isEmpty && abs(med - 20.0) <= 8.0
+            // 一整段连续鼾就该是一段：30 s 里出 3 段以上说明「允许的最大间隔」又变小了，
+            // 【发作次数/小时】会虚高好几倍。
+            let ok = !bouts.isEmpty && bouts.count <= 3 && cov > 0.10 && gaps.isEmpty
+                && abs(med - 20.0) <= 8.0
             out.append(SnoreCaseResult(name: "不规则鼾要判成鼾", ok: ok,
-                                       detail: String(format: "发作 %d 段（要 ≥2）／鼾声占 %.0f%%（要 >4%%）／中断 %d（要 0）／节律 %.1f 次/分（要 20±8）",
+                                       detail: String(format: "发作 %d 段（要 1–3）／鼾声占 %.0f%%（要 >10%%）／中断 %d（要 0）／节律 %.1f 次/分（要 20±8）",
                                                       bouts.count, cov * 100, gaps.count, med)))
         }
         return out
