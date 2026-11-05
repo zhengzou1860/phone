@@ -312,7 +312,7 @@ final class PageViewController: UIViewController {
             guard let text = raw, let seconds = LiveTime.parse(text) else {
                 // 这一格在 PC 上是「视频路径」，在手机上只是跳转输入：手机上片子是本地挑的，
                 // 把名字当路径发回 PC 只会吃一次 409/400，所以不代跑页面那个 setVideoPath()
-                self.status("手机上这一格只当跳转输入用：填 秒数或 mm:ss 再点它＝跳到那儿；"
+                self.status("手机上这一格只当跳转输入用：填 秒数或 mm:ss 再按回车＝跳到那儿；"
                             + "换一段片子点「选择视频文件」", "error")
                 return
             }
@@ -564,7 +564,7 @@ final class PageViewController: UIViewController {
         let durText = dur.isFinite ? LiveTime.clock(dur) : "-"
         let size = video.naturalSize
         status("已选中 \(name)（\(durText)·\(Int(size.width))×\(Int(size.height))）："
-               + "点「播放」开始推流｜那一格里输 秒数或 mm:ss 再点「设置视频路径」= 跳到那儿")
+               + "点「播放」开始推流｜那一格里输 秒数或 mm:ss 再按回车 = 跳到那儿")
     }
 }
 

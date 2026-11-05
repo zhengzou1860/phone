@@ -45,7 +45,7 @@ enum LiveConfig {
 
     /// 追加到 WKWebView 默认 UA 末尾：PC 那边看 access log 就知道是手机 app 在访问，
     /// 而不是有人在浏览器里手点。
-    static let userAgentSuffix = "LiveSwap/0.6"
+    static let userAgentSuffix = "LiveSwap/0.7"
 
     /// 第一次启动时地址栏里预填的这台：PC 侧现在监听的就是它。
     /// 只当预填和提示用，不当写死的配置——PC 重连 WiFi 以后 IP 会变，
@@ -172,7 +172,7 @@ enum LiveAuth {
 // MARK: - 跳转输入
 
 enum LiveTime {
-    /// 手机上「设置视频路径」那一格兼作跳转输入：接受 "75"、"75.5"、"1:15"、"01:15:30"。
+    /// 手机上 #video-path 那一格兼作跳转输入：接受 "75"、"75.5"、"1:15"、"01:15:30"。
     /// 解析不出时间的（比如 PC 上的文件路径）返回 nil，调用方就把这一笔原样交回页面自己处理。
     static func parse(_ raw: String) -> Double? {
         let s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -266,15 +266,19 @@ enum LiveShim {
     /// 不是按钮，是页面加载完主动报上来的一行：界面挂子上没对上号就在这里说出口
     static let hookReady = "ready"
 
-    /// 三条挂子的选择器就是 PC 页面 templates/index.html 里已有的元素：
-    /// 手机上不新增任何控件，只把这三个已有按钮接到原生。
+    /// 跳转没有按钮了：PC 撤掉了「设置视频路径」，现在由这一格的回车触发。
+    /// 页面自己的回车会直接 POST /set_video，手机上那是本地文件名，
+    /// 必须在捕获阶段截下来改成“跳到第几秒”。
+    static let pathSelector = "#video-path"
+
+    /// 点击挂子只剩两个：三条挂子的选择器就是 PC 页面 templates/index.html 里已有的元素，
+    /// 手机上不新增任何控件，只把已有按钮接到原生。跳转走 keydown，不进这张表。
     static let hooks: [LiveHook] = [
         LiveHook(name: hookPick, selector: "#select-file-btn"),
         LiveHook(name: hookPlay, selector: "#start-button"),
-        LiveHook(name: hookSeek, selector: "[onclick^=\"setVideoPath\"]"),
     ]
 
-    static var actionNames: [String] { hooks.map { $0.name } }
+    static var actionNames: [String] { hooks.map { $0.name } + [hookSeek] }
 
     /// 注入脚本用的 JSON 字面量：引号反斜杠交给 JSONSerialization，不自己拼转义。
     static func jsLiteral(_ s: String) -> String {
@@ -294,6 +298,8 @@ enum LiveShim {
         let pairs = hooks.map { "[\(jsLiteral($0.name)),\(jsLiteral($0.selector))]" }
                         .joined(separator: ",")
         return template.replacingOccurrences(of: "__HOOKS__", with: "[" + pairs + "]")
+                          .replacingOccurrences(of: "__PATH__", with: jsLiteral(pathSelector))
+                          .replacingOccurrences(of: "__SEEK__", with: jsLiteral(hookSeek))
                           .replacingOccurrences(of: "__BRIDGE__", with: jsLiteral(LiveConfig.bridgeName))
     }
 
@@ -302,6 +308,8 @@ enum LiveShim {
       'use strict';
       var HOOKS = __HOOKS__;
       var BRIDGE = __BRIDGE__;
+      var PATH_SEL = __PATH__;
+      var SEEK = __SEEK__;
 
       function send(payload) {
         try {
@@ -327,6 +335,18 @@ enum LiveShim {
           send({ action: HOOKS[i][0] });
           return;
         }
+      }, true);
+
+      // 「设置视频路径」那颗按钮 PC 已经撤了，路径格回车会直接 POST /set_video。
+      // 手机上那一格填的是本地文件名或跳转秒数，不能让它发给 PC：捕获阶段先拦下，
+      // 改成原生的“跳到第几秒”。不带按钮的入口只剩这一条。
+      document.addEventListener('keydown', function (ev) {
+        if (ev.key !== 'Enter') return;
+        var el = find(PATH_SEL);
+        if (!el || ev.target !== el) return;
+        ev.preventDefault();
+        ev.stopPropagation();
+        send({ action: SEEK });
       }, true);
 
       // 手机往页面里写状态一律走页面自己的 showStatus 和 #status-message，
@@ -358,6 +378,7 @@ enum LiveShim {
       UI.report = function () {
         var have = {};
         for (var i = 0; i < HOOKS.length; i++) have[HOOKS[i][0]] = !!find(HOOKS[i][1]);
+        have[SEEK] = !!find(PATH_SEL);
         var t = document.querySelector('h1');
         send({ action: 'ready', hooks: have, title: t ? String(t.textContent || '') : '' });
       };

@@ -164,6 +164,10 @@ ck("脚本 报 ready", shim.contains("action: 'ready'") && LiveShim.hookReady ==
 ck("脚本 捕获阶段拦", shim.contains("}, true);") && shim.contains("stopPropagation"))
 ck("脚本 走页面自己的showStatus", shim.contains("showStatus"))
 ck("脚本 桥名注入了", shim.contains(LiveShim.jsLiteral(LiveConfig.bridgeName)))
+ck("脚本 跳转改成回车", shim.contains("addEventListener('keydown'") && shim.contains("'Enter'")
+   && shim.contains(LiveShim.jsLiteral(LiveShim.pathSelector)) && shim.contains("[SEEK]"))
+ck("脚本 不再挂被删的按钮", !shim.contains("onclick^"),
+   "PC 撤掉了「设置视频路径」那颗按钮，选择器留着也匹配不到")
 // PC 页面从这一版起自己也有 LiveUI（setPlaying/refreshStream/autoRefresh）：
 // 注入脚本只能在其上补方法。整赋一个新对象会把页面那三个一起冲掉，
 // 暂停态改完绑定以后那次 re_rendered 自动重连就调用不到，屏幕定在原帧。
