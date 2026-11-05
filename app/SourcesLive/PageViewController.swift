@@ -37,6 +37,9 @@ final class PageViewController: UIViewController {
     private var lastSentTick: TimeInterval = 0
     private var lastWarnKey = ""
     private var lastWarnTick: TimeInterval = 0
+    /// 屏幕不动时补一次 /video_feed 重连的节流。页面 30 秒盲刷已经在注入脚本里关掉，
+    /// 这条是它之外唯一的兜底：长连接断掉时 WebView 不一定报 error。
+    private var lastFeedRefresh: TimeInterval = 0
     /// 没存过地址时要在界面出现以后才能弹框：viewDidLoad 里 present 会被系统
     /// 静默拒绝（那时还没进窗口），表现就是一片黑、连填地址的输入框都看不到。
     private var pendingAddressPrompt = false
@@ -413,8 +416,13 @@ final class PageViewController: UIViewController {
         // 前提是这一秒手机确实在发帧：自己刚停手、刚拖完进度条重建 reader 的那一秒不出帧，
         // 不该报成 PC 挂了。
         if LiveWatch.stalled(outputAgeMs: client.outputAgeMs, localFPS: fps),
-           let age = client.outputAgeMs, warnOnce("age") {
-            status("手机在推、PC 有 \(age)ms 没出帧了：查那台电脑的换脸进程还在不在", "error")
+           let age = client.outputAgeMs {
+            // 只报警不够：屏幕那条 MJPEG 长连接可能已经断了，PC 再出帧也看不到。
+            // 重连一次；全屏那份是页面克隆出来的 img，注入脚本也一并换掉它的地址。
+            refreshFeedInPage()
+            if warnOnce("age") {
+                status("手机在推、PC 有 \(age)ms 没出帧了：查那台电脑的换脸进程还在不在", "error")
+            }
         }
         // 冷启动预热期 PC 入口队列会一次性丢一大批帧，那不是故障，所以只进这一行账目、不报警
         if warnOnce("fps", every: 10.0) {
@@ -438,6 +446,21 @@ final class PageViewController: UIViewController {
         lastWarnKey = key
         lastWarnTick = now
         return true
+    }
+
+    /// 让页面重连 /video_feed，全屏克隆出来那份也换一次地址。
+    /// 8 秒内最多一次：看门狗每秒都在算，停着不等于每秒都要弹一条新长连接。
+    private func refreshFeedInPage() {
+        let now = CFAbsoluteTimeGetCurrent()
+        guard now - lastFeedRefresh >= 8 else { return }
+        lastFeedRefresh = now
+        webView.evaluateJavaScript("""
+        (function () {
+          try { if (window.LiveUI && LiveUI.refreshStream) LiveUI.refreshStream(); } catch (e) {}
+          var f = document.getElementById('fullscreen-video');
+          if (f) f.src = '/video_feed?t=' + Date.now();
+        })();
+        """)
     }
 
     // MARK: - PC 地址那一格

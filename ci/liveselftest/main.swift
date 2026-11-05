@@ -164,6 +164,15 @@ ck("脚本 报 ready", shim.contains("action: 'ready'") && LiveShim.hookReady ==
 ck("脚本 捕获阶段拦", shim.contains("}, true);") && shim.contains("stopPropagation"))
 ck("脚本 走页面自己的showStatus", shim.contains("showStatus"))
 ck("脚本 桥名注入了", shim.contains(LiveShim.jsLiteral(LiveConfig.bridgeName)))
+// PC 页面从这一版起自己也有 LiveUI（setPlaying/refreshStream/autoRefresh）：
+// 注入脚本只能在其上补方法。整赋一个新对象会把页面那三个一起冲掉，
+// 暂停态改完绑定以后那次 re_rendered 自动重连就调用不到，屏幕定在原帧。
+ck("脚本 不整个覆盖页面LiveUI", !shim.contains("window.LiveUI = {"),
+   "整赋新对象会把 setPlaying/refreshStream/autoRefresh 一起冲掉")
+ck("脚本 合并到现有LiveUI", shim.contains("var UI = window.LiveUI") && shim.contains("window.LiveUI = UI"))
+ck("脚本 关掉页面30秒盲刷", shim.contains("UI.autoRefresh(false)"))
+ck("脚本 长连接断了会重连", shim.contains("LiveUI.refreshStream") && shim.contains("id === 'video-stream'"))
+ck("脚本 全屏克隆那份也重连", shim.contains("fullscreen-video"), "全屏里是克隆出来的 img，原图被隐藏着")
 ck("转义 引号反斜杠", LiveShim.jsLiteral("a\"b\\c") == "\"a\\\"b\\\\c\"",
    LiveShim.jsLiteral("a\"b\\c"))
 ck("转义 中文原样", LiveShim.jsLiteral("推流").hasPrefix("\"推流"))

@@ -45,7 +45,7 @@ enum LiveConfig {
 
     /// 追加到 WKWebView 默认 UA 末尾：PC 那边看 access log 就知道是手机 app 在访问，
     /// 而不是有人在浏览器里手点。
-    static let userAgentSuffix = "LiveSwap/0.5"
+    static let userAgentSuffix = "LiveSwap/0.6"
 
     /// 第一次启动时地址栏里预填的这台：PC 侧现在监听的就是它。
     /// 只当预填和提示用，不当写死的配置——PC 重连 WiFi 以后 IP 会变，
@@ -331,37 +331,76 @@ enum LiveShim {
 
       // 手机往页面里写状态一律走页面自己的 showStatus 和 #status-message，
       // 不另外盖一层浮标：界面上看到的字和 PC 上同一格是一个来源。
-      window.LiveUI = {
-        status: function (msg, kind) {
-          try {
-            if (typeof showStatus === 'function') { showStatus(msg, kind || 'success'); return 'showStatus'; }
-          } catch (e) {}
-          var d = document.getElementById('status-message');
-          if (d) { d.textContent = msg; return 'status-message'; }
-          return 'none';
-        },
-        path: function (v) {
-          var e = document.getElementById('video-path');
-          if (!e) return false;
-          e.value = v;
-          return true;
-        },
-        readPath: function () {
-          var e = document.getElementById('video-path');
-          return e ? String(e.value || '') : '';
-        },
-        report: function () {
-          var have = {};
-          for (var i = 0; i < HOOKS.length; i++) have[HOOKS[i][0]] = !!find(HOOKS[i][1]);
-          var t = document.querySelector('h1');
-          send({ action: 'ready', hooks: have, title: t ? String(t.textContent || '') : '' });
-        }
+      //
+      // PC 页面自己也有 LiveUI（setPlaying / refreshStream / autoRefresh），
+      // 这里只能在它上面补 App 用的四个方法：整个赋一个新对象会把页面那三个冲掉，
+      // 暂停态改完绑定以后那次 re_rendered 自动重连就再也调用不到，画面定在原处。
+      var UI = window.LiveUI;
+      if (!UI || typeof UI !== 'object') UI = {};
+      UI.status = function (msg, kind) {
+        try {
+          if (typeof showStatus === 'function') { showStatus(msg, kind || 'success'); return 'showStatus'; }
+        } catch (e) {}
+        var d = document.getElementById('status-message');
+        if (d) { d.textContent = msg; return 'status-message'; }
+        return 'none';
       };
+      UI.path = function (v) {
+        var e = document.getElementById('video-path');
+        if (!e) return false;
+        e.value = v;
+        return true;
+      };
+      UI.readPath = function () {
+        var e = document.getElementById('video-path');
+        return e ? String(e.value || '') : '';
+      };
+      UI.report = function () {
+        var have = {};
+        for (var i = 0; i < HOOKS.length; i++) have[HOOKS[i][0]] = !!find(HOOKS[i][1]);
+        var t = document.querySelector('h1');
+        send({ action: 'ready', hooks: have, title: t ? String(t.textContent || '') : '' });
+      };
+      window.LiveUI = UI;
+
+      function refreshFeed() {
+        try {
+          if (window.LiveUI && LiveUI.refreshStream) { LiveUI.refreshStream(); return true; }
+        } catch (e) {}
+        return false;
+      }
+
+      // 页面自带的 30 秒盲重连会让画面整块闪一下，也救不了真断掉时该立刻重连的场景。
+      // PC 给了开关就关掉它，改由下面的 error 钩子按需重连；没有这个接口（老页面）
+      // 就保留原样，宁可按老节奏闪，也别让画面永远不回来。
+      try { if (UI.autoRefresh) UI.autoRefresh(false); } catch (e) {}
+
+      // /video_feed 是长连接：WebView 退后台、网络抖一下都会让它报 error 且不自恢复。
+      // 全屏那份是页面克隆出来的 #fullscreen-video，原图被隐藏着，得各自重连；
+      // 1.5 秒内只试一次，免得 error 连环把长连接打成轮询。
+      function retryFeed(img) {
+        if (img.__liveRetry) return;
+        img.__liveRetry = setTimeout(function () {
+          img.__liveRetry = null;
+          if (img.id === 'fullscreen-video') {
+            img.src = '/video_feed?t=' + Date.now();
+          } else {
+            refreshFeed();
+          }
+        }, 1500);
+      }
+
+      document.addEventListener('error', function (ev) {
+        var img = ev.target;
+        if (!img || img.tagName !== 'IMG') return;
+        if (img.id !== 'video-stream' && img.id !== 'fullscreen-video') return;
+        retryFeed(img);
+      }, true);
 
       if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', window.LiveUI.report);
+        document.addEventListener('DOMContentLoaded', UI.report);
       } else {
-        window.LiveUI.report();
+        UI.report();
       }
     })();
     """#
