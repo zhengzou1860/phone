@@ -12,7 +12,7 @@ import Foundation
 import CoreGraphics
 
 enum LiveConfig {
-    static let defaultPort = 5000
+    static let defaultPort = 5100
 
     /// PC 那边 /live_start 响应里的 max_width 是权威；这个只在读不到响应时兜底。
     static let fallbackMaxWidth = 640
@@ -45,19 +45,19 @@ enum LiveConfig {
 
     /// 追加到 WKWebView 默认 UA 末尾：PC 那边看 access log 就知道是手机 app 在访问，
     /// 而不是有人在浏览器里手点。
-    static let userAgentSuffix = "LiveSwap/0.4"
+    static let userAgentSuffix = "LiveSwap/0.5"
 
     /// 第一次启动时地址栏里预填的这台：PC 侧现在监听的就是它。
     /// 只当预填和提示用，不当写死的配置——PC 重连 WiFi 以后 IP 会变，
     /// 长按改地址那条路必须一直留着。
-    static let suggestedHost = "192.168.31.100:5000"
+    static let suggestedHost = "192.168.31.100:5100"
 }
 
 // MARK: - PC 地址
 
 enum LiveHost {
     /// 把那一格里可能出现的写法归一成 base URL：
-    /// "192.168.1.20"、"192.168.1.20:5000"、"http://192.168.1.20:5000/" 都收，
+    /// "192.168.1.20"、"192.168.1.20:5100"、"http://192.168.1.20:5100/" 都收，
     /// 带真路径的拒（那种是把页面地址整条粘过来了，让它过去只会在 404 里绕）。
     static func base(_ raw: String, defaultPort: Int = LiveConfig.defaultPort) -> URL? {
         var s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -88,7 +88,7 @@ enum LiveHost {
         return URL(string: "http://\(host):\(port)")
     }
 
-    /// 给状态行回显用的 "192.168.1.20:5000"
+    /// 给状态行回显用的 "192.168.1.20:5100"
     static func display(_ url: URL) -> String {
         guard let host = url.host else { return url.absoluteString }
         if let p = url.port { return "\(host):\(p)" }

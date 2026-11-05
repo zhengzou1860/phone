@@ -32,7 +32,7 @@ func eq<T: Equatable>(_ a: T?, _ b: T) -> Bool { a == b }
 
 func host(_ s: String) -> String? { LiveHost.base(s)?.absoluteString }
 
-ck("地址 光host补默认端口", eq(host("192.168.1.20"), "http://192.168.1.20:5000"),
+ck("地址 光host补默认端口", eq(host("192.168.1.20"), "http://192.168.1.20:5100"),
    "\(String(describing: host("192.168.1.20")))")
 ck("地址 带端口", eq(host("192.168.1.20:5055"), "http://192.168.1.20:5055"),
    "\(String(describing: host("192.168.1.20:5055")))")
@@ -197,7 +197,10 @@ ck("看门狗 没出过帧(null)不报", !LiveWatch.stalled(outputAgeMs: nil, lo
    "预热期 output_age_ms 是 null，不能当 PC 挂了")
 ck("看门狗 2500ms 边界", !LiveWatch.stalled(outputAgeMs: 2500, localFPS: 13),
    "阈值本身不算超")
-ck("契约 PC默认端口5000", LiveConfig.defaultPort == 5000)
+ck("契约 PC默认端口5100", LiveConfig.defaultPort == 5100,
+   "5000 已被另一台程序占用，换脸服务长期在 5100")
+ck("契约 预填地址用5100", LiveConfig.suggestedHost.hasSuffix(":5100"),
+   LiveConfig.suggestedHost)
 ck("契约 预填那台能解析成地址", LiveHost.base(LiveConfig.suggestedHost) != nil,
    LiveConfig.suggestedHost)
 
