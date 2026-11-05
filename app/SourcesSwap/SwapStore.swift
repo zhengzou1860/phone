@@ -49,6 +49,9 @@ enum SwapStore {
         let sha256: String
         let bytes: Int
         let files: [File]
+        /// 载荷（各文件字节连起来）的 sha256。归档头里写的就是这一格；
+        /// 发布位这一格是后来才加的，老清单没有，所以是可选的。
+        let payloadSha: String?
     }
 
     // MARK: - 盘上那一份
@@ -116,7 +119,8 @@ enum SwapStore {
         for u in all {
             let n = u.lastPathComponent
             let stale = (u.pathExtension == "mlpackage" && !keep.contains(n))
-                || n == "archive.part" || n == "emap.bin"     // emap 是上一版 inswapper 的口径，本版没有这一步
+                || n == "emap.bin"     // emap 是上一版 inswapper 的口径，本版没有这一步
+            // archive.part 不在这儿删：验过 sha 的那一份要留着，解包被系统掐掉时下次只解不重下。
             guard stale else { continue }
             let mb = Double((try? u.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0) / 1_048_576
             do {
@@ -138,10 +142,12 @@ enum SwapStore {
     }
 
     static func statusLine() -> String {
-        if haveAll() { return "已下好 版本 \(localVersion())｜两张网齐（\(chainTag)）" }
+        if haveAll() {
+            return "已下好 版本 \(localVersion().prefix(12))…｜两张网齐（\(chainTag)）｜点核对只比版本，不会重下"
+        }
         let v = localVersion()
         return v.isEmpty ? "没下（点「下模型」，或直接开始换脸会自动下）"
-                         : "没下齐（盘上版本 \(v) 不全）"
+                         : "没下齐（盘上版本 \(v.prefix(12))… 不全）"
     }
 
     // MARK: - 清单
@@ -196,6 +202,8 @@ enum SwapStore {
         private var lastAt: UInt64 = DispatchTime.now().uptimeNanoseconds
         private var finished = false
         private var saidStatus = false
+        /// 清单说的这一份多大。响应头一对不上就当场掐掉：旧的那份下完 566 MB 再被 sha256 否掉，白等几分钟。
+        private var expect: Int64 = 0
 
         /// 这么久没有新字节就当这条源卡住了。挂着的下载最烦：不动、也不报错，等它一小时。
         static let stallSec: Double = 45
@@ -214,8 +222,9 @@ enum SwapStore {
             sem.signal()
         }
 
-        func grab(_ url: URL, to dst: URL, timeout: TimeInterval) -> (ok: Bool, note: String) {
+        func grab(_ url: URL, to dst: URL, timeout: TimeInterval, expect: Int64 = 0) -> (ok: Bool, note: String) {
             self.dst = dst
+            self.expect = expect
             let cfg = URLSessionConfiguration.default
             cfg.timeoutIntervalForRequest = 60
             cfg.timeoutIntervalForResource = timeout
@@ -257,9 +266,17 @@ enum SwapStore {
             let first = !saidStatus
             saidStatus = true
             let resp = downloadTask.response
+            let want = expect
             lock.unlock()
             if first, let r = resp as? HTTPURLResponse {
                 onStatus?("模型 归档 HTTP \(r.statusCode)｜\(r.url?.absoluteString ?? urlText(resp))")
+            }
+            if want > 0, totalBytesExpectedToWrite > 0, totalBytesExpectedToWrite != want {
+                let gotMB = String(format: "%.0f", Double(totalBytesExpectedToWrite) / 1_048_576)
+                let wantMB = String(format: "%.0f", Double(want) / 1_048_576)
+                markFinished("这条源上是旧的那份（\(gotMB) MB ≠ 清单 \(wantMB) MB），没往下下")
+                downloadTask.cancel()
+                return
             }
             onProgress?(totalBytesWritten, totalBytesExpectedToWrite)
         }
@@ -290,6 +307,63 @@ enum SwapStore {
         }
     }
 
+    /// 只读归档开头那一小段：SWPM＋头长＋JSON 头，里面写着这一份的版本号和载荷 sha。
+    /// 用途是在搬 566 MB 之前先认一下这条源上是不是清单里那一份：PC 上那台要是还挂着旧的，
+    /// 用户看到的就是「下完一遍又一遍」。Range 只取 16 KB；对面不认 Range 就边收边掐，最多收几百字节。
+    final class Peek: NSObject, URLSessionDataDelegate {
+        private var buf = Data()
+        private var hlen = -1
+        private let sem = DispatchSemaphore(value: 0)
+        private var done = false
+        private(set) var version: String?
+        private(set) var payloadSha: String?
+
+        func head(_ url: URL, timeout: TimeInterval = 10) -> (version: String, payloadSha: String)? {
+            let cfg = URLSessionConfiguration.default
+            cfg.timeoutIntervalForRequest = timeout
+            cfg.timeoutIntervalForResource = timeout
+            let session = URLSession(configuration: cfg, delegate: self, delegateQueue: nil)
+            var req = URLRequest(url: url)
+            req.setValue("bytes=0-16383", forHTTPHeaderField: "Range")
+            req.cachePolicy = .reloadIgnoringLocalCacheData
+            let task = session.dataTask(with: req)
+            task.resume()
+            if sem.wait(timeout: .now() + timeout + 3) == .timedOut { task.cancel() }
+            session.invalidateAndCancel()
+            guard let v = version else { return nil }
+            return (v, payloadSha ?? "")
+        }
+
+        func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+            buf.append(data)
+            if hlen < 0, buf.count >= 8 {
+                let b = [UInt8](buf.prefix(8))
+                guard b[0] == 0x53, b[1] == 0x57, b[2] == 0x50, b[3] == 0x4D else {
+                    finish(); dataTask.cancel(); return
+                }
+                hlen = Int(b[4]) | (Int(b[5]) << 8) | (Int(b[6]) << 16) | (Int(b[7]) << 24)
+                if hlen <= 0 || hlen > 4_000_000 { finish(); dataTask.cancel(); return }
+            }
+            if hlen > 0, buf.count >= 8 + hlen {
+                let head = buf.subdata(in: 8..<(8 + hlen))
+                if let mm = try? JSONDecoder().decode(Manifest.self, from: head) {
+                    version = mm.version
+                    payloadSha = mm.sha256
+                }
+                finish()
+                dataTask.cancel()
+            }
+        }
+
+        func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+            finish()
+        }
+
+        private func finish() {
+            if !done { done = true; sem.signal() }
+        }
+    }
+
     static func sha256(_ url: URL) -> String? {
         guard let fh = try? FileHandle(forReadingFrom: url) else { return nil }
         defer { try? fh.close() }
@@ -302,7 +376,8 @@ enum SwapStore {
     }
 
     /// 归档 → 盘上。头是 "SWPM"＋4 字节头长＋JSON 头，之后各文件字节按清单顺序排下去。
-    static func extract(_ archive: URL, manifest m: Manifest, to dir: URL) -> (ok: Bool, note: String) {
+    static func extract(_ archive: URL, manifest m: Manifest, to dir: URL,
+                        onLine: ((String) -> Void)? = nil) -> (ok: Bool, note: String) {
         let fm = FileManager.default
         guard let fh = try? FileHandle(forReadingFrom: archive) else { return (false, "归档打不开") }
         defer { try? fh.close() }
@@ -330,7 +405,9 @@ enum SwapStore {
             let p = dir.appendingPathComponent("\(r).mlpackage", isDirectory: true)
             try? fm.removeItem(at: p)
         }
-        for f in man.files {
+        let total = man.files.count
+        for (i, f) in man.files.enumerated() {
+            onLine?("模型 解包 \(i + 1)/\(total)：\(f.path)")
             let p = dir.appendingPathComponent(f.path)
             do {
                 try fm.createDirectory(at: p.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -356,20 +433,75 @@ enum SwapStore {
         return (true, "解出 \(man.files.count) 个文件")
     }
 
+    /// 一次只许一路在上面：出片、预览、注册目标照都会经过这里，两路同时进来会各下一份 566 MB，
+    /// 还往同一个 archive.part 里写。锁住以后，后进来的等前一路走完，看见盘上已齐就直接回。
+    private static let gate = NSLock()
+
+    /// 从一份已经验过 sha256 的归档解到盘上：解成了写版本号、删归档；没成把归档留着，下次只解不重下。
+    /// 返回非 nil＝成了（这一句是给人看的结论）。
+    private static func finishFromArchive(_ archive: URL, manifest m: Manifest, dir: URL,
+                                          onLine: (String) -> Void) -> String? {
+        let ex = extract(archive, manifest: m, to: dir, onLine: onLine)
+        guard ex.ok else {
+            onLine("模型 解包没成：\(ex.note)｜归档留着（\(m.bytes / 1_048_576) MB），再点一次只解不重下")
+            return nil
+        }
+        do {
+            try m.version.write(to: dir.appendingPathComponent("version.txt"), atomically: true, encoding: .utf8)
+        } catch {
+            onLine("模型 解好了，但版本号写不进去：\(error.localizedDescription)")
+        }
+        try? FileManager.default.removeItem(at: archive)
+        var rv = URLResourceValues()
+        rv.isExcludedFromBackup = true          // 几百 MB 权重不进 iCloud 备份
+        var modelDir = dir                       // setResourceValues 是 mutating 的，URL 得是可改的
+        try? modelDir.setResourceValues(rv)
+        onLine("模型 解好了：\(ex.note)｜版本 \(m.version.prefix(12))…")
+        return "模型 下好了：版本 \(m.version)｜两张网齐（\(chainTag)）"
+    }
+
     /// 盘上没有就下。force＝true 时先问一次版本：版本对得上也不重下。
     /// 返回的第一句是给人看的（进流水、也顶到界面上），第二句是给日志的细节。
     static func ensure(force: Bool = false, onLine: @escaping (String) -> Void) -> (ok: Bool, note: String) {
+        gate.lock()
+        defer { gate.unlock() }
+        // 下模型按十几分钟算：屏幕自己锁上，iOS 当场把进程冻住，下到一半就断。
+        SwapUtil.keepScreenAwake(true)
+        defer { SwapUtil.keepScreenAwake(false) }
         let fm = FileManager.default
-        if haveAll() && !force {
-            return (true, "模型 盘上那一份就是齐的（版本 \(localVersion())），不联网、不重下")
-        }
         guard let dir = dir else { return (false, "模型 拿不到 Documents 目录") }
-        let (man, mnote, _) = fetchManifest()
-        guard let m = man else { return (false, "模型 \(mnote)") }
-        onLine("模型 清单到手：\(mnote)｜\(String(format: "%.0f", Double(m.bytes) / 1_048_576)) MB")
-        if haveAll() && localVersion() == m.version {
-            return (true, "模型 盘上那一份就是最新的（版本 \(m.version)），不用重下")
+        let tmp = dir.appendingPathComponent("archive.part")
+        if haveAll() && !force {
+            try? fm.removeItem(at: tmp)      // 齐了，上次剩下的归档没用了
+            return (true, "模型 盘上那一份就是齐的（版本 \(localVersion().prefix(12))…），不联网、不重下")
         }
+        let (man, mnote, _) = fetchManifest()
+        guard let m = man else {
+            // 核对不上不该把能用的一套装成「坏了」：盘上齐着就照跑，只是这次没问到发布位。
+            if haveAll() {
+                return (true, "模型 盘上那份是齐的（版本 \(localVersion().prefix(12))…），这次没连上发布位核对：\(mnote)")
+            }
+            return (false, "模型 \(mnote)")
+        }
+        onLine("模型 清单到手：\(mnote)｜这一份 \(Int((Double(m.bytes) / 1_048_576).rounded())) MB（只是核对，还没下）")
+        let local = localVersion()
+        if haveAll() && local == m.version {
+            try? fm.removeItem(at: tmp)
+            return (true, "模型 盘上就是最新的（版本 \(m.version.prefix(12))…），只核对了清单，没下载任何字节")
+        }
+        do { try fm.createDirectory(at: dir, withIntermediateDirectories: true) } catch {
+            return (false, "模型 建不出目录：\(error.localizedDescription)")
+        }
+        // 上次已经下好、验过 sha 的那一份还在（解包那一步被系统掐掉／写盘失败）：直接解，别再下一遍。
+        if fm.fileExists(atPath: tmp.path), sha256(tmp) == m.sha256 {
+            onLine("模型 上次下好并验过的归档还在（\(m.bytes / 1_048_576) MB）｜直接解包，不再下载")
+            if let done = finishFromArchive(tmp, manifest: m, dir: dir, onLine: onLine) {
+                return (true, done)
+            }
+            return (false, "模型 归档是好的（sha256 对得上清单），但解包没成；归档留在手机上，"
+                + "清出空间或重启后再点一次，只解不重下")
+        }
+        try? fm.removeItem(at: tmp)           // 半截的、或者上一版的，留着没用
         // 先腾地方再下载：旧版那几张对本版一点用都没有（haveAll() 认的是这两张），
         // 却要在下载这一刻和归档同时占着盘，挤不下就是半截失败。
         let cleared = purgeStale(dir)
@@ -379,13 +511,24 @@ enum SwapStore {
             return (false, "模型 手机上的可用空间不够：这一份要能同时放下归档和解开的两张网，约 \(need) GB，"
                 + "现在只剩 \(SwapFacts.diskFreeGB()) GB｜先清一清（旧视频、旧照片）再点「下模型」")
         }
-        do { try fm.createDirectory(at: dir, withIntermediateDirectories: true) } catch {
-            return (false, "模型 建不出目录：\(error.localizedDescription)")
-        }
-        let tmp = dir.appendingPathComponent("archive.part")
+        let want = Int64(m.bytes)
         var why: [String] = []
         for b in archiveBases {
             guard let url = URL(string: "\(b)/\(archiveName)") else { why.append("\(b) 地址非法"); continue }
+            // 下载前先读这 700 字节的归档头：PC 上那台要是还挂着旧的，当场认出来，别先白下 566 MB。
+            if let pv = Peek().head(url) {
+                if pv.version != m.version {
+                    why.append("\(b) 上是旧的那份（版本 \(pv.version.prefix(12))…）")
+                    onLine("模型 \(b) 上是旧的那份（版本 \(pv.version.prefix(12))… ≠ 清单 \(m.version.prefix(12))…）"
+                        + "｜跳过，不白下 \(Int((Double(m.bytes) / 1_048_576).rounded())) MB")
+                    continue
+                }
+                if let wantPS = m.payloadSha, !wantPS.isEmpty, !pv.payloadSha.isEmpty, pv.payloadSha != wantPS {
+                    why.append("\(b) 上那份的载荷对不上清单")
+                    onLine("模型 \(b) 上那份和清单不是同一份（载荷 sha 对不上）｜跳过，不白下")
+                    continue
+                }
+            }
             try? fm.removeItem(at: tmp)
             let grab = Grabber()
             var lastMB = -1
@@ -398,7 +541,7 @@ enum SwapStore {
                     onLine("模型 下到 \(mb)/\(tot) MB（\(b)）")
                 }
             }
-            let g = grab.grab(url, to: tmp, timeout: 1800)
+            let g = grab.grab(url, to: tmp, timeout: 1800, expect: want)
             guard g.ok else {
                 try? fm.removeItem(at: tmp)
                 why.append("\(b) \(g.note)")
@@ -413,23 +556,14 @@ enum SwapStore {
             guard sha == m.sha256 else {
                 try? fm.removeItem(at: tmp)
                 why.append("\(b) 整包 sha256 对不上（要 \(m.sha256.prefix(12))… 拿到 \(sha.prefix(12))…）")
-                onLine("模型 \(b) 那份对不上（多半是电脑上的缓存旧了）｜换下一条")
+                onLine("模型 \(b) 那份不是清单里那一份（sha256 对不上）｜换下一条")
                 continue
             }
             onLine("模型 整包 sha256 对上了（\(sha.prefix(12))…）｜开始解包")
-            let ex = extract(tmp, manifest: m, to: dir)
-            try? fm.removeItem(at: tmp)
-            guard ex.ok else {
-                why.append("\(b) \(ex.note)")
-                continue
+            if let done = finishFromArchive(tmp, manifest: m, dir: dir, onLine: onLine) {
+                return (true, done)
             }
-            try? m.version.write(to: dir.appendingPathComponent("version.txt"), atomically: true, encoding: .utf8)
-            var rv = URLResourceValues()
-            rv.isExcludedFromBackup = true          // 几百 MB 权重不进 iCloud 备份
-            var modelDir = dir                       // setResourceValues 是 mutating 的，URL 得是可改的
-            try? modelDir.setResourceValues(rv)
-            onLine("模型 解好了：\(ex.note)｜版本 \(m.version)")
-            return (true, "模型 下好了：版本 \(m.version)｜两张网齐（\(chainTag)）")
+            return (false, "模型 归档已下好并验过 sha256，但解包没成；归档留着，再点一次只解不重下")
         }
         return (false, "模型 几条源都没成：" + why.joined(separator: "；"))
     }

@@ -300,6 +300,9 @@ def pack_archive(base, files_order, out_bin, out_json, version):
         f.write(arch)
     man = {'version': version,
            'sha256': hashlib.sha256(arch).hexdigest(),
+           # 载荷本身的 sha（归档头里那一格也是它）。手机下之前只读归档头，就能拿它
+           # 和这一格对：CI 重跑一次换了转换器，版本号不变、字节变了，也能当场认出来。
+           'payloadSha': hashlib.sha256(bytes(blob)).hexdigest(),
            'bytes': len(arch),
            'files': files}
     with open(out_json, 'w', encoding='utf-8') as f:

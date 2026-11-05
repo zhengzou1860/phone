@@ -118,9 +118,9 @@ struct SwapContentView: View {
                         Text("先从同一张网上的电脑拿模型（手机直连 GitHub 慢得离谱），"
                              + "第一次会问「允许访问本地网络」，点允许。电脑不在就走 GitHub 那条。")
                             .font(.caption2)
-                        Text("改了程序不用重下模型；模型换了才重下。")
+                        Text("改了程序不用重下模型；模型换了才重下。盘上齐着时这个按钮只核对版本，不搬字节。")
                             .font(.caption2)
-                        Button(modelBusy ? "下模型跑着…" : (SwapStore.haveAll() ? "查模型版本" : "下模型")) { downloadModels() }
+                        Button(modelBusy ? "核对中…" : (SwapStore.haveAll() ? "核对模型版本（不重下）" : "下模型")) { downloadModels() }
                             .buttonStyle(.bordered)
                             .disabled(modelBusy || running || pv.on || castBusy)
                         Text(pv.modelText.isEmpty ? SwapStore.statusLine() : pv.modelText)
@@ -801,16 +801,17 @@ struct SwapContentView: View {
     /// 下模型：两张网（带一份口径标记 chain.txt）合成一个 models.bin 挂在 release 上，下完 sha256 对得上才解包。
     /// 下到 Documents/swap_models —— 程序随便换，这一份原封不动。
     private func downloadModels() {
+        let checking = SwapStore.haveAll()
         modelBusy = true
-        pv.modelText = "下模型跑着…"
-        SwapJournal.line("开始下模型")
+        pv.modelText = checking ? "核对模型版本（只比版本，不重下）…" : "下模型跑着…"
+        SwapJournal.line(checking ? "开始核对模型版本" : "开始下模型")
         Task.detached {
             SwapCast.release()
             let g = SwapStore.ensure(force: true) { line in
                 SwapJournal.line(line)
                 DispatchQueue.main.async { pv.modelText = line }
             }
-            SwapJournal.line("下模型 " + g.note)
+            SwapJournal.line((checking ? "核对模型 " : "下模型 ") + g.note)
             DispatchQueue.main.async {
                 pv.modelText = g.note
                 modelBusy = false
