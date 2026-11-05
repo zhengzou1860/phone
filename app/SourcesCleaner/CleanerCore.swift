@@ -20,11 +20,11 @@ enum CleanCategory: String, CaseIterable, Identifiable, Sendable {
     var subtitle: String {
         switch self {
         case .junk:
-            return "运行日志、容器 tmp / 共享临时区残留、后缀 .tmp 的中断下载；6 小时内还在变的文件不动"
+            return "运行日志、容器 tmp / 共享临时区残留（含视频）、后缀 .tmp 的中断下载；6 小时内还在变的文件不动"
         case .model:
             return "旧模型包、旧版本编译缓存、没删掉的深度缓存；当前模型和下载中的 archive.part 一律保留"
         case .history:
-            return "剪辑／VR／语音的旧成片，以及鼾声监测的旧一晚；默认不勾，按天数处理"
+            return "所有视频文件（含子目录和 tmp 里的）以及鼾声监测的旧一晚；默认不勾，按天数或全部处理"
         }
     }
 }
@@ -339,7 +339,7 @@ final class Cleaner {
         }
 
         if categories.contains(.history) {
-            let days = max(1, historyDays)
+            let days = max(0, historyDays)
             for target in env.targets {
                 for container in target.containers {
                     let r = scanHistory(target: target, container: container, days: days)
@@ -347,6 +347,9 @@ final class Cleaner {
                     notes += r.notes
                 }
             }
+            let sharedVideos = scanSharedTmpVideos(days: days)
+            items += sharedVideos.items
+            notes += sharedVideos.notes
         }
 
         var seen = Set<String>()
@@ -402,7 +405,7 @@ final class Cleaner {
 
     private static let tmpRules: [TmpRule] = [
         TmpRule(token: "swap_", exact: false, bundleID: "com.qoder.swapbench",
-                appName: "换脸出片", note: "出片中间文件／上次留下的半成品"),
+                appName: "换脸出片", note: "换脸出片／选片副本（共享临时区；出片前会先清上一轮）"),
         TmpRule(token: "vr3d_", exact: false, bundleID: "com.qoder.vr3d",
                 appName: "VR3D", note: "选片副本／深度缓存残留"),
         TmpRule(token: "pick_", exact: false, bundleID: "",
@@ -422,8 +425,23 @@ final class Cleaner {
         "livecontainer", "sidestore", "altstore", "com.kdt", "com.rileytestut",
     ]
 
+    private static let videoExtensions: Set<String> = [
+        "mov", "mp4", "m4v", "avi", "mkv", "webm", "3gp", "mts", "m2ts", "ts",
+    ]
+
+    // 递归找视频时不进：用户数据／模型包／系统目录／LC 的共享 app group 和收件箱。
+    private static let videoSkipDirs: Set<String> = [
+        "voice_models", "swap_idents", "samples", "nights",
+        "Cookies", "Cookies2", "Preferences", "SystemData",
+        "LCAppGroup", "Inbox",
+    ]
+
     private static func isTmpName(_ name: String) -> Bool {
         name.count > 4 && name.lowercased().hasSuffix(".tmp")
+    }
+
+    private static func isVideoName(_ name: String) -> Bool {
+        videoExtensions.contains((name as NSString).pathExtension.lowercased())
     }
 
     private static func isForbiddenTmpName(_ name: String) -> Bool {
@@ -439,7 +457,8 @@ final class Cleaner {
             includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey, .contentModificationDateKey, .fileSizeKey],
             options: []
         )) ?? []
-        var generic = 0
+        var genericTmp = 0
+        var genericVideo = 0
         for url in entries {
             let name = url.lastPathComponent
             if let rule = Self.tmpRules.first(where: {
@@ -448,15 +467,26 @@ final class Cleaner {
                 if let item = tmpItem(rule: rule, url: url) { out.items.append(item) }
                 continue
             }
-            // 剩下的只认顶层普通文件、后缀 .tmp；目录和符号链接一律不碰。
+            // 剩下的只认顶层普通文件（.tmp 或视频）；目录和符号链接一律不碰。
             guard let f = facts(url), !f.isSymbolicLink, !f.isDirectory,
-                  Self.isTmpName(name), !Self.isForbiddenTmpName(name),
-                  let item = sharedTmpItem(url: url, facts: f) else { continue }
-            out.items.append(item)
-            generic += 1
+                  !Self.isForbiddenTmpName(name) else { continue }
+            if Self.isTmpName(name) {
+                if let item = sharedTmpItem(url: url, facts: f) {
+                    out.items.append(item)
+                    genericTmp += 1
+                }
+            } else if Self.isVideoName(name) {
+                if let item = sharedTmpVideoItem(url: url, facts: f) {
+                    out.items.append(item)
+                    genericVideo += 1
+                }
+            }
         }
-        if generic > 0 {
-            out.notes.append("共享临时区里有 \(generic) 个 6 小时没改动的 .tmp 文件：所有 app 共用，判不出归属，默认不勾选；确认是本机 app 留下的再手动选上")
+        if genericTmp > 0 {
+            out.notes.append("共享临时区里有 \(genericTmp) 个 6 小时没改动的 .tmp 文件：所有 app 共用，判不出归属，默认不勾选；确认是本机 app 留下的再手动选上")
+        }
+        if genericVideo > 0 {
+            out.notes.append("共享临时区里有 \(genericVideo) 个 6 小时没改动的视频文件：判不出归属，默认不勾选；换脸成片通常以 swap_ 开头，会按换脸出片列出")
         }
         return out
     }
@@ -473,6 +503,25 @@ final class Cleaner {
             displayPath: "临时区/\(url.lastPathComponent)",
             bytes: f.bytes,
             note: "中断的下载／导出留下的 .tmp（6 小时没改动）",
+            isDirectory: false,
+            minAgeHours: 6,
+            inSharedTmp: true,
+            containerRoot: nil
+        )
+    }
+
+    private func sharedTmpVideoItem(url: URL, facts f: FileFacts) -> CleanItem? {
+        guard !f.isDirectory, let base = f.modified,
+              Date().timeIntervalSince(base) >= 6 * 3600 else { return nil }
+        return CleanItem(
+            category: .junk,
+            appName: "共享临时区（所有 app 共用）",
+            bundleID: "",
+            containerName: "共享临时区",
+            url: url,
+            displayPath: "临时区/\(url.lastPathComponent)",
+            bytes: f.bytes,
+            note: "共享临时区里的视频文件（6 小时没改动，判不出归属）",
             isDirectory: false,
             minAgeHours: 6,
             inSharedTmp: true,
@@ -768,6 +817,101 @@ final class Cleaner {
 
         default:
             break
+        }
+
+        // 不管 app 把成片写成什么名字、放在哪一层，只要是视频就列出来。
+        let videos = scanHistoryVideos(target: target, container: container, days: days)
+        out.items += videos.items
+        out.notes += videos.notes
+        return out
+    }
+
+    private func scanHistoryVideos(target: CleanTarget, container: CleanContainer, days: Int) -> RuleResult {
+        var out = RuleResult()
+        let minHours = Double(days) * 24
+        let note = days == 0 ? "视频文件（不限天数）" : "视频文件（\(days) 天前）"
+        for url in findVideoFiles(in: container.url) {
+            if let item = containerItem(
+                category: .history, target: target, container: container, url: url,
+                note: note, minAgeHours: minHours
+            ) {
+                out.items.append(item)
+            }
+        }
+        if !out.items.isEmpty {
+            out.notes.append("「\(target.name)」视频：列了 \(out.items.count) 个（含 Documents / Library / 真实 tmp 的子目录）")
+        }
+        return out
+    }
+
+    private func scanSharedTmpVideos(days: Int) -> RuleResult {
+        var out = RuleResult()
+        let minHours = Double(days) * 24
+        let note = days == 0
+            ? "共享临时区里的视频文件（不限天数，判不出归属）"
+            : "共享临时区里的视频文件（\(days) 天没改动，判不出归属）"
+        let entries = (try? fm.contentsOfDirectory(
+            at: env.tmpDir,
+            includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey, .contentModificationDateKey, .fileSizeKey],
+            options: []
+        )) ?? []
+        for url in entries {
+            let name = url.lastPathComponent
+            guard let f = facts(url), !f.isSymbolicLink, !f.isDirectory,
+                  Self.isVideoName(name), !Self.isForbiddenTmpName(name),
+                  let base = f.modified,
+                  Date().timeIntervalSince(base) >= minHours * 3600 else { continue }
+            out.items.append(CleanItem(
+                category: .history,
+                appName: "共享临时区（所有 app 共用）",
+                bundleID: "",
+                containerName: "共享临时区",
+                url: url,
+                displayPath: "临时区/\(name)",
+                bytes: f.bytes,
+                note: note,
+                isDirectory: false,
+                minAgeHours: minHours,
+                inSharedTmp: true,
+                containerRoot: nil
+            ))
+        }
+        if !out.items.isEmpty {
+            out.notes.append("共享临时区里的视频列了 \(out.items.count) 个，判不出归属，默认不勾选")
+        }
+        return out
+    }
+
+    private func findVideoFiles(in base: URL) -> [URL] {
+        let keys: Set<URLResourceKey> = [
+            .isDirectoryKey, .isSymbolicLinkKey, .isRegularFileKey,
+            .fileSizeKey, .contentModificationDateKey,
+        ]
+        guard let e = fm.enumerator(
+            at: base,
+            includingPropertiesForKeys: Array(keys),
+            options: [],
+            errorHandler: { _, _ in true }
+        ) else { return [] }
+        var out: [URL] = []
+        for case let u as URL in e {
+            guard let v = try? u.resourceValues(forKeys: keys) else { continue }
+            if v.isSymbolicLink == true {
+                e.skipDescendants()
+                continue
+            }
+            if v.isDirectory == true {
+                let name = u.lastPathComponent
+                if Self.videoSkipDirs.contains(name)
+                    || name.hasSuffix(".mlpackage")
+                    || name.hasSuffix(".mlmodelc") {
+                    e.skipDescendants()
+                }
+                continue
+            }
+            if v.isRegularFile == true, Self.isVideoName(u.lastPathComponent) {
+                out.append(u)
+            }
         }
         return out
     }

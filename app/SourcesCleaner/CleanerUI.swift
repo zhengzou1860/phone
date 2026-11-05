@@ -3,7 +3,7 @@ import SwiftUI
 
 @MainActor
 final class CleanerModel: ObservableObject {
-    static let historyOptions = [7, 14, 30, 90]
+    static let historyOptions = [0, 7, 14, 30, 90]
 
     let env: CleanerEnv
 
@@ -262,7 +262,9 @@ struct CleanerRootView: View {
                 }
                 if model.categories.contains(.history) {
                     Divider()
-                    Text("历史保留：只列 \(model.historyDays) 天以前的东西；鼾声最新 3 晚永远保留")
+                    Text(model.historyDays == 0
+                        ? "历史：不限天数，所有视频和旧记录都会列；鼾声最新 3 晚永远保留"
+                        : "历史保留：只列 \(model.historyDays) 天以前的东西；鼾声最新 3 晚永远保留")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     Picker("历史保留", selection: Binding(
@@ -270,7 +272,7 @@ struct CleanerRootView: View {
                         set: { model.historyDays = $0 }
                     )) {
                         ForEach(CleanerModel.historyOptions, id: \.self) { d in
-                            Text("\(d) 天").tag(d)
+                            Text(d == 0 ? "全部" : "\(d) 天").tag(d)
                         }
                     }
                     .pickerStyle(.segmented)
@@ -490,6 +492,7 @@ struct CleanerRootView: View {
                 bullet("LC 会把 <容器>/tmp 做成指向共享临时区的符号链接，这种目录只跳过、不跟随，避免同一批文件被扫两遍；只有 app 自己重建的真实 tmp 目录才逐个清。")
                 bullet("共享临时区认 swap_ / vr3d_ / pick_ / cut_ / LiveIn 五个前缀，另外列顶层后缀 .tmp 的中断下载；都要求 6 小时内没有改动。名字里带 livecontainer / sidestore / altstore 的一律不列。")
                 bullet("容器 Documents 和 Library/Caches 里散落的 .tmp 只删文件；voice_models、nights、samples、swap_idents 和 .mlpackage / .mlmodelc 内部不进去。")
+                bullet("视频按后缀 .mov / .mp4 / .m4v / .avi / .mkv / .webm / .3gp / .mts / .ts 递归扫，改名、放子目录、落在真实 tmp 里都能列出来；循环选「全部」时不限天数。模型包、nights、voice_models、samples、swap_idents、Cookies、Preferences、SystemData、LCAppGroup、Inbox 不进去。")
                 bullet("换脸只删非当前版本的模型包和编译缓存；fsx_arc / fsx_swap、version.txt、chain.txt、archive.part、swap_idents 和语音模型目录都保留，避免重复下载。")
                 bullet("删除前会按同一套规则重新扫描，只有仍然在清单里的路径才会被删；删掉的文件不进系统「最近删除」。")
             }
