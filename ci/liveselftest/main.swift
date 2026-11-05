@@ -343,6 +343,19 @@ ck("cookie 路径不匹配不拼",
 ck("cookie Secure 不往 http 送",
    CookieBridge.header([cookie("v", domain: phost, secure: true)!], for: liveURL) == nil)
 
+// MARK: - 原声跟播的对齐量
+
+// PC 重启后出流改为 640 全分辨率、q70、12.8fps：输出年龄峰值 ~78ms，和输入年龄相加仍在
+// 实测的 155–207ms 一帧附近；公式不变，只是随读数自己变小。
+ck("音频 用两个年龄之和", LiveAudio.measuredDelay(inputMs: 40, outputMs: 160) == 0.2,
+   "\(String(describing: LiveAudio.measuredDelay(inputMs: 40, outputMs: 160)))")
+ck("音频 输出太老不当延迟", LiveAudio.measuredDelay(inputMs: 30, outputMs: 4000) == nil,
+   "/live_start 不清上一轮 latest_frame，闲置很久后的 output_age 是旧账")
+ck("音频 缺读数不当延迟", LiveAudio.measuredDelay(inputMs: nil, outputMs: 100) == nil)
+ck("音频 下限 50ms", LiveAudio.measuredDelay(inputMs: 1, outputMs: 1) == 0.05)
+ck("音频 上限 600ms", LiveAudio.measuredDelay(inputMs: 500, outputMs: 600) == 0.6)
+ck("音频 起播兜底 200ms", LiveAudio.startDelay(inputMs: nil, outputMs: nil) == 0.20)
+
 // MARK: - 判定
 
 if fails == 0 {

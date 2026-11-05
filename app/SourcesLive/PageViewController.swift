@@ -33,6 +33,10 @@ final class PageViewController: UIViewController {
     private var greetedHost = ""
     /// 页面给 <html> 加 .fs 时置 true：原生藏状态栏/Home 指示条，横屏铺满。
     private var pageFullscreen = false
+    /// MJPEG 没有声音，原声在手机上跟播；对齐量见 LiveAudio。
+    private let audio = ClipAudio()
+    /// PC 还没出过新鲜帧（冷启动模型在加载）：声音先不响，等 tick 看到第一帧再对当前画面起播。
+    private var audioWaitingForOutput = false
 
     private var meterTimer: Timer?
     private var lastSentSample = 0
@@ -113,6 +117,8 @@ final class PageViewController: UIViewController {
         guard phase == .pushing else { return }
         pushGen += 1
         video.stop()
+        audio.pause()
+        audioWaitingForOutput = false
         resumeSeconds = clampSeconds(CMTimeGetSeconds(video.currentPTS))
         stopMeter()
         phase = .paused
@@ -182,6 +188,8 @@ final class PageViewController: UIViewController {
         video.onSegmentEnd = { [weak self] in
             guard let self = self else { return }
             self.pushGen += 1
+            self.audio.pause()
+            self.audioWaitingForOutput = false
             self.phase = .loaded
             self.resumeSeconds = 0
             self.stopMeter()
@@ -208,6 +216,12 @@ final class PageViewController: UIViewController {
         c.attachCookieStore(webView.configuration.websiteDataStore.httpCookieStore)
         client = c
         pushGen += 1
+        // 换地址可能发生在推流中：旧 reader 会继续往新 client 发帧（没 /live_start 只会吃 409），
+        // 声音也得一起停。
+        video.stop()
+        stopMeter()
+        audio.pause()
+        audioWaitingForOutput = false
         phase = .none
         resumeSeconds = 0
         greetedHost = ""
@@ -273,6 +287,8 @@ final class PageViewController: UIViewController {
             let wasPaused = phase == .paused
             pushGen += 1
             video.stop()
+            audio.pause()
+            audioWaitingForOutput = false
             let c = client
             Task { @MainActor in
                 await c?.seek()
@@ -380,8 +396,27 @@ final class PageViewController: UIViewController {
             self.lastWarnKey = ""
             self.startMeter()
             self.pushSeek(cur: seconds, total: CMTimeGetSeconds(self.video.duration))
+            self.startAudio(at: seconds, client: client)
             self.status("手机推流中：从 \(LiveTime.clock(seconds)) 起，"
                         + "宽 \(self.video.targetWidth)、\(Int(self.video.pushFPS))fps")
+        }
+    }
+
+    /// 起播声音：延迟读数新鲜就直接落后 L 秒出声；PC 还没出帧（冷启动模型加载中）
+    /// 就先等着，tick 看到第一帧新鲜输出再对着当前画面起播，免得声音在没画面时自己跑远。
+    /// 两个 age 都还是 nil 说明这一轮还没轮询过（第一次点播放），不知道延迟不等于没画面：
+    /// 按兜底值先出声，tick 拿到读数后偏得多再纠一次。
+    private func startAudio(at seconds: Double, client: SwapClient) {
+        if let delay = LiveAudio.measuredDelay(inputMs: client.inputAgeMs,
+                                               outputMs: client.outputAgeMs) {
+            audioWaitingForOutput = false
+            audio.start(at: seconds, delay: delay)
+        } else if client.inputAgeMs == nil && client.outputAgeMs == nil {
+            audioWaitingForOutput = false
+            audio.start(at: seconds, delay: LiveAudio.defaultDelay)
+        } else {
+            audioWaitingForOutput = true
+            audio.pause()
         }
     }
 
@@ -414,6 +449,8 @@ final class PageViewController: UIViewController {
                     // AVAssetReader 开始读以后不能 seek：停手、换 timeRange 重建
                     self.pushGen += 1
                     self.video.stop()
+                    self.audio.pause()
+                    self.audioWaitingForOutput = false
                     self.resumePushing(from: seconds, reason: "跳到 \(LiveTime.clock(seconds))",
                                        needStart: wasPaused, manual: true)
                 } else {
@@ -426,6 +463,8 @@ final class PageViewController: UIViewController {
     private func stopPush(_ note: String) {
         pushGen += 1
         video.stop()
+        audio.pause()
+        audioWaitingForOutput = false
         resumeSeconds = clampSeconds(CMTimeGetSeconds(video.currentPTS))
         phase = .loaded
         stopMeter()
@@ -462,6 +501,18 @@ final class PageViewController: UIViewController {
         guard let client = client, phase == .pushing else { return }
         pushSeek(cur: CMTimeGetSeconds(video.currentPTS),
                  total: CMTimeGetSeconds(video.duration))
+        // 屏幕上现在放的是 reader 送出位置往前 L 秒的那帧；声音跟着它走。
+        // 读数不新鲜说明 PC 还没出帧，先不动，等下一 Tick。
+        if let delay = LiveAudio.measuredDelay(inputMs: client.inputAgeMs,
+                                               outputMs: client.outputAgeMs) {
+            let shown = max(0, CMTimeGetSeconds(video.currentPTS) - delay)
+            if audioWaitingForOutput {
+                audioWaitingForOutput = false
+                audio.start(at: shown, delay: 0)
+            } else {
+                audio.sync(to: shown)
+            }
+        }
         let sent = client.framesSent
         let now = CFAbsoluteTimeGetCurrent()
         let span = max(0.001, now - lastSentTick)
@@ -474,6 +525,8 @@ final class PageViewController: UIViewController {
         // 光看状态码就是「帧在走」。这条得排在重连前面——重连也进不去，只会白试三轮。
         if client.sessionLost {
             video.stop()
+            audio.pause()
+            audioWaitingForOutput = false
             resumeSeconds = clampSeconds(CMTimeGetSeconds(video.currentPTS))
             stopMeter()
             phase = .loaded
@@ -487,6 +540,8 @@ final class PageViewController: UIViewController {
         if client.saw409 != lastSeen409 || !client.pcLiveMode {
             lastSeen409 = client.saw409
             video.stop()
+            audio.pause()
+            audioWaitingForOutput = false
             resumeSeconds = clampSeconds(CMTimeGetSeconds(video.currentPTS))
             stopMeter()
             phase = .loaded
@@ -648,6 +703,8 @@ final class PageViewController: UIViewController {
     private func useClip(_ url: URL, name: String) {
         video.load(url: url)
         guard video.hasClip else { return }     // load 里已经通过 onError 报过了
+        audio.load(url: url)                    // 同步摘音轨：选完马上点播放也来得及
+        audioWaitingForOutput = false
         pushGen += 1
         phase = .loaded
         resumeSeconds = 0
@@ -658,7 +715,8 @@ final class PageViewController: UIViewController {
         let durText = dur.isFinite ? LiveTime.clock(dur) : "-"
         let size = video.naturalSize
         status("已选中 \(name)（\(durText)·\(Int(size.width))×\(Int(size.height))）："
-               + "点「播放」开始推流｜那一格里输 秒数或 mm:ss 再按回车 = 跳到那儿")
+               + "点「播放」开始推流｜那一格里输 秒数或 mm:ss 再按回车 = 跳到那儿"
+               + (audio.hasTrack ? "｜原声在手机上跟播" : "｜这一段没有音轨，只有画面"))
     }
 }
 

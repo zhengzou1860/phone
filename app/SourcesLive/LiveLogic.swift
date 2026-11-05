@@ -47,7 +47,7 @@ enum LiveConfig {
 
     /// 追加到 WKWebView 默认 UA 末尾：PC 那边看 access log 就知道是手机 app 在访问，
     /// 而不是有人在浏览器里手点。
-    static let userAgentSuffix = "LiveSwap/0.11"
+    static let userAgentSuffix = "LiveSwap/0.12"
 
     /// 第一次启动时地址栏里预填的这台：PC 侧现在监听的就是它。
     /// 只当预填和提示用，不当写死的配置——PC 重连 WiFi 以后 IP 会变，
@@ -312,6 +312,28 @@ enum LiveWatch {
     static func warm(outputAgeMs: Int?, maxAgeMs: Int = LiveConfig.warmAgeMs) -> Bool {
         guard let age = outputAgeMs else { return false }
         return age < maxAgeMs
+    }
+}
+
+// MARK: - 原声跟播的对齐量
+
+enum LiveAudio {
+    /// 读不到读数时的兜底：PC 实测这条换脸链一帧 155–207ms。
+    static let defaultDelay: Double = 0.20
+    /// output_age 超过这个数说明 PC 还没开始出帧。`/live_start` 不清上一轮的 latest_frame，
+    /// 这时的年龄是「上一轮留了多久」，不是流水线延迟，不能拿来对音。
+    static let staleOutputMs = 700
+
+    /// 音轨要落后 reader 多少秒：PC 下发的 input_age_ms + output_age_ms。
+    /// 不新鲜就返回 nil：起播时退回 defaultDelay，推流中则先等着，等第一帧新画面出来再对。
+    static func measuredDelay(inputMs: Int?, outputMs: Int?) -> Double? {
+        guard let i = inputMs, let o = outputMs, i >= 0, o >= 0,
+              o < staleOutputMs else { return nil }
+        return min(0.6, max(0.05, Double(i + o) / 1000.0))
+    }
+
+    static func startDelay(inputMs: Int?, outputMs: Int?) -> Double {
+        measuredDelay(inputMs: inputMs, outputMs: outputMs) ?? defaultDelay
     }
 }
 
