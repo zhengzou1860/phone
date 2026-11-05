@@ -10,6 +10,7 @@
 
 判据分三层，少一层都可能把「能跑但画面是错的」发出去：
   ① onnxruntime 对账：证明 CI 下到的这两份权重和 PC 那两份逐字节是同一个行为（字节数只是第一道）；
+     换脸网里 6 个 BatchNormalization 转换器降不了，折进前面的 ConvTranspose 后再对一遍；
   ② 转换器自己 --verify：证明 MIL 改写没把数算歪；
   ③ 落盘读回来的包再预测一遍：手机上用的是这份包，内存里那个转换对象不算数。
 """
@@ -68,6 +69,89 @@ def update_file(h, p, chunk=1 << 22):
             if not b:
                 break
             h.update(b)
+
+
+def fold_batchnorm(model):
+    """把 BatchNormalization 折进前一张卷积——onnx2coreml 降不了 hyperswap 里的这 6 个 BN。
+
+    6 个全挂在 ConvTranspose 后面、后面接 LeakyRelu，都是纯推理式（training_mode=0）：
+      y = scale*(x-mean)/sqrt(var+eps) + bias
+    折进卷积的权重／偏置后逐式等价，转换器就不用再见这个算子。
+    权重保持原 dtype（整张网内部是 fp16），折完本机对 PC 标答 PSNR 79 dB、最大差 1 灰阶。
+    """
+    import onnx
+    from onnx import numpy_helper
+    g = model.graph
+    init = {i.name: i for i in g.initializer}
+    prod = {}
+    for n in g.node:
+        for o in n.output:
+            prod[o] = n
+    cons = {}
+    for n in g.node:
+        for x in n.input:
+            cons[x] = cons.get(x, 0) + 1
+
+    kept = []
+    folded = 0
+    for n in g.node:
+        if n.op_type != 'BatchNormalization':
+            kept.append(n)
+            continue
+        src = prod.get(n.input[0])
+        if src is None or src.op_type not in ('Conv', 'ConvTranspose'):
+            raise RuntimeError('BN 前面不是卷积，没有现成的折法：%s' % n.name)
+        if cons.get(n.input[0], 0) != 1:
+            raise RuntimeError('卷积输出还有别的消费者，折了会改到别的支路：%s' % n.name)
+        groups = next((a.i for a in src.attribute if a.name == 'group'), 1)
+        if groups != 1:
+            raise RuntimeError('group=%d 的卷积没有试过折法：%s' % (groups, src.name))
+        if any(a.name == 'training_mode' and a.i != 0 for a in n.attribute):
+            raise RuntimeError('BN 是训练态，不能按推理式折：%s' % n.name)
+        if src.input[1] not in init or any(x not in init for x in n.input[1:5]):
+            raise RuntimeError('卷积权重或 BN 参数不是常量，折不了：%s' % n.name)
+        eps = next((a.f for a in n.attribute if a.name == 'epsilon'), 1e-5)
+        scale = numpy_helper.to_array(init[n.input[1]]).astype(np.float64)
+        bias = numpy_helper.to_array(init[n.input[2]]).astype(np.float64)
+        mean = numpy_helper.to_array(init[n.input[3]]).astype(np.float64)
+        var = numpy_helper.to_array(init[n.input[4]]).astype(np.float64)
+        k = scale / np.sqrt(var + eps)
+        w0 = numpy_helper.to_array(init[src.input[1]])
+        w = w0.astype(np.float64)
+        # ConvTranspose 的权重是 (in, out/groups, kh, kw)，BN 按输出通道缩放的是第 1 维
+        if w.ndim != 4 or w.shape[1] != k.size:
+            raise RuntimeError('权重 %s 和 BN 通道 %d 对不上：%s' % (w.shape, k.size, src.name))
+        w = w * k[None, :, None, None]
+        has_bias = len(src.input) >= 3
+        if has_bias and src.input[2] not in init:
+            raise RuntimeError('卷积偏置不是常量，折不了：%s' % src.name)
+        b0 = numpy_helper.to_array(init[src.input[2]]).astype(np.float64) if has_bias \
+            else np.zeros(k.size, np.float64)
+        b = (b0 - mean) * k + bias
+        init[src.input[1]].CopyFrom(numpy_helper.from_array(w.astype(w0.dtype), src.input[1]))
+        if has_bias:
+            init[src.input[2]].CopyFrom(numpy_helper.from_array(b.astype(w0.dtype), src.input[2]))
+        else:
+            nb = n.input[1] + '_folded_bias'
+            init[nb] = numpy_helper.from_array(b.astype(w0.dtype), nb)
+            g.initializer.append(init[nb])
+            src.input.append(nb)
+        src.output[0] = n.output[0]
+        folded += 1
+
+    g.ClearField('node')
+    g.node.extend(kept)
+    if any(n.op_type == 'BatchNormalization' for n in g.node):
+        raise RuntimeError('还有 BN 没折掉，转换器照样会栽')
+    used = set()
+    for n in g.node:
+        used.update(n.input)
+    keep = [i for i in g.initializer if i.name in used]
+    if len(keep) != len(g.initializer):
+        g.ClearField('initializer')
+        g.initializer.extend(keep)
+    onnx.checker.check_model(model)
+    return folded
 
 
 def pack_archive(base, files_order, out_bin, out_json, version):
@@ -156,7 +240,7 @@ def main():
         raise RuntimeError('onnx 基线就和 PC 不一致（cos %.6f／PSNR %.2f）⇒ 下到的不是那两份权重'
                            % (cos_onnx, ps_onnx))
 
-    # ---- ② 钉死符号维后落盘（转换器只认文件；w600k_r50 的 batch 维是 pytorch 1.8 留的 None）
+    # ---- ② 钉死符号维、把 BN 折进卷积后落盘（转换器只认文件；w600k_r50 的 batch 维是 pytorch 1.8 留的 None）
     tmp = os.path.join(os.environ.get('RUNNER_TEMP', '/tmp'), 'fsxpack')
     shutil.rmtree(tmp, ignore_errors=True)
     os.makedirs(tmp)
@@ -166,7 +250,18 @@ def main():
     arc_model = P.load_onnx_fixed(arc_onnx)
     sw_model = P.load_onnx_fixed(sw_onnx)
     onnx.save(arc_model, arc_fixed)
+    # onnx2coreml 降不了这张网里的 BatchNormalization（上一趟就栽在 encoder/up_samples 的 BN 上）：
+    # 折进前面的 ConvTranspose 再转，折完必须拿同一套标准答案再对一遍——折错就是整片脸都错。
+    n_bn = fold_batchnorm(sw_model)
     onnx.save(sw_model, sw_fixed)
+    ss = ort.InferenceSession(sw_fixed, providers=['CPUExecutionProvider'])
+    out_fold, _ = P.ort_swap_tuned(ss, tgt, ref_emb, 0.5, 0.5, True)
+    del ss
+    mx_f, mn_f, ps_f = P.img_diff(out_fold / 255.0, out_ref)
+    P.log('FXP-FOLD', 'BatchNorm %d 个折进卷积｜折后 vs PC max=%.2f mean=%.3f 灰阶 PSNR=%.2f dB'
+          % (n_bn, mx_f, mn_f, ps_f))
+    if ps_f < MIN_SWAP_PSNR:
+        raise RuntimeError('BN 折完对不上 PC 标答（PSNR %.2f）' % ps_f)
 
     # ---- ④ 两张各转 fp32 一遍，转完立刻从盘上读回来对账
     rec = {}
