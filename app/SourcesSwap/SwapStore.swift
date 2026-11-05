@@ -146,6 +146,10 @@ enum SwapStore {
             return "已下好 版本 \(localVersion().prefix(12))…｜两张网齐（\(chainTag)）｜点核对只比版本，不会重下"
         }
         let v = localVersion()
+        let kept = dir.map { FileManager.default.fileExists(atPath: $0.appendingPathComponent("archive.part").path) } ?? false
+        if kept {
+            return "没下齐（盘上版本 \(v.prefix(12))… 不全）｜盘上留着上次的归档：对得上清单就直接解、不重下"
+        }
         return v.isEmpty ? "没下（点「下模型」，或直接开始换脸会自动下）"
                          : "没下齐（盘上版本 \(v.prefix(12))… 不全）"
     }
