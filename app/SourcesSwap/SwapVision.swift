@@ -21,6 +21,15 @@ enum SwapVision {
                height: rect.height * CGFloat(h))
     }
 
+    /// 相邻两格的框是不是「同一张脸该有的大小」。同一人走近/走远一格变不了两倍；
+    /// 没有这一关，路过的小脸会接上大脸的轨迹把人认错（上机 11-05 换错路人的那条路）。
+    static func sameScale(_ a: CGRect, _ b: CGRect) -> Bool {
+        let aw = Double(max(a.width, 1)), ah = Double(max(a.height, 1))
+        let bw = Double(max(b.width, 1)), bh = Double(max(b.height, 1))
+        let rw = bw / aw, rh = bh / ah
+        return rw > 0.5 && rw < 2.0 && rh > 0.5 && rh < 2.0
+    }
+
     /// 只有框没有五官点时的 5 点近似（框内固定比例）。退回这一档时分数会掉，必须报出来。
     static func keypoints(from box: CGRect) -> [CGPoint] {
         let x = box.minX, y = box.minY, w = box.width, h = box.height

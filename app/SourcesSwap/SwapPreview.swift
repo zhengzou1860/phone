@@ -68,7 +68,7 @@ final class SwapPreview {
     private var pasteScratch = FsxGeo.PasteScratch()
     private var decodeMs: [Double] = [], detectMs: [Double] = [], warpMs: [Double] = []
     private var frameMs: [Double] = [], pasteMs: [Double] = [], swapMs: [Double] = []
-    private var nSwap = 0, nFaces = 0, nDecode = 0, noFace = 0, unmatched = 0
+    private var nSwap = 0, nPub = 0, nFaces = 0, nDecode = 0, noFace = 0, unmatched = 0
     private var smallFace = 0, mirror = 0, fitFail = 0, netFail = 0, nTracks = 0
     /// 被手性闸门挡下的帧分两拨：点是从 Vision 五官来的、还是只按脸框猜的
     private var mirrorReal = 0, mirrorGuess = 0
@@ -82,9 +82,9 @@ final class SwapPreview {
         var member: Int
         var cos: Double
         var lastBox: CGRect
-        var lastTick: Int
+        var lastSec: Double
         var samples: Int
-        var sampleAt: Int
+        var sampleAt: Double
     }
 
     private struct PFace {
@@ -233,7 +233,7 @@ final class SwapPreview {
         face = [Float](repeating: 0, count: 3 * side * side)
         decodeMs = []; detectMs = []; warpMs = []; frameMs = []
         pasteMs = []; swapMs = []
-        nSwap = 0; nFaces = 0; nDecode = 0; noFace = 0; unmatched = 0
+        nSwap = 0; nPub = 0; nFaces = 0; nDecode = 0; noFace = 0; unmatched = 0
         smallFace = 0; mirror = 0; fitFail = 0; netFail = 0; nTracks = 0
         mirrorReal = 0; mirrorGuess = 0; gapN = 0; gapMax = 0
 
@@ -253,15 +253,19 @@ final class SwapPreview {
             return .stop
         }
         let req = VNDetectFaceLandmarksRequest()
-        let tick = 1.0 / max(1.0, c.fpsTarget)
+        // 格距从 1/16 s 起，算不过来按实测单价放稀（见每格末尾）：一张换脸网 128 ms，
+        // 16 格/秒要 2.4 s 算 1 s 素材，A13 的 CPU 给不出这个数。硬按 16 格跑就是 11-05 那一趟：
+        // 素材每 1 s 只走 0.56 s，看着又慢又顿。
+        let baseTick = 1.0 / max(1.0, c.fpsTarget)
+        var tick = baseTick
+        var cellAvg = 0.0
         let fps = max(1.0, src.fps)
         say("预览开跑 进链 \(src.outW)x\(src.outH)｜从 \(String(format: "%.2f", fromSec)) s"
-            + "｜每 1/\(String(format: "%.0f", c.fpsTarget)) s 换一格新画面"
+            + "｜格距 1/\(String(format: "%.0f", c.fpsTarget)) s 起，按实测单价自动放稀（目标：素材 1 s 走 1 s）"
             + "｜目标表 " + castLabel(cast))
         confirm(castLabel(cast))
 
-        var lastTick = -1
-        var tickSeq = 0
+        var nextCellSec = fromSec
         var tracks: [PTrack] = []
         var nextTrack = 0
         var basePTS: CMTime = .zero
@@ -297,17 +301,18 @@ final class SwapPreview {
                 lastSec = sec
                 if !started { anchorWall = seconds(); anchorSec = sec; started = true }
 
-                let n = Int((sec / tick).rounded())
-                if n != lastTick {
-                    lastTick = n
-                    tickSeq += 1
+                if sec + 0.001 >= nextCellSec {
+                    nextCellSec = sec + tick
                     let ts = ns()
                     let t1 = ns()
                     let (obs, derr) = SwapVision.faces(pb, req)
                     if !derr.isEmpty { say("预览检测抛错：\(derr)") }
                     detectMs.append(msFrom(t1))
-                    // 隔两格没再见到就当归档：出画再回来会另起一条轨迹、重新认一次人
-                    tracks.removeAll { tickSeq - $0.lastTick > 2 }
+                    // 连着 0.3 s 素材没再见到才当归档：Vision 偶尔漏一格，丢早了同一个人会被切成
+                    // 两条轨迹、每条都重认一次，轨迹边界上还会来回换人。出画再回来仍会另起一条、重新认一次。
+                    // 按素材秒数而不是格数：格距现在会跟着单价放稀（16 格/秒 → 最稀 2.5 格/秒），
+                    // 按格数算的话格距一变，归档窗口就跟着从 0.25 s 漂到 1.6 s。
+                    tracks.removeAll { sec - $0.lastSec > 0.30 }
                     if SwapVision.yTopLeftOrigin == nil,
                        let l = SwapVision.largest(obs, w: frameW, h: frameH),
                        let line = SwapVision.settleOriginStrict(face: obs[l.index]) {
@@ -341,7 +346,8 @@ final class SwapPreview {
                         }
                         var best = -1
                         var bestIoU = 0.0
-                        for (ti, t) in tracks.enumerated() where !used.contains(t.id) {
+                        for (ti, t) in tracks.enumerated()
+                        where !used.contains(t.id) && SwapVision.sameScale(box, t.lastBox) {
                             let v = iou(box, t.lastBox)
                             if v > bestIoU { bestIoU = v; best = ti }
                         }
@@ -349,7 +355,8 @@ final class SwapPreview {
                         if best < 0 || bestIoU < 0.25 {
                             var near = -1
                             var nearD = Double.greatestFiniteMagnitude
-                            for (ti, t) in tracks.enumerated() where !used.contains(t.id) {
+                            for (ti, t) in tracks.enumerated()
+                            where !used.contains(t.id) && SwapVision.sameScale(box, t.lastBox) {
                                 let dx = Double(box.midX - t.lastBox.midX)
                                 let dy = Double(box.midY - t.lastBox.midY)
                                 let d = (dx * dx + dy * dy).squareRoot()
@@ -363,9 +370,10 @@ final class SwapPreview {
                             used.insert(tracks[best].id)
                             var t = tracks[best]
                             t.lastBox = box
-                            t.lastTick = tickSeq
-                            // 轨迹开头那一格可能是运动糊的：隔十格再认一次，余弦更高的那次说了算
-                            if t.samples < 2, tickSeq >= t.sampleAt {
+                            t.lastSec = sec
+                            // 轨迹开头那一格可能是运动糊的：隔 0.6 s 素材再认一次，余弦更高的那次说了算。
+                            // 脸太小时不采（上采样出来的余弦不算数），等它长到 identMinPx 再采。
+                            if t.samples < 2, sec >= t.sampleAt, sd >= SwapCast.identMinPx {
                                 let got = identify(pb, pl: pl, engine: engine, cast: cast)
                                 if got.member >= 0, got.cos > t.cos {
                                     t.member = got.member
@@ -376,18 +384,26 @@ final class SwapPreview {
                                     }
                                 }
                                 t.samples += 1
-                                t.sampleAt = tickSeq + 10
+                                t.sampleAt = sec + 0.6
                             }
                             member = t.member
                             tracks[best] = t
                         } else {
-                            let got = identify(pb, pl: pl, engine: engine, cast: cast)
+                            // 小脸上的身份证全是上采样噪声：这一格不认，轨迹先留着，等脸够大再采
+                            let canId = sd >= SwapCast.identMinPx
+                            let got = canId ? identify(pb, pl: pl, engine: engine, cast: cast)
+                                            : (member: -1, best: -1, cos: -9.0)
                             member = got.member
                             tracks.append(PTrack(id: nextTrack, member: member, cos: got.cos,
-                                                 lastBox: box, lastTick: tickSeq,
-                                                 samples: 1, sampleAt: tickSeq + 10))
+                                                 lastBox: box, lastSec: sec,
+                                                 samples: canId ? 1 : 0,
+                                                 sampleAt: canId ? sec + 0.6 : sec))
                             nextTrack += 1
-                            if got.cos > -8 {
+                            if !canId {
+                                say("预览 新轨迹 \(nextTrack - 1) 第 \(nDecode) 帧（\(String(format: "%.2f", sec)) s）短边 "
+                                    + String(format: "%.0f", sd) + " px｜脸太小，先不认（要 "
+                                    + String(format: "%.0f", SwapCast.identMinPx) + " px）→ 不动")
+                            } else if got.cos > -8 {
                                 say("预览 新轨迹 \(nextTrack - 1) 第 \(nDecode) 帧（\(String(format: "%.2f", sec)) s）短边 "
                                     + String(format: "%.0f", sd) + " px｜最近 \(got.best >= 0 ? cast[got.best].targetLabel : "—")"
                                     + " 余弦 \(String(format: "%.3f", got.cos))"
@@ -404,22 +420,40 @@ final class SwapPreview {
                         }
                         faces.append(PFace(pl: pl, member: member))
                     }
+                    var painted = 0
                     if !faces.isEmpty {
-                        if SwapTech.copyRows(from: pb, to: hd),
-                           compose(engine, faces: faces, cast: cast) > 0 {
-                            nSwap += 1
-                            let hold = sec - lastPub
-                            if hold > 0.25 { gapN += 1; gapMax = max(gapMax, hold) }
-                            lastPub = sec
-                            publish(dst)
+                        if SwapTech.copyRows(from: pb, to: hd) {
+                            painted = compose(engine, faces: faces, cast: cast)
+                            if painted > 0 { nSwap += 1 } else { netFail += 1 }
                         } else {
                             netFail += 1
                         }
-                    } else {
-                        if obs.isEmpty { noFace += 1 }
+                    } else if obs.isEmpty {
+                        noFace += 1
                     }
+                    // 没换到脸也把这一格原片递出去。以前只递换过的格：目标不在画面的那几秒
+                    // 界面一直摆着上一张带补丁的旧图（上机 11-05 最长 9.18 s），看着既卡，
+                    // 又像那块补丁自己在画面上飘——其实画面根本没往前走。
+                    publish(painted > 0 ? dst : pb)
+                    nPub += 1
+                    // 格距放稀到 0.4 s 是故意的（算不过来就跳帧保速度），不算卡住：
+                    // 这里只记超过 0.5 s 的停顿，那才是真被什么事挡住了。
+                    let hold = sec - lastPub
+                    if hold > 0.5 { gapN += 1; gapMax = max(gapMax, hold) }
+                    lastPub = sec
                     nTracks = max(nTracks, tracks.count)
-                    swapMs.append(msFrom(ts))
+                    let cellWall = msFrom(ts)
+                    swapMs.append(cellWall)
+                    // 这一格真换过脸 ⇒ 用它的墙钟给下一格定格距：算得比 1/16 s 慢就放稀，
+                    // 放到「1 s 素材≈1 s 墙钟」为止（×1.08 补上跳帧本身要读的那几格）。
+                    // 没换脸的格只有检测＋递画面，便宜，格距立刻收回 1/16 s，画面就不会白白变稀。
+                    if painted > 0 {
+                        cellAvg = cellAvg <= 0 ? cellWall : cellAvg * 0.8 + cellWall * 0.2
+                        tick = min(0.4, max(baseTick, cellAvg / 1000 * 1.08))
+                    } else {
+                        cellAvg *= 0.85
+                        tick = baseTick
+                    }
                 }
                 sleepTo = anchorWall + (sec - anchorSec)
                 if sec - lastStat >= 1.0 {
@@ -528,19 +562,20 @@ final class SwapPreview {
         let unit = avg(detectMs) + avg(warpMs) + avg(frameMs) + avg(pasteMs)
         let need = unit * c.fpsTarget + avg(decodeMs) * fps
         let rate = wall > 0.1 ? Double(nSwap) / wall : 0
-        let verdict = rate >= c.fpsTarget - 0.6 ? "够 16 帧"
-            : (need <= 1000 ? "算着够、这一趟没跑到（素材短或停在开头）" : "不够 16 帧")
+        let advance = play / max(wall, 0.01)
+        let verdict = advance >= 0.9 ? "格距已按单价放稀，素材按真实速度走（16 格/秒给不出）"
+            : (need <= 1000 ? "算着够、这一趟没跑到（素材短或停在开头）" : "还不够 1×")
         say("预览单价 每换一格 \(String(format: "%.2f", unit)) ms＝检测 \(SwapUtil.stat(detectMs))"
             + "＋裁 256 \(SwapUtil.stat(warpMs))＋换脸网整次 \(SwapUtil.stat(frameMs))"
             + "＋画布重铺＋贴回 \(SwapUtil.stat(pasteMs))")
         say("      \(engine?.statsLine() ?? "网没装上（这一趟没跑到）")")
         say("      解码 \(SwapUtil.stat(decodeMs))×\(String(format: "%.1f", fps)) 帧/秒"
             + "｜整帧含节奏 \(SwapUtil.stat(swapMs))")
-        say("      这一趟 换出 \(nSwap) 格／共换 \(nFaces) 张脸／读掉 \(nDecode) 格｜轨迹最多 \(nTracks) 条"
+        say("      这一趟 换出 \(nSwap) 格／共换 \(nFaces) 张脸／递出 \(nPub) 格／读掉 \(nDecode) 格｜轨迹最多 \(nTracks) 条"
             + "｜没脸 \(noFace)｜目标表外 \(unmatched)｜太小 \(smallFace)｜拟合没过 \(fitFail)"
             + "｜镜像 \(mirror)（真点位 \(mirrorReal)／框猜 \(mirrorGuess)）｜画不出 \(netFail)｜点位 \(pointSrc)")
-        say("      画面停住 超过 0.25 s 素材 \(gapN) 次｜最长 \(String(format: "%.2f", gapMax)) s"
-            + "（一格没换新东西就一直摆着上一格，卡顿先按这一条分账：停住＝被挡的格多，不掉＝单价跑不满 16 帧）")
+        say("      画面停住 超过 0.5 s 素材 \(gapN) 次｜最长 \(String(format: "%.2f", gapMax)) s"
+            + "（每格都递；格距放稀到 0.4 s 是故意的，超过 0.5 s 才是真卡住）")
         say("      16 帧/秒这笔账 \(String(format: "%.2f", unit)) ms×\(String(format: "%.0f", c.fpsTarget))"
             + "＋解码 \(String(format: "%.1f", avg(decodeMs) * fps)) ms＝每播 1 s 素材要 \(String(format: "%.0f", need)) ms（一秒 1000 ms）"
             + "｜实测出画 \(String(format: "%.1f", rate)) 帧/真实秒、素材推进 \(String(format: "%.2f", play / max(wall, 0.01)))×"
