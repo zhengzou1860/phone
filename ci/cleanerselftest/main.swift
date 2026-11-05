@@ -182,6 +182,7 @@ writeText("incoming", to: tmp.appendingPathComponent("LiveIn/incoming.mp4"))
 makeOld(tmp.appendingPathComponent("swap_old.tmp"), hours: 10)
 makeOld(tmp.appendingPathComponent("cut_old.tmp"), hours: 10)
 makeOld(tmp.appendingPathComponent("not_ours.bin"), hours: 10)
+makeOld(tmp.appendingPathComponent("LiveIn"), hours: 10)
 makeOld(tmp.appendingPathComponent("LiveIn/incoming.mp4"), hours: 10)
 
 // MARK: 发现
