@@ -1,0 +1,163 @@
+name: build-cleaner-ipa
+
+# 清理助手（com.qoder.cleaner）自己的分支、自己的发布位。
+# 关键不是「编过」，而是「只删白名单 container」：CI 先拿假 LiveContainer 目录跑安全自检，
+# 不过 CLEANER-VERDICT PASS 就不出包——那种包装到手机上可能连别人的文件一起删。
+on:
+  push:
+    branches: [cleaner]
+    paths:
+      - 'app/SourcesCleaner/**'
+      - 'app/project-cleaner.yml'
+      - 'ci/cleanerselftest/**'
+      - '.github/workflows/build-cleaner.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cleaner
+  cancel-in-progress: true
+
+jobs:
+  cleaner:
+    runs-on: macos-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: show toolchain
+        run: sw_vers && xcodebuild -version && xcodebuild -showsdks | grep -i ios
+
+      # 本机是 Windows，没有 Swift 工具链：容器发现、路径闸门、删除前复核一次都没被真编译器跑过。
+      # 这里用假 LiveContainer 目录把「只认白名单、符号链接跳过、当前模型保留、LC/SideStore 不碰」跑成 CASE。
+      - name: 清理安全自检（不过就不出包）
+        run: |
+          set -o pipefail
+          rec() { tee -a /tmp/selftest.log; }
+          touch /tmp/selftest.log /tmp/build.log
+          xcrun swiftc -swift-version 5 -O \
+            app/SourcesCleaner/CleanerCore.swift \
+            ci/cleanerselftest/main.swift \
+            -o /tmp/cleanertest 2>&1 | rec
+          if [ ! -x /tmp/cleanertest ]; then echo "CLEANER-VERDICT FAIL 自检没编出来，见上面编译错" | rec; exit 1; fi
+          /tmp/cleanertest 2>&1 | rec
+          grep -q "^CLEANER-VERDICT PASS" /tmp/selftest.log || { echo "上面每一条 CASE 就是没过的判据" | rec; exit 1; }
+
+      - name: install xcodegen
+        run: |
+          set -euo pipefail
+          curl -sL -o /tmp/xg.zip https://github.com/yonaskolb/XcodeGen/releases/download/2.46.0/xcodegen.zip
+          rm -rf /tmp/xg && unzip -q /tmp/xg.zip -d /tmp/xg
+          sudo /tmp/xg/xcodegen/install.sh
+          xcodegen --version
+
+      - name: generate project
+        working-directory: app
+        run: xcodegen --spec project-cleaner.yml
+
+      - name: build
+        working-directory: app
+        run: |
+          set -euo pipefail
+          rm -rf build
+          xcodebuild -project CleanerBench.xcodeproj -scheme CleanerBench \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY= EXPANDED_CODE_SIGN_IDENTITY= \
+            build 2>&1 | tee -a /tmp/build.log
+
+      - name: package ipa
+        working-directory: app
+        run: |
+          set -euo pipefail
+          ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=8{print "::error::" p substr($0,1,230)}'; }
+          rec() { tee -a /tmp/selftest.log; }
+          APP=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' | head -1)
+          test -n "$APP"
+          echo "built app: $APP" >> /tmp/build.log
+          file "$APP/CleanerBench" | tee -a /tmp/build.log
+          plutil -p "$APP/Info.plist" > /tmp/infoplist.txt 2>&1
+          pid=$(awk -F' => ' '/"CFBundleIdentifier"/{gsub(/"/,"",$2); print $2; exit}' /tmp/infoplist.txt)
+          pver=$(awk -F' => ' '/"CFBundleShortVersionString"/{gsub(/"/,"",$2); print $2; exit}' /tmp/infoplist.txt)
+          pname=$(awk -F' => ' '/"CFBundleDisplayName"/{gsub(/"/,"",$2); print $2; exit}' /tmp/infoplist.txt)
+          echo "I-VERDICT 包 id=$pid 版本=$pver 显示名=$pname" | rec
+          # 包 id 缺了手机装不上，版本缺了分不清装的是哪一轮，包 id 不对则会清错对象——三条都是闸门。
+          if [ "$pid" != "com.qoder.cleaner" ] || [ -z "$pver" ]; then
+            echo "::error::I-VERDICT 包里的 Info.plist 不对（id=[$pid] 版本=[$pver]）——这包不能上手机，不出"
+            exit 1
+          fi
+          rm -rf Payload cleaner.ipa
+          mkdir Payload
+          cp -R "$APP" Payload/
+          ditto -c -k --keepParent Payload cleaner.ipa
+          ls -la cleaner.ipa | tee -a /tmp/build.log
+
+      - name: publish release
+        working-directory: app
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set +e
+          ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=6{print "::error::" p substr($0,1,230)}'; }
+          cat /tmp/selftest.log /tmp/build.log > ./build.log 2>/dev/null || cp /tmp/build.log ./build.log
+          echo "待发文件 [cleaner.ipa build.log]" | ann "REL "
+          # 不删了重发：删这一下下载位就出现空窗。先建已发布的 release（不带文件），再用 upload --clobber 传。
+          gh release view channel-cleaner >/dev/null 2>&1 || gh release create channel-cleaner \
+            --title "CleanerBench build" --prerelease --notes "CI artifact（占位，等 asset 上传）" 2>&1 | ann "REL "
+          gh release upload channel-cleaner cleaner.ipa build.log --clobber 2>&1 | ann "REL "
+          gh release edit channel-cleaner --draft=false --prerelease >/dev/null 2>&1
+          RID=$(gh release view channel-cleaner --json id --jq .id 2>/dev/null)
+          curl -sS -X PATCH \
+            -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/$RID" \
+            -d '{"draft":false,"prerelease":true,"tag_name":"channel-cleaner","name":"CleanerBench build","body":"CI artifact for commit '"$GITHUB_SHA"'"}' \
+            >/tmp/rel_patch.json 2>&1
+          echo "R-PATCH id=$RID 回包=$(head -c 120 /tmp/rel_patch.json | tr -d '\n')" | ann "REL "
+          echo "url=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/channel-cleaner/cleaner.ipa" | ann "REL "
+          # 闸门三条同时满足才算数：isDraft=false（草稿 SideStore 拉不到）＋列到 cleaner.ipa＋匿名 HEAD 回 200
+          hit=0
+          for i in 1 2 3; do
+            draft=$(gh release view channel-cleaner --json isDraft --jq .isDraft 2>&1)
+            names=$(gh release view channel-cleaner --json assets --jq '.assets[] | .name + "=" + (.size|tostring)' 2>&1 | tr '\n' ' ')
+            anon=$(curl -sIL -o /dev/null -w '%{http_code}' --max-time 90 \
+              "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/channel-cleaner/cleaner.ipa" 2>/dev/null)
+            echo "第 $i 次：isDraft=$draft｜匿名 HEAD ipa=$anon｜ [$names]" | ann "REL-GATE "
+            if [ "$draft" = "false" ] && [ "$anon" = 200 ]; then
+              case "$names" in *cleaner.ipa*) hit=1 ;; esac
+              [ "$hit" = 1 ] && break
+            fi
+            sleep 10
+          done
+          [ "$hit" = 1 ] || echo "::error::REL-GATE 三次都没同时满足「isDraft=false」+「列到 cleaner.ipa」+「匿名 HEAD 回 200」⇒ 这一版手机上拿不到"
+          if [ "$hit" = 1 ]; then exit 0; else exit 1; fi
+
+      - name: report compile errors
+        if: failure()
+        working-directory: app
+        run: |
+          set +e
+          ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=8{print "::error::" p substr($0,1,230)}'; }
+          cat /tmp/selftest.log /tmp/build.log > ./build.log 2>/dev/null || cp /tmp/build.log ./build.log 2>/dev/null || echo "no build log at all" > ./build.log
+          grep -nE "error:|fatal error:" ./build.log | ann "ERR "
+          exit 0
+
+      - name: report failure log
+        if: failure()
+        working-directory: app
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set +e
+          ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=6{print "::error::" p substr($0,1,230)}'; }
+          cat /tmp/selftest.log /tmp/build.log > ./build.log 2>/dev/null || cp /tmp/build.log ./build.log 2>/dev/null || echo "no build log at all" > ./build.log
+          echo "待发文件 [build.log]" | ann "GH-FAIL "
+          gh release delete channel-cleaner-fail --cleanup-tag -y >/dev/null 2>&1 || true
+          gh release create channel-cleaner-fail build.log \
+            --title "CleanerBench CI failed log" \
+            --prerelease \
+            --notes "no ipa this round" 2>&1 | ann "GH-FAIL "
+          exit 0

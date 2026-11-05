@@ -1,0 +1,42 @@
+name: CleanerBench
+options:
+  createIntermediateGroups: true
+  deploymentTarget:
+    iOS: "18.0"
+settings:
+  base:
+    CODE_SIGNING_ALLOWED: "NO"
+    CODE_SIGNING_REQUIRED: "NO"
+    CODE_SIGN_IDENTITY: ""
+    IPHONEOS_DEPLOYMENT_TARGET: "18.0"
+targets:
+  CleanerBench:
+    type: application
+    platform: iOS
+    sources:
+      - SourcesCleaner
+    info:
+      path: Info-Cleaner.plist
+      properties:
+        CFBundleDisplayName: 清理助手
+        CFBundleName: CleanerBench
+        CFBundleExecutable: CleanerBench
+        CFBundleIdentifier: com.qoder.cleaner
+        CFBundlePackageType: APPL
+        CFBundleShortVersionString: "0.1"
+        CFBundleVersion: "1"
+        CFBundleInfoDictionaryVersion: "6.0"
+        LSRequiresIPhoneOS: true
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.qoder.cleaner
+        PRODUCT_NAME: CleanerBench
+        TARGETED_DEVICE_FAMILY: "1"
+        ARCHS: arm64
+        SWIFT_VERSION: "5.0"
+        SWIFT_STRICT_CONCURRENCY: minimal
+        ENABLE_BITCODE: "NO"
+        GENERATE_INFOPLIST_FILE: "NO"

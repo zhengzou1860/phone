@@ -1,0 +1,498 @@
+import Combine
+import SwiftUI
+
+@MainActor
+final class CleanerModel: ObservableObject {
+    static let historyOptions = [7, 14, 30, 90]
+
+    let env: CleanerEnv
+
+    @Published var categories: Set<CleanCategory> = [.junk, .model] {
+        didSet { scan() }
+    }
+
+    @Published var historyDays: Int = 30 {
+        didSet {
+            if categories.contains(.history) { scan() }
+        }
+    }
+
+    @Published private(set) var items: [CleanItem] = []
+    @Published private(set) var notes: [String] = []
+    @Published private(set) var selected: Set<String> = []
+    @Published private(set) var scanning = false
+    @Published private(set) var deleting = false
+    @Published private(set) var resultLines: [String] = []
+    @Published private(set) var lastSummary = "还没扫描"
+    @Published private(set) var lastScanDate: Date?
+    @Published var showDeleteConfirm = false
+
+    private var scanTask: Task<Void, Never>?
+    private var generation = 0
+
+    init() {
+        env = CleanerDiscovery.discover()
+        scan()
+    }
+
+    var selectedBytes: Int64 {
+        items.filter { selected.contains($0.id) }.reduce(Int64(0)) { $0 + $1.bytes }
+    }
+
+    func hasCategory(_ cat: CleanCategory) -> Bool { categories.contains(cat) }
+
+    func setCategory(_ cat: CleanCategory, on: Bool) {
+        if on {
+            categories.insert(cat)
+        } else {
+            categories.remove(cat)
+        }
+    }
+
+    func isSelected(_ item: CleanItem) -> Bool { selected.contains(item.id) }
+
+    func toggleSelection(_ item: CleanItem) {
+        if selected.contains(item.id) {
+            selected.remove(item.id)
+        } else {
+            selected.insert(item.id)
+        }
+    }
+
+    func selectAll() { selected = Set(items.map(\.id)) }
+
+    func clearSelection() { selected.removeAll() }
+
+    func count(_ cat: CleanCategory) -> Int {
+        items.reduce(0) { $0 + ($1.category == cat ? 1 : 0) }
+    }
+
+    func bytes(_ cat: CleanCategory) -> Int64 {
+        items.reduce(Int64(0)) { $0 + ($1.category == cat ? $1.bytes : 0) }
+    }
+
+    func scan() {
+        guard !deleting else { return }
+        let cats = categories
+        let days = historyDays
+        generation += 1
+        let gen = generation
+        scanTask?.cancel()
+        scanning = true
+        let env = self.env
+        scanTask = Task.detached(priority: .userInitiated) { [weak self] in
+            let result = Cleaner(env: env).scan(categories: cats, historyDays: days)
+            await MainActor.run {
+                guard let self, gen == self.generation else { return }
+                self.apply(result)
+                self.scanning = false
+            }
+        }
+    }
+
+    func deleteSelected() {
+        guard !selected.isEmpty, !deleting else { return }
+        let chosen = items.filter { selected.contains($0.id) }
+        let cats = categories
+        let days = historyDays
+        let env = self.env
+        deleting = true
+        scanTask?.cancel()
+        Task.detached(priority: .userInitiated) { [weak self] in
+            let outcome = Cleaner(env: env).delete(items: chosen, categories: cats, historyDays: days)
+            await MainActor.run {
+                guard let self else { return }
+                self.deleting = false
+                self.apply(outcome.fresh)
+                self.resultLines = outcome.lines
+                self.resultLines.insert(
+                    "这次删掉 \(outcome.deleted) 项，回收 \(CleanFormat.bytes(outcome.freed))；失败 \(outcome.failed)，跳过 \(outcome.skipped)",
+                    at: 0
+                )
+                self.resultLines.append(
+                    "删除后重新扫描：还剩 \(outcome.fresh.items.count) 项｜\(CleanFormat.bytes(outcome.fresh.totalBytes))"
+                )
+            }
+        }
+    }
+
+    private func apply(_ result: ScanResult) {
+        items = result.items
+        notes = result.notes
+        selected = Set(result.items.map(\.id))
+        lastSummary = "\(result.items.count) 项｜\(CleanFormat.bytes(result.totalBytes))"
+        lastScanDate = Date()
+    }
+}
+
+struct CleanerRootView: View {
+    @StateObject private var model = CleanerModel()
+
+    private struct AppGroup: Identifiable {
+        let name: String
+        let items: [CleanItem]
+        var bytes: Int64 { items.reduce(Int64(0)) { $0 + $1.bytes } }
+        var id: String { name }
+    }
+
+    private var groups: [AppGroup] {
+        let dict = Dictionary(grouping: model.items, by: { $0.appName })
+        return dict.keys.sorted().map { AppGroup(name: $0, items: dict[$0] ?? []) }
+    }
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    environmentCard
+                    categoryCard
+                    actionCard
+                    if !model.items.isEmpty || model.scanning {
+                        listCard
+                    }
+                    if !model.notes.isEmpty {
+                        notesCard
+                    }
+                    if !model.resultLines.isEmpty {
+                        resultCard
+                    }
+                    safetyCard
+                    Text("清理助手 0.1｜只清你写在 LiveContainer 里的 app，不碰 LiveContainer 和 SideStore 自己的文件")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .center)
+                        .padding(.bottom, 8)
+                }
+                .padding(16)
+            }
+            .background(Color(.systemGroupedBackground))
+            .navigationTitle("清理助手")
+            .refreshable { model.scan() }
+            .alert("确认删除这 \(model.selected.count) 项？", isPresented: $model.showDeleteConfirm) {
+                Button("取消", role: .cancel) {}
+                Button("删除", role: .destructive) { model.deleteSelected() }
+            } message: {
+                Text("合计 \(CleanFormat.bytes(model.selectedBytes))。删除前会重新扫描并复核容器身份，刚被改过的文件会自动跳过；删掉的文件不进系统「最近删除」。")
+            }
+        }
+        .tint(.orange)
+    }
+
+    // MARK: 环境
+
+    private var environmentCard: some View {
+        GroupBox {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 8) {
+                    Image(systemName: model.env.insideLC ? "checkmark.seal.fill" : "exclamationmark.triangle.fill")
+                        .foregroundStyle(model.env.insideLC ? Color.green : Color.orange)
+                    Text(model.env.insideLC ? "已找到 LiveContainer 主目录" : "没找到 LiveContainer 主目录")
+                        .font(.subheadline.weight(.semibold))
+                    Spacer()
+                }
+                Text("白名单 \(CleanerDiscovery.apps.count) 个 app｜找到 \(model.env.containerCount) 个数据容器")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if !model.env.insideLC {
+                    Text("清理助手必须和被清理的 app 装在同一个 LiveContainer 里；它看不到别的 LiveContainer，也不会去碰 LiveContainer / SideStore 自己的目录。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                DisclosureGroup("路径与环境说明") {
+                    VStack(alignment: .leading, spacing: 8) {
+                        labeledPath("LC 主目录", model.env.lcHome?.path ?? "—")
+                        ForEach(model.env.dataRoots, id: \.path) { labeledPath("数据目录", $0.path) }
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("只认这些包名（完全相等）：").font(.caption2).foregroundStyle(.secondary)
+                            Text(CleanerDiscovery.apps.map { "\($0.name)　\($0.bundleID)" }.joined(separator: "\n"))
+                                .font(.caption2.monospaced())
+                                .textSelection(.enabled)
+                        }
+                        if !model.env.notes.isEmpty {
+                            VStack(alignment: .leading, spacing: 3) {
+                                ForEach(model.env.notes, id: \.self) { note in
+                                    Text("• \(note)")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                }
+                            }
+                        }
+                    }
+                    .padding(.top, 4)
+                }
+                .font(.footnote)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private func labeledPath(_ label: String, _ path: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(label).font(.caption2).foregroundStyle(.secondary)
+            Text(path)
+                .font(.caption2.monospaced())
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    // MARK: 范围
+
+    private var categoryCard: some View {
+        GroupBox {
+            VStack(alignment: .leading, spacing: 12) {
+                Text("清理范围").font(.headline)
+                ForEach(CleanCategory.allCases) { cat in
+                    Toggle(isOn: Binding(
+                        get: { model.hasCategory(cat) },
+                        set: { model.setCategory(cat, on: $0) }
+                    )) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(cat.title).font(.subheadline.weight(.medium))
+                            Text(cat.subtitle)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                    .toggleStyle(.switch)
+                    .disabled(model.scanning || model.deleting)
+                }
+                if model.categories.contains(.history) {
+                    Divider()
+                    Text("历史保留：只列 \(model.historyDays) 天以前的东西；鼾声最新 3 晚永远保留")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Picker("历史保留", selection: Binding(
+                        get: { model.historyDays },
+                        set: { model.historyDays = $0 }
+                    )) {
+                        ForEach(CleanerModel.historyOptions, id: \.self) { d in
+                            Text("\(d) 天").tag(d)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .disabled(model.scanning || model.deleting)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    // MARK: 动作与统计
+
+    private var actionCard: some View {
+        GroupBox {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 10) {
+                    Button {
+                        model.scan()
+                    } label: {
+                        Label(model.scanning ? "扫描中…" : "扫描", systemImage: "magnifyingglass")
+                            .frame(minWidth: 72)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(model.scanning || model.deleting)
+
+                    Button(role: .destructive) {
+                        model.showDeleteConfirm = true
+                    } label: {
+                        Label(model.deleting ? "删除中…" : "删除勾选（\(model.selected.count)）", systemImage: "trash")
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(model.selected.isEmpty || model.scanning || model.deleting)
+
+                    Spacer()
+                }
+
+                HStack {
+                    Text(model.lastSummary).font(.footnote.monospacedDigit())
+                    Spacer()
+                    if let d = model.lastScanDate {
+                        Text(CleanFormat.date(d))
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                HStack(spacing: 10) {
+                    ForEach(CleanCategory.allCases) { cat in
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(cat.title).font(.caption2).foregroundStyle(.secondary)
+                            Text("\(model.count(cat)) 项｜\(CleanFormat.bytes(model.bytes(cat)))")
+                                .font(.caption2.monospacedDigit())
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(8)
+                        .background(Color(.secondarySystemGroupedBackground))
+                        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    }
+                }
+
+                if !model.items.isEmpty {
+                    HStack(spacing: 12) {
+                        Button("全选") { model.selectAll() }
+                        Button("全不选") { model.clearSelection() }
+                        Spacer()
+                        Text("勾选 \(model.selected.count) / \(model.items.count)｜\(CleanFormat.bytes(model.selectedBytes))")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                    .font(.caption)
+                    .disabled(model.scanning || model.deleting)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    // MARK: 清单
+
+    private var listCard: some View {
+        GroupBox {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack {
+                    Text("清单").font(.headline)
+                    Spacer()
+                    Text("点一行取消／重新勾选")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+
+                if model.items.isEmpty {
+                    if model.scanning {
+                        HStack(spacing: 8) {
+                            ProgressView()
+                            Text("正在扫描…").font(.footnote).foregroundStyle(.secondary)
+                        }
+                        .frame(maxWidth: .infinity, minHeight: 80)
+                    } else {
+                        ContentUnavailableView(
+                            "没有发现可清理的东西",
+                            systemImage: "checkmark.circle",
+                            description: Text("当前勾选的范围里没有符合规则的项。")
+                        )
+                        .frame(minHeight: 120)
+                    }
+                } else {
+                    LazyVStack(alignment: .leading, spacing: 14) {
+                        ForEach(groups) { group in
+                            VStack(alignment: .leading, spacing: 6) {
+                                HStack {
+                                    Text(group.name).font(.subheadline.weight(.semibold))
+                                    Spacer()
+                                    Text("\(group.items.count) 项｜\(CleanFormat.bytes(group.bytes))")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                }
+                                ForEach(group.items) { item in
+                                    row(item)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private func row(_ item: CleanItem) -> some View {
+        Button {
+            model.toggleSelection(item)
+        } label: {
+            HStack(alignment: .top, spacing: 8) {
+                Image(systemName: model.isSelected(item) ? "checkmark.circle.fill" : "circle")
+                    .foregroundStyle(model.isSelected(item) ? Color.accentColor : Color.secondary)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(item.displayPath)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.primary)
+                        .lineLimit(3)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    HStack(alignment: .top, spacing: 6) {
+                        Text(item.category.title)
+                            .font(.caption2)
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 1)
+                            .background(Color(.tertiarySystemFill))
+                            .clipShape(Capsule())
+                        Text(item.note)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                    }
+                }
+                Spacer(minLength: 4)
+                Text(CleanFormat.bytes(item.bytes))
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(model.deleting)
+    }
+
+    // MARK: 说明与回执
+
+    private var notesCard: some View {
+        GroupBox {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("扫描说明").font(.headline)
+                ForEach(model.notes, id: \.self) { note in
+                    Text("• \(note)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private var resultCard: some View {
+        GroupBox {
+            DisclosureGroup("删除回执（\(model.resultLines.count) 行）") {
+                VStack(alignment: .leading, spacing: 4) {
+                    ForEach(Array(model.resultLines.enumerated()), id: \.offset) { pair in
+                        Text(pair.element)
+                            .font(.caption2.monospaced())
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }
+                .padding(.top, 4)
+            }
+        }
+    }
+
+    private var safetyCard: some View {
+        GroupBox {
+            VStack(alignment: .leading, spacing: 8) {
+                Label("安全边界", systemImage: "lock.shield")
+                    .font(.headline)
+                bullet("只认白名单里完全相等的包名：com.qoder.hellolc / snorebench / swapbench / vr3d / voice / liveswap。LiveContainer（com.kdt.*）和 SideStore / AltStore（com.SideStore.* / com.rileytestut.*）即使看起来是垃圾也不列、不删。")
+                bullet("容器身份只认 LCContainerInfo.plist 的 appIdentifier；每次删除前重读一次，对不上就跳过。没有这个 plist 的容器不进清单。")
+                bullet("符号链接一律跳过；1 小时内被改过的文件不动，历史文件按天数算。")
+                bullet("共享临时区只认 swap_ / vr3d_ / pick_ / cut_ / LiveIn 五个前缀，并且要求 6 小时内没有改动。")
+                bullet("换脸只删非当前版本的模型包和编译缓存；fsx_arc / fsx_swap、version.txt、chain.txt、archive.part、swap_idents 和语音模型目录都保留，避免重复下载。")
+                bullet("删除前会按同一套规则重新扫描，只有仍然在清单里的路径才会被删；删掉的文件不进系统「最近删除」。")
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private func bullet(_ text: String) -> some View {
+        HStack(alignment: .top, spacing: 6) {
+            Text("•").font(.caption)
+            Text(text)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+}
