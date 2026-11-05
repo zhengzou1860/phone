@@ -1,5 +1,6 @@
 import Foundation
 import CoreGraphics
+import Accelerate
 
 /// fsx 那条链路的几何，逐式对照 PC 上跑通、肉眼认过的 fsx/netstage.py：
 /// 5 点 → 相似变换 → warpAffine 到 112（身份证）和 256（补丁）→ 结果按官方那三刀贴回。
@@ -87,6 +88,55 @@ enum FsxGeo {
         if out.count != 3 * plane { out = [Float](repeating: 0, count: 3 * plane) }
         let p = base.assumingMemoryBound(to: UInt8.self)
         let rowPix = bytesPerRow / 4
+        let wm1 = w - 1, hm1 = h - 1
+        // 坐标按 ax·ox＋行首常数算（两个乘加），不逐格累加；四个邻的权重每格只算一次，三个通道共用。
+        // 旧写法每像素 4 次乘法×3 通道、权重也算 3 遍——256² 一格就是几十万次多余的乘加。
+        let ax = Float(inv.a), bx = Float(inv.b), cx = Float(inv.c)
+        let ay = Float(inv.d), by = Float(inv.e), cy = Float(inv.f)
+        let inv255: Float = 1.0 / 255.0
+        out.withUnsafeMutableBufferPointer { ob in
+            let q = ob.baseAddress!
+            for oy in 0..<size {
+                let rowFx = bx * Float(oy) + cx
+                let rowFy = by * Float(oy) + cy
+                let krow = oy * size
+                for ox in 0..<size {
+                    // 一行之内 ox 由 0 走到 255：ax·ox 只有一次舍入，误差远小于 1e-5 格；
+                    // 旧写法每格 fx+=ax 会把 256 次舍入累起来（边缘能差出小半个像素）。
+                    let fx = ax * Float(ox) + rowFx
+                    let fy = ay * Float(ox) + rowFy
+                    let x0 = Int(fx.rounded(.down)), y0 = Int(fy.rounded(.down))
+                    let dx = fx - Float(x0), dy = fy - Float(y0)
+                    let xa = min(max(x0, 0), wm1), xb = min(max(x0 + 1, 0), wm1)
+                    let ya = min(max(y0, 0), hm1), yb = min(max(y0 + 1, 0), hm1)
+                    let ra = ya * rowPix * 4, rb = yb * rowPix * 4
+                    let ca = xa * 4, cb = xb * 4
+                    let o00 = ra + ca, o10 = ra + cb, o01 = rb + ca, o11 = rb + cb
+                    let w00 = (1 - dx) * (1 - dy), w10 = dx * (1 - dy)
+                    let w01 = (1 - dx) * dy, w11 = dx * dy
+                    let k = krow + ox
+                    q[k] = (Float(p[o00 + 2]) * w00 + Float(p[o10 + 2]) * w10
+                          + Float(p[o01 + 2]) * w01 + Float(p[o11 + 2]) * w11) * inv255
+                    q[plane + k] = (Float(p[o00 + 1]) * w00 + Float(p[o10 + 1]) * w10
+                                  + Float(p[o01 + 1]) * w01 + Float(p[o11 + 1]) * w11) * inv255
+                    q[2 * plane + k] = (Float(p[o00]) * w00 + Float(p[o10]) * w10
+                                      + Float(p[o01]) * w01 + Float(p[o11]) * w11) * inv255
+                }
+            }
+        }
+        return true
+    }
+
+    /// 旧逐通道写法，只给 selfTest 对拍用：CI 的几何闸门拿同一张合成图把两条路逐像素比一遍，
+    /// 差过 1e-4 就不出包。生产路径永远走上面那条。
+    @inline(never)
+    static func warpCropSlow(_ base: UnsafeRawPointer, bytesPerRow: Int, w: Int, h: Int,
+                             fwd: M23, size: Int, out: inout [Float]) -> Bool {
+        guard let inv = inverse(fwd) else { return false }
+        let plane = size * size
+        if out.count != 3 * plane { out = [Float](repeating: 0, count: 3 * plane) }
+        let p = base.assumingMemoryBound(to: UInt8.self)
+        let rowPix = bytesPerRow / 4
         for oy in 0..<size {
             for ox in 0..<size {
                 let fx = inv.a * Double(ox) + inv.b * Double(oy) + inv.c
@@ -134,8 +184,46 @@ enum FsxGeo {
     /// 多贴那一带的收口夹在②③中间（PC 是腐蚀完乘那张带 alpha 的斜坡图，再糊），顺序换了就不是同一条边。
     /// 全程只在外接框（再加腐蚀与糊的半径）里做，框外一像素不碰。
     /// face 必须是已经量化到 8 位那一份（PC 是 uint8 转 float 再 warp 的，跳过这步差半格）。
+    /// 出片每帧都贴一次，这几块工作数组必须复用：旧写法每帧现造 bin/integ/ero/tmp/alpha 五块，
+    /// 一张 300×300 的框就是每帧几百 KB 的分配＋清零，A13 上分配器那几毫秒白扔。
+    struct PasteScratch {
+        var bin: [Float] = []
+        var integ: [Int] = []
+        var ero: [Float] = []
+        var tmp: [Float] = []
+        var alpha: [Float] = []
+        var gauss: [Float] = []
+        var gaussN: Int = 0
+    }
+
+    @inline(__always)
+    private static func zeroFloat(_ a: inout [Float], _ n: Int) {
+        if a.count != n {
+            a = [Float](repeating: 0, count: n)
+        } else if n > 0 {
+            a.withUnsafeMutableBufferPointer { memset($0.baseAddress!, 0, n * MemoryLayout<Float>.size) }
+        }
+    }
+
+    @inline(__always)
+    private static func sizeFloat(_ a: inout [Float], _ n: Int) {
+        if a.count != n { a = [Float](repeating: 0, count: n) }
+    }
+
+    @inline(__always)
+    private static func sizeInt(_ a: inout [Int], _ n: Int) {
+        if a.count != n { a = [Int](repeating: 0, count: n) }
+    }
+
     static func pasteBack(_ base: UnsafeMutableRawPointer, bytesPerRow: Int, w: Int, h: Int,
                           face: [Float], fwd: M23) -> Bool {
+        var scratch = PasteScratch()
+        return pasteBack(base, bytesPerRow: bytesPerRow, w: w, h: h,
+                         face: face, fwd: fwd, scratch: &scratch)
+    }
+
+    static func pasteBack(_ base: UnsafeMutableRawPointer, bytesPerRow: Int, w: Int, h: Int,
+                          face: [Float], fwd: M23, scratch: inout PasteScratch) -> Bool {
         let s = sideSwap
         let ext = extDown
         guard face.count == 3 * s * s, let im = inverse(fwd) else { return false }
@@ -155,14 +243,14 @@ enum FsxGeo {
         let r1y1 = min(h - 1, Int((ys.max() ?? 0).rounded(.up)) + 2)
         guard r1x1 >= r1x0, r1y1 >= r1y0, r1x0 < w, r1y0 < h else { return false }
         let r1w = r1x1 - r1x0 + 1, r1h = r1y1 - r1y0 + 1
-        var bin = [Float](repeating: 0, count: r1w * r1h)
+        zeroFloat(&scratch.bin, r1w * r1h)
         var minX = Int.max, maxX = -1, minY = Int.max, maxY = -1
         for oy in 0..<r1h {
             for ox in 0..<r1w {
                 let fx = fwd.a * Double(r1x0 + ox) + fwd.b * Double(r1y0 + oy) + fwd.c
                 let fy = fwd.d * Double(r1x0 + ox) + fwd.e * Double(r1y0 + oy) + fwd.f
                 if whiteTap(fx, fy, ext: ext) > 20 {
-                    bin[oy * r1w + ox] = 255
+                    scratch.bin[oy * r1w + ox] = 255
                     if ox < minX { minX = ox }
                     if ox > maxX { maxX = ox }
                     if oy < minY { minY = oy }
@@ -186,29 +274,31 @@ enum FsxGeo {
         // 越出外接框但还在画面里的，遮罩本来就是 0。
         let padE = k + kb + 8
         let gw = r1w + 2 * padE, gh = r1h + 2 * padE
-        var integ = [Int](repeating: 0, count: (gh + 1) * (gw + 1))
-        for gy in 0..<gh {
-            let Y = r1y0 - padE + gy
-            var run = 0
-            for gx in 0..<gw {
-                let X = r1x0 - padE + gx
-                var on = 0
-                if X < 0 || Y < 0 || X >= w || Y >= h {
-                    on = 1                                  // 画面以外＝最大，腐蚀不吃这一圈
-                } else {
-                    let lx = X - r1x0, ly = Y - r1y0
-                    if lx >= 0, ly >= 0, lx < r1w, ly < r1h, bin[ly * r1w + lx] > 0 { on = 1 }
+        sizeInt(&scratch.integ, (gh + 1) * (gw + 1))
+        // 递归只写第 1..gh 行、第 1..gw 列，第 0 行／第 0 列永远是 0；scratch 是上一帧留下的，
+        // 不重新置零就会把上一帧的边界和搬进这一帧（尺寸碰巧一样时最容易漏）。
+        for gx in 0...gw { scratch.integ[gx] = 0 }
+        for gy in 1...gh { scratch.integ[gy * (gw + 1)] = 0 }
+        let binView = scratch.bin
+        scratch.integ.withUnsafeMutableBufferPointer { integ in
+            binView.withUnsafeBufferPointer { bin in
+                for gy in 0..<gh {
+                    let Y = r1y0 - padE + gy
+                    var run = 0
+                    for gx in 0..<gw {
+                        let X = r1x0 - padE + gx
+                        var on = 0
+                        if X < 0 || Y < 0 || X >= w || Y >= h {
+                            on = 1                                  // 画面以外＝最大，腐蚀不吃这一圈
+                        } else {
+                            let lx = X - r1x0, ly = Y - r1y0
+                            if lx >= 0, ly >= 0, lx < r1w, ly < r1h, bin[ly * r1w + lx] > 0 { on = 1 }
+                        }
+                        run += on
+                        integ[(gy + 1) * (gw + 1) + (gx + 1)] = integ[gy * (gw + 1) + (gx + 1)] + run
+                    }
                 }
-                run += on
-                integ[(gy + 1) * (gw + 1) + (gx + 1)] = integ[gy * (gw + 1) + (gx + 1)] + run
             }
-        }
-        func allWhite(_ X: Int, _ Y: Int) -> Bool {
-            // 窗口 [X-k/2, X+k/2-1]×[Y-k/2, Y+kBot-1] 换成积分图的下标
-            let gx0 = X - r1x0 + padE - k / 2, gy0 = Y - r1y0 + padE - kTop
-            let s0 = integ[gy0 * (gw + 1) + gx0] + integ[(gy0 + ky) * (gw + 1) + gx0 + k]
-                - integ[gy0 * (gw + 1) + gx0 + k] - integ[(gy0 + ky) * (gw + 1) + gx0]
-            return s0 == k * ky
         }
 
         let pad = max(k / 2, kBot) + kb + 4
@@ -216,38 +306,74 @@ enum FsxGeo {
         let r2x1 = min(w - 1, r1x0 + maxX + pad), r2y1 = min(h - 1, r1y0 + maxY + pad)
         guard r2x1 >= r2x0, r2y1 >= r2y0 else { return false }
         let r2w = r2x1 - r2x0 + 1, r2h = r2y1 - r2y0 + 1
-        var ero = [Float](repeating: 0, count: r2w * r2h)
+        zeroFloat(&scratch.ero, r2w * r2h)
         for oy in 0..<r2h {
             let Y = r2y0 + oy
             for ox in 0..<r2w {
-                guard allWhite(r2x0 + ox, Y) else { continue }
-                let fy = fwd.d * Double(r2x0 + ox) + fwd.e * Double(Y) + fwd.f
-                ero[oy * r2w + ox] = Float(255.0 * rampTap(fy))
+                // 窗口 [X-k/2, X+k/2-1]×[Y-k/2, Y+kBot-1] 换成积分图的下标；全白才留
+                let X = r2x0 + ox
+                let gx0 = X - r1x0 + padE - k / 2, gy0 = Y - r1y0 + padE - kTop
+                let s0 = scratch.integ[gy0 * (gw + 1) + gx0]
+                    + scratch.integ[(gy0 + ky) * (gw + 1) + gx0 + k]
+                    - scratch.integ[gy0 * (gw + 1) + gx0 + k]
+                    - scratch.integ[(gy0 + ky) * (gw + 1) + gx0]
+                guard s0 == k * ky else { continue }
+                let fy = fwd.d * Double(X) + fwd.e * Double(Y) + fwd.f
+                scratch.ero[oy * r2w + ox] = Float(255.0 * rampTap(fy))
             }
         }
 
         // ③ 糊＋混合
-        let alpha = gaussSep(ero, r2w, r2h, gauss1d(2 * kb + 1))
+        let kn = 2 * kb + 1
+        if scratch.gaussN != kn {
+            scratch.gauss = gauss1d(kn)
+            scratch.gaussN = kn
+        }
+        gaussSep(scratch.ero, r2w, r2h, scratch.gauss, tmp: &scratch.tmp, out: &scratch.alpha)
+        let alphaView = scratch.alpha
         let plane = s * s
-        for oy in 0..<r2h {
-            let Y = r2y0 + oy
-            for ox in 0..<r2w {
-                let al = Double(alpha[oy * r2w + ox]) / 255.0
-                if al <= 0 { continue }
-                let X = r2x0 + ox
-                let fx = fwd.a * Double(X) + fwd.b * Double(Y) + fwd.c
-                let fy = fwd.d * Double(X) + fwd.e * Double(Y) + fwd.f
-                let o = Y * rowPix * 4 + X * 4
-                for ch in 0..<3 {
-                    // 内存是 BGRA，模型的 planar 是 RGB：第 0 通道 R 落在内存的第 2 格
-                    let fake = Double(planarTap(face, plane, s, fx, fy, 2 - ch, ext: ext))
-                    let mix = al * fake * 255.0 + (1 - al) * Double(q[o + ch])
-                    // PC 收的是 np.clip(out,0,255).astype(np.uint8)＝截断不是四舍五入，照它的来
-                    q[o + ch] = UInt8(max(0.0, min(255.0, mix)).rounded(.down))
+        // 三个通道共用一套 x0/y0/dx/dy 和四个邻的下标；旧写法每个通道把坐标和边界再算一遍。
+        alphaView.withUnsafeBufferPointer { ap in
+            face.withUnsafeBufferPointer { fp in
+                for oy in 0..<r2h {
+                    let Y = r2y0 + oy
+                    for ox in 0..<r2w {
+                        let al = Double(ap[oy * r2w + ox]) / 255.0
+                        if al <= 0 { continue }
+                        let X = r2x0 + ox
+                        let fx = fwd.a * Double(X) + fwd.b * Double(Y) + fwd.c
+                        let fy = fwd.d * Double(X) + fwd.e * Double(Y) + fwd.f
+                        let x0 = Int(fx.rounded(.down)), y0 = Int(fy.rounded(.down))
+                        let dx = Float(fx - Double(x0)), dy = Float(fy - Double(y0))
+                        let i00 = tapIndex(x0, y0, s, ext), i10 = tapIndex(x0 + 1, y0, s, ext)
+                        let i01 = tapIndex(x0, y0 + 1, s, ext), i11 = tapIndex(x0 + 1, y0 + 1, s, ext)
+                        let o = Y * rowPix * 4 + X * 4
+                        for ch in 0..<3 {
+                            // 内存是 BGRA、补丁是 planar RGB：第 0 格（B）要取平面的第 2 层
+                            let b = (2 - ch) * plane
+                            let v00 = i00 >= 0 ? fp[b + i00] : 0
+                            let v10 = i10 >= 0 ? fp[b + i10] : 0
+                            let v01 = i01 >= 0 ? fp[b + i01] : 0
+                            let v11 = i11 >= 0 ? fp[b + i11] : 0
+                            let top = v00 + (v10 - v00) * dx
+                            let bot = v01 + (v11 - v01) * dx
+                            let fake = Double(top + (bot - top) * dy)
+                            let mix = al * fake * 255.0 + (1 - al) * Double(q[o + ch])
+                            // PC 收的是 np.clip(out,0,255).astype(np.uint8)＝截断不是四舍五入，照它的来
+                            q[o + ch] = UInt8(max(0.0, min(255.0, mix)).rounded(.down))
+                        }
+                    }
                 }
             }
         }
         return true
+    }
+
+    /// planar 补丁的一个邻：越左/上/右补 0，往下 ext 格取方块最后一行（同旧 planarTap 的边界口径）。
+    @inline(__always)
+    private static func tapIndex(_ xx: Int, _ yy: Int, _ s: Int, _ ext: Int) -> Int {
+        if xx < 0 || yy < 0 || xx >= s || yy >= s + ext { return -1 }
+        return min(yy, s - 1) * s + xx
     }
 
     /// 延出去那一带每一行的 alpha：方块里 1，带里最下面 fadeDown 格线性收到 0，带外 0（＝cv2 borderValue）。
@@ -269,17 +395,24 @@ enum FsxGeo {
         return rowWeight(y0) * (1 - dy) + rowWeight(y0 + 1) * dy
     }
 
-    /// 白图投回来：落在 256 方块（往下带 ext 格）里的邻按双线性权重相加再乘 255，外面那一份就是 borderValue=0
+    /// 白图投回来：落在 256 方块（往下带 ext 格）里的邻按双线性权重相加再乘 255，外面那一份就是 borderValue=0。
+    /// 旧写法每个像素现造两对 (下标, 权重) 的小数组——遮罩外接框十几万格，一帧就是几十万次分配；
+    /// 摊成四个 if 之后同一份数，一格不再分配。
     private static func whiteTap(_ fx: Double, _ fy: Double, ext: Int) -> Double {
-        let limX = Double(sideSwap) - 1
-        let limY = Double(sideSwap - 1 + ext)
+        let limX = sideSwap - 1
+        let limY = sideSwap - 1 + ext
         let x0 = Int(fx.rounded(.down)), y0 = Int(fy.rounded(.down))
         let dx = fx - Double(x0), dy = fy - Double(y0)
+        let wx0 = 1 - dx, wy0 = 1 - dy
+        let x1 = x0 + 1, y1 = y0 + 1
         var sum = 0.0
-        for (ox, wx) in [(x0, 1 - dx), (x0 + 1, dx)] {
-            for (oy, wy) in [(y0, 1 - dy), (y0 + 1, dy)] {
-                if ox >= 0 && oy >= 0 && Double(ox) <= limX && Double(oy) <= limY { sum += wx * wy }
-            }
+        if x0 >= 0 && x0 <= limX {
+            if y0 >= 0 && y0 <= limY { sum += wx0 * wy0 }
+            if y1 >= 0 && y1 <= limY { sum += wx0 * dy }
+        }
+        if x1 >= 0 && x1 <= limX {
+            if y0 >= 0 && y0 <= limY { sum += dx * wy0 }
+            if y1 >= 0 && y1 <= limY { sum += dx * dy }
         }
         return sum * 255.0
     }
@@ -301,43 +434,74 @@ enum FsxGeo {
     }
 
     /// cv2.getGaussianKernel(ksize, 0)：σ 由核长现算＝0.3*((k-1)*0.5-1)+0.8，核就是这一串归一化高斯
-    static func gauss1d(_ ksize: Int) -> [Double] {
+    static func gauss1d(_ ksize: Int) -> [Float] {
         var ks = max(1, ksize)
         if ks % 2 == 0 { ks += 1 }
         let sigma = 0.3 * (Double(ks - 1) * 0.5 - 1.0) + 0.8
         let r = ks / 2
-        var w = [Double](repeating: 0, count: ks)
+        var w = [Float](repeating: 0, count: ks)
         var tot = 0.0
         for i in 0..<ks {
             let x = Double(i - r)
-            w[i] = exp(-0.5 * (x / sigma) * (x / sigma))
-            tot += w[i]
+            let v = exp(-0.5 * (x / sigma) * (x / sigma))
+            w[i] = Float(v)
+            tot += v
         }
-        for i in 0..<ks { w[i] /= tot }
+        let inv = Float(1.0 / tot)
+        for i in 0..<ks { w[i] *= inv }
         return w
     }
 
     /// 可分离高斯＋BORDER_REFLECT_101（-1→1 那种翻法，不复制边缘）。
     /// 只在 ROI 上糊：ROI 外那一圈腐完本来就是 0，翻边翻到的也是 0，跟整幅糊同一个结果。
-    private static func gaussSep(_ a: [Float], _ w0: Int, _ h0: Int, _ k: [Double]) -> [Float] {
+    /// 中间那一段四个邻都在界内，横向一个 tap 一次 vDSP 整行加；纵向每个 tap 取一整行加。
+    /// 两端才走反射逐格算——A13 上这一刀从几百万次 Double 乘加降到几百次 vDSP 调用。
+    private static func gaussSep(_ a: [Float], _ w0: Int, _ h0: Int, _ k: [Float],
+                                 tmp: inout [Float], out: inout [Float]) {
+        sizeFloat(&tmp, w0 * h0)
+        sizeFloat(&out, w0 * h0)
         let r = k.count / 2
-        var tmp = [Float](repeating: 0, count: w0 * h0)
-        for y in 0..<h0 {
-            for x in 0..<w0 {
-                var s = 0.0
-                for i in 0..<k.count { s += k[i] * Double(a[y * w0 + refl101(x + i - r, w0)]) }
-                tmp[y * w0 + x] = Float(s)
+        let kn = k.count
+        a.withUnsafeBufferPointer { ap in
+            tmp.withUnsafeMutableBufferPointer { tp in
+                for y in 0..<h0 {
+                    let row = y * w0
+                    let x0 = min(r, w0)
+                    let x1 = min(w0, max(x0, w0 - kn + 1 + r))
+                    if x1 > x0 {
+                        let n = vDSP_Length(x1 - x0)
+                        let dst = tp.baseAddress! + row + x0
+                        vDSP_vclr(dst, 1, n)
+                        for i in 0..<kn {
+                            var kk = k[i]
+                            let src = ap.baseAddress! + row + x0 - r + i
+                            vDSP_vsma(src, 1, &kk, dst, 1, dst, 1, n)
+                        }
+                    }
+                    for x in 0..<x0 {
+                        var s: Float = 0
+                        for i in 0..<kn { s += k[i] * ap[row + refl101(x + i - r, w0)] }
+                        tp[row + x] = s
+                    }
+                    for x in x1..<w0 {
+                        var s: Float = 0
+                        for i in 0..<kn { s += k[i] * ap[row + refl101(x + i - r, w0)] }
+                        tp[row + x] = s
+                    }
+                }
+                out.withUnsafeMutableBufferPointer { op in
+                    for y in 0..<h0 {
+                        let dst = op.baseAddress! + y * w0
+                        vDSP_vclr(dst, 1, vDSP_Length(w0))
+                        for i in 0..<kn {
+                            var kk = k[i]
+                            let src = tp.baseAddress! + refl101(y + i - r, h0) * w0
+                            vDSP_vsma(src, 1, &kk, dst, 1, dst, 1, vDSP_Length(w0))
+                        }
+                    }
+                }
             }
         }
-        var out = [Float](repeating: 0, count: w0 * h0)
-        for y in 0..<h0 {
-            for x in 0..<w0 {
-                var s = 0.0
-                for i in 0..<k.count { s += k[i] * Double(tmp[refl101(y + i - r, h0) * w0 + x]) }
-                out[y * w0 + x] = Float(s)
-            }
-        }
-        return out
     }
 
     private static func refl101(_ i: Int, _ n: Int) -> Int {
@@ -485,6 +649,31 @@ enum FsxGeo {
             warpCrop(raw.baseAddress!, bytesPerRow: 16, w: 4, h: 4, fwd: idn, size: 4, out: &ch4)
         } && abs(ch4[0] - Float(210) / 255) < 1e-6 && abs(ch4[16] - Float(110) / 255) < 1e-6
             && abs(ch4[32] - Float(10) / 255) < 1e-6
+        // ⑦ 裁片快慢两路逐像素对拍（详见 warpCropSlow）：生产那条改成单精度坐标、一套权重算三通道，
+        //    拿一张 17×13 的小图做 32×32 的裁片（四边都有采样落在画面外，把边界钳位也走到），
+        //    与旧 Double 写法比，差过 1e-4（≈0.03 个灰阶）就不出包。
+        let sw = 17, sh = 13, sz = 32
+        var big = [UInt8](repeating: 0, count: 4 * sw * sh)
+        for i in 0..<(sw * sh) {
+            big[i * 4] = UInt8((i * 13) % 256)
+            big[i * 4 + 1] = UInt8((i * 29 + 37) % 256)
+            big[i * 4 + 2] = UInt8((i * 47 + 91) % 256)
+            big[i * 4 + 3] = 255
+        }
+        let mw = M23(a: 2.0, b: 0.5, c: 3.0, d: -0.5, e: 2.0, f: 5.0)
+        var fFast = [Float](repeating: 0, count: 3 * sz * sz)
+        var fSlow = [Float](repeating: 0, count: 3 * sz * sz)
+        let bothOK = big.withUnsafeBytes { raw -> Bool in
+            warpCrop(raw.baseAddress!, bytesPerRow: sw * 4, w: sw, h: sh, fwd: mw, size: sz, out: &fFast)
+                && warpCropSlow(raw.baseAddress!, bytesPerRow: sw * 4, w: sw, h: sh, fwd: mw, size: sz, out: &fSlow)
+        }
+        var fastDiff = 0.0
+        var nonFinite = 0
+        for i in 0..<(3 * sz * sz) {
+            if !fFast[i].isFinite || !fSlow[i].isFinite { nonFinite += 1 }
+            fastDiff = max(fastDiff, abs(Double(fFast[i]) - Double(fSlow[i])))
+        }
+        let fastOK = bothOK && nonFinite == 0 && fastDiff <= 1e-4
         return "模板 224 与官方那份最大差 \(String(format: "%.6f", worst))"
             + "｜换脸模板 256 与 arcface_128 最大差 \(String(format: "%.4f", worstSw))"
             + "｜往返残差 \(String(format: "%.9f", round))"
@@ -493,5 +682,6 @@ enum FsxGeo {
             + " 最后一行复制\(rep == 1 ? "对" : "错") 带外取样\(beyond == 0 ? "零，对" : "非零，错")"
             + "｜收口 \(fadeDown) 格\(fadeOK ? "对" : "错")（下巴那一格满、最底一格归 0）"
             + "｜裁片通道 RGB\(chOK ? "对" : "错")（BGRA 内存序倒着读；读反了整张脸偏蓝）"
+            + "｜裁片快慢两路最大差 \(String(format: "%.2e", fastDiff))（要 ≤1e-4）\(fastOK ? "对" : "错")"
     }
 }

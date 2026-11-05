@@ -3,7 +3,8 @@
 再打成 models.bin＋models.json，外加一份 chain.txt 口径标记。
 
 这一条是「将来真装到手机上」那一条，不是探针：探针在 mac runner 上量过 fp16 的代价（上一代 128 换脸网
-差 74 个灰阶、PSNR 29.5 dB）。所以这里只转 fp32、一遍、不留第二条配方；对账不过就地失败，一个文件都不发。
+差 74 个灰阶、PSNR 29.5 dB——那是拿随机噪声当人脸量的，对生成式网不算数）。所以发布配方只转 fp32、一遍；
+要单独看 fp16 的真实画质，加 --probe-fp16：同样转一份、拿 PC 标答量，只记数、不参与发布。
 
 帮手全从 fsx_probe 里拿（load_onnx_fixed／convert／feed_coreml／pick_out／img_diff）。
 那个文件里每一式都在 mac runner 上跑绿过，在这儿重写一遍就是重新赌一遍。
@@ -316,6 +317,8 @@ def main():
     ap.add_argument('--out-root', default='app/SwapModel',
                     help='两份 mlpackage＋chain.txt＋models.bin/json 落这里（不能落进 SourcesSwap，xcodegen 会把 mlpackage 当编译输入）')
     ap.add_argument('--cli', default=None, help='onnx2coreml 可执行文件路径；不给就在 PATH 里找')
+    ap.add_argument('--probe-fp16', action='store_true',
+                    help='顺手把两张网再转一份 fp16，拿同一套 PC 标答量画质与耗时（不参与发布，只写日志／summary）')
     a = ap.parse_args()
 
     arc_onnx = os.path.join(a.onnx_dir, 'w600k_r50.onnx')
@@ -454,6 +457,60 @@ def main():
             traceback.print_exc(file=sys.stdout)
         finally:
             m = None
+    # ---- ④b 显式 --probe-fp16 才走：同样两张 onnx 再转一份 fp16，拿同一套 PC 标答量画质和速度。
+    # 这一路不参与发布、不改上面的 fp32 配方，只把数写进日志和 fsx_summary.json。
+    # 上一代 128 网判死 fp16 用的是转换器随机输入那套（对生成式网没有意义，fp32 正品也会被判 FAIL），
+    # 这次直接看真 fixture：手机端要快，先得知道 fp16 到底掉多少画质。
+    if a.probe_fp16:
+        pdir = os.path.join(tmp, 'fp16')
+        os.makedirs(pdir, exist_ok=True)
+        for pkg_name, model, fixed, which in ((ARC_PKG, arc_model, arc_fixed, 'arc'),
+                                              (SWAP_PKG, sw_model, sw_fixed, 'swap')):
+            pkg = os.path.join(pdir, pkg_name + '.mlpackage')
+            try:
+                m16, el16, rel16 = P.convert(model, pkg, True, fixed, cli, verify=False)
+                ins16, outs16 = P.coreml_io(m16)
+                if which == 'arc':
+                    x112 = (src112.astype(np.float32) - 127.5) / 127.5
+                    res, ms16 = P.coreml_predict(
+                        m16, P.feed_coreml(ins16, [(x112.transpose(2, 0, 1)[None], x112)]))
+                    _, got16 = P.pick_out(res, 512)
+                    e = got16.reshape(-1).astype(np.float64)
+                    en = e / max(float(np.linalg.norm(e)), 1e-12)
+                    rn = ref_emb.astype(np.float64) / max(float(np.linalg.norm(ref_emb)), 1e-12)
+                    c16 = P.cos(en, rn)
+                    md16 = float(np.abs(en - rn).max())
+                    rec['arc_fp16'] = {'cos': c16, 'max_abs': md16,
+                                       'mb': round(P.pkg_mb(pkg), 1),
+                                       'convert_s': round(el16, 1), 'infer_ms': round(ms16, 1)}
+                    P.log('FXP-FP16', 'arc(fp16) 转换 %.0f s 包 %.1f MB 一次推理 %.1f ms'
+                          '｜嵌入 cos=%.6f max|Δ|=%.5f｜%s'
+                          % (el16, P.pkg_mb(pkg), ms16, c16, md16,
+                             '过闸门' if c16 >= MIN_ARC_COS else '不过闸门'))
+                else:
+                    rgb = tgt.astype(np.float32) / 255.0
+                    x = ((rgb - 0.5) / 0.5).transpose(2, 0, 1)[None]
+                    feed = P.feed_coreml(ins16, [(x, rgb), (ref_emb[None], ref_emb)])
+                    P.coreml_predict(m16, feed)                # 第一趟含建管线，丢掉
+                    res, ms16 = P.coreml_predict(m16, feed)
+                    _, got16 = P.pick_out(res, 3 * SIDE * SIDE)
+                    if got16.ndim == 4:
+                        got16 = got16[0]
+                    bad16 = int(np.sum(~np.isfinite(got16)))
+                    o01 = np.clip(got16.transpose(1, 2, 0) * 0.5 + 0.5, 0.0, 1.0)
+                    mx16, mn16, ps16 = P.img_diff(o01, out_ref)
+                    rec['swap_fp16'] = {'psnr': ps16, 'max_abs': mx16, 'nonfinite': bad16,
+                                        'mb': round(P.pkg_mb(pkg), 1),
+                                        'convert_s': round(el16, 1), 'infer_ms': round(ms16, 1)}
+                    P.log('FXP-FP16', 'swap(fp16) 转换 %.0f s 包 %.1f MB 一次推理 %.1f ms'
+                          '｜非有限数 %d 个｜max=%.2f mean=%.3f 灰阶 PSNR=%.2f dB｜%s'
+                          % (el16, P.pkg_mb(pkg), ms16, bad16, mx16, mn16, ps16,
+                             '过闸门' if (bad16 == 0 and ps16 >= MIN_SWAP_PSNR) else '不过闸门'))
+                m16 = None
+            except Exception as e:
+                P.log('FXP-FP16', which, 'fp16 这一路失败：', repr(e)[:300])
+                traceback.print_exc(file=sys.stdout)
+
     # 钉过维的两份中间产物（~695 MB）转完就没用了：归档那一步要在内存里再攒 ~694 MB，先腾出来
     shutil.rmtree(tmp, ignore_errors=True)
 

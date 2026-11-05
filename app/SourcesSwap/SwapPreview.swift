@@ -63,6 +63,7 @@ final class SwapPreview {
     private var held: CVPixelBuffer?
     private var frameW = 0, frameH = 0
     private var att = [Float](), face = [Float]()
+    private var pasteScratch = FsxGeo.PasteScratch()
     private var decodeMs: [Double] = [], detectMs: [Double] = [], warpMs: [Double] = []
     private var frameMs: [Double] = [], pasteMs: [Double] = [], swapMs: [Double] = []
     private var nSwap = 0, nDecode = 0, noFace = 0, smallFace = 0, mirror = 0, fitFail = 0, netFail = 0
@@ -354,7 +355,8 @@ final class SwapPreview {
         var pasted = false
         if let base = CVPixelBufferGetBaseAddress(dst) {
             pasted = FsxGeo.pasteBack(base, bytesPerRow: CVPixelBufferGetBytesPerRow(dst),
-                                      w: frameW, h: frameH, face: face, fwd: pl.fwdSwap)
+                                      w: frameW, h: frameH, face: face, fwd: pl.fwdSwap,
+                                      scratch: &pasteScratch)
         }
         CVPixelBufferUnlockBaseAddress(dst, [])
         pasteMs.append(msFrom(t4))

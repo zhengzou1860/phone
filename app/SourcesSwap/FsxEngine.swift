@@ -1,6 +1,7 @@
 import Foundation
 import CoreML
 import CoreVideo
+import Accelerate
 
 /// fsx 那条链路的两张网：脸向量网（112 出 512 维身份证）＋ hyperswap_1a_256（256 进 256 出）。
 /// 换脸网这一格收的就是那张归一化过的 512 维向量本身，不再乘 latent 矩阵——
@@ -11,12 +12,6 @@ enum FsxNets {
     static let embDim = 512
     static let side112 = 112
     static let sideSwap = 256
-
-    /// arcface 那一路的归一化：手里是 0..1 的 planar，先还原成 0..255 再走 PC 那一式 (x−127.5)/127.5
-    static func normalizeArc(_ v: Float) -> Float { (v * 255.0 - 127.5) / 127.5 }
-
-    /// 换脸网那一路：mean 0.5／std 0.5，0..1 的 planar 进去就是 2x−1
-    static func normalizeSwap(_ v: Float) -> Float { v * 2.0 - 1.0 }
 
     /// 把模型自己声明的入参/出参打印成人能读的一行（对账全靠它）
     static func describe(_ model: MLModel) -> String {
@@ -280,32 +275,45 @@ final class FsxEngine {
         }
         guard let arr = try? MLMultiArray(shape: dims.map { NSNumber(value: $0) }, dataType: c.dataType)
         else { return (nil, "\(name) 建不出 MLMultiArray \(dims)") }
-        var v = planar
+        // 两张网对 0..1 planar 的归一化正好是同一条 2x−1：arc 的 (x·255−127.5)/127.5 里
+        // 255/127.5＝2、127.5/127.5＝1，约掉就是它。原来每个数在 Double 里走一遍再搬；
+        // 现在 float32 那一路（两张网都是这一档）直接 vDSP 乘加写进模型数组，不再多造一份临时数组。
+        var needs = false
         switch scale {
-        case .arc:
-            for i in 0..<v.count { v[i] = FsxNets.normalizeArc(v[i]) }
-        case .swap:
-            for i in 0..<v.count { v[i] = FsxNets.normalizeSwap(v[i]) }
-        case .raw:
-            break
+        case .raw: break
+        case .arc, .swap: needs = true
         }
         switch c.dataType {
         case .float32:
-            if isContiguous(arr, dims: dims) {
-                v.withUnsafeBufferPointer { src in
-                    memcpy(arr.dataPointer, src.baseAddress!, total * MemoryLayout<Float32>.size)
+            let p = arr.dataPointer.assumingMemoryBound(to: Float32.self)
+            let cont = isContiguous(arr, dims: dims)
+            planar.withUnsafeBufferPointer { src in
+                if needs {
+                    var two: Float = 2.0, minusOne: Float = -1.0
+                    if cont {
+                        vDSP_vsmsa(src.baseAddress!, 1, &two, &minusOne, p, 1, vDSP_Length(total))
+                    } else {
+                        strideWalk(arr, dims: dims) { off, i in p[off] = src[i] * two + minusOne }
+                    }
+                } else if cont {
+                    memcpy(p, src.baseAddress!, total * MemoryLayout<Float32>.size)
+                } else {
+                    strideWalk(arr, dims: dims) { off, i in p[off] = src[i] }
                 }
-            } else {
-                let p = arr.dataPointer.assumingMemoryBound(to: Float32.self)
-                strideWalk(arr, dims: dims) { off, i in p[off] = v[i] }
             }
         case .float16:
+            var v = planar
+            if needs { for i in 0..<v.count { v[i] = v[i] * 2 - 1 } }
             let p = arr.dataPointer.assumingMemoryBound(to: Float16.self)
             strideWalk(arr, dims: dims) { off, i in p[off] = Float16(v[i]) }
         case .float64:
+            var v = planar
+            if needs { for i in 0..<v.count { v[i] = v[i] * 2 - 1 } }
             let p = arr.dataPointer.assumingMemoryBound(to: Double.self)
             strideWalk(arr, dims: dims) { off, i in p[off] = Double(v[i]) }
         case .int32:
+            var v = planar
+            if needs { for i in 0..<v.count { v[i] = v[i] * 2 - 1 } }
             let p = arr.dataPointer.assumingMemoryBound(to: Int32.self)
             strideWalk(arr, dims: dims) { off, i in p[off] = Int32(v[i]) }
         @unknown default:
@@ -460,10 +468,21 @@ final class FsxEngine {
             guard r.v.count >= want else { return ([], ms, r.note) }
             var f = Array(r.v[0..<want])
             var bad = 0
-            for i in 0..<f.count {
-                if !f[i].isFinite { bad += 1; f[i] = 0 }
-                let v = max(0.0, min(1.0, Double(f[i]) * 0.5 + 0.5))
-                f[i] = Float(floor(v * 255.0) / 255.0)
+            // 出参 → 8 位那一串：y·0.5+0.5、夹到 0..1、乘 255、向下取整、再除回 255。
+            // 原来每个数走一遍 Double（cvt/mul/floor/div），256 那一路一帧就是 19.6 万次；
+            // 现在只有「非有限数」那一趟是逐个数看的，其余全交给 vDSP／vForce，原地改。
+            let n = f.count
+            f.withUnsafeMutableBufferPointer { fb in
+                let b = fb.baseAddress!
+                for i in 0..<n where !fb[i].isFinite { bad += 1; fb[i] = 0 }
+                var half: Float = 0.5, one: Float = 1.0, zero: Float = 0.0
+                var k255: Float = 255.0, inv255: Float = 1.0 / 255.0
+                var nn = Int32(n)
+                vDSP_vsmsa(b, 1, &half, &half, b, 1, vDSP_Length(n))
+                vDSP_vclip(b, 1, &zero, &one, b, 1, vDSP_Length(n))
+                vDSP_vsmul(b, 1, &k255, b, 1, vDSP_Length(n))
+                vvfloorf(b, b, &nn)
+                vDSP_vsmul(b, 1, &inv255, b, 1, vDSP_Length(n))
             }
             swapMs.append(ms)
             var note = r.note

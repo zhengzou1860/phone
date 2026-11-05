@@ -179,7 +179,7 @@ enum SwapClip {
                                               // CPU 这一档也正是 CI 转换时对账用的那条 fp32 路。界面那格能换
         var longEdge: Int = 1920
         var minFacePx: Double = 40
-        var sampleEvery: Int = 30
+        var sampleEvery: Int = 60
         /// 收兵线：换脸网单张 onnx 权重 403 MB，装成 fp32 包还要更大；旧那条线四张小网定的 900 MB 会把正常跑当成越界。
         /// iPhone 11 的单进程水位线在 1.5 GB 上下，踩到就是系统直接杀进程（连一行流水都留不下），所以这条线只能往下压着留。
         var footprintStopMB: Int = 1300
@@ -588,6 +588,7 @@ enum SwapClip {
         var face = [Float](repeating: 0, count: 3 * side * side)     // 换出来的那张脸（已量化到 8 位）
         var f112 = [Float](repeating: 0, count: 3 * FsxGeo.side112 * FsxGeo.side112)   // 复测：256 缩到 112
         var c112 = [Float](repeating: 0, count: 3 * FsxGeo.side112 * FsxGeo.side112)   // 复测：从成片帧直接裁 112
+        var pasteScratch = FsxGeo.PasteScratch()   // 贴回的工作数组一整趟复用（每帧现造是几百 KB 分配＋清零）
 
         while why.isEmpty {
             var ended = ""
@@ -689,7 +690,8 @@ enum SwapClip {
                                 face = r.face
                                 let tm = DispatchTime.now().uptimeNanoseconds
                                 let pasted = SwapTech.withPixels(dst) { base, bpr -> Bool in
-                                    FsxGeo.pasteBack(base, bytesPerRow: bpr, w: w, h: h, face: face, fwd: pl.fwdSwap)
+                                    FsxGeo.pasteBack(base, bytesPerRow: bpr, w: w, h: h, face: face,
+                                                     fwd: pl.fwdSwap, scratch: &pasteScratch)
                                 }
                                 pasteMs.append(Double(DispatchTime.now().uptimeNanoseconds - tm) / 1_000_000)
                                 did = pasted == true
@@ -803,7 +805,7 @@ enum SwapClip {
                     let el = Double(DispatchTime.now().uptimeNanoseconds - wall0) / 1_000_000_000
                     let per = el / Double(max(1, made))
                     // 近 60 帧那一格的均速单独报：A13 跑五分钟会热降频，只看整趟均速看不出来
-                    let win = Double(DispatchTime.now().uptimeNanoseconds - lastMark) / 1_000_000_000 / 60.0
+                    let win = Double(DispatchTime.now().uptimeNanoseconds - lastMark) / 1_000_000 / 60.0
                     lastMark = DispatchTime.now().uptimeNanoseconds
                     say("换到第 \(made)/\(estFrames) 帧｜已用 \(String(format: "%.1f", el)) s"
                         + "｜约还需 \(String(format: "%.1f", per * Double(max(0, estFrames - made)))) s｜足迹 \(now) MB"
