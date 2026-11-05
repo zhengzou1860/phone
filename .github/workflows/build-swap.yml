@@ -79,7 +79,10 @@ jobs:
           set +e
           ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=6{print "::error::" p substr($0,1,230)}'; }
           rec() { tee -a /tmp/model.log; }
-          rm -f /tmp/model.log
+          # 这里原来有一句 rm -f /tmp/model.log：它把前面两道闸门（身份包编解码、几何自测）的判决行
+          # 一起清掉了，出包之后想问「那一趟闸门到底跑了什么」只能翻 CI 那一步，翻不到就成谜。
+          # 改成缺了就建、有不许清：同一份 build.log 里从 CODEC-VERDICT 到 M-VERDICT 一路读下来。
+          [ -f /tmp/model.log ] || touch /tmp/model.log
           echo "PY 版本=$(python3 -V 2>&1)" | rec
           python3 -m venv /tmp/m2c >/dev/null 2>&1
           # opencv 是 fsx_pack 读 fixture 那三张 png 用的（探针那边同款依赖，探针已跑绿）
