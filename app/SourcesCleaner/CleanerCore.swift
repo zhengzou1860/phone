@@ -24,7 +24,7 @@ enum CleanCategory: String, CaseIterable, Identifiable, Sendable {
         case .model:
             return "旧模型包、旧版本编译缓存、没删掉的深度缓存；当前模型和下载中的 archive.part 一律保留"
         case .history:
-            return "所有视频文件（含子目录和 tmp 里的）以及鼾声监测的旧一晚；默认不勾，按天数或全部处理"
+            return "所有视频文件（含子目录和 tmp 里的）以及鼾声监测的旧一晚；默认不勾，保留几天由你填"
         }
     }
 }

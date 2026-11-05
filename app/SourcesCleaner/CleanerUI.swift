@@ -3,8 +3,6 @@ import SwiftUI
 
 @MainActor
 final class CleanerModel: ObservableObject {
-    static let historyOptions = [0, 7, 14, 30, 90]
-
     let env: CleanerEnv
 
     @Published var categories: Set<CleanCategory> = [.junk, .model] {
@@ -16,6 +14,8 @@ final class CleanerModel: ObservableObject {
             if categories.contains(.history) { scan() }
         }
     }
+
+    @Published var historyDaysText: String = "30"
 
     @Published private(set) var items: [CleanItem] = []
     @Published private(set) var notes: [String] = []
@@ -66,6 +66,35 @@ final class CleanerModel: ObservableObject {
     func selectAll() { selected = Set(items.map(\.id)) }
 
     func clearSelection() { selected.removeAll() }
+
+    // 保留几天由人填：只收数字，按「应用」或收起键盘时才真正扫描。
+    func setHistoryDaysText(_ text: String) {
+        historyDaysText = String(text.filter { $0.isNumber }.prefix(6))
+    }
+
+    func applyHistoryDaysText() {
+        guard let value = Int(historyDaysText) else {
+            historyDaysText = historyDays == 0 ? "" : "\(historyDays)"
+            return
+        }
+        if value == 0 {
+            historyDaysText = "0"
+            historyDays = 0
+            return
+        }
+        historyDaysText = "\(value)"
+        historyDays = value
+    }
+
+    func setHistoryUnlimited(_ on: Bool) {
+        if on {
+            historyDays = 0
+        } else {
+            let restore = historyDaysText.isEmpty ? "30" : historyDaysText
+            historyDaysText = restore
+            historyDays = Int(restore) ?? 30
+        }
+    }
 
     func verdict(for item: CleanItem) -> CleanerVerdictEntry? { verdicts[item.id] }
 
@@ -321,17 +350,37 @@ struct CleanerRootView: View {
                         : "历史保留：只列 \(model.historyDays) 天以前的东西；鼾声最新 3 晚永远保留")
                         .font(.caption)
                         .foregroundStyle(.secondary)
-                    Picker("历史保留", selection: Binding(
-                        get: { model.historyDays },
-                        set: { model.historyDays = $0 }
-                    )) {
-                        ForEach(CleanerModel.historyOptions, id: \.self) { d in
-                            Text(d == 0 ? "全部" : "\(d) 天").tag(d)
-                        }
-                    }
-                    .pickerStyle(.segmented)
-                    .labelsHidden()
+                    Toggle("不限天数（全部）", isOn: Binding(
+                        get: { model.historyDays == 0 },
+                        set: { model.setHistoryUnlimited($0) }
+                    ))
+                    .toggleStyle(.switch)
                     .disabled(model.scanning || model.deleting)
+                    if model.historyDays != 0 {
+                        HStack(spacing: 8) {
+                            Text("只列")
+                                .font(.caption)
+                            TextField("天数", text: Binding(
+                                get: { model.historyDaysText },
+                                set: { model.setHistoryDaysText($0) }
+                            ))
+                            .keyboardType(.numberPad)
+                            .textFieldStyle(.roundedBorder)
+                            .frame(width: 76)
+                            .multilineTextAlignment(.center)
+                            .disabled(model.scanning || model.deleting)
+                            Text("天以前")
+                                .font(.caption)
+                            Button("应用") { model.applyHistoryDaysText() }
+                                .font(.caption)
+                                .buttonStyle(.bordered)
+                                .disabled(model.scanning || model.deleting)
+                            Spacer()
+                        }
+                        Text("天数自己填，想查多久填多久；填 0 或不限天数＝全部。")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -618,7 +667,7 @@ struct CleanerRootView: View {
                 bullet("LC 会把 <容器>/tmp 做成指向共享临时区的符号链接，这种目录只跳过、不跟随，避免同一批文件被扫两遍；只有 app 自己重建的真实 tmp 目录才逐个清。")
                 bullet("共享临时区认 swap_ / vr3d_ / pick_ / cut_ / LiveIn 五个前缀，另外列顶层后缀 .tmp 的中断下载；都要求 6 小时内没有改动。名字里带 livecontainer / sidestore / altstore 的一律不列。")
                 bullet("容器 Documents 和 Library/Caches 里散落的 .tmp 只删文件；voice_models、nights、samples、swap_idents 和 .mlpackage / .mlmodelc 内部不进去。")
-                bullet("视频按后缀 .mov / .mp4 / .m4v / .avi / .mkv / .webm / .3gp / .mts / .ts 递归扫，改名、放子目录、落在真实 tmp 里都能列出来；循环选「全部」时不限天数。模型包、nights、voice_models、samples、swap_idents、Cookies、Preferences、SystemData、LCAppGroup、Inbox 不进去。")
+                bullet("视频按后缀 .mov / .mp4 / .m4v / .avi / .mkv / .webm / .3gp / .mts / .ts 递归扫，改名、放子目录、落在真实 tmp 里都能列出来；开「不限天数」时不限天数。模型包、nights、voice_models、samples、swap_idents、Cookies、Preferences、SystemData、LCAppGroup、Inbox 不进去。")
                 bullet("换脸只删非当前版本的模型包和编译缓存；fsx_arc / fsx_swap、version.txt、chain.txt、archive.part、swap_idents 和语音模型目录都保留，避免重复下载。")
                 bullet("删除前会按同一套规则重新扫描，只有仍然在清单里的路径才会被删；删掉的文件不进系统「最近删除」。")
                 bullet("「发到电脑」只发清单（路径、大小、时间），不发文件内容。电脑回的「保留／可删／待定」只标在行上，app 不会照着自动删；要删还是人核对后按「删除勾选」，删除时照样重扫和复核容器身份。")
