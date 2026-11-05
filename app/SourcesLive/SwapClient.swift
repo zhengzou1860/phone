@@ -44,6 +44,14 @@ final class SwapClient: ObservableObject {
     @Published var sessionLost = false          // 搬完 cookie 还吃 401：页面那边得重登了
     @Published var lastError: String?
 
+    /// 本次 /live_start 以来 PC 收下的帧数与字节数：只在停止时报一个「上行均值 KB/帧」，
+    /// 给 PC 定出流质量用，不参与控制逻辑。
+    private(set) var sessionBytes = 0
+    private(set) var sessionFrames = 0
+    var averageFrameBytes: Int {
+        sessionFrames > 0 ? sessionBytes / sessionFrames : 0
+    }
+
     let baseURL: URL
     /// /live_start 响应里下发的生效宽度，手机按它缩放（PC 的硬上限是 640）。
     private(set) var liveWidth = LiveConfig.fallbackMaxWidth
@@ -156,6 +164,10 @@ final class SwapClient: ObservableObject {
     /// 返回 PC 实际生效的帧宽。手机请求 640，PC 可以在硬上限内往下压。
     @discardableResult
     func startLive() async throws -> Int {
+        await MainActor.run {
+            self.sessionBytes = 0
+            self.sessionFrames = 0
+        }
         let body = try JSONSerialization.data(withJSONObject: ["max_width": LiveConfig.fallbackMaxWidth])
         // 登录很可能就发生在刚才那一页：发之前先搬一次，401 再搬一次重试（见 callWithAuthRetry）。
         let (data, resp) = try await callWithAuthRetry("/live_start", body: body,
@@ -304,7 +316,11 @@ final class SwapClient: ObservableObject {
                     self.lastError = "PC 拒了这一帧：HTTP \(code)"
                 }
             case .accepted:
-                DispatchQueue.main.async { self.framesSent += 1 }
+                DispatchQueue.main.async {
+                    self.framesSent += 1
+                    self.sessionBytes += jpeg.count
+                    self.sessionFrames += 1
+                }
             }
         }.resume()
     }

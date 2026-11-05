@@ -27,6 +27,8 @@ enum LiveConfig {
 
     /// 注入脚本里 messageHandlers 的名字；Swift 侧注册和脚本发送共用这一条。
     static let bridgeName = "livebridge"
+    /// 进度条松手（change）单独走这条桥：页面 postMessage(浮点秒)，原生只管本地 seek。
+    static let seekBridgeName = "liveSeek"
 
     /// PC 输出帧 age 超过这个数、并且手机这一秒确实还在发帧，才认定流水线停了。
     /// 1500 太紧：实测推流收尾那一秒 age 到过 1489，再晚 0.2 秒就报「PC 没出帧」，
@@ -45,7 +47,7 @@ enum LiveConfig {
 
     /// 追加到 WKWebView 默认 UA 末尾：PC 那边看 access log 就知道是手机 app 在访问，
     /// 而不是有人在浏览器里手点。
-    static let userAgentSuffix = "LiveSwap/0.10"
+    static let userAgentSuffix = "LiveSwap/0.11"
 
     /// 第一次启动时地址栏里预填的这台：PC 侧现在监听的就是它。
     /// 只当预填和提示用，不当写死的配置——PC 重连 WiFi 以后 IP 会变，
@@ -362,6 +364,9 @@ enum LiveShim {
     static let hookPick = "pick"
     static let hookPlay = "play"
     static let hookSeek = "seek"
+    /// 页面给 <html> 加/去 class="fs" 时由注入脚本上报，原生据此藏状态栏。
+    /// 不是按钮挂子，所以不进 actionNames 的 ready 对账表。
+    static let hookFullscreen = "fullscreen"
     /// 不是按钮，是页面加载完主动报上来的一行：界面挂子上没对上号就在这里说出口
     static let hookReady = "ready"
 
@@ -399,6 +404,7 @@ enum LiveShim {
         return template.replacingOccurrences(of: "__HOOKS__", with: "[" + pairs + "]")
                           .replacingOccurrences(of: "__PATH__", with: jsLiteral(pathSelector))
                           .replacingOccurrences(of: "__SEEK__", with: jsLiteral(hookSeek))
+                          .replacingOccurrences(of: "__FULLSCREEN__", with: jsLiteral(hookFullscreen))
                           .replacingOccurrences(of: "__BRIDGE__", with: jsLiteral(LiveConfig.bridgeName))
     }
 
@@ -409,6 +415,7 @@ enum LiveShim {
       var BRIDGE = __BRIDGE__;
       var PATH_SEL = __PATH__;
       var SEEK = __SEEK__;
+      var FS = __FULLSCREEN__;
 
       function send(payload) {
         try {
@@ -496,26 +503,39 @@ enum LiveShim {
       try { if (UI.autoRefresh) UI.autoRefresh(false); } catch (e) {}
 
       // /video_feed 是长连接：WebView 退后台、网络抖一下都会让它报 error 且不自恢复。
-      // 全屏那份是页面克隆出来的 #fullscreen-video，原图被隐藏着，得各自重连；
+      // 0.11 起全屏不再 clone 第二个 img（页面只给 <html> 加 .fs），所以只有这一路要重连。
       // 1.5 秒内只试一次，免得 error 连环把长连接打成轮询。
       function retryFeed(img) {
         if (img.__liveRetry) return;
         img.__liveRetry = setTimeout(function () {
           img.__liveRetry = null;
-          if (img.id === 'fullscreen-video') {
-            img.src = '/video_feed?t=' + Date.now();
-          } else {
-            refreshFeed();
-          }
+          refreshFeed();
         }, 1500);
       }
 
       document.addEventListener('error', function (ev) {
         var img = ev.target;
         if (!img || img.tagName !== 'IMG') return;
-        if (img.id !== 'video-stream' && img.id !== 'fullscreen-video') return;
+        if (img.id !== 'video-stream') return;
         retryFeed(img);
       }, true);
+
+      // 全屏只靠 <html class="fs"> 表达；页面不会额外调原生，这里盯 class 变化再上报。
+      // 原生只拿它来藏/恢复状态栏，不参与画面布局。
+      var lastFs = null;
+      function noteFullscreen() {
+        var on = false;
+        try { on = document.documentElement.classList.contains('fs'); } catch (e) {}
+        if (on === lastFs) return;
+        lastFs = on;
+        send({ action: FS, on: on });
+      }
+      try {
+        new MutationObserver(noteFullscreen).observe(document.documentElement, {
+          attributes: true, attributeFilter: ['class']
+        });
+      } catch (e) {}
+      noteFullscreen();
 
       if (document.readyState === 'loading') {
         document.addEventListener('DOMContentLoaded', UI.report);

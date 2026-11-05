@@ -154,7 +154,8 @@ let shim = LiveShim.source()
 ck("挂子 三条都有名字", LiveShim.actionNames == [LiveShim.hookPick, LiveShim.hookPlay, LiveShim.hookSeek],
    "\(LiveShim.actionNames)")
 ck("挂子 名字是页面里那几个", LiveConfig.bridgeName == "livebridge")
-ck("脚本 占位符全替换掉了", !shim.contains("__HOOKS__") && !shim.contains("__BRIDGE__"))
+ck("脚本 占位符全替换掉了", !shim.contains("__HOOKS__") && !shim.contains("__BRIDGE__")
+   && !shim.contains("__SEEK__") && !shim.contains("__FULLSCREEN__"))
 for hook in LiveShim.hooks {
     // 脚本里注入的是 JSON 字面量（选择器带引号），所以按编码后的形态找
     ck("脚本 带挂子 \(hook.name)",
@@ -176,7 +177,12 @@ ck("脚本 不整个覆盖页面LiveUI", !shim.contains("window.LiveUI = {"),
 ck("脚本 合并到现有LiveUI", shim.contains("var UI = window.LiveUI") && shim.contains("window.LiveUI = UI"))
 ck("脚本 关掉页面30秒盲刷", shim.contains("UI.autoRefresh(false)"))
 ck("脚本 长连接断了会重连", shim.contains("LiveUI.refreshStream") && shim.contains("img.id !== 'video-stream'"))
-ck("脚本 全屏克隆那份也重连", shim.contains("fullscreen-video"), "全屏里是克隆出来的 img，原图被隐藏着")
+ck("脚本 全屏不再克隆第二路流", !shim.contains("fullscreen-video"),
+   "0.11 起页面只用 html.fs 铺满，同一路 #video-stream")
+ck("脚本 全屏态上报原生", shim.contains("action: FS") && LiveShim.hookFullscreen == "fullscreen",
+   "原生靠它藏/恢复状态栏")
+ck("桥名 进度条独立", LiveConfig.seekBridgeName == "liveSeek"
+   && LiveConfig.seekBridgeName != LiveConfig.bridgeName)
 ck("转义 引号反斜杠", LiveShim.jsLiteral("a\"b\\c") == "\"a\\\"b\\\\c\"",
    LiveShim.jsLiteral("a\"b\\c"))
 ck("转义 中文原样", LiveShim.jsLiteral("推流").hasPrefix("\"推流"))

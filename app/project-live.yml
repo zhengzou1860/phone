@@ -24,8 +24,8 @@ targets:
         CFBundleExecutable: LiveSwap
         CFBundleIdentifier: com.qoder.liveswap
         CFBundlePackageType: APPL
-        CFBundleShortVersionString: "0.10"
-        CFBundleVersion: "10"
+        CFBundleShortVersionString: "0.11"
+        CFBundleVersion: "11"
         CFBundleInfoDictionaryVersion: "6.0"
         NSAppTransportSecurity:
           # 局域网那台电脑是 http://192.168.x.x，这道闸不放行的话 WKWebView 和原生推流一起被杀
@@ -37,6 +37,8 @@ targets:
         UILaunchScreen: {}
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.qoder.liveswap

@@ -31,6 +31,8 @@ final class PageViewController: UIViewController {
     private var phase: Phase = .none
     private var resumeSeconds: Double = 0
     private var greetedHost = ""
+    /// 页面给 <html> 加 .fs 时置 true：原生藏状态栏/Home 指示条，横屏铺满。
+    private var pageFullscreen = false
 
     private var meterTimer: Timer?
     private var lastSentSample = 0
@@ -77,6 +79,10 @@ final class PageViewController: UIViewController {
         loadPage()
     }
 
+    override var prefersStatusBarHidden: Bool { pageFullscreen }
+    override var prefersHomeIndicatorAutoHidden: Bool { pageFullscreen }
+    override var supportedInterfaceOrientations: UIInterfaceOrientationMask { .allButUpsideDown }
+
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
         if pendingAddressPrompt {
@@ -98,6 +104,8 @@ final class PageViewController: UIViewController {
         NotificationCenter.default.removeObserver(self)
         webView.configuration.userContentController.removeScriptMessageHandler(
             forName: LiveConfig.bridgeName)
+        webView.configuration.userContentController.removeScriptMessageHandler(
+            forName: LiveConfig.seekBridgeName)
     }
 
     /// 手机不能一边在后台一边解 1080p 还指望它推帧：先停手，把 PC 的锁也放开。
@@ -138,6 +146,7 @@ final class PageViewController: UIViewController {
         let cfg = WKWebViewConfiguration()
         cfg.applicationNameForUserAgent = LiveConfig.userAgentSuffix
         cfg.userContentController.add(self, name: LiveConfig.bridgeName)
+        cfg.userContentController.add(self, name: LiveConfig.seekBridgeName)
         cfg.userContentController.addUserScript(
             WKUserScript(source: LiveShim.source(),
                          injectionTime: .atDocumentEnd,
@@ -176,6 +185,7 @@ final class PageViewController: UIViewController {
             self.phase = .loaded
             self.resumeSeconds = 0
             self.stopMeter()
+            self.pushSeek(cur: 0, total: 0)
             let c = self.client
             Task { await c?.stopLive() }
             self.status("这一段推完了：再点「播放」从头重推，或选另一段")
@@ -202,6 +212,8 @@ final class PageViewController: UIViewController {
         resumeSeconds = 0
         greetedHost = ""
         restartTries = 0
+        setPageFullscreen(false)
+        pushSeek(cur: 0, total: 0)
         webView.load(URLRequest(url: base))
     }
 
@@ -223,6 +235,67 @@ final class PageViewController: UIViewController {
         webView.evaluateJavaScript(js) { obj, _ in
             then(obj as? String)
         }
+    }
+
+    /// 进度条走页面自己的容器：每秒回填当前/总长；total<=0 页面会整行收起。
+    private func pushSeek(cur: Double, total: Double) {
+        guard webView != nil else { return }
+        let c = cur.isFinite ? max(0, cur) : 0
+        let t = (total.isFinite && total > 0) ? total : 0
+        let js = "window.LiveUI && window.LiveUI.setSeek && window.LiveUI.setSeek("
+            + String(format: "%.3f", c) + ", " + String(format: "%.3f", t) + ")"
+        webView.evaluateJavaScript(js, completionHandler: nil)
+    }
+
+    /// 页面在 change（松手）时 postMessage(秒)：推流中重建 reader；停止态只记起播点。
+    private func handleSeekBar(_ body: Any) {
+        let seconds: Double
+        if let n = body as? NSNumber {
+            seconds = n.doubleValue
+        } else if let s = body as? String, let v = Double(s) {
+            seconds = v
+        } else {
+            return
+        }
+        seekTo(seconds)
+    }
+
+    private func seekTo(_ raw: Double) {
+        guard raw.isFinite, video.hasClip, phase != .none else { return }
+        let dur = CMTimeGetSeconds(video.duration)
+        let target = max(0, min(raw, dur.isFinite && dur > 0 ? max(0, dur - 0.05) : raw))
+        resumeSeconds = target
+        pushSeek(cur: target, total: dur)
+
+        switch phase {
+        case .pushing, .paused:
+            // 和输入框回车走同一条：先停 reader，清 PC 的旧帧/旧姿势缓存，再从新 PTS 重建。
+            let wasPaused = phase == .paused
+            pushGen += 1
+            video.stop()
+            let c = client
+            Task { @MainActor in
+                await c?.seek()
+                let expected: Phase = wasPaused ? .paused : .pushing
+                guard self.phase == expected else { return }
+                self.resumePushing(from: target, reason: "跳到 \(LiveTime.clock(target))",
+                                   needStart: wasPaused, manual: true)
+            }
+        case .loaded:
+            status("已记下起播点 \(LiveTime.clock(target))，点「播放」从这儿开始推")
+        case .none:
+            break
+        }
+    }
+
+    /// 页面用 <html class="fs"> 表达全屏；这里只负责系统状态栏/Home 条，布局全在页面里。
+    private func setPageFullscreen(_ on: Bool) {
+        guard pageFullscreen != on else { return }
+        pageFullscreen = on
+        LiveChrome.shared.fullscreen = on
+        setNeedsStatusBarAppearanceUpdate()
+        setNeedsUpdateOfHomeIndicatorAutoHidden()
+        parent?.setNeedsStatusBarAppearanceUpdate()
     }
 
     // MARK: - 三条挂子的原生侧
@@ -306,6 +379,7 @@ final class PageViewController: UIViewController {
             self.lastSeen409 = client.saw409
             self.lastWarnKey = ""
             self.startMeter()
+            self.pushSeek(cur: seconds, total: CMTimeGetSeconds(self.video.duration))
             self.status("手机推流中：从 \(LiveTime.clock(seconds)) 起，"
                         + "宽 \(self.video.targetWidth)、\(Int(self.video.pushFPS))fps")
         }
@@ -355,10 +429,12 @@ final class PageViewController: UIViewController {
         resumeSeconds = clampSeconds(CMTimeGetSeconds(video.currentPTS))
         phase = .loaded
         stopMeter()
+        pushSeek(cur: 0, total: 0)
         restartTries = 0
+        let avg = client?.averageFrameBytes ?? 0
         let c = client
         Task { await c?.stopLive() }
-        status(note)
+        status(avg > 0 ? note + "；上行均值 \(max(1, avg / 1024)) KB/帧" : note)
     }
 
     private func clampSeconds(_ s: Double) -> Double {
@@ -384,6 +460,8 @@ final class PageViewController: UIViewController {
 
     private func tick() {
         guard let client = client, phase == .pushing else { return }
+        pushSeek(cur: CMTimeGetSeconds(video.currentPTS),
+                 total: CMTimeGetSeconds(video.duration))
         let sent = client.framesSent
         let now = CFAbsoluteTimeGetCurrent()
         let span = max(0.001, now - lastSentTick)
@@ -399,6 +477,7 @@ final class PageViewController: UIViewController {
             resumeSeconds = clampSeconds(CMTimeGetSeconds(video.currentPTS))
             stopMeter()
             phase = .loaded
+            pushSeek(cur: 0, total: 0)
             let c = client
             Task { await c.stopLive() }
             status(LiveAuth.lostMessage, "error")
@@ -423,7 +502,7 @@ final class PageViewController: UIViewController {
         if LiveWatch.stalled(outputAgeMs: client.outputAgeMs, localFPS: fps),
            let age = client.outputAgeMs {
             // 只报警不够：屏幕那条 MJPEG 长连接可能已经断了，PC 再出帧也看不到。
-            // 重连一次；全屏那份是页面克隆出来的 img，注入脚本也一并换掉它的地址。
+            // 重连一次；全屏只是 <html class="fs">，同一路 #video-stream，不用另刷。
             refreshFeedInPage()
             if warnOnce("age") {
                 status("手机在推、PC 有 \(age)ms 没出帧了：查那台电脑的换脸进程还在不在", "error")
@@ -464,7 +543,7 @@ final class PageViewController: UIViewController {
         return true
     }
 
-    /// 让页面重连 /video_feed，全屏克隆出来那份也换一次地址。
+    /// 让页面重连 /video_feed。0.11 起全屏不再克隆第二个 img，只有页面那一路。
     /// 8 秒内最多一次：看门狗每秒都在算，停着不等于每秒都要弹一条新长连接。
     private func refreshFeedInPage() {
         let now = CFAbsoluteTimeGetCurrent()
@@ -473,8 +552,6 @@ final class PageViewController: UIViewController {
         webView.evaluateJavaScript("""
         (function () {
           try { if (window.LiveUI && LiveUI.refreshStream) LiveUI.refreshStream(); } catch (e) {}
-          var f = document.getElementById('fullscreen-video');
-          if (f) f.src = '/video_feed?t=' + Date.now();
         })();
         """)
     }
@@ -575,6 +652,7 @@ final class PageViewController: UIViewController {
         phase = .loaded
         resumeSeconds = 0
         restartTries = 0
+        pushSeek(cur: 0, total: 0)
         setPath(name)
         let dur = CMTimeGetSeconds(video.duration)
         let durText = dur.isFinite ? LiveTime.clock(dur) : "-"
@@ -589,6 +667,10 @@ final class PageViewController: UIViewController {
 extension PageViewController: WKScriptMessageHandler {
     func userContentController(_ userContentController: WKUserContentController,
                                didReceive message: WKScriptMessage) {
+        if message.name == LiveConfig.seekBridgeName {
+            handleSeekBar(message.body)
+            return
+        }
         guard message.name == LiveConfig.bridgeName,
               let body = message.body as? [String: Any],
               let action = body["action"] as? String else { return }
@@ -600,6 +682,8 @@ extension PageViewController: WKScriptMessageHandler {
             onPlay()
         case LiveShim.hookSeek:
             onSeek()
+        case LiveShim.hookFullscreen:
+            setPageFullscreen((body["on"] as? Bool) ?? false)
         case LiveShim.hookReady:
             let hooks = body["hooks"] as? [String: Bool] ?? [:]
             let missing = LiveShim.actionNames.filter { hooks[$0] != true }
@@ -711,11 +795,32 @@ struct RootView: UIViewControllerRepresentable {
     func updateUIViewController(_ uiViewController: PageViewController, context: Context) {}
 }
 
+/// 全屏是页面里的 CSS 类，SwiftUI 这层只知道「要不要藏系统条」。
+final class LiveChrome: ObservableObject {
+    static let shared = LiveChrome()
+    @Published var fullscreen = false
+    private init() {}
+}
+
 @main
 struct LiveApp: App {
+    @StateObject private var chrome = LiveChrome.shared
+
     var body: some Scene {
         WindowGroup {
+            chromeContent
+        }
+    }
+
+    @ViewBuilder private var chromeContent: some View {
+        if #available(iOS 16.0, *) {
             RootView().ignoresSafeArea()
+                .statusBarHidden(chrome.fullscreen)
+                .persistentSystemOverlays(chrome.fullscreen ? .hidden : .automatic)
+        } else {
+            // iOS 15：状态栏能藏，Home 条交给 PageViewController 的 prefersHomeIndicatorAutoHidden。
+            RootView().ignoresSafeArea()
+                .statusBar(hidden: chrome.fullscreen)
         }
     }
 }
