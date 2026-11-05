@@ -209,6 +209,8 @@ enum CleanerDiscovery {
         let fm = FileManager.default
         if isDirectory(url.appendingPathComponent("Documents/Data/Application", isDirectory: true)) { return true }
         if isDirectory(url.appendingPathComponent("Documents/Applications", isDirectory: true)) { return true }
+        if isDirectory(url.appendingPathComponent("Data/Application", isDirectory: true)) { return true }
+        if isDirectory(url.appendingPathComponent("LiveContainer/Data/Application", isDirectory: true)) { return true }
         return fm.fileExists(atPath: url.appendingPathComponent("Library/Preferences/com.kdt.livecontainer.plist").path)
     }
 
