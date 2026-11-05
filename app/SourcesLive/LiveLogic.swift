@@ -263,7 +263,7 @@ enum PlanHint {
                         bestSim: Double?, matchThr: Double?) -> String? {
         // 空表不是故障：PC 本来就是一帧都不换，说清楚表里没配就行。
         if planCount == 0 {
-            return "还没配目标脸：这一帧不换脸（先在页面上传一张目标脸照片再播）"
+            return "还没配目标脸：这一帧不换脸（先在页面上传目标脸、选好替换特征再播）"
         }
         guard swappedFaces == 0 else { return nil }
         guard let best = bestSim, let thr = matchThr else { return nil }
