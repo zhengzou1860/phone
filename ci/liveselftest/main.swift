@@ -210,6 +210,29 @@ ck("看门狗 没出过帧(null)不报", !LiveWatch.stalled(outputAgeMs: nil, lo
    "预热期 output_age_ms 是 null，不能当 PC 挂了")
 ck("看门狗 2500ms 边界", !LiveWatch.stalled(outputAgeMs: 2500, localFPS: 13),
    "阈值本身不算超")
+
+// 配了目标脸却没换：解释只读 PC 下发的 best_sim/match_thr，门槛不写死
+ck("解释 没配目标脸不说", PlanHint.explain(planCount: 0, swappedFaces: 0,
+                                        bestSim: 0.1, matchThr: 0.3) == nil)
+ck("解释 已经换了不说", PlanHint.explain(planCount: 2, swappedFaces: 1,
+                                     bestSim: 0.1, matchThr: 0.3) == nil)
+ck("解释 老PC没字段不说", PlanHint.explain(planCount: 1, swappedFaces: 0,
+                                       bestSim: nil, matchThr: nil) == nil,
+   "老 PC 不读这两个字段也能照常推流")
+ck("解释 没检到脸", (PlanHint.explain(planCount: 1, swappedFaces: 0,
+                                    bestSim: -1, matchThr: 0.3) ?? "").contains("还没检到脸"))
+ck("解释 0.1x 判不是同一人", (PlanHint.explain(planCount: 2, swappedFaces: 0,
+                                           bestSim: 0.12, matchThr: 0.3) ?? "")
+   .contains("不是视频里同一个人"))
+ck("解释 0.2x 判太小太糊", (PlanHint.explain(planCount: 1, swappedFaces: 0,
+                                         bestSim: 0.24, matchThr: 0.3) ?? "")
+   .contains("照片太小或太糊"))
+ck("解释 门槛用PC下发的", (PlanHint.explain(planCount: 1, swappedFaces: 0,
+                                       bestSim: 0.24, matchThr: 0.5) ?? "").contains("0.50"),
+   "不许把 0.30 写死在手机里")
+ck("解释 过了门槛只提示再等", (PlanHint.explain(planCount: 1, swappedFaces: 0,
+                                          bestSim: 0.35, matchThr: 0.3) ?? "")
+   .contains("可能刚起播"))
 ck("契约 PC默认端口5100", LiveConfig.defaultPort == 5100,
    "5000 已被另一台程序占用，换脸服务长期在 5100")
 ck("契约 预填地址用5100", LiveConfig.suggestedHost.hasSuffix(":5100"),

@@ -40,6 +40,8 @@ final class PageViewController: UIViewController {
     /// 屏幕不动时补一次 /video_feed 重连的节流。页面 30 秒盲刷已经在注入脚本里关掉，
     /// 这条是它之外唯一的兜底：长连接断掉时 WebView 不一定报 error。
     private var lastFeedRefresh: TimeInterval = 0
+    /// 目标脸没换的解释 12 秒最多说一次：页面自己的目标脸状态行每秒都在刷新，不用跟着刷屏。
+    private var lastPlanHintTick: TimeInterval = 0
     /// 没存过地址时要在界面出现以后才能弹框：viewDidLoad 里 present 会被系统
     /// 静默拒绝（那时还没进窗口），表现就是一片黑、连填地址的输入框都看不到。
     private var pendingAddressPrompt = false
@@ -436,6 +438,16 @@ final class PageViewController: UIViewController {
                     + "｜PC 拒 \(client.framesRejected)｜PC 收到 \(client.pcFramesIn)、"
                     + "预热丢 \(client.pcFramesDropped)"
                     + "｜屏幕长按 1.5 秒改 PC 地址")
+        }
+        // 配了目标脸却一张没换：用 PC 下发的 best_sim/match_thr 说清是“不是同一个人”
+        // 还是“照片太小太糊”。老 PC 没有这两个字段时 PlanHint 返回 nil，不猜也不报警。
+        if let hint = PlanHint.explain(planCount: client.planCount,
+                                       swappedFaces: client.swappedFaces,
+                                       bestSim: client.bestSim,
+                                       matchThr: client.matchThr),
+           now - lastPlanHintTick >= 12 {
+            lastPlanHintTick = now
+            status(hint, "error")
         }
     }
 

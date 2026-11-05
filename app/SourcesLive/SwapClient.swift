@@ -20,6 +20,11 @@ struct LiveSnapshot {
     var framesDropped: Int
     var inputAgeMs: Int?
     var outputAgeMs: Int?
+    // PC 的纯增量字段：配了目标脸却没换时用它解释原因。老版本没有这几个键。
+    var planCount: Int
+    var swappedFaces: Int
+    var bestSim: Double?
+    var matchThr: Double?
 }
 
 final class SwapClient: ObservableObject {
@@ -30,6 +35,10 @@ final class SwapClient: ObservableObject {
     @Published var pcFramesDropped = 0
     @Published var outputAgeMs: Int?           // PC 最近一帧输出的年龄；超阈值说明流水线停了
     @Published var inputAgeMs: Int?
+    @Published var planCount = 0                // 目标脸表里有几格（0 = 一帧都不换）
+    @Published var swappedFaces = 0             // 当前帧真正换了几张
+    @Published var bestSim: Double?             // 画面里最像绑定表的那张脸的余弦；缺字段就是 nil
+    @Published var matchThr: Double?            // PC 下发的判定门槛；手机上不写死
     @Published var pcLiveMode = false          // PC 静默 10 秒会自己退出推流模式，手机靠这个知道要重来
     @Published var saw409 = 0                  // 被 PC 判「不在推流模式」的次数，恢复逻辑的触发信号
     @Published var sessionLost = false          // cookie 失效：PC 把请求弹回登录页，这边只有重登一条路
@@ -134,7 +143,11 @@ final class SwapClient: ObservableObject {
             framesIn: (j["frames_in"] as? NSNumber)?.intValue ?? 0,
             framesDropped: (j["frames_dropped"] as? NSNumber)?.intValue ?? 0,
             inputAgeMs: (j["input_age_ms"] as? NSNumber)?.intValue,
-            outputAgeMs: (j["output_age_ms"] as? NSNumber)?.intValue
+            outputAgeMs: (j["output_age_ms"] as? NSNumber)?.intValue,
+            planCount: (j["plan_count"] as? NSNumber)?.intValue ?? 0,
+            swappedFaces: (j["swapped_faces"] as? NSNumber)?.intValue ?? 0,
+            bestSim: (j["best_sim"] as? NSNumber)?.doubleValue,
+            matchThr: (j["match_thr"] as? NSNumber)?.doubleValue
         )
     }
 
@@ -156,6 +169,10 @@ final class SwapClient: ObservableObject {
         outputAgeMs = snap.outputAgeMs
         inputAgeMs = snap.inputAgeMs
         pcLiveMode = snap.liveMode
+        planCount = snap.planCount
+        swappedFaces = snap.swappedFaces
+        bestSim = snap.bestSim
+        matchThr = snap.matchThr
     }
 
     // MARK: - 数据面（每帧一次，回调式，不为每帧起一个 Task）

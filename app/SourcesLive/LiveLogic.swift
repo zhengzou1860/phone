@@ -45,7 +45,7 @@ enum LiveConfig {
 
     /// 追加到 WKWebView 默认 UA 末尾：PC 那边看 access log 就知道是手机 app 在访问，
     /// 而不是有人在浏览器里手点。
-    static let userAgentSuffix = "LiveSwap/0.7"
+    static let userAgentSuffix = "LiveSwap/0.8"
 
     /// 第一次启动时地址栏里预填的这台：PC 侧现在监听的就是它。
     /// 只当预填和提示用，不当写死的配置——PC 重连 WiFi 以后 IP 会变，
@@ -247,6 +247,37 @@ enum LiveWatch {
     static func warm(outputAgeMs: Int?, maxAgeMs: Int = LiveConfig.warmAgeMs) -> Bool {
         guard let age = outputAgeMs else { return false }
         return age < maxAgeMs
+    }
+}
+
+// MARK: - 配了目标脸却没换时的解释
+
+enum PlanHint {
+    /// 「0.1x = 不是同一个人」这条分界只负责选解释文案，不是判定门槛；
+    /// 门槛一律用 PC 下发的 match_thr，不把 0.30 写死在手机里。
+    static let wrongPersonCeiling = 0.20
+
+    /// 配了目标脸、这一帧却一张都没换：用画面里最像那张脸和 PC 下发的门槛解释原因。
+    /// 老版本 PC 没有 best_sim/match_thr 就什么也不说——不猜、不当故障上报。
+    static func explain(planCount: Int, swappedFaces: Int,
+                        bestSim: Double?, matchThr: Double?) -> String? {
+        guard planCount > 0, swappedFaces == 0 else { return nil }
+        guard let best = bestSim, let thr = matchThr else { return nil }
+        if best < 0 {
+            return "目标脸 \(planCount) 张、这一帧没换：画面里还没检到脸"
+        }
+        let b = String(format: "%.2f", best)
+        let t = String(format: "%.2f", thr)
+        if best < wrongPersonCeiling {
+            return "目标脸 \(planCount) 张、这一帧没换：画面里最像的只有 \(b)（门槛 \(t)）——"
+                + "照片里多半不是视频里同一个人，换一张视频里那个人的清晰正脸"
+        }
+        if best < thr {
+            return "目标脸 \(planCount) 张、这一帧没换：最像 \(b) 没过门槛 \(t)——"
+                + "是同一个人，但照片太小或太糊"
+        }
+        return "目标脸 \(planCount) 张、这一帧没换：最像 \(b) 已过门槛 \(t)，"
+            + "可能刚起播；一直这样就把 PC 日志发我"
     }
 }
 
