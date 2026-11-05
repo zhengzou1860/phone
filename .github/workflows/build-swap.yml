@@ -14,6 +14,7 @@ on:
       - '.github/workflows/build-swap.yml'
       - 'ci/fsx_pack.py'
       - 'ci/fsx_probe.py'
+      - 'ci/fsx_fixtures/**'
       - 'ci/identcodec/**'
       - 'ci/fsxgeo_check/**'
   workflow_dispatch:
@@ -28,8 +29,8 @@ concurrency:
 jobs:
   swap:
     runs-on: macos-latest
-    # 这一版是「下两张大网（554 MB＋174 MB）→ 各转一遍 fp32（还带 --verify）→ 打成 ~694 MB 归档传上发布位 → 再编 ipa」。
-    # 单张 528 MB 的转换实测 36 s，但 --verify 和落盘读回来各自还要几十秒到几分钟；上一轮照「四张小网」估的 60 分钟不成立。
+    # 这一版是「下两张大网（403 MB＋174 MB）→ 各转一遍 fp32（还带 --verify）→ 打成 ~500 MB 归档传上发布位 → 再编 ipa」。
+    # 单张几百 MB 的转换实测几十秒，但 --verify 和落盘读回来各自还要几十秒到几分钟；上一轮照「四张小网」估的 60 分钟不成立。
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
@@ -94,28 +95,28 @@ jobs:
           echo "M-VERDICT 转换器就绪" | rec
           exit 0
 
-      # 权重不进 git（728 MB），只在这台机器上下一次，字节数钉死：换源就换字节，换字节就换画面。
-      # inswapper_128.onnx = 554253681，w600k_r50.onnx = 174383860（本机 PC 上验通的那两份，逐字节同一个）。
+      # 权重不进 git（577 MB），只在这台机器上下一次，字节数钉死：换源就换字节，换字节就换画面。
+      # hyperswap_1a_256.onnx = 402742682，w600k_r50.onnx = 174383860（本机 PC 上验通的那两份，逐字节同一个）。
       # 下在 /tmp/fm 而不是工程里：xcodegen 会扫工程，模型一旦落进 sources 就被当编译输入交给
       # coremlc generate（VR3D 第 5 轮正是这么死在 build 阶段，A valid manifest does not exist）。
-      - name: 下 inswapper_128（554 MB）
+      - name: 下 hyperswap_1a_256（403 MB）
         run: |
           set +e
           ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=6{print "::error::" p substr($0,1,230)}'; }
           rec() { tee -a /tmp/model.log; }
           mkdir -p /tmp/fm
-          WANT=554253681
-          U=https://github.com/deepinsight/insightface/releases/download/model-zoo/inswapper_128.onnx
-          code=$(curl -sS -L --retry 3 --retry-all-errors --max-time 1200 -o /tmp/fm/inswapper_128.onnx -w '%{http_code}' "$U")
-          sz=$(wc -c < /tmp/fm/inswapper_128.onnx 2>/dev/null | tr -d ' ')
-          echo "DL-VERDICT inswapper http=$code bytes=${sz:-0}（要 $WANT）" | rec
+          WANT=402742682
+          U=https://github.com/facefusion/facefusion-assets/releases/download/models-3.3.0/hyperswap_1a_256.onnx
+          code=$(curl -sS -L --retry 3 --retry-all-errors --max-time 1200 -o /tmp/fm/hyperswap_1a_256.onnx -w '%{http_code}' "$U")
+          sz=$(wc -c < /tmp/fm/hyperswap_1a_256.onnx 2>/dev/null | tr -d ' ')
+          echo "DL-VERDICT hyperswap http=$code bytes=${sz:-0}（要 $WANT）" | rec
           # 这里一律 exit 0：下载／转换没成也先把 ipa 编出来，一轮就把两件事都问了（本机没有 Swift，
           # 编译错和模型错挤在一轮里看比分开快得多）。真正的闸门在「publish release」最后那条版本比对上。
           if [ "${sz:-0}" != "$WANT" ]; then
-            echo "DL-VERDICT inswapper 字节对不上 ⇒ 这一版不发模型，发布位上那一版对不上号的会被闸门拦下" | rec | ann "DL "
+            echo "DL-VERDICT hyperswap 字节对不上 ⇒ 这一版不发模型，发布位上那一版对不上号的会被闸门拦下" | rec | ann "DL "
             exit 0
           fi
-          shasum -a 256 /tmp/fm/inswapper_128.onnx | rec | ann "DL "
+          shasum -a 256 /tmp/fm/hyperswap_1a_256.onnx | rec | ann "DL "
           exit 0
 
       - name: 下 buffalo_l 取 w600k_r50（人脸向量网）
@@ -139,9 +140,9 @@ jobs:
           ls -l /tmp/fm | rec | ann "DL-LS "
           exit 0
 
-      # 这一版整条链路只有两张网：w600k_r50（112→512 维身份证）＋ inswapper_128（128 进 128 出），
-      # 外加 onnx 里没人用的 buff2fs 那张 512×512（手机上身份证→latent 自己乘，单独抽成 emap.bin）。
-      # 只转 fp32：探针在 mac runner 上把 fp16 判死了（CI run 41781612527，两张都在转换器自己的
+      # 这一版整条链路只有两张网：w600k_r50（112→512 维身份证）＋ hyperswap_1a_256（256 进 256 出，
+      # 源直接吃归一化后的 512 维向量，不再乘 buff2fs 那张 512×512——所以也没有 emap.bin 了）。
+      # 只转 fp32：探针在上一代 128 换脸网上把 fp16 判死了（CI run 41781612527，两张都在转换器自己的
       # --verify 上 FAIL——向量网 512 维嵌入 max_abs=4.930e-02，换脸网 max_abs=2.886e-01＝差 74 个灰阶，
       # psnr 只有 29.48 dB），fp32 两张全过（cos=1.000000／PSNR=52.90 dB）。
       # 「保持原来的处理速度」这一条不许拿画质换：掉精度就是程序错了，所以这里连 fp16 都不试第二遍。
@@ -149,8 +150,8 @@ jobs:
       # 任何一层不过就地失败、一个文件都不打包。这一条 step 本身一律 exit 0（见上面下载那步的理由：
       # 本机没有 Swift，一轮把「编译过不过」和「模型对不对账」两件事都问了才算快），
       # 真闸门在 publish 最后那条「发布位上的 models.json 版本必须等于这一轮算出来的版本」上。
-      # 554 MB 那张光转换就 36 s、还带 --verify，加上下两次大文件，上一轮照「四张小网」估的 60 分钟不成立。
-      - name: 转两张网＋抽 emap＋与 PC 对账＋打包 models.bin
+      # 403 MB 那张光转换就几十秒、还带 --verify，加上下两次大文件，上一轮照「四张小网」估的 60 分钟不成立。
+      - name: 转两张网＋与 PC 对账＋打包 models.bin
         run: |
           set +e
           ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=10{print "::error::" p substr($0,1,230)}'; }
@@ -220,9 +221,9 @@ jobs:
           if [ -n "$left" ]; then
             echo "P-VERDICT 包里还有模型$left ⇒ 这一版模型没真正分离出去" | rec
           else
-            echo "P-VERDICT 包里没有模型（两张网＋emap 在发布位上：models.bin）｜这一版手机上第一次用会自己下" | rec
+            echo "P-VERDICT 包里没有模型（两张网＋chain.txt 在发布位上：models.bin）｜这一版手机上第一次用会自己下" | rec
           fi
-          echo "P-VERDICT 模型归档 $([ -s SwapModel/models.bin ] && echo 有 || echo 缺)｜$(wc -c < SwapModel/models.bin 2>/dev/null | tr -d ' ') 字节｜emap.bin $([ -s SwapModel/emap.bin ] && echo 有 || echo 缺)" | rec
+          echo "P-VERDICT 模型归档 $([ -s SwapModel/models.bin ] && echo 有 || echo 缺)｜$(wc -c < SwapModel/models.bin 2>/dev/null | tr -d ' ') 字节｜chain.txt $([ -s SwapModel/chain.txt ] && cat SwapModel/chain.txt || echo 缺)" | rec
           rm -rf Payload swap.ipa
           mkdir Payload
           cp -R "$APP" Payload/
@@ -244,7 +245,7 @@ jobs:
             echo "整个 app=$(du -sk "$APP" 2>/dev/null | awk '{print $1"KB"}')"
             echo "swap.ipa=$(wc -c < swap.ipa 2>/dev/null | tr -d ' ') 字节"
             echo "models.bin=$(wc -c < SwapModel/models.bin 2>/dev/null | tr -d ' ') 字节"
-            echo "emap.bin=$(wc -c < SwapModel/emap.bin 2>/dev/null | tr -d ' ') 字节（要 1048576）"
+            echo "chain.txt=$(cat SwapModel/chain.txt 2>/dev/null)（要 hyperswap-1a-256）"
             echo "models.json=$(wc -c < SwapModel/models.json 2>/dev/null | tr -d ' ') 字节"; } | tee -a /tmp/model.log | ann "B-VERDICT "
           exit 0
 

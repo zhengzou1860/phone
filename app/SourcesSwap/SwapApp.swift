@@ -579,7 +579,7 @@ struct SwapContentView: View {
         SwapContentView.engine.seek(sec)
     }
 
-    /// 下模型：两张网＋emap.bin 合成一个 models.bin 挂在 release 上，下完 sha256 对得上才解包。
+    /// 下模型：两张网（带一份口径标记 chain.txt）合成一个 models.bin 挂在 release 上，下完 sha256 对得上才解包。
     /// 下到 Documents/swap_models —— 程序随便换，这一份原封不动。
     private func downloadModels() {
         modelBusy = true

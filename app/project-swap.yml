@@ -13,7 +13,7 @@ targets:
   SwapBench:
     type: application
     platform: iOS
-    # 只吃自己的目录。模型彻底不进包：两张网＋emap.bin 由 CI 打成 models.bin 挂在 release 上，
+    # 只吃自己的目录。模型彻底不进包：两张网＋chain.txt 由 CI 打成 models.bin 挂在 release 上，
     # 手机第一次用时自己下到 Documents/swap_models（改了程序不用重下模型，版本号＝两张 onnx 的 sha256）。
     # app 那边 FsxEngine.locate() 只认盘上那一份，没有「包里再塞一份」的退路。
     sources:
@@ -26,12 +26,12 @@ targets:
         CFBundleExecutable: SwapBench
         CFBundleIdentifier: com.qoder.swapbench
         CFBundlePackageType: APPL
-        CFBundleShortVersionString: "0.40"
-        CFBundleVersion: "40"
+        CFBundleShortVersionString: "0.41"
+        CFBundleVersion: "41"
         CFBundleInfoDictionaryVersion: "6.0"
         NSPhotoLibraryAddUsageDescription: "要把换好脸的片段存回相册"
         NSPhotoLibraryUsageDescription: "要选一张源脸照片和一条要换脸的视频"
-        # 0.34 起模型先从局域网上那台电脑拿（手机直连 GitHub 那条被掐着走，344 MB 能爬一两个小时）。
+        # 0.34 起模型先从局域网上那台电脑拿（手机直连 GitHub 那条被掐着走，几百 MB 能爬一两个小时）。
         # 走局域网必须写这一句：iOS 14 以后没这句就直接把本机网络访问挡掉，连弹窗都不弹。
         NSLocalNetworkUsageDescription: "要把模型从同一张网上的电脑上拿到手机里"
         NSAppTransportSecurity:

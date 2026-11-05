@@ -1,26 +1,36 @@
 import Foundation
 import CoreGraphics
 
-/// fsx 那条链路的几何，逐式对照 PC 上跑通、肉眼认过的 fsx/swapcore.py：
-/// 5 点 → 相似变换 → warpAffine 到 112（身份证）和 128（补丁）→ 结果按官方那三刀贴回。
+/// fsx 那条链路的几何，逐式对照 PC 上跑通、肉眼认过的 fsx/netstage.py：
+/// 5 点 → 相似变换 → warpAffine 到 112（身份证）和 256（补丁）→ 结果按官方那三刀贴回。
 /// 这一份不调旧算法（SwapGeo）里的任何函数：矩阵、取样、遮罩、腐蚀、糊全在这里现写——
-/// 旧那条线的贴区形状是分割网画出来的，这一条线的贴区是 128 方块投回帧空间的那个平行四边形。
+/// 旧那条线的贴区形状是分割网画出来的，这一条线的贴区是 256 方块投回帧空间的那个平行四边形。
 enum FsxGeo {
     static let side112 = 112
-    static let side128 = 128
+    static let sideSwap = 256
 
     /// 2×3：dst = [a b c; d e f]·(x, y, 1)，和 cv2 的 M 同一个排法
     struct M23 { var a, b, c, d, e, f: Double }
 
     /// arcface 的 5 点标准框（112 空间）＝官方 REFERENCE_FACIAL_POINTS 的 x 各 +8。
-    /// 换脸那一步按 size/112 缩放它（PC: TPL112*(size/112)）——所以 112 和 128 两个框是同一个框，
-    /// 身份证和补丁落在同一张脸上，不会错开。
     static let tpl112: [(Double, Double)] = [(38.2946, 51.6963), (73.5318, 51.5014), (56.0252, 71.7366),
                                              (41.5493, 92.3655), (70.7299, 92.2041)]
 
+    /// 身份证那一格：tpl112 按边长缩（112 就是它本身）。
     static func templateFor(_ size: Int) -> [CGPoint] {
         let s = Double(size) / 112.0
         return tpl112.map { CGPoint(x: $0.0 * s, y: $0.1 * s) }
+    }
+
+    /// 换脸网那一格的 5 点框：FaceFusion 的 arcface_128 模板，归一化到边长 1，再乘 256。
+    /// 它和身份证那组不是同一个框（相对位置差一截），换脸网训练时用的就是这一组；
+    /// 拿 tpl112×256/112 去对，不会报错，只是身份低一截、边缘对不上（PC 上两臂并排量过）。
+    static let tplSwapUnit: [(Double, Double)] = [(0.36167656, 0.40387734), (0.63696719, 0.40235469),
+                                                  (0.50019687, 0.56044219), (0.38710391, 0.72160547),
+                                                  (0.61507734, 0.72034453)]
+
+    static func swapTemplate() -> [CGPoint] {
+        tplSwapUnit.map { CGPoint(x: $0.0 * Double(sideSwap), y: $0.1 * Double(sideSwap)) }
     }
 
     /// 5 组点对求 4 自由度相似（等比缩放＋旋转＋平移）。
@@ -57,11 +67,11 @@ enum FsxGeo {
                    d: -m.d / det, e: m.a / det, f: (m.d * m.c - m.a * m.f) / det)
     }
 
-    /// 5 个点位 → 这一条链路要的那两份正向矩阵（整幅→112、整幅→128）
-    static func align(_ pts: [CGPoint]) -> (fwd112: M23, fwd128: M23)? {
+    /// 5 个点位 → 这一条链路要的那两份正向矩阵（整幅→112、整幅→256）
+    static func align(_ pts: [CGPoint]) -> (fwd112: M23, fwdSwap: M23)? {
         guard let f112 = fit(pts, templateFor(side112)),
-              let f128 = fit(pts, templateFor(side128)) else { return nil }
-        return (f112, f128)
+              let fSw = fit(pts, swapTemplate()) else { return nil }
+        return (f112, fSw)
     }
 
     // MARK: - 正向：整幅 BGRA → size×size planar RGB 0..1
@@ -107,20 +117,18 @@ enum FsxGeo {
         return (top + (bot - top) * dy) / 255.0
     }
 
-    // MARK: - 反向：128 的补丁贴回整幅
+    // MARK: - 反向：256 的补丁贴回整幅
 
-    /// 贴回往下多贴几格（128 口径）。官方那三刀之后遮罩的底边落在 128 框的第 120 格上下，
-    /// 而这一档人脸的下巴在 128 框的第 134 格（PC 上拿检测框底量的：嘴角 1175、框底 1338、
-    /// 官方遮罩底 1252，帧像素，1 格 128＝5.9 帧像素）——连方块自己的底（127.9）都还差 39 帧像素，
-    /// 所以「够不着下巴」不是那把刀收错了，是官方那个方块本来就没把下巴装进来：四边的腐蚀照旧，只往下多贴。
+    /// 贴回往下多贴几格。这组尺当初是按 128 口径量的（ext 12／收 6），PC 那边按 size/128 折算；
+    /// 256 口径就是 24 格／收 12 格。官方那三刀之后遮罩的底边落在方块第 120/128 格上下，
+    /// 而这一档人脸的下巴在 134/128 格——方块自己就没把下巴装进来，所以四边腐蚀照旧、只往下多贴。
     /// 多贴出去那一带没有网络生成的内容，取方块最后一行复制填上（跟 PC 那边 np.repeat(fake[-1:]) 同式）。
-    static let extDown = 12
+    static let extDown = 24
     /// 延出去那一带最下面几格把 alpha 线性收到 0（0＝硬边，PC 上量过：硬边就在脖子上切出一条横线）。
-    /// 12 格／收 6 格这一档＝PC 上四臂并排比出来、看过片定的 C 档：第 20 帧中心列 alpha 过半落在 y=1337，下巴实测 1338。
-    static let fadeDown = 6
+    static let fadeDown = 12
 
-    /// 官方 inswapper 的贴回，三刀一刀不减，只在底边加一截多贴：
-    /// ① 白图随 128 方块投回帧空间（往下带 extDown 格），>20 的格子拉成 255＝贴区就是这个平行四边形自己；
+    /// 官方贴回，三刀一刀不减，只在底边加一截多贴：
+    /// ① 白图随 256 方块投回帧空间（往下带 extDown 格），>20 的格子拉成 255＝贴区就是这个平行四边形自己；
     /// ② 按这块贴区量出的边长腐蚀 k＝max(mask_size//10,10)，四边同宽（官方那颗 k×k 方核）；
     /// ③ 再糊一刀，核长 2*max(mask_size//20,5)+1、σ 由核长现算（cv2 传 sigma=0 就是这个口径）。
     /// 多贴那一带的收口夹在②③中间（PC 是腐蚀完乘那张带 alpha 的斜坡图，再糊），顺序换了就不是同一条边。
@@ -128,7 +136,7 @@ enum FsxGeo {
     /// face 必须是已经量化到 8 位那一份（PC 是 uint8 转 float 再 warp 的，跳过这步差半格）。
     static func pasteBack(_ base: UnsafeMutableRawPointer, bytesPerRow: Int, w: Int, h: Int,
                           face: [Float], fwd: M23) -> Bool {
-        let s = side128
+        let s = sideSwap
         let ext = extDown
         guard face.count == 3 * s * s, let im = inverse(fwd) else { return false }
         let q = base.assumingMemoryBound(to: UInt8.self)
@@ -243,10 +251,10 @@ enum FsxGeo {
     }
 
     /// 延出去那一带每一行的 alpha：方块里 1，带里最下面 fadeDown 格线性收到 0，带外 0（＝cv2 borderValue）。
-    /// PC 那边是把这一串行权拼成 (128+ext)×128 的图再 warpAffine 回帧空间；因为每行是常数，
+    /// PC 那边是把这一串行权拼成 (256+ext)×256 的图再 warpAffine 回帧空间；因为每行是常数，
     /// 双线性在 x 方向拿到的还是同一个数，只剩 y 方向那一插，所以这里按 fy 一维插值就是同一份数。
     private static func rowWeight(_ row: Int) -> Double {
-        let s = side128
+        let s = sideSwap
         if row < 0 || row >= s + extDown { return 0 }
         if row < s { return 1 }
         let j = (s + extDown - 1) - row
@@ -261,10 +269,10 @@ enum FsxGeo {
         return rowWeight(y0) * (1 - dy) + rowWeight(y0 + 1) * dy
     }
 
-    /// 白图投回来：落在 128 方块（往下带 ext 格）里的邻按双线性权重相加再乘 255，外面那一份就是 borderValue=0
+    /// 白图投回来：落在 256 方块（往下带 ext 格）里的邻按双线性权重相加再乘 255，外面那一份就是 borderValue=0
     private static func whiteTap(_ fx: Double, _ fy: Double, ext: Int) -> Double {
-        let limX = Double(side128) - 1
-        let limY = Double(side128 - 1 + ext)
+        let limX = Double(sideSwap) - 1
+        let limY = Double(sideSwap - 1 + ext)
         let x0 = Int(fx.rounded(.down)), y0 = Int(fy.rounded(.down))
         let dx = fx - Double(x0), dy = fy - Double(y0)
         var sum = 0.0
@@ -342,13 +350,13 @@ enum FsxGeo {
 
     struct Placed {
         let fwd112: M23      // 整幅 → 112（身份证）
-        let fwd128: M23      // 整幅 → 128（补丁；回贴用的就是这一份的正向，它的逆把补丁投回帧空间）
+        let fwdSwap: M23     // 整幅 → 256（补丁；回贴用的就是这一份的正向，它的逆把补丁投回帧空间）
         let pts: [CGPoint]
         let src: String      // 点位来路：真点位／框猜
         let shortSide: Double
         let mirrored: Bool
         let chir: (nose: Double, mouth: Double)
-        let resid128: Double // 5 点映进 128 后离模板的平均距离，单位＝128 方块里的像素
+        let residSwap: Double // 5 点映进 256 后离模板的平均距离，单位＝256 方块里的像素
         let residPx: Double  // 同一件事折回原图像素
         let scale: Double    // 拟合的缩放（＝√det）
     }
@@ -371,27 +379,27 @@ enum FsxGeo {
     /// 5 个像素点 → 这一条链路要的整帧产物。点不够 5 个、拟合退化、映不出逆，都返回 nil＝这帧不换。
     static func place(pts: [CGPoint], src: String, shortSide: Double) -> Placed? {
         guard pts.count == 5, let both = align(pts) else { return nil }
-        let tpl = templateFor(side128)
+        let tpl = swapTemplate()
         let c = chirality(pts), t = chirality(tpl)
         let mir = c.nose * t.nose < 0 || c.mouth * t.mouth < 0
         var sum = 0.0
         for i in 0..<5 {
             let px = Double(pts[i].x), py = Double(pts[i].y)
-            let qx = both.fwd128.a * px + both.fwd128.b * py + both.fwd128.c
-            let qy = both.fwd128.d * px + both.fwd128.e * py + both.fwd128.f
+            let qx = both.fwdSwap.a * px + both.fwdSwap.b * py + both.fwdSwap.c
+            let qy = both.fwdSwap.d * px + both.fwdSwap.e * py + both.fwdSwap.f
             let dx = qx - Double(tpl[i].x), dy = qy - Double(tpl[i].y)
             sum += (dx * dx + dy * dy).squareRoot()
         }
         let resid = sum / 5.0
-        let det = both.fwd128.a * both.fwd128.e - both.fwd128.b * both.fwd128.d
+        let det = both.fwdSwap.a * both.fwdSwap.e - both.fwdSwap.b * both.fwdSwap.d
         guard det > 1e-9 else { return nil }
         let sc = det.squareRoot()
-        return Placed(fwd112: both.fwd112, fwd128: both.fwd128, pts: pts, src: src,
+        return Placed(fwd112: both.fwd112, fwdSwap: both.fwdSwap, pts: pts, src: src,
                       shortSide: shortSide, mirrored: mir, chir: c,
-                      resid128: resid, residPx: sc > 1e-9 ? resid / sc : 999.0, scale: sc)
+                      residSwap: resid, residPx: sc > 1e-9 ? resid / sc : 999.0, scale: sc)
     }
 
-    // MARK: - 128 → 112（身份复测要把贴完的补丁再送一次向量网）
+    // MARK: - 256 → 112（身份复测要把贴完的补丁再送一次向量网）
 
 
     /// 双线性缩小（PC 是 cv2.resize(...,(112,112))，默认 INTER_LINEAR，半像素口径）
@@ -420,13 +428,14 @@ enum FsxGeo {
     }
 
     /// 给自己看的判据（CI 里编成命令行跑）：
-    /// ① 这一份模板必须逐点等于 insightface 官方 REFERENCE_FACIAL_POINTS（x 各 +8 是官方 preprocess 那一格）
+    /// ① 身份证那一份模板必须逐点等于 insightface 官方 REFERENCE_FACIAL_POINTS（x 各 +8）
     ///    ×size/112——旧那条线在手机上验过的就是这一组点，同一个模板才对得上同一套 Vision 点位；
+    ///    换脸那一份必须是 FaceFusion arcface_128×256（这里钉 4 位小数），拿身份证那组缩放去顶就会在这里翻红；
     /// ② 映出去再映回来必须回到原地（逆矩阵那式没写反）；
     /// ③ 腐蚀/糊那两档的取整口径（mask_size 100 时 k=10、kb=5）钉住，改式子就会被这里抓到；
     /// ④ 往下多贴 extDown 格这一档：延伸带里白图该满、出了带该归 0，补丁取样在带里该拿到最后一行（复制）、
     ///    带外该拿到 0——这两条一错，贴回去的下巴就是一片黑或者一层膜；
-    /// ⑤ 带子底部的收口：方块底边和下巴那一格（128 口径第 134 格）都得是满的，最底一格归 0、带外归 0，
+    /// ⑤ 带子底部的收口：方块底边和下巴那一格（256 口径第 268 格）都得是满的，最底一格归 0、带外归 0，
     ///    中间按 fadeDown 线性——收口接错就是脖子上那条硬边或者下巴盖上一层膜。
     static func selfTest() -> String {
         let official: [(Double, Double)] = [(30.29459953, 51.69630051), (65.53179932, 51.50139999),
@@ -437,25 +446,33 @@ enum FsxGeo {
         for i in 0..<5 {
             worst = max(worst, abs(t224[i].x - (official[i].0 + 8) * 2), abs(t224[i].y - official[i].1 * 2))
         }
+        // FaceFusion arcface_128 模板 × 256 的期望值（独立抄一份，不是从 tplSwapUnit 推的）
+        let wantSwap: [(Double, Double)] = [(92.5892, 103.3926), (163.0636, 103.0028), (128.0504, 143.4732),
+                                            (99.0986, 184.7310), (157.4598, 184.4082)]
+        let tSw = swapTemplate()
+        var worstSw = 0.0
+        for i in 0..<5 {
+            worstSw = max(worstSw, abs(tSw[i].x - wantSwap[i].0), abs(tSw[i].y - wantSwap[i].1))
+        }
         let pts: [CGPoint] = [CGPoint(x: 38, y: 52), CGPoint(x: 74, y: 51), CGPoint(x: 56, y: 72),
                               CGPoint(x: 42, y: 92), CGPoint(x: 71, y: 92)]
-        guard let m = fit(pts, templateFor(128)), let im = inverse(m) else { return "拟合失败" }
+        guard let m = fit(pts, swapTemplate()), let im = inverse(m) else { return "拟合失败" }
         let u = m.a * 50 + m.b * 60 + m.c, v = m.d * 50 + m.e * 60 + m.f
         let bx = im.a * u + im.b * v + im.c, by = im.d * u + im.e * v + im.f
         let round = max(abs(bx - 50), abs(by - 60))
         let ms = 100
         var gate = (max(ms / 10, 10) == 10 && max(ms / 20, 5) == 5 && gauss1d(11).count == 11)
-        let s = side128
-        let inExt = whiteTap(64, Double(s - 1 + extDown / 2), ext: extDown) > 20
-        let outExt = whiteTap(64, Double(s + extDown), ext: extDown) == 0
+        let s = sideSwap
+        let inExt = whiteTap(128, Double(s - 1 + extDown / 2), ext: extDown) > 20
+        let outExt = whiteTap(128, Double(s + extDown), ext: extDown) == 0
         var pf = [Float](repeating: 0, count: 3 * s * s)
         for j in 0..<s { pf[(s - 1) * s + j] = 1 }                    // 只有 R 平面最后一行是 1
-        let rep = planarTap(pf, s * s, s, 64, Double(s + 1), 0, ext: extDown)
-        let beyond = planarTap(pf, s * s, s, 64, Double(s + extDown), 0, ext: extDown)
+        let rep = planarTap(pf, s * s, s, 128, Double(s + 1), 0, ext: extDown)
+        let beyond = planarTap(pf, s * s, s, 128, Double(s + extDown), 0, ext: extDown)
         gate = gate && inExt && outExt && rep == 1 && beyond == 0
-        // 收口那一段：方块底边还是满的，下巴那一格（128 口径第 134 格）也必须满，最底一格归 0、带外归 0，
-        // 中间那一格按 fadeDown 线性（137 行＝离底 2 格／收 6 格＝0.4）
-        let fadeOK = rampTap(Double(s)) == 1 && rampTap(134) == 1 && rampTap(137) == 0.4
+        // 收口那一段：方块底边还是满的，下巴那一格（256 口径第 268 格）也必须满，最底一格归 0、带外归 0，
+        // 中间那一格按 fadeDown 线性（272 行＝离底 7 格／收 12 格＝7/11）
+        let fadeOK = rampTap(Double(s)) == 1 && rampTap(268) == 1 && rampTap(272) == 7.0 / 11.0
             && rampTap(Double(s + extDown - 1)) == 0 && rampTap(Double(s + extDown)) == 0
         gate = gate && fadeOK
         // ⑥ 裁片的通道序：内存是 BGRA、两张网都要 planar RGB，顺着内存序喂进去就是把 B 摆进 R 的位置——
@@ -468,7 +485,9 @@ enum FsxGeo {
             warpCrop(raw.baseAddress!, bytesPerRow: 16, w: 4, h: 4, fwd: idn, size: 4, out: &ch4)
         } && abs(ch4[0] - Float(210) / 255) < 1e-6 && abs(ch4[16] - Float(110) / 255) < 1e-6
             && abs(ch4[32] - Float(10) / 255) < 1e-6
-        return "模板 224 与官方那份最大差 \(String(format: "%.6f", worst))｜往返残差 \(String(format: "%.9f", round))"
+        return "模板 224 与官方那份最大差 \(String(format: "%.6f", worst))"
+            + "｜换脸模板 256 与 arcface_128 最大差 \(String(format: "%.4f", worstSw))"
+            + "｜往返残差 \(String(format: "%.9f", round))"
             + "｜腐蚀糊两档 \(gate ? "对" : "错")"
             + "｜往下多贴 \(extDown) 格：带内满\(inExt ? "对" : "错") 带外零\(outExt ? "对" : "错")"
             + " 最后一行复制\(rep == 1 ? "对" : "错") 带外取样\(beyond == 0 ? "零，对" : "非零，错")"

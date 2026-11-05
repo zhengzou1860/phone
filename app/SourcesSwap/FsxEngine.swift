@@ -2,23 +2,21 @@ import Foundation
 import CoreML
 import CoreVideo
 
-/// fsx 那条链路的两张网：脸向量网（112 出 512 维身份证）＋ inswapper（128 进 128 出）。
-/// 这一条线只有这两张网，外加一张 512×512 的 latent 映射矩阵——旧那四张（权重生成／逐帧／分割）全不用。
-///
-/// 为什么身份证要自己乘那一张矩阵：inswapper_128.onnx 里 buff2fs 那个 (512,512) 的初始化值挂在图上、
-/// 没有任何一个节点用它（onnxruntime 自己会报一句 "Removing initializer 'buff2fs'"）。
-/// 官方 App 是在图外面拿 emb@emap 算 latent 再喂进 source 那一格的；转成 CoreML 之后这张矩阵更不会带过去，
-/// 所以 CI 把它单独抽成 emap.bin 跟着模型一起下，手机上这一步自己做。
+/// fsx 那条链路的两张网：脸向量网（112 出 512 维身份证）＋ hyperswap_1a_256（256 进 256 出）。
+/// 换脸网这一格收的就是那张归一化过的 512 维向量本身，不再乘 latent 矩阵——
+/// inswapper 那套 emap 是它自己图上的安排；这一张网没有那一步，喂 emap 出来的东西它不认识。
 enum FsxNets {
     static let arcResource = "fsx_arc"
     static let swapResource = "fsx_swap"
-    static let emapName = "emap.bin"
     static let embDim = 512
     static let side112 = 112
-    static let side128 = 128
+    static let sideSwap = 256
 
     /// arcface 那一路的归一化：手里是 0..1 的 planar，先还原成 0..255 再走 PC 那一式 (x−127.5)/127.5
     static func normalizeArc(_ v: Float) -> Float { (v * 255.0 - 127.5) / 127.5 }
+
+    /// 换脸网那一路：mean 0.5／std 0.5，0..1 的 planar 进去就是 2x−1
+    static func normalizeSwap(_ v: Float) -> Float { v * 2.0 - 1.0 }
 
     /// 把模型自己声明的入参/出参打印成人能读的一行（对账全靠它）
     static func describe(_ model: MLModel) -> String {
@@ -54,12 +52,11 @@ enum FsxNets {
     }
 }
 
-/// 一次换脸的运行时：两张网都装好、当前身份的 latent 在手，逐帧只剩「裁 128 → 一次前向 → 贴回」。
+/// 一次换脸的运行时：两张网都装好、当前身份的向量在手，逐帧只剩「裁 256 → 一次前向 → 贴回」。
 /// 只能在调用方的后台线程上用：装包那一步现场编译可能几分钟，绝不在主线程。
 final class FsxEngine {
     let arc: MLModel
     let swap: MLModel
-    let emap: [Float]
     let loadNote: String
 
     struct Contract {
@@ -71,7 +68,7 @@ final class FsxEngine {
     }
     let contract: Contract
 
-    /// 当前这个人的 latent（512 维，已归一化）。没装身份就一片都没有，逐帧那一步直接拒。
+    /// 当前这个人的向量（512 维，已归一化）。这一格收的就是它本身，不再过 emap。
     private var latent: [Float] = []
     private(set) var identityEmb: [Float] = []
 
@@ -131,6 +128,20 @@ final class FsxEngine {
         return d
     }
 
+    /// 换模型版本后，旧版本编好的那几份不再命中，却还占着 Caches（一份包编出来也是几百 MB）。
+    /// 留着两份就是双倍占用，A13 上会直接影响下一趟装包，所以版本一对不上就删。
+    private static func dropOldCompiled() {
+        guard let c = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first else { return }
+        let root = c.appendingPathComponent("compiled", isDirectory: true)
+        let v = SwapStore.localVersion()
+        guard !v.isEmpty,
+              let all = try? FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)
+        else { return }
+        for u in all where u.lastPathComponent != v {
+            try? FileManager.default.removeItem(at: u)
+        }
+    }
+
     static func load(units: MLComputeUnits, onLine: @escaping (String) -> Void) -> (engine: FsxEngine?, note: String) {
         var note = ""
         if !SwapStore.haveAll() {
@@ -139,6 +150,7 @@ final class FsxEngine {
             onLine("模型 \(g.note)")
             if !g.ok { return (nil, "模型 没下下来：\(g.note)") }
         }
+        dropOldCompiled()
         var made: [String: MLModel] = [:]
         for res in [FsxNets.arcResource, FsxNets.swapResource] {
             let cfg = MLModelConfiguration()
@@ -173,28 +185,15 @@ final class FsxEngine {
             let got = made.keys.sorted().joined(separator: "／")
             return (nil, note + "两张网没凑齐（装上的是 \(got)），这一版出不了片")
         }
-        guard let em = loadEmap() else {
-            return (nil, note + "emap.bin 读不出来（\(SwapStore.dir?.path ?? "拿不到 Documents")/\(FsxNets.emapName)）："
-                + "身份证到 latent 那一步乘不了，硬跑只会换出一张不像人的脸")
-        }
         let got = FsxEngine.contract(arc: a, swap: s)
         onLine("接口对账: \(got.note)")
         guard let c = got.value else { return (nil, note + "接口对账：\(got.note)\n") }
         note += "接口对账：\(got.note)\n"
-        return (FsxEngine(arc: a, swap: s, emap: em, loadNote: note, contract: c), note)
-    }
-
-    /// 512×512 行优先的 f32，一维摆平（PC 是 np.ascontiguousarray(emap, float32).tofile()）
-    static func loadEmap() -> [Float]? {
-        guard let d = SwapStore.dir else { return nil }
-        let want = FsxNets.embDim * FsxNets.embDim * 4
-        let u = d.appendingPathComponent(FsxNets.emapName)
-        guard let data = try? Data(contentsOf: u), data.count == want else { return nil }
-        return data.withUnsafeBytes { raw in Array(raw.bindMemory(to: Float.self)) }
+        return (FsxEngine(arc: a, swap: s, loadNote: note, contract: c), note)
     }
 
     /// 名字按声明的元素数认领，不认顺序：
-    /// 换脸那一张有两个入参（128 的图和 512 的向量），光看名字（target/source）转换器一改就认不出，
+    /// 换脸那一张有两个入参（256 的图和 512 的向量），光看名字（target/source）转换器一改就认不出，
     /// 认反了两张网照样跑、不报错，只是画面是错的——所以只认形状，认不出就拒绝出片。
     /// 声明成 image 型的也拒绝：那一路的归一化是编译期烘进包的，喂法完全不同，
     /// 这一版对账用的是张量口径，包要是变成 image 就回去改转换配方，不在手机上猜。
@@ -215,7 +214,7 @@ final class FsxEngine {
             return nil
         }
         let arcTot = 3 * FsxNets.side112 * FsxNets.side112
-        let swTot = 3 * FsxNets.side128 * FsxNets.side128
+        let swTot = 3 * FsxNets.sideSwap * FsxNets.sideSwap
         func listed(_ m: MLModel, _ ins: Bool) -> String {
             let d = m.modelDescription
             let k = (ins ? d.inputDescriptionsByName : d.outputDescriptionsByName).keys.sorted()
@@ -238,7 +237,7 @@ final class FsxEngine {
             return (nil, err.joined(separator: "；"))
         }
         guard let sl = findIn(swap, want: FsxNets.embDim) else {
-            err.append("换脸网找不到 512 那个入参（latent 喂不进去）")
+            err.append("换脸网找不到 512 那个入参（身份向量喂不进去）")
             return (nil, err.joined(separator: "；"))
         }
         guard let so = findOut(swap, want: swTot) else {
@@ -249,19 +248,24 @@ final class FsxEngine {
         return (c, "arc 入 \(ai)→出 \(ao)｜swap 入 \(st)+\(sl)→出 \(so)")
     }
 
-    init(arc: MLModel, swap: MLModel, emap: [Float], loadNote: String, contract: Contract) {
+    init(arc: MLModel, swap: MLModel, loadNote: String, contract: Contract) {
         self.arc = arc
         self.swap = swap
-        self.emap = emap
         self.loadNote = loadNote
         self.contract = contract
     }
 
     // MARK: - 喂与读
 
+    /// 喂进去之前要对 0..1 的 planar 做哪一式：两张网的口径不一样，混了画面不会报错、只是不对。
+    private enum Scale {
+        case raw        // 原样喂（512 那路已经归一化过）
+        case arc        // (x·255−127.5)/127.5
+        case swap       // (x−0.5)/0.5
+    }
+
     /// planar 数组 → 模型声明的那个形状和类型。
-    /// arcStyle＝在喂之前把 PC 那一式 (x−127.5)/127.5 做完（逐帧那一张不配这一式，它收的就是 0..1）。
-    private func value(_ model: MLModel, name: String, planar: [Float], arcStyle: Bool)
+    private func value(_ model: MLModel, name: String, planar: [Float], scale: Scale)
         -> (MLFeatureValue?, String) {
         guard let d = model.modelDescription.inputDescriptionsByName[name] else {
             return (nil, "\(name) 没有输入描述")
@@ -277,8 +281,13 @@ final class FsxEngine {
         guard let arr = try? MLMultiArray(shape: dims.map { NSNumber(value: $0) }, dataType: c.dataType)
         else { return (nil, "\(name) 建不出 MLMultiArray \(dims)") }
         var v = planar
-        if arcStyle {
+        switch scale {
+        case .arc:
             for i in 0..<v.count { v[i] = FsxNets.normalizeArc(v[i]) }
+        case .swap:
+            for i in 0..<v.count { v[i] = FsxNets.normalizeSwap(v[i]) }
+        case .raw:
+            break
         }
         switch c.dataType {
         case .float32:
@@ -384,7 +393,7 @@ final class FsxEngine {
         guard crop112_01.count == 3 * FsxNets.side112 * FsxNets.side112 else {
             return ([], 0, 0, "112 裁片个数不对（\(crop112_01.count)）")
         }
-        let vr = value(arc, name: contract.arcInput, planar: crop112_01, arcStyle: true)
+        let vr = value(arc, name: contract.arcInput, planar: crop112_01, scale: .arc)
         guard let fv = vr.0 else { return ([], 0, 0, vr.1) }
         guard let inp = try? MLDictionaryFeatureProvider(dictionary: [contract.arcInput: fv]) else {
             return ([], 0, 0, "\(vr.1)｜建不进输入")
@@ -409,49 +418,33 @@ final class FsxEngine {
         }
     }
 
-    /// ② 身份证 → latent：图上没有这一步，所以自己乘。
-    /// emap 行优先：第 j 个输出＝Σ_i emb[i]*emap[i*512+j]（PC 的 emb @ emap 就是这个下标式）。
-    func latent(fromEmb emb: [Float]) -> [Float] {
-        guard emb.count == FsxNets.embDim, emap.count == FsxNets.embDim * FsxNets.embDim else { return [] }
-        var o = [Float](repeating: 0, count: FsxNets.embDim)
-        for i in 0..<FsxNets.embDim {
-            let ei = emb[i]
-            if ei == 0 { continue }
-            let b = i * FsxNets.embDim
-            for j in 0..<FsxNets.embDim { o[j] += ei * emap[b + j] }
-        }
-        let n = FsxEngine.norm(o)
-        guard n > 1e-9 else { return [] }
-        let sc = Float(1.0 / n)
-        for j in 0..<FsxNets.embDim { o[j] *= sc }
-        return o
-    }
-
-    /// 装当前身份：512 维身份证 → latent（每人一次，整片共用）
+    /// ② 装当前身份：512 维单位向量原样留着（每人一次，整片共用）。
+    /// 这一张网收的就是归一化后的向量本身；inswapper 那一步 emb@emap 是它自己图上的安排，这里没有。
     @discardableResult
     func useIdentity(emb: [Float]) -> Bool {
-        let l = latent(fromEmb: emb)
-        guard l.count == FsxNets.embDim else { return false }
-        latent = l
+        guard emb.count == FsxNets.embDim else { return false }
+        let n = FsxEngine.norm(emb)
+        guard n > 1e-9 else { return false }
+        latent = emb.map { Float(Double($0) / n) }
         identityEmb = emb
         return true
     }
 
     var hasIdentity: Bool { latent.count == FsxNets.embDim }
 
-    /// ③ 一次换脸：128 的 planar RGB 0..1 → 换出来的那张脸（planar RGB 0..1）。
-    /// 图上那串 Conv→LeakyRelu→Pad→Conv→Tanh→Add→Div 已经把结果落在 0..1（PC 实测 0.0191..0.9901），
-    /// 这里还是钳一遍并量化到 8 位＝PC 那边先 clip 再 astype(uint8) 才拿去 warp，跳过这步会差半格。
+    /// ③ 一次换脸：256 的 planar RGB 0..1 → 换出来的那张脸（planar RGB 0..1）。
+    /// 这一张网的出参是带符号的（mean 0.5／std 0.5 口径，PC 实测 −0.999..1.000），
+    /// 先 y·0.5+0.5 还原回 0..1，再按 PC 那一式截断到 8 位（clip 后 astype(uint8) 是向下取整，不是四舍五入）。
     /// 非有限数（NaN/inf）单独报数：fp16 装的那一份要是栽在这一格上，画面会是一片黑，必须当场看见。
-    func swap(crop128_01: [Float]) -> (face: [Float], ms: Double, note: String) {
+    func swap(cropSwap_01: [Float]) -> (face: [Float], ms: Double, note: String) {
         guard hasIdentity else { return ([], 0, "还没装身份（先 useIdentity）") }
-        let side = FsxNets.side128
-        guard crop128_01.count == 3 * side * side else {
-            return ([], 0, "128 裁片个数不对（\(crop128_01.count)）")
+        let side = FsxNets.sideSwap
+        guard cropSwap_01.count == 3 * side * side else {
+            return ([], 0, "\(side) 裁片个数不对（\(cropSwap_01.count)）")
         }
-        let vt = value(swap, name: contract.swapTarget, planar: crop128_01, arcStyle: false)
+        let vt = value(swap, name: contract.swapTarget, planar: cropSwap_01, scale: .swap)
         guard let t = vt.0 else { return ([], 0, vt.1) }
-        let vs = value(swap, name: contract.swapSource, planar: latent, arcStyle: false)
+        let vs = value(swap, name: contract.swapSource, planar: latent, scale: .raw)
         guard let s = vs.0 else { return ([], 0, vs.1) }
         guard let inp = try? MLDictionaryFeatureProvider(
             dictionary: [contract.swapTarget: t, contract.swapSource: s]) else {
@@ -469,8 +462,8 @@ final class FsxEngine {
             var bad = 0
             for i in 0..<f.count {
                 if !f[i].isFinite { bad += 1; f[i] = 0 }
-                let c = max(0.0, min(255.0, floor(f[i] * 255.0)))
-                f[i] = c / 255.0
+                let v = max(0.0, min(1.0, Double(f[i]) * 0.5 + 0.5))
+                f[i] = Float(floor(v * 255.0) / 255.0)
             }
             swapMs.append(ms)
             var note = r.note

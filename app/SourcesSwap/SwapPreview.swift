@@ -10,12 +10,12 @@ import Vision
 
 /// 预览档：把「已存的人」逐个贴进小窗看效果。只看、不导出，手机侧一个字节的文件都不写。
 ///
-/// 这一条为什么能一帧一帧地过：身份全在 ② 那一步乘出来的 512 维 latent 里、与帧无关，
-/// 换一个人只要读盘把身份证取回来重乘一次（几毫秒），所以一帧都不必缓存
+/// 这一条为什么能一帧一帧地过：身份全在 ② 那一步归一化后的 512 维向量里、与帧无关，
+/// 换一个人只要读盘把身份证取回来归一化一次（几毫秒），所以一帧都不必缓存
 /// ⇒ 长度上没有「超过 3 分钟就不行」那道墙。
 ///
-/// 每一帧的钱几乎全在那一张 200 GMAC 的换脸网上：其余各步（检测、裁 128、贴回）合起来只有几毫秒，
-/// 而这一张按 CPU 跑是一秒到几秒一格 ⇒ 这一条链路的算力单元默认给「all」，让 CoreML 自己挑 ANE／GPU。
+/// 每一帧的钱几乎全在那一张 30 GMAC 的换脸网上：其余各步（检测、裁 256、贴回）合起来只有几毫秒，
+/// 而这一张按 CPU 跑是一秒到几秒一格 ⇒ 这一条链路的算力单元默认跟界面那格（0.40 起钉 CPU，可以手动换）。
 /// 进链仍钉在 640 那一档：取样与回贴都按像素数走，小窗比成片便宜的就是这一截。
 ///
 /// 减帧口径：解码不跳，只有每 1/16 秒挑最贴近的那一帧真换，其余帧沿用上一格画面。
@@ -23,8 +23,8 @@ import Vision
 final class SwapPreview {
 
     struct Cfg {
-        var units: MLComputeUnits = .all
-        var unitsTxt = "all"
+        var units: MLComputeUnits = .cpuOnly
+        var unitsTxt = "CPU(cpuOnly)"
         var fpsTarget: Double = 16
         var minFacePx: Double = 40
         var longEdge = 640
@@ -185,7 +185,7 @@ final class SwapPreview {
         progress(min(max(0, fromSec), dur), dur)
         frameW = src.outW
         frameH = src.outH
-        let side = FsxGeo.side128
+        let side = FsxGeo.sideSwap
         guard let dst = SwapTech.pixelBuffer(src.outW, src.outH).pb,
               let hd = SwapTech.pixelBuffer(src.outW, src.outH).pb else {
             say("预览 建不出 \(src.outW)x\(src.outH) 的小窗缓冲")
@@ -318,24 +318,24 @@ final class SwapPreview {
         return outcome
     }
 
-    /// 一帧的活：小窗那一幅 → 裁 128 → 一次前向 → 按官方那三刀贴回小窗。
+    /// 一帧的活：小窗那一幅 → 裁 256 → 一次前向 → 按官方那三刀贴回小窗。
     /// 与成片同一条链路、同一组数：预览只是进链尺寸小，没有另配一档算法。
     private func compose(_ engine: FsxEngine, pl: FsxGeo.Placed) -> Bool {
         guard let dst = work, let hd = held else { return false }
-        let side = FsxGeo.side128
+        let side = FsxGeo.sideSwap
         let t0 = ns()
         if CVPixelBufferLockBaseAddress(hd, .readOnly) != kCVReturnSuccess { return false }
         var got = true
         if let base = CVPixelBufferGetBaseAddress(hd) {
             got = FsxGeo.warpCrop(UnsafeRawPointer(base), bytesPerRow: CVPixelBufferGetBytesPerRow(hd),
-                                  w: frameW, h: frameH, fwd: pl.fwd128, size: side, out: &att)
+                                  w: frameW, h: frameH, fwd: pl.fwdSwap, size: side, out: &att)
         } else { got = false }
         CVPixelBufferUnlockBaseAddress(hd, .readOnly)
         if !got { return false }
         warpMs.append(msFrom(t0))
 
         let t1 = ns()
-        let r = engine.swap(crop128_01: att)
+        let r = engine.swap(cropSwap_01: att)
         frameMs.append(msFrom(t1))
         if r.face.count != 3 * side * side {
             if netFail < 2 { say("预览 网没回话：\(r.note)") }
@@ -354,14 +354,14 @@ final class SwapPreview {
         var pasted = false
         if let base = CVPixelBufferGetBaseAddress(dst) {
             pasted = FsxGeo.pasteBack(base, bytesPerRow: CVPixelBufferGetBytesPerRow(dst),
-                                      w: frameW, h: frameH, face: face, fwd: pl.fwd128)
+                                      w: frameW, h: frameH, face: face, fwd: pl.fwdSwap)
         }
         CVPixelBufferUnlockBaseAddress(dst, [])
         pasteMs.append(msFrom(t4))
         return pasted
     }
 
-    /// 「开始预览」定下那个人挂进来的那一步：读盘取身份证、乘出 latent。一整趟只在这里装一次，装完不再换人。
+    /// 「开始预览」定下那个人挂进来的那一步：读盘取身份证、归一化。一整趟只在这里装一次，装完不再换人。
     private func applyPending(_ engine: FsxEngine) {
         lock.lock()
         let pid = wantPerson
@@ -382,13 +382,13 @@ final class SwapPreview {
         let put = engine.useIdentity(emb: one.emb)
         let ms = msFrom(t0)
         guard put else {
-            refuse("预览开不起来：「\(one.name)」的身份证乘不出 latent"
-                + "（\(one.emb.count) 维／emap \(engine.emap.count) 个数），先停预览换一个人")
+            refuse("预览开不起来：「\(one.name)」的身份证装不上"
+                + "（\(one.emb.count) 维，不是 \(FsxNets.embDim) 维或全零），先停预览换一个人")
             return
         }
         person = pid
         confirm(pid)
-        say("预览 装到人「\(one.name)」：读盘＋乘 latent \(SwapUtil.ms(ms))"
+        say("预览 装到人「\(one.name)」：读盘＋归一化 \(SwapUtil.ms(ms))"
             + "｜跳过 ①（每人一次的那一步）｜足迹 \(SwapFacts.footprintMB()) MB")
     }
 
@@ -422,7 +422,7 @@ final class SwapPreview {
         let verdict = rate >= c.fpsTarget - 0.6 ? "够 16 帧"
             : (need <= 1000 ? "算着够、这一趟没跑到（素材短或停在开头）" : "不够 16 帧")
         say("预览单价 每换一帧 \(String(format: "%.2f", unit)) ms＝检测 \(SwapUtil.stat(detectMs))"
-            + "＋裁 128 \(SwapUtil.stat(warpMs))＋换脸网整次 \(SwapUtil.stat(frameMs))"
+            + "＋裁 256 \(SwapUtil.stat(warpMs))＋换脸网整次 \(SwapUtil.stat(frameMs))"
             + "＋画布重铺＋贴回 \(SwapUtil.stat(pasteMs))")
         say("      \(engine?.statsLine() ?? "网没装上（这一趟没跑到）")")
         say("      解码 \(SwapUtil.stat(decodeMs))×\(String(format: "%.1f", fps)) 帧/秒"

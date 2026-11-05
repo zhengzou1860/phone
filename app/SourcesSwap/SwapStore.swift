@@ -8,9 +8,8 @@ import CryptoKit
 /// 版本号＝两张 onnx 的 sha256 再加转换配方那一句（CI 那头算），所以「换模型」和「改程序」这两件事在盘上是分开的：
 /// 程序改完装上去，那一份模型原封不动；只有模型本身（或转换配方）换了，手机上那份才会被换掉。
 ///
-/// 这一版 fsx 那条链路带的三样：fsx_arc.mlpackage／fsx_swap.mlpackage／emap.bin。
-/// emap.bin 是 512×512 的 f32（身份证→latent 那一步要乘的矩阵，图上没人用它，所以只能单独带一份），
-/// 它不是 mlpackage，所以「齐不齐」这一关得单独认它。
+/// 这一版 fsx 那条链路带的两样：fsx_arc.mlpackage／fsx_swap.mlpackage（hyperswap_1a_256）。
+/// 换脸网收的就是归一化后的 512 维向量，不再需要 inswapper 那张 emap 矩阵。
 ///
 /// 发布位：CI 把这些打成两个文件，挂在 channel-swap 这条 release 上：
 ///   models.json  清单：版本号＋整包 sha256＋每个文件的大小
@@ -22,7 +21,7 @@ enum SwapStore {
     ///
     /// 清单（1 KB）以 GitHub 上那条发布位为准，局域网那份只当兜底：版本号是「这两张网换没换」的凭据，
     /// 不能让电脑上一份旧的说了算。
-    /// 归档（这一版 ~694 MB：两张 fp32 网 166＋528，加 1 MB 的 emap）反过来，先走局域网上那台电脑：
+    /// 归档（这一版：两张 fp32 网，不含 emap）反过来，先走局域网上那台电脑：
     /// 手机直连 GitHub 那条路被掐着走时能爬一两个小时（实测 30 KB/s，同一台电脑上却是 4.5 MB/s）；
     /// 走局域网两三分半钟就完。哪条下来的都过 sha256，对不上就换下一条。
     static let manifestBases = [
@@ -38,6 +37,11 @@ enum SwapStore {
     static let manifestName = "models.json"
     static let archiveName = "models.bin"
     static let dirName = "swap_models"
+
+    /// 本版链路的口径标记：归档里带一份 chain.txt，内容对得上才算「这一版的模型」。
+    /// 两张资源名没变（fsx_swap.mlpackage），旧版装过的那份同名包光看名字分不出来——
+    /// 不带这一关，升级后第一次出片会在接口对账那一刻才炸（256 的入参在 128 的包里找不到）。
+    static let chainTag = "hyperswap-1a-256"
 
     struct Manifest: Decodable {
         struct File: Decodable { let path: String; let size: Int }
@@ -75,31 +79,26 @@ enum SwapStore {
         return p
     }
 
-    /// 两张都在、Manifest.json 也都在、emap.bin 字节数正好，才算齐。
-    /// 半个 mlpackage 进 compileModel 会炸；emap.bin 少了或短了，身份证到 latent 那一步乘出来的是空的，
-    /// 画面照样「像个人」，只是换的不是那个人——这种错必须在这一关就挡下来。
+    static func chainTagOK() -> Bool {
+        guard let d = dir,
+              let s = try? String(contentsOf: d.appendingPathComponent("chain.txt"), encoding: .utf8)
+        else { return false }
+        return s.trimmingCharacters(in: .whitespacesAndNewlines) == chainTag
+    }
+
+    /// 口径标记对得上、两张都在、Manifest.json 也都在，才算齐。
+    /// 半个 mlpackage 进 compileModel 会炸，所以清单文件也得在。
     static func haveAll() -> Bool {
+        guard chainTagOK() else { return false }
         for r in resources {
             guard let p = local(r) else { return false }
             guard FileManager.default.fileExists(atPath: p.appendingPathComponent("Manifest.json").path) else { return false }
         }
-        guard let d = dir else { return false }
-        let em = d.appendingPathComponent(FsxNets.emapName)
-        guard let sz = try? FileManager.default.attributesOfItem(atPath: em.path)[.size] as? NSNumber,
-              sz.intValue == FsxNets.embDim * FsxNets.embDim * 4 else { return false }
         return true
     }
 
-    /// emap.bin 在不在、多大（缺了就要重下，不能只补这一件：整包 sha256 是一个口径）
-    static func haveEmap() -> Bool {
-        guard let d = dir else { return false }
-        let em = d.appendingPathComponent(FsxNets.emapName)
-        guard let sz = try? FileManager.default.attributesOfItem(atPath: em.path)[.size] as? NSNumber else { return false }
-        return sz.intValue == FsxNets.embDim * FsxNets.embDim * 4
-    }
-
     /// 把这一版用不上的旧模型先腾掉。
-    /// 为什么要在下载之前就腾：这一版归档 ~694 MB，「归档落盘」和「解出来的两张网落盘」在那一刻是同时存在的，
+    /// 为什么要在下载之前就腾：归档落盘和解出来的两张网落盘在那一刻是同时存在的，
     /// 旧那四张（~345 MB）要还占着，手机就得一口气空出 1.7 GB 才够——空间不够最烦的不是失败，
     /// 是下到 90 % 写不进去、几条源全这么废一轮还看不出为什么。
     /// 认这一版要的就是 resources 那两张，别的 *.mlpackage 一律是上一版留下的，删了不影响 haveAll()。
@@ -116,7 +115,8 @@ enum SwapStore {
         }
         for u in all {
             let n = u.lastPathComponent
-            let stale = (u.pathExtension == "mlpackage" && !keep.contains(n)) || n == "archive.part"
+            let stale = (u.pathExtension == "mlpackage" && !keep.contains(n))
+                || n == "archive.part" || n == "emap.bin"     // emap 是上一版 inswapper 的口径，本版没有这一步
             guard stale else { continue }
             let mb = Double((try? u.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0) / 1_048_576
             do {
@@ -138,7 +138,7 @@ enum SwapStore {
     }
 
     static func statusLine() -> String {
-        if haveAll() { return "已下好 版本 \(localVersion())｜两张网＋emap 齐" }
+        if haveAll() { return "已下好 版本 \(localVersion())｜两张网齐（\(chainTag)）" }
         let v = localVersion()
         return v.isEmpty ? "没下（点「下模型」，或直接开始换脸会自动下）"
                          : "没下齐（盘上版本 \(v) 不全）"
@@ -146,7 +146,7 @@ enum SwapStore {
 
     // MARK: - 清单
 
-    /// 清单就几 KB：版本对得上就不用再动那 345 MB。
+    /// 清单就几 KB：版本对得上就不用再动那几百 MB。
     /// 挨个源试，第一个通的就算；note 里带上是哪一条源通的。
     static func fetchManifest(timeout: TimeInterval = 30) -> (m: Manifest?, note: String, base: String?) {
         var why: [String] = []
@@ -352,7 +352,7 @@ enum SwapStore {
                 return (false, "写 \(f.path) 失败：\(error.localizedDescription)")
             }
         }
-        guard haveAll() else { return (false, "解完了但两张网＋emap 没齐（清单 \(man.files.count) 个文件）") }
+        guard haveAll() else { return (false, "解完了但两张网／\(chainTag) 没齐（清单 \(man.files.count) 个文件）") }
         return (true, "解出 \(man.files.count) 个文件")
     }
 
@@ -371,7 +371,7 @@ enum SwapStore {
             return (true, "模型 盘上那一份就是最新的（版本 \(m.version)），不用重下")
         }
         // 先腾地方再下载：旧版那几张对本版一点用都没有（haveAll() 认的是这两张），
-        // 却要在下载这一刻和归档同时占着盘——694 MB 的归档不是 345 MB，挤不下就是半截失败。
+        // 却要在下载这一刻和归档同时占着盘，挤不下就是半截失败。
         let cleared = purgeStale(dir)
         if !cleared.isEmpty { onLine("模型 先腾掉上一版留下的：\(cleared.joined(separator: "、"))") }
         guard fitsArchive(m.bytes) else {
@@ -429,7 +429,7 @@ enum SwapStore {
             var modelDir = dir                       // setResourceValues 是 mutating 的，URL 得是可改的
             try? modelDir.setResourceValues(rv)
             onLine("模型 解好了：\(ex.note)｜版本 \(m.version)")
-            return (true, "模型 下好了：版本 \(m.version)｜两张网＋emap 齐")
+            return (true, "模型 下好了：版本 \(m.version)｜两张网齐（\(chainTag)）")
         }
         return (false, "模型 几条源都没成：" + why.joined(separator: "；"))
     }

@@ -3,9 +3,9 @@ import Foundation
 
 /// 一按把界面上那四档算力逐档量一遍。
 /// 为什么要有这一按：0.38 上机每帧 1230 ms，钱全在换脸网那一次前向（avg 1157／中位 1114 ms），
-/// 检测 22＋裁 128 那 0.3＋贴回 50 加起来才七十几个毫秒——慢的不是手机的几何，是 units=all 这一档
+/// 检测 22＋裁 256 那 0.3＋贴回 50 加起来才七十几个毫秒——慢的不是手机的几何，是 units=all 这一档
 /// CoreML 自己挑的硬件。挑对了没有，光看一个数判不出来；四档各装各跑一遍才有得比。
-/// 每一档都要重新装一次那两张网（换脸网单张装包 5～6.5 s、足迹 726 MB），四档连着几十秒，
+/// 每一档都要重新装一次那两张网（换脸网 30 GMAC 的 fp32 包也不小），四档连着几十秒，
 /// 只能在后台线程跑，而且一句一句往界面上递——不递的话这一趟看着就跟死机一样。
 enum FsxBench {
     /// 名字跟界面上那格一字一样，量完直接照名字切
@@ -58,15 +58,15 @@ enum FsxBench {
             return nil
         }
         guard e.useIdentity(emb: fakeEmb()) else {
-            onLine("量速 \(name) 身份装不上（emap 那一张乘不出来）")
+            onLine("量速 \(name) 身份装不上（512 维向量没归一化出来）")
             return nil
         }
-        let side = FsxGeo.side128
+        let side = FsxGeo.sideSwap
         let crop = fakeCrop()
         var ms: [Double] = []
         var last: [Float]?
         for i in 0..<passes {
-            let r = e.swap(crop128_01: crop)
+            let r = e.swap(cropSwap_01: crop)
             if r.face.count != 3 * side * side {
                 onLine("量速 \(name) 第 \(i + 1) 格网没回话：\(r.note)")
                 return nil
@@ -99,7 +99,7 @@ enum FsxBench {
 
     /// 全 0 的裁片会让逐元素那几步走得偏便宜，拿一张有内容的图量才诚实
     private static func fakeCrop() -> [Float] {
-        let side = FsxGeo.side128
+        let side = FsxGeo.sideSwap
         let plane = side * side
         var v = [Float](repeating: 0, count: 3 * plane)
         for i in 0..<plane {
@@ -116,7 +116,7 @@ enum FsxBench {
         return e
     }
 
-    /// 这一档的两张网要真交出去再装下一档：两份 726 MB 同时在手里不是慢，是被系统当场杀掉
+    /// 这一档的两张网要真交出去再装下一档：两份权重同时在手里不是慢，是被系统当场杀掉
     private static func waitRelease() {
         var spins = 0
         while SwapFacts.footprintMB() > 260 && spins < 40 {

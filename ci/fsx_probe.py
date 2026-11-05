@@ -1,13 +1,12 @@
 # -*- coding: utf-8 -*-
-"""在 mac 上回答三个问题：这两张 onnx 苹果的工具链认不认、fp16 掉不掉身份、CoreML 出的脸和 PC 是不是同一张。
+"""第一轮的 CoreML 探针（inswapper_128 口径）：两张 onnx 认不认、fp16 掉不掉身份、画面是不是同一张。
+这一趟已经把 fp16 判死、把 fp32 判活，结论写进了 fsx_pack.py 的注释。
 
-手机只能跑 CoreML，而 Windows 这边转不了，所以整套判据都在 CI 那台 mac 上落：
-  ① w600k_r50.onnx（人脸向量网）→ CoreML，嵌入和 PC 的标准答案对余弦；
-  ② inswapper_128.onnx（换脸网）→ CoreML，128 那张脸和标准答案逐像素对；
-  ③ 两张都各转 fp16／fp32 一遍，把「掉多少身份」「掉多少像素」「多大」「多久」「吃了多少内存」全记下来。
-判据全走 FSX- 前缀的行，方便在 annotation 里一眼看到；全文写进 --out-dir/fsx_probe.log。
+现在这个文件主要由 ci/fsx_pack.py 当帮手库 import（load_onnx_fixed／convert／feed_coreml／pick_out／
+img_diff／imread_rgb／log 这些）；底下的 main() 是当初那份探针原文，fixtures 换成 256 之后已经跑不了，
+留着只作判据出处的记录——要再问「别的网能不能转」请另写一份，别改这一份去迁就新网。
 
-对账用的标准答案由本机 fsx/mkfixtures.py 生成，随仓库进 ci/fsx_fixtures/。
+对账用的标准答案由本机 fsx/mkfixtures256.py 生成，随仓库进 ci/fsx_fixtures/。
 """
 import argparse
 import json
@@ -91,6 +90,28 @@ def ort_swap(sess, rgb128, latent, tag=''):
     if out.ndim == 4:
         out = out[0]
     return np.clip(out.transpose(1, 2, 0), 0.0, 1.0)
+
+
+def ort_swap_tuned(sess, rgb, src_vec, mean, std, signed):
+    """按某张换脸网自己的口径喂：图像 (x/255−mean)/std，源向量原样；signed 时出参先 ×std+mean 再 clip。
+
+    hyperswap 那一档的 PC 标答就是这么做出来的（fsx/netstage.py 的 to_input／from_output），
+    这里逐式照抄，喂法一变就对不上 fsx_out256.png。
+    """
+    blob = ((rgb.astype(np.float32) / 255.0 - mean) / std).transpose(2, 0, 1)[None]
+    feed = {}
+    for i in sess.get_inputs():
+        tot = 1
+        for d in i.shape:
+            tot *= int(d) if isinstance(d, int) else 1
+        feed[i.name] = blob if tot > 512 else np.asarray(src_vec, np.float32).reshape(1, -1)
+    out = sess.run(None, feed)[0]
+    if out.ndim == 4:
+        out = out[0]
+    y = out.transpose(1, 2, 0)
+    if signed:
+        y = y * std + mean
+    return np.clip(y * 255.0, 0, 255).astype(np.uint8), out
 
 
 def extract_emap(onnx_path, out_bin):
