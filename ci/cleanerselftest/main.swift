@@ -276,8 +276,8 @@ check(!paths.contains(tmp.appendingPathComponent("swap_new.tmp").path), "扫描�
 check(!paths.contains(tmp.appendingPathComponent("not_ours.bin").path), "扫描：不认识的临时文件不列")
 
 check(paths.contains(staleDownload.path), "扫描：共享临时区里旧的通用 .tmp 在清单里")
-check(junkAndModel.items.first { $0.url.path == staleDownload.path }?.needsConfirm == true, "扫描：判不出归属的共享 .tmp 默认不勾选")
-check(junkAndModel.items.first { $0.url.path == tmp.appendingPathComponent("swap_old.tmp").path }?.needsConfirm == false, "扫描：认识前缀的临时文件可默认勾选")
+check(junkAndModel.items.first { $0.url.standardizedFileURL.path == staleDownload.path }?.needsConfirm == true, "扫描：判不出归属的共享 .tmp 默认不勾选")
+check(junkAndModel.items.first { $0.url.standardizedFileURL.path == tmp.appendingPathComponent("swap_old.tmp").path }?.needsConfirm == false, "扫描：认识前缀的临时文件可默认勾选")
 check(!paths.contains(freshDownload.path), "扫描：共享临时区里刚写的 .tmp 不动")
 check(!paths.contains(lcTmpFile.path), "扫描：名字带 livecontainer 的 .tmp 不列")
 check(paths.contains(swapTmp.appendingPathComponent("leftover_export.tmp").path), "扫描：容器真实 tmp 里的旧 .tmp 在清单里")
