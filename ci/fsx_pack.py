@@ -10,7 +10,8 @@
 
 判据分三层，少一层都可能把「能跑但画面是错的」发出去：
   ① onnxruntime 对账：证明 CI 下到的这两份权重和 PC 那两份逐字节是同一个行为（字节数只是第一道）；
-     换脸网里 6 个 BatchNormalization 转换器降不了，折进前面的 ConvTranspose 后再对一遍；
+     换脸网里 6 个 BatchNormalization 和 16 个 InstanceNormalization 转换器降不了，
+     BN 折进前面的 ConvTranspose、IN 拆成基础算子，动完再用同一套标准答案对一遍；
   ② 转换器自己 --verify：证明 MIL 改写没把数算歪；
   ③ 落盘读回来的包再预测一遍：手机上用的是这份包，内存里那个转换对象不算数。
 """
@@ -154,6 +155,118 @@ def fold_batchnorm(model):
     return folded
 
 
+def _drop_unused_initializers(g):
+    used = set()
+    for n in g.node:
+        used.update(n.input)
+    keep = [i for i in g.initializer if i.name in used]
+    if len(keep) != len(g.initializer):
+        g.ClearField('initializer')
+        g.initializer.extend(keep)
+
+
+def materialize_constants(model):
+    """把 Constant 节点落成 initializer：折 BN／拆 IN 都要按常量读它们的值，
+    转换器自己的常数折叠在它内部那一步才发生，这里等不到它。"""
+    import onnx
+    g = model.graph
+    kept = []
+    n = 0
+    for node in g.node:
+        if node.op_type == 'Constant':
+            val = next((a.t for a in node.attribute
+                        if a.name == 'value' and a.type == onnx.AttributeProto.TENSOR), None)
+            if val is not None:
+                t = onnx.TensorProto()
+                t.CopyFrom(val)
+                t.name = node.output[0]
+                g.initializer.append(t)
+                n += 1
+                continue
+        kept.append(node)
+    g.ClearField('node')
+    g.node.extend(kept)
+    return n
+
+
+def decompose_instance_norm(model):
+    """InstanceNormalization 也降不了：转换器给 MIL 的 epsilon 是 fp32 常数，而这张网内部是 fp16，
+    类型对不上（BN 那 6 个栽的是同一条）。拆成 ReduceMean／Sub／Mul／ReduceMean／Add／Sqrt／Div
+    再乘 gamma、加 beta，全部留在 fp16 里；本机对 PC 标答与原图逐像素同一份（raw max|Δ|=5e-7）。
+    """
+    import onnx
+    from onnx import helper, numpy_helper, TensorProto
+    try:
+        model = onnx.shape_inference.infer_shapes(model)
+    except Exception:
+        pass
+    g = model.graph
+    init = {i.name: i for i in g.initializer}
+    vi = {}
+    for coll in (g.value_info, g.input, g.output):
+        for v in coll:
+            vi[v.name] = v
+    np_of = {TensorProto.FLOAT: np.float32, TensorProto.FLOAT16: np.float16,
+             TensorProto.DOUBLE: np.float64}
+
+    def rank_dtype(name):
+        v = vi.get(name)
+        if v is None:
+            return 4, np.float16
+        tt = v.type.tensor_type
+        r = len(tt.shape.dim) if tt.HasField('shape') else 4
+        return r, np_of.get(tt.elem_type, np.float16)
+
+    out_nodes = []
+    n_in = 0
+    for n in g.node:
+        if n.op_type != 'InstanceNormalization':
+            out_nodes.append(n)
+            continue
+        x, scale, bias = n.input[0], n.input[1], n.input[2]
+        if scale not in init or bias not in init:
+            raise RuntimeError('IN 的 gamma／beta 不是常量，拆不了：%s' % n.name)
+        eps = next((a.f for a in n.attribute if a.name == 'epsilon'), 1e-5)
+        rank, x_np = rank_dtype(x)
+        if rank < 3:
+            raise RuntimeError('IN 的输入 rank=%d，没写过这种拆法：%s' % (rank, n.name))
+        gamma = numpy_helper.to_array(init[scale])
+        beta = numpy_helper.to_array(init[bias])
+        c = int(gamma.size)
+        # ONNX 广播从右边对齐：gamma 是 [C]，直接乘会落到 W 上，先铺成 [1,C,1,1]
+        bcast = [1, c] + [1] * (rank - 2)
+        tag = n.name + '_d'
+        names = {}
+        for suffix, arr in (('g4', gamma.astype(x_np).reshape(bcast)),
+                            ('b4', beta.astype(x_np).reshape(bcast)),
+                            ('eps', np.array(eps, dtype=x_np))):
+            nm = tag + '_' + suffix
+            t = numpy_helper.from_array(arr, nm)
+            g.initializer.append(t)
+            init[nm] = t
+            names[suffix] = nm
+        spatial = list(range(2, rank))
+        out_nodes.extend([
+            helper.make_node('ReduceMean', [x], [tag + '_mu'], name=tag + '_ReduceMean', axes=spatial, keepdims=1),
+            helper.make_node('Sub', [x, tag + '_mu'], [tag + '_d'], name=tag + '_Sub'),
+            helper.make_node('Mul', [tag + '_d', tag + '_d'], [tag + '_dd'], name=tag + '_Mul'),
+            helper.make_node('ReduceMean', [tag + '_dd'], [tag + '_var'], name=tag + '_ReduceMean1', axes=spatial, keepdims=1),
+            helper.make_node('Add', [tag + '_var', names['eps']], [tag + '_ve'], name=tag + '_Add'),
+            helper.make_node('Sqrt', [tag + '_ve'], [tag + '_sd'], name=tag + '_Sqrt'),
+            helper.make_node('Div', [tag + '_d', tag + '_sd'], [tag + '_nrm'], name=tag + '_Div'),
+            helper.make_node('Mul', [tag + '_nrm', names['g4']], [tag + '_sg'], name=tag + '_Mul1'),
+            helper.make_node('Add', [tag + '_sg', names['b4']], [n.output[0]], name=tag + '_Add1'),
+        ])
+        n_in += 1
+    g.ClearField('node')
+    g.node.extend(out_nodes)
+    if any(n.op_type == 'InstanceNormalization' for n in g.node):
+        raise RuntimeError('还有 InstanceNormalization 没拆掉，转换器照样会栽')
+    _drop_unused_initializers(g)
+    onnx.checker.check_model(model)
+    return n_in
+
+
 def pack_archive(base, files_order, out_bin, out_json, version):
     """归档：头 "SWPM"＋uint32 小端头长＋JSON 头＋各文件字节依次排下去（不压缩）。
 
@@ -250,18 +363,22 @@ def main():
     arc_model = P.load_onnx_fixed(arc_onnx)
     sw_model = P.load_onnx_fixed(sw_onnx)
     onnx.save(arc_model, arc_fixed)
-    # onnx2coreml 降不了这张网里的 BatchNormalization（上一趟就栽在 encoder/up_samples 的 BN 上）：
-    # 折进前面的 ConvTranspose 再转，折完必须拿同一套标准答案再对一遍——折错就是整片脸都错。
+    # onnx2coreml 降不了这张网里的 BatchNormalization／InstanceNormalization（上一趟就栽在这两种算子上）：
+    # 常数落成 initializer、BN 折进前面的 ConvTranspose、IN 拆成基础算子，再转；
+    # 动完必须拿同一套标准答案再对一遍——折错／拆错就是整片脸都错。
+    n_const = materialize_constants(sw_model)
     n_bn = fold_batchnorm(sw_model)
+    n_in = decompose_instance_norm(sw_model)
     onnx.save(sw_model, sw_fixed)
     ss = ort.InferenceSession(sw_fixed, providers=['CPUExecutionProvider'])
     out_fold, _ = P.ort_swap_tuned(ss, tgt, ref_emb, 0.5, 0.5, True)
     del ss
     mx_f, mn_f, ps_f = P.img_diff(out_fold / 255.0, out_ref)
-    P.log('FXP-FOLD', 'BatchNorm %d 个折进卷积｜折后 vs PC max=%.2f mean=%.3f 灰阶 PSNR=%.2f dB'
-          % (n_bn, mx_f, mn_f, ps_f))
+    P.log('FXP-FOLD', '常数 %d 个落盘｜BatchNorm %d 个折进卷积｜InstanceNorm %d 个拆成基础算子'
+          '｜动完 vs PC max=%.2f mean=%.3f 灰阶 PSNR=%.2f dB'
+          % (n_const, n_bn, n_in, mx_f, mn_f, ps_f))
     if ps_f < MIN_SWAP_PSNR:
-        raise RuntimeError('BN 折完对不上 PC 标答（PSNR %.2f）' % ps_f)
+        raise RuntimeError('BN/IN 改完对不上 PC 标答（PSNR %.2f）' % ps_f)
 
     # ---- ④ 两张各转 fp32 一遍，转完立刻从盘上读回来对账
     rec = {}
