@@ -119,7 +119,8 @@ final class CleanerModel: ObservableObject {
     private func apply(_ result: ScanResult) {
         items = result.items
         notes = result.notes
-        selected = Set(result.items.map(\.id))
+        // 判不出归属的共享 .tmp 不默认勾选，避免顺手删到别的 app 正在用的临时文件。
+        selected = Set(result.items.filter { !$0.needsConfirm }.map(\.id))
         lastSummary = "\(result.items.count) 项｜\(CleanFormat.bytes(result.totalBytes))"
         lastScanDate = Date()
     }
@@ -419,6 +420,15 @@ struct CleanerRootView: View {
                             .padding(.vertical, 1)
                             .background(Color(.tertiarySystemFill))
                             .clipShape(Capsule())
+                        if item.needsConfirm {
+                            Text("需确认")
+                                .font(.caption2)
+                                .padding(.horizontal, 5)
+                                .padding(.vertical, 1)
+                                .background(Color.orange.opacity(0.18))
+                                .foregroundStyle(.orange)
+                                .clipShape(Capsule())
+                        }
                         Text(item.note)
                             .font(.caption2)
                             .foregroundStyle(.secondary)
@@ -477,7 +487,9 @@ struct CleanerRootView: View {
                 bullet("只认白名单里完全相等的包名：com.qoder.hellolc / snorebench / swapbench / vr3d / voice / liveswap。LiveContainer（com.kdt.*）和 SideStore / AltStore（com.SideStore.* / com.rileytestut.*）即使看起来是垃圾也不列、不删。")
                 bullet("容器身份只认 LCContainerInfo.plist 的 appIdentifier；每次删除前重读一次，对不上就跳过。没有这个 plist 的容器不进清单。")
                 bullet("符号链接一律跳过；1 小时内被改过的文件不动，历史文件按天数算。")
-                bullet("共享临时区只认 swap_ / vr3d_ / pick_ / cut_ / LiveIn 五个前缀，并且要求 6 小时内没有改动。")
+                bullet("LC 会把 <容器>/tmp 做成指向共享临时区的符号链接，这种目录只跳过、不跟随，避免同一批文件被扫两遍；只有 app 自己重建的真实 tmp 目录才逐个清。")
+                bullet("共享临时区认 swap_ / vr3d_ / pick_ / cut_ / LiveIn 五个前缀，另外列顶层后缀 .tmp 的中断下载；都要求 6 小时内没有改动。名字里带 livecontainer / sidestore / altstore 的一律不列。")
+                bullet("容器 Documents 和 Library/Caches 里散落的 .tmp 只删文件；voice_models、nights、samples、swap_idents 和 .mlpackage / .mlmodelc 内部不进去。")
                 bullet("换脸只删非当前版本的模型包和编译缓存；fsx_arc / fsx_swap、version.txt、chain.txt、archive.part、swap_idents 和语音模型目录都保留，避免重复下载。")
                 bullet("删除前会按同一套规则重新扫描，只有仍然在清单里的路径才会被删；删掉的文件不进系统「最近删除」。")
             }

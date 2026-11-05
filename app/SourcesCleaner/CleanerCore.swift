@@ -20,7 +20,7 @@ enum CleanCategory: String, CaseIterable, Identifiable, Sendable {
     var subtitle: String {
         switch self {
         case .junk:
-            return "运行日志、上次跑崩留下的临时文件；共享临时区里只认几个固定前缀"
+            return "运行日志、容器 tmp / 共享临时区残留、后缀 .tmp 的中断下载；6 小时内还在变的文件不动"
         case .model:
             return "旧模型包、旧版本编译缓存、没删掉的深度缓存；当前模型和下载中的 archive.part 一律保留"
         case .history:
@@ -250,6 +250,11 @@ struct CleanItem: Identifiable, Sendable {
     let containerRoot: URL?
 
     var id: String { url.standardizedFileURL.path }
+
+    // 共享临时区里判不出归属的 .tmp：列出来，但默认不勾，必须由人确认。
+    var needsConfirm: Bool {
+        inSharedTmp && appName.hasPrefix("共享临时区（所有 app 共用）")
+    }
 }
 
 struct ScanResult: Sendable {
@@ -310,9 +315,17 @@ final class Cleaner {
             for target in env.targets {
                 for container in target.containers {
                     items += scanLogs(target: target, container: container)
+                    let containerTmp = scanContainerTmp(target: target, container: container)
+                    items += containerTmp.items
+                    notes += containerTmp.notes
+                    let loose = scanLooseTmp(target: target, container: container)
+                    items += loose.items
+                    notes += loose.notes
                 }
             }
-            items += scanTmp()
+            let shared = scanTmp()
+            items += shared.items
+            notes += shared.notes
         }
 
         if categories.contains(.model) {
@@ -400,19 +413,155 @@ final class Cleaner {
                 appName: "直播", note: "直播收件目录（上次没清掉）"),
     ]
 
-    private func scanTmp() -> [CleanItem] {
+    // 递归找散落的 .tmp 时不进这些目录：要么是用户数据，要么是模型包内部。
+    private static let looseTmpSkip: Set<String> = [
+        "voice_models", "swap_idents", "samples", "nights",
+    ]
+
+    private static let forbiddenTmpTokens = [
+        "livecontainer", "sidestore", "altstore", "com.kdt", "com.rileytestut",
+    ]
+
+    private static func isTmpName(_ name: String) -> Bool {
+        name.count > 4 && name.lowercased().hasSuffix(".tmp")
+    }
+
+    private static func isForbiddenTmpName(_ name: String) -> Bool {
+        let lower = name.lowercased()
+        return forbiddenTmpTokens.contains { lower.contains($0) }
+    }
+
+    // 共享临时区 = LC 进程的 TMPDIR，所有客人 app 的 tmp 符号链接都指到这里。
+    private func scanTmp() -> RuleResult {
+        var out = RuleResult()
         let entries = (try? fm.contentsOfDirectory(
             at: env.tmpDir,
             includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey, .contentModificationDateKey, .fileSizeKey],
             options: []
         )) ?? []
-        var out: [CleanItem] = []
+        var generic = 0
         for url in entries {
             let name = url.lastPathComponent
-            guard let rule = Self.tmpRules.first(where: {
+            if let rule = Self.tmpRules.first(where: {
                 $0.exact ? name == $0.token : name.hasPrefix($0.token)
-            }) else { continue }
-            if let item = tmpItem(rule: rule, url: url) { out.append(item) }
+            }) {
+                if let item = tmpItem(rule: rule, url: url) { out.items.append(item) }
+                continue
+            }
+            // 剩下的只认顶层普通文件、后缀 .tmp；目录和符号链接一律不碰。
+            guard let f = facts(url), !f.isSymbolicLink, !f.isDirectory,
+                  Self.isTmpName(name), !Self.isForbiddenTmpName(name),
+                  let item = sharedTmpItem(url: url, facts: f) else { continue }
+            out.items.append(item)
+            generic += 1
+        }
+        if generic > 0 {
+            out.notes.append("共享临时区里有 \(generic) 个 6 小时没改动的 .tmp 文件：所有 app 共用，判不出归属，默认不勾选；确认是本机 app 留下的再手动选上")
+        }
+        return out
+    }
+
+    private func sharedTmpItem(url: URL, facts f: FileFacts) -> CleanItem? {
+        guard !f.isDirectory, let base = f.modified,
+              Date().timeIntervalSince(base) >= 6 * 3600 else { return nil }
+        return CleanItem(
+            category: .junk,
+            appName: "共享临时区（所有 app 共用）",
+            bundleID: "",
+            containerName: "共享临时区",
+            url: url,
+            displayPath: "临时区/\(url.lastPathComponent)",
+            bytes: f.bytes,
+            note: "中断的下载／导出留下的 .tmp（6 小时没改动）",
+            isDirectory: false,
+            minAgeHours: 6,
+            inSharedTmp: true,
+            containerRoot: nil
+        )
+    }
+
+    // LC 启动时把 <容器>/tmp 做成指向共享 TMPDIR 的符号链接；跟着扫会和共享临时区重复，
+    // 所以只扫真实目录（有些 app 会把符号链接删掉、自己建一个）。
+    private func scanContainerTmp(target: CleanTarget, container: CleanContainer) -> RuleResult {
+        var out = RuleResult()
+        let tmp = container.url.appendingPathComponent("tmp", isDirectory: true)
+        guard let tf = facts(tmp), !tf.isSymbolicLink, tf.isDirectory else { return out }
+        let entries = (try? fm.contentsOfDirectory(
+            at: tmp,
+            includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey, .contentModificationDateKey, .fileSizeKey],
+            options: []
+        )) ?? []
+        for url in entries {
+            guard let ef = facts(url), !ef.isSymbolicLink else { continue }
+            let ageBase = ef.isDirectory ? newestModification(url) : nil
+            if let item = containerItem(
+                category: .junk, target: target, container: container, url: url,
+                note: "容器真实 tmp 目录里的残留（不是共享临时区的符号链接）",
+                minAgeHours: 6, ageBase: ageBase
+            ) {
+                out.items.append(item)
+            }
+        }
+        if !out.items.isEmpty {
+            out.notes.append("「\(target.name)」的容器里有一个真实 tmp 目录，列了 \(out.items.count) 项 6 小时没改动的残留")
+        }
+        return out
+    }
+
+    // Documents / Library/Caches 里散落的 .tmp：只认普通文件，不进模型包、nights、voice_models 这些用户数据目录。
+    private func scanLooseTmp(target: CleanTarget, container: CleanContainer) -> RuleResult {
+        var out = RuleResult()
+        let bases = [
+            container.url.appendingPathComponent("Documents", isDirectory: true),
+            container.url.appendingPathComponent("Library", isDirectory: true)
+                .appendingPathComponent("Caches", isDirectory: true),
+        ]
+        for base in bases where CleanerDiscovery.isDirectory(base) {
+            for url in findTmpFiles(in: base) {
+                if let item = containerItem(
+                    category: .junk, target: target, container: container, url: url,
+                    note: "中断的下载／导出留下的 .tmp（6 小时没改动）", minAgeHours: 6
+                ) {
+                    out.items.append(item)
+                }
+            }
+        }
+        if !out.items.isEmpty {
+            out.notes.append("「\(target.name)」的 Documents / Library/Caches 里有 \(out.items.count) 个 .tmp 残留（只删文件；模型包和用户数据目录不进去）")
+        }
+        return out
+    }
+
+    private func findTmpFiles(in base: URL) -> [URL] {
+        let keys: Set<URLResourceKey> = [
+            .isDirectoryKey, .isSymbolicLinkKey, .isRegularFileKey,
+            .fileSizeKey, .contentModificationDateKey,
+        ]
+        guard let e = fm.enumerator(
+            at: base,
+            includingPropertiesForKeys: Array(keys),
+            options: [],
+            errorHandler: { _, _ in true }
+        ) else { return [] }
+        var out: [URL] = []
+        for case let u as URL in e {
+            guard let v = try? u.resourceValues(forKeys: keys) else { continue }
+            if v.isSymbolicLink == true {
+                e.skipDescendants()
+                continue
+            }
+            if v.isDirectory == true {
+                let name = u.lastPathComponent
+                if Self.looseTmpSkip.contains(name)
+                    || name.hasSuffix(".mlpackage")
+                    || name.hasSuffix(".mlmodelc") {
+                    e.skipDescendants()
+                }
+                continue
+            }
+            if v.isRegularFile == true, Self.isTmpName(u.lastPathComponent) {
+                out.append(u)
+            }
         }
         return out
     }
