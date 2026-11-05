@@ -41,7 +41,7 @@ final class SwapClient: ObservableObject {
     @Published var matchThr: Double?            // PC 下发的判定门槛；手机上不写死
     @Published var pcLiveMode = false          // PC 静默 10 秒会自己退出推流模式，手机靠这个知道要重来
     @Published var saw409 = 0                  // 被 PC 判「不在推流模式」的次数，恢复逻辑的触发信号
-    @Published var sessionLost = false          // cookie 失效：PC 把请求弹回登录页，这边只有重登一条路
+    @Published var sessionLost = false          // 搬完 cookie 还吃 401：页面那边得重登了
     @Published var lastError: String?
 
     let baseURL: URL
@@ -52,6 +52,15 @@ final class SwapClient: ObservableObject {
     private let inflight = DispatchSemaphore(value: LiveConfig.inflightLimit)
     private var statusTask: Task<Void, Never>?
 
+    // WK 页面那边的会话快照。pageCookies 走锁是因为帧的完成回调在 URLSession 的队列上；
+    // 其余三个只在 cookieQueue 上动。
+    private let cookieLock = NSLock()
+    private let cookieQueue = DispatchQueue(label: "liveswap.cookies")
+    private var pageCookies: [HTTPCookie] = []
+    private var cookieStore: WKHTTPCookieStore?
+    private var cookieRefreshing = false
+    private var cookieWaiters: [() -> Void] = []
+
     init(baseURL: URL) {
         self.baseURL = baseURL
         let cfg = URLSessionConfiguration.default
@@ -59,9 +68,9 @@ final class SwapClient: ObservableObject {
         cfg.timeoutIntervalForRequest = 5
         cfg.timeoutIntervalForResource = 30
         cfg.requestCachePolicy = .reloadIgnoringLocalCacheData
-        cfg.httpCookieAcceptPolicy = .always
-        cfg.httpShouldSetCookies = true
-        cfg.httpCookieStorage = HTTPCookieStorage.shared
+        // cookie 由 CookieBridge 从 WK 的 store 取来、直接挂在 Cookie 头上；
+        // 关掉 URLSession 自己的 cookie 处理，免得共享 jar 里的旧值把它盖掉。
+        cfg.httpShouldSetCookies = false
         session = URLSession(configuration: cfg)
     }
 
@@ -76,17 +85,69 @@ final class SwapClient: ObservableObject {
 
     // MARK: - cookie：页面里登录，原生这边借用
 
-    /// WKWebView 用自己的 cookie 存储，不搬一次的话原生 /live_frame 会被 302 弹回登录页。
-    /// 方向是 页面 → 原生：登录用的是 PC 自己的登录页，界面因此和 PC 完全一致。
-    /// 每加载完一页都搬一次：用户在这一页重新登录以后，这一搬就是「会话续上了」的信号。
-    func importCookies(from store: WKHTTPCookieStore, then: @escaping () -> Void) {
-        store.getAllCookies { cookies in
-            let jar = HTTPCookieStorage.shared
-            for c in cookies { jar.setCookie(c) }
-            DispatchQueue.main.async {
-                self.sessionLost = false
-                then()
+    /// 页面和原生必须盯同一个 host（connect 时传的就是这个 webView 的 store），
+    /// 否则 cookie 按主机匹配根本对不上。
+    func attachCookieStore(_ store: WKHTTPCookieStore) {
+        cookieQueue.sync { cookieStore = store }
+    }
+
+    /// 每加载完一页、点播放前、以及任何 /live_* 回 401 以后都重新取一份。
+    /// 并发的多次请求只真正读一次 store，等在后面的回调一起放行。
+    func importCookies(then: (() -> Void)? = nil) {
+        cookieQueue.async {
+            if let then = then { self.cookieWaiters.append(then) }
+            guard !self.cookieRefreshing else { return }
+            guard let store = self.cookieStore else {
+                self.finishCookieRefresh()
+                return
             }
+            self.cookieRefreshing = true
+            store.getAllCookies { [weak self] cookies in
+                guard let self = self else { return }
+                let host = CookieBridge.hostOf(self.baseURL)
+                let prepared = cookies.compactMap { CookieBridge.normalized($0, host: host) }
+                self.cookieLock.lock()
+                self.pageCookies = prepared
+                self.cookieLock.unlock()
+                // 一条都没取到就别说会话续上了：这时候 /live_* 去也是 401，宁可让人重登。
+                if !prepared.isEmpty {
+                    DispatchQueue.main.async { self.sessionLost = false }
+                }
+                self.cookieQueue.async { self.finishCookieRefresh() }
+            }
+        }
+    }
+
+    private func finishCookieRefresh() {
+        cookieRefreshing = false
+        let waiters = cookieWaiters
+        cookieWaiters = []
+        for waiter in waiters { waiter() }
+    }
+
+    private func refreshCookies() async {
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            importCookies { cont.resume() }
+        }
+    }
+
+    private func authHeader(for url: URL) -> String? {
+        cookieLock.lock()
+        let cookies = pageCookies
+        cookieLock.unlock()
+        return CookieBridge.header(cookies, for: url)
+    }
+
+    /// 页面上到底有没有可用会话：401 时用它决定是「搬一次就该好了」还是「这一页根本没登录」。
+    private var hasPageCookies: Bool {
+        cookieLock.lock()
+        defer { cookieLock.unlock() }
+        return !pageCookies.isEmpty
+    }
+
+    private func authorize(_ req: inout URLRequest) {
+        if let header = authHeader(for: req.url ?? baseURL) {
+            req.setValue(header, forHTTPHeaderField: "Cookie")
         }
     }
 
@@ -96,16 +157,20 @@ final class SwapClient: ObservableObject {
     @discardableResult
     func startLive() async throws -> Int {
         let body = try JSONSerialization.data(withJSONObject: ["max_width": LiveConfig.fallbackMaxWidth])
-        let (data, resp) = try await call("/live_start", body: body, contentType: "application/json")
+        // 登录很可能就发生在刚才那一页：发之前先搬一次，401 再搬一次重试（见 callWithAuthRetry）。
+        let (data, resp) = try await callWithAuthRetry("/live_start", body: body,
+                                                       contentType: "application/json",
+                                                       refreshBefore: true)
         let code = (resp as? HTTPURLResponse)?.statusCode ?? -1
         if let http = resp as? HTTPURLResponse, LiveAuth.lost(http) {
             await MainActor.run { self.sessionLost = true }
-            throw SwapError(message: LiveAuth.lostMessage)
+            // 页面 store 里一条 cookie 都没有：多半是在别的浏览器登录的，或者在别的页面上。
+            throw SwapError(message: hasPageCookies
+                ? LiveAuth.lostMessage
+                : "这一页还没登录（原生取不到会话 cookie）：先在 App 打开的页面上登录，再点「播放」")
         }
         let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         guard code == 200, let j = j, (j["status"] as? String) == "success" else {
-            // @login_required 会把未登录的 POST 重定向到登录页，跟随后拿回来的是 200 的 HTML：
-            // code 好看但 JSON 解析不出来，这一条基本就是没登录
             let why = (j?["message"] as? String)
                 ?? (j == nil ? "PC 回的不是 JSON（多半是没登录，被弹到登录页）" : "HTTP \(code)")
             throw SwapError(message: why)
@@ -124,19 +189,27 @@ final class SwapClient: ObservableObject {
     func stopLive() async {
         statusTask?.cancel()
         statusTask = nil
-        _ = try? await call("/live_stop", body: Data(), contentType: nil)
+        _ = try? await callWithAuthRetry("/live_stop", body: Data(), contentType: nil)
         await MainActor.run { self.pcLiveMode = false }
     }
 
     /// 跳转以后必须调：PC 会丢掉队列里的旧帧和上一姿势的检测缓存，否则糊到跳转之后。
     func seek() async {
-        _ = try? await call("/live_seek", body: Data(), contentType: nil)
+        _ = try? await callWithAuthRetry("/live_seek", body: Data(), contentType: nil)
     }
 
     /// 回前台时先问一次再决定要不要重新 startLive——不看状态就猛推会一路吃 409。
     func fetchStatusOnce() async -> LiveSnapshot? {
-        guard let (data, resp) = try? await session.data(from: url("/live_status")),
-              (resp as? HTTPURLResponse)?.statusCode == 200,
+        var req = URLRequest(url: url("/live_status"))
+        authorize(&req)
+        guard let (data, resp) = try? await session.data(for: req),
+              let http = resp as? HTTPURLResponse else { return nil }
+        if LiveAuth.lost(http) {
+            // 401：页面那边可能刚重登，搬一次给下一轮用；这一轮按「读不到」处理。
+            importCookies()
+            return nil
+        }
+        guard http.statusCode == 200,
               let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
         return LiveSnapshot(
             liveMode: (j["live_mode"] as? Bool) ?? false,
@@ -179,7 +252,8 @@ final class SwapClient: ObservableObject {
 
     /// 满 3 帧在途就丢新帧（丢最新），绝不排队——
     /// PC 入口队列只有 2 格且满则丢最旧，手机这边再排一层只会把延迟堆起来。
-    func push(_ jpeg: Data) {
+    /// authRetried 只给「401 后搬完 cookie 重发这一帧」用，最多一次，不会打转。
+    func push(_ jpeg: Data, authRetried: Bool = false) {
         guard inflight.wait(timeout: .now()) == .success else {
             DispatchQueue.main.async { self.framesDroppedLocal += 1 }
             return
@@ -188,6 +262,7 @@ final class SwapClient: ObservableObject {
         req.httpMethod = "POST"
         req.setValue("image/jpeg", forHTTPHeaderField: "Content-Type")
         req.httpBody = jpeg
+        authorize(&req)
         session.dataTask(with: req) { [weak self] _, resp, err in
             guard let self = self else { return }
             self.inflight.signal()
@@ -204,10 +279,17 @@ final class SwapClient: ObservableObject {
             guard let http = resp as? HTTPURLResponse else { return }
             switch LiveAuth.judge(http) {
             case .sessionLost:
-                // 跟着 302 拿回来的是登录页：光看状态码像「这一帧被收了」，实际一帧没进
-                DispatchQueue.main.async {
-                    self.sessionLost = true
-                    self.lastError = LiveAuth.lostMessage
+                if authRetried {
+                    // 搬过一次还是 401：页面那边确实没登录了，停下来让人重登。
+                    DispatchQueue.main.async {
+                        self.sessionLost = true
+                        self.lastError = LiveAuth.lostMessage
+                    }
+                } else {
+                    // 第一回 401 不急着停推流：重新搬一次 cookie，这一帧再发一次。
+                    self.importCookies {
+                        self.push(jpeg, authRetried: true)
+                    }
                 }
             case .notLive:
                 // 409 = PC 已退出推流模式（10 秒空闲看门狗或那边重启），必须重新 /live_start
@@ -237,7 +319,22 @@ final class SwapClient: ObservableObject {
         req.httpMethod = "POST"
         if let ct = contentType { req.setValue(ct, forHTTPHeaderField: "Content-Type") }
         req.httpBody = body
+        authorize(&req)
         return try await session.data(for: req)
+    }
+
+    /// 401 就是「会话没带上/失效了」：重新从页面搬一次 cookie，再按原请求发一遍，最多重试一次。
+    /// 重试后还 401 的由调用方判 sessionLost（startLive 会抛，帧会停推流）。
+    private func callWithAuthRetry(_ path: String, body: Data, contentType: String?,
+                                   refreshBefore: Bool = false) async throws
+        -> (Data, URLResponse) {
+        if refreshBefore { await refreshCookies() }
+        var out = try await call(path, body: body, contentType: contentType)
+        if let http = out.1 as? HTTPURLResponse, LiveAuth.lost(http) {
+            await refreshCookies()
+            out = try await call(path, body: body, contentType: contentType)
+        }
+        return out
     }
 }
 

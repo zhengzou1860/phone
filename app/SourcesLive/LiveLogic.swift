@@ -45,7 +45,7 @@ enum LiveConfig {
 
     /// 追加到 WKWebView 默认 UA 末尾：PC 那边看 access log 就知道是手机 app 在访问，
     /// 而不是有人在浏览器里手点。
-    static let userAgentSuffix = "LiveSwap/0.9"
+    static let userAgentSuffix = "LiveSwap/0.10"
 
     /// 第一次启动时地址栏里预填的这台：PC 侧现在监听的就是它。
     /// 只当预填和提示用，不当写死的配置——PC 重连 WiFi 以后 IP 会变，
@@ -165,8 +165,71 @@ enum LiveAuth {
         return judge(statusCode: resp.statusCode, path: path, contentType: type)
     }
 
-    /// 给用户看的那一句：会话丢了下一步只有重登，手机这边没什么可重试的。
-    static let lostMessage = "登录失效了（PC 把请求弹回登录页）：在这一页重新登录，再点「播放」接着推"
+    /// 给用户看的那一句：重新搬一次 cookie 还是 401，页面那边就得重登了。
+    static let lostMessage = "登录失效了（PC 回 401 未登录）：在这一页重新登录，再点「播放」接着推"
+}
+
+// MARK: - 页面会话 cookie
+
+/// 页面登录出来的会话在 WKWebView 自己的 cookie store 里，原生 URLSession 看不见。
+/// 这里把 WK 取回来的 cookie 统一成「按页面主机算」的一份，再直接拼成 Cookie 头发出去：
+/// 不经过 HTTPCookieStorage —— WK 对 IP 主机给回来的 cookie 可能没有 domain，
+/// 原样 setCookie 会被静默丢掉，症状正是「页面 200、原生 /live_start 401」。
+enum CookieBridge {
+    /// 页面和原生用的是同一个 baseURL，这里只做小写归一。
+    static func hostOf(_ url: URL) -> String { (url.host ?? "").lowercased() }
+
+    /// 重建一份能按页面主机匹配的 cookie。WK 对 IP 主机可能把 domain 丢空，那一条按页面主机补；
+    /// 是本页父域的（正常域名场景）保留原写法；别的站点的 cookie 一律不带，别往这台 PC 上误送。
+    static func normalized(_ cookie: HTTPCookie, host: String) -> HTTPCookie? {
+        let h = host.lowercased()
+        guard !h.isEmpty, !cookie.name.isEmpty else { return nil }
+        let raw = cookie.domain.lowercased()
+        let base = raw.hasPrefix(".") ? String(raw.dropFirst()) : raw
+        let domain: String
+        if base.isEmpty {
+            domain = h
+        } else if h == base || h.hasSuffix("." + base) {
+            domain = cookie.domain
+        } else {
+            return nil
+        }
+        var props: [HTTPCookiePropertyKey: Any] = [
+            .name: cookie.name,
+            .value: cookie.value,
+            .domain: domain,
+            .path: cookie.path.isEmpty ? "/" : cookie.path,
+            .version: 0,
+        ]
+        if let d = cookie.expiresDate { props[.expires] = d }
+        if cookie.isSecure { props[.secure] = "TRUE" }
+        return HTTPCookie(properties: props)
+    }
+
+    /// 按 RFC 6265 的规则拼 Cookie 头：域、路径、Secure 都要对得上。
+    /// 同名只留最后一条——Werkzeug 解析重复键时也是后一条生效。
+    static func header(_ cookies: [HTTPCookie], for url: URL) -> String? {
+        let host = hostOf(url)
+        guard !host.isEmpty else { return nil }
+        let scheme = (url.scheme ?? "").lowercased()
+        let path = url.path.isEmpty ? "/" : url.path
+        var picked: [String: String] = [:]
+        var order: [String] = []
+        for c in cookies {
+            let raw = c.domain.lowercased()
+            let d = raw.hasPrefix(".") ? String(raw.dropFirst()) : raw
+            guard !d.isEmpty, host == d || host.hasSuffix("." + d) else { continue }
+            if c.isSecure && scheme != "https" { continue }
+            let p = c.path.isEmpty ? "/" : c.path
+            guard path == p || path.hasPrefix(p.hasSuffix("/") ? p : p + "/") else { continue }
+            if picked[c.name] == nil { order.append(c.name) }
+            picked[c.name] = c.value
+        }
+        guard !order.isEmpty else { return nil }
+        return order.compactMap { name in
+            picked[name].map { "\(name)=\($0)" }
+        }.joined(separator: "; ")
+    }
 }
 
 // MARK: - 跳转输入

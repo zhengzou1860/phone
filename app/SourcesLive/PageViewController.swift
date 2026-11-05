@@ -193,6 +193,9 @@ final class PageViewController: UIViewController {
 
     private func connect(to base: URL) {
         let c = SwapClient(baseURL: base)
+        // 页面和原生盯的是同一个 base（下面 load 的就是它），cookie 按主机匹配才不会错位；
+        // store 也取这个 webView 自己的，不碰别的 WebView / 其他 app 的会话。
+        c.attachCookieStore(webView.configuration.websiteDataStore.httpCookieStore)
         client = c
         pushGen += 1
         phase = .none
@@ -615,7 +618,7 @@ extension PageViewController: WKScriptMessageHandler {
 extension PageViewController: WKNavigationDelegate {
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         guard let client = client else { return }
-        client.importCookies(from: webView.configuration.websiteDataStore.httpCookieStore) { [weak self] in
+        client.importCookies { [weak self] in
             guard let self = self else { return }
             let host = LiveHost.display(client.baseURL)
             guard self.greetedHost != host else { return }

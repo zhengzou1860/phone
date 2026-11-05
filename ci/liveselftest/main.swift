@@ -298,6 +298,45 @@ ck("归类 415 算拒不算送到", jd(415, "/login") == .sessionLost,
 ck("归类 405 算拒", jd(405, "/live_stop", "text/html") == .rejected(405))
 ck("归类 500 算拒", jd(500) == .rejected(500))
 
+// MARK: - 页面会话 cookie（WK 的 store → 原生请求头）
+
+func cookie(_ value: String, domain: String?, path: String = "/",
+            secure: Bool = false) -> HTTPCookie? {
+    var p: [HTTPCookiePropertyKey: Any] = [.name: "session", .value: value, .path: path,
+                                           .version: 0]
+    if let d = domain { p[.domain] = d }
+    if secure { p[.secure] = "TRUE" }
+    return HTTPCookie(properties: p)
+}
+
+let phost = "192.168.31.100"
+let liveURL = URL(string: "http://192.168.31.100:5100/live_start")!
+let frameURL = URL(string: "http://192.168.31.100:5100/live_frame")!
+let wkCookie = cookie("eyJh.b.c", domain: phost)!
+let moved = CookieBridge.normalized(wkCookie, host: phost)!
+ck("cookie 重建保留名值", moved.name == "session" && moved.value == "eyJh.b.c")
+ck("cookie 拼头", CookieBridge.header([moved], for: liveURL) == "session=eyJh.b.c",
+   String(describing: CookieBridge.header([moved], for: liveURL)))
+ck("cookie 主机归一", CookieBridge.hostOf(liveURL) == phost)
+ck("cookie 换主机不拼",
+   CookieBridge.header([moved], for: URL(string: "http://192.168.31.101:5100/live_start")!) == nil)
+ck("cookie 别的域不搬",
+   CookieBridge.normalized(cookie("v", domain: "example.com")!, host: phost) == nil)
+let parentDomain = CookieBridge.normalized(cookie("v", domain: ".example.com")!,
+                                           host: "a.example.com")?.domain
+ck("cookie 父域保留原写法",
+   parentDomain == ".example.com" || parentDomain == "example.com",
+   String(describing: parentDomain))
+ck("cookie 同名后一条生效",
+   CookieBridge.header([moved, cookie("new", domain: phost)!], for: liveURL) == "session=new")
+ck("cookie 精确路径匹配",
+   CookieBridge.header([cookie("v", domain: phost, path: "/live_frame")!], for: frameURL)
+       == "session=v")
+ck("cookie 路径不匹配不拼",
+   CookieBridge.header([cookie("v", domain: phost, path: "/live_frame")!], for: liveURL) == nil)
+ck("cookie Secure 不往 http 送",
+   CookieBridge.header([cookie("v", domain: phost, secure: true)!], for: liveURL) == nil)
+
 // MARK: - 判定
 
 if fails == 0 {
