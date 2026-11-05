@@ -29,7 +29,7 @@ concurrency:
 jobs:
   swap:
     runs-on: macos-latest
-    # 这一版是「下两张大网（403 MB＋174 MB）→ 各转一遍 fp32（还带 --verify）→ 打成 ~500 MB 归档传上发布位 → 再编 ipa」。
+    # 这一版是「下两张大网（403 MB＋174 MB）→ 换脸网转 fp16、身份证转 fp32 → 打成 ~566 MB 归档传上发布位 → 再编 ipa」。
     # 单张几百 MB 的转换实测几十秒，但 --verify 和落盘读回来各自还要几十秒到几分钟；上一轮照「四张小网」估的 60 分钟不成立。
     timeout-minutes: 120
     steps:
@@ -142,9 +142,10 @@ jobs:
 
       # 这一版整条链路只有两张网：w600k_r50（112→512 维身份证）＋ hyperswap_1a_256（256 进 256 出，
       # 源直接吃归一化后的 512 维向量，不再乘 buff2fs 那张 512×512——所以也没有 emap.bin 了）。
-      # 只把 fp32 打进发布位。fp16 上一代的判决（差 74 个灰阶、PSNR 29.5 dB）是拿转换器随机噪声
-      # 当人脸量出来的，对生成式网不算数——所以这一轮加 --probe-fp16：同样两张 onnx 再转一份 fp16，
-      # 拿真 fixture 量画质/耗时，只写 FXP-FP16 日志和 fsx_summary.json，不参与发布、不改 fp32 配方。
+      # 发布配方：换脸网 fp16、身份证 fp32。换脸网一帧跑一次，fp16 拿真 fixture 对 PC 标答是
+      # PSNR 52.71 dB／max 3.71 灰阶／非有限数 0（与 fp32 同一份数），Mac 上一次推理 184→79 ms；
+      # 身份证只在身份复测里用，fp16 的 cos 会从 1.000000 掉到 0.999898，那一格决定「还是不是那个人」，
+      # 所以仍转 fp32。上一代 128 网判死 fp16 用的是转换器随机噪声那套，对生成式网不算数。
       # 对账三层一起过才许打包（onnxruntime 基线／转换器 --verify／落盘的包读回来再预测），
       # 任何一层不过就地失败、一个文件都不打包。这一条 step 本身一律 exit 0（见上面下载那步的理由：
       # 本机没有 Swift，一轮把「编译过不过」和「模型对不对账」两件事都问了才算快），
@@ -158,7 +159,6 @@ jobs:
           rm -rf app/SwapModel && mkdir -p app/SwapModel
           /usr/bin/time -l /tmp/m2c/bin/python ci/fsx_pack.py --onnx-dir /tmp/fm \
             --fixtures ci/fsx_fixtures --out-root app/SwapModel --cli /tmp/m2c/bin/onnx2coreml \
-            --probe-fp16 \
             >/tmp/fsx_pack_out.log 2>&1
           rc=$?
           echo "PACK rc=$rc" | rec
