@@ -197,7 +197,11 @@ def decompose_instance_norm(model):
     import onnx
     from onnx import helper, numpy_helper, TensorProto
     try:
-        model = onnx.shape_inference.infer_shapes(model)
+        # infer_shapes 返回的是一份拷贝（上一趟就是改了拷贝、存档的还是原图，CI 照样在 IN 上栽）；
+        # 这里只借它的 value_info，图必须改传进来的这一份。
+        inferred = onnx.shape_inference.infer_shapes(model)
+        model.graph.ClearField('value_info')
+        model.graph.value_info.extend(inferred.graph.value_info)
     except Exception:
         pass
     g = model.graph
@@ -370,6 +374,11 @@ def main():
     n_bn = fold_batchnorm(sw_model)
     n_in = decompose_instance_norm(sw_model)
     onnx.save(sw_model, sw_fixed)
+    # 回读存档本身：判据不能只看内存里改过没改过（上一趟就是改在拷贝上，存档还是原图）
+    left = sorted({n.op_type for n in onnx.load(sw_fixed).graph.node
+                   if n.op_type in ('BatchNormalization', 'InstanceNormalization', 'Constant')})
+    if left:
+        raise RuntimeError('落盘的换脸网里还留着转换器不认的算子：%s' % '／'.join(left))
     ss = ort.InferenceSession(sw_fixed, providers=['CPUExecutionProvider'])
     out_fold, _ = P.ort_swap_tuned(ss, tgt, ref_emb, 0.5, 0.5, True)
     del ss
