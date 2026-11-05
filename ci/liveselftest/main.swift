@@ -212,15 +212,22 @@ ck("看门狗 2500ms 边界", !LiveWatch.stalled(outputAgeMs: 2500, localFPS: 13
    "阈值本身不算超")
 
 // 配了目标脸却没换：解释只读 PC 下发的 best_sim/match_thr，门槛不写死
-ck("解释 没配目标脸不说", PlanHint.explain(planCount: 0, swappedFaces: 0,
-                                        bestSim: 0.1, matchThr: 0.3) == nil)
+ck("解释 没配目标脸要说清", (PlanHint.explain(planCount: 0, swappedFaces: 0,
+                                          bestSim: 0.1, matchThr: 0.3) ?? "")
+   .contains("还没配目标脸"),
+   "空表是 PC 的正常行为，不是故障，但得让用户知道要先传脸")
+ck("解释 空表不露-1.0", !(PlanHint.explain(planCount: 0, swappedFaces: 0,
+                                        bestSim: -1, matchThr: 0.3) ?? "")
+   .contains("-1.0"))
 ck("解释 已经换了不说", PlanHint.explain(planCount: 2, swappedFaces: 1,
                                      bestSim: 0.1, matchThr: 0.3) == nil)
 ck("解释 老PC没字段不说", PlanHint.explain(planCount: 1, swappedFaces: 0,
                                        bestSim: nil, matchThr: nil) == nil,
    "老 PC 不读这两个字段也能照常推流")
-ck("解释 没检到脸", (PlanHint.explain(planCount: 1, swappedFaces: 0,
-                                    bestSim: -1, matchThr: 0.3) ?? "").contains("还没检到脸"))
+ck("解释 没检到可比的脸", (PlanHint.explain(planCount: 1, swappedFaces: 0,
+                                        bestSim: -1, matchThr: 0.3) ?? "")
+   .contains("还没检到可比的脸"),
+   "-1 是哨兵值，不是负相似度，也不许把 -1.0 显示出来")
 ck("解释 0.1x 判不是同一人", (PlanHint.explain(planCount: 2, swappedFaces: 0,
                                            bestSim: 0.12, matchThr: 0.3) ?? "")
    .contains("不是视频里同一个人"))

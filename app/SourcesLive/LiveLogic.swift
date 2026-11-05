@@ -45,7 +45,7 @@ enum LiveConfig {
 
     /// 追加到 WKWebView 默认 UA 末尾：PC 那边看 access log 就知道是手机 app 在访问，
     /// 而不是有人在浏览器里手点。
-    static let userAgentSuffix = "LiveSwap/0.8"
+    static let userAgentSuffix = "LiveSwap/0.9"
 
     /// 第一次启动时地址栏里预填的这台：PC 侧现在监听的就是它。
     /// 只当预填和提示用，不当写死的配置——PC 重连 WiFi 以后 IP 会变，
@@ -261,10 +261,15 @@ enum PlanHint {
     /// 老版本 PC 没有 best_sim/match_thr 就什么也不说——不猜、不当故障上报。
     static func explain(planCount: Int, swappedFaces: Int,
                         bestSim: Double?, matchThr: Double?) -> String? {
-        guard planCount > 0, swappedFaces == 0 else { return nil }
+        // 空表不是故障：PC 本来就是一帧都不换，说清楚表里没配就行。
+        if planCount == 0 {
+            return "还没配目标脸：这一帧不换脸（先在页面上传一张目标脸照片再播）"
+        }
+        guard swappedFaces == 0 else { return nil }
         guard let best = bestSim, let thr = matchThr else { return nil }
+        // -1 是 PC 的哨兵值，意思是画面里没有可比的脸，不是“负相似度”。
         if best < 0 {
-            return "目标脸 \(planCount) 张、这一帧没换：画面里还没检到脸"
+            return "目标脸 \(planCount) 张、这一帧没换：画面里还没检到可比的脸"
         }
         let b = String(format: "%.2f", best)
         let t = String(format: "%.2f", thr)
