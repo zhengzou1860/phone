@@ -1169,13 +1169,27 @@ struct ContentView: View {
         }
     }
 
-    /// 一条成品wav的三件套：播放 / 停止 / 导出。①「转换」和 ④「读小说」各挂一份在自己的格子里，
+    /// 一条成品wav的四件套：语速 / 播放 / 停止 / 导出。①「转换」和 ④「读小说」各挂一份在自己的格子里，
     /// 共用一个 PlayController，所以「播放中」只点亮正在响的那一行。
     @ViewBuilder
     private func playbackSection(url: URL, headline: String, share: Binding<Bool>) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             Text(headline)
                 .font(.headline)
+
+            // 语速这一档苹果自己的播放控件没给（AVAudioPlayer 那个 rate 是变调的快进，1.5× 等于抬 7 个半音，
+            // 对着一版「音调必须对上」的 app 不能用）。这里走 TimePitch：只有时长变，音高钉死。
+            // 两条格子共用同一个值：① 和 ④ 用的是同一个 controller，调一次两条都跟着。
+            HStack(spacing: 10) {
+                Text(String(format: "语速 %.2f×", player.rate))
+                    .font(.caption)
+                    .frame(width: 92, alignment: .leading)
+                Slider(value: $player.rate, in: 0.5...2.0, step: 0.05)
+                    .frame(maxWidth: 240)
+                Button("原速") { player.rate = 1.0 }
+                    .buttonStyle(.bordered)
+                    .font(.caption)
+            }
 
             HStack(spacing: 15) {
                 Button {

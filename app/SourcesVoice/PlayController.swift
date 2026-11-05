@@ -12,6 +12,13 @@ import AVFoundation
 ///
 /// 顺带把这条 wav 的峰值/rms 写进磁盘日志：手机上「链子到底有没有出声」只有这一处能看出来，
 /// 别靠耳朵猜。
+///
+/// ## 语速为什么不走 `AVAudioPlayer.rate`
+/// 那个也有 rate，但它是**变调的**（磁带快进那种：1.5× 等于把整条频谱抬 7 个半音）。
+/// 这一版 app 整个围着「音调得对上」做，快一点就变尖的声音不能用 ⇒ 播的时候走
+/// `AVAudioEngine` + `AVAudioUnitTimePitch`，`rate` 只改时长、`pitch` 钉死 0 音分。
+/// 引擎这条路真机上还没验过，起不来就退回原来那条 `AVAudioPlayer`（那一趟语速不生效，
+/// 状态行会写清走的哪条）。
 @MainActor
 final class PlayController: NSObject, ObservableObject {
     @Published var isPlaying = false
@@ -20,7 +27,30 @@ final class PlayController: NSObject, ObservableObject {
     /// 只留 isPlaying 的话「播放中」会同时点亮在两条上，看不出谁在响。
     @Published var playingURL: URL?
 
+    /// 语速倍率 0.5–2.0，1.0 是原速，音高不动。正在播的那一条当场跟着变，不用停了重播。
+    /// 存 UserDefaults：调顺手之后就别每次开 app 再调一遍。
+    @Published var rate: Float {
+        didSet {
+            guard rate != oldValue else { return }
+            timePitch.rate = rate
+            UserDefaults.standard.set(rate, forKey: "playRate")
+            VoiceJournal.line(String(format: "语速设成 %.2f×（音高不动）", rate))
+        }
+    }
+
+    private let engine = AVAudioEngine()
+    private let node = AVAudioPlayerNode()
+    private let timePitch = AVAudioUnitTimePitch()
+    private var attached = false
+    /// 引擎起不来时的退路：那条只有原速。
     private var player: AVAudioPlayer?
+
+    override init() {
+        let saved = UserDefaults.standard.float(forKey: "playRate")
+        rate = (saved >= 0.5 && saved <= 2.0) ? saved : 1.0
+        super.init()
+        timePitch.pitch = 0
+    }
 
     func play(url: URL) {
         stop()
@@ -33,6 +63,51 @@ final class PlayController: NSObject, ObservableObject {
             VoiceJournal.line("播放前设会话失败：\(error.localizedDescription)")
         }
 
+        status = ""
+        if !playWithEngine(url) {
+            playWithPlayer(url)
+        }
+        measure(url)
+    }
+
+    /// 文件 → TimePitch → 输出。返回 false 就是没起来，调用方退回原速那条。
+    private func playWithEngine(_ url: URL) -> Bool {
+        do {
+            let file = try AVAudioFile(forReading: url)
+            if !attached {
+                engine.attach(node)
+                engine.attach(timePitch)
+                attached = true
+            }
+            // 每播一条重接：④ 的系统原声和链子成品的采样率不一定一样，接死了就绑在上一条的格式上。
+            engine.disconnectNodeOutput(node)
+            engine.disconnectNodeOutput(timePitch)
+            engine.connect(node, to: timePitch, format: file.processingFormat)
+            engine.connect(timePitch, to: engine.mainMixerNode, format: file.processingFormat)
+            timePitch.rate = rate
+            timePitch.pitch = 0
+            engine.prepare()
+            try engine.start()
+            node.stop()
+            node.scheduleFile(file, at: nil)
+            node.play()
+            isPlaying = true
+            playingURL = url
+            status = String(format: "播放中（语速 %.2f×，音高不动）", rate)
+            VoiceJournal.line(String(format: "走引擎播 %@：语速 %.2f×｜%@",
+                                     url.lastPathComponent, rate, formatText(url)))
+            watchEngine()
+            return true
+        } catch {
+            VoiceJournal.line("引擎这条路起不来：\(error.localizedDescription)｜退回原速播放")
+            engine.pause()
+            isPlaying = false
+            playingURL = nil
+            return false
+        }
+    }
+
+    private func playWithPlayer(_ url: URL) {
         do {
             let p = try AVAudioPlayer(contentsOf: url)
             player = p
@@ -40,7 +115,8 @@ final class PlayController: NSObject, ObservableObject {
             if p.play() {
                 isPlaying = true
                 playingURL = url
-                status = "播放中"
+                status = rate == 1.0 ? "播放中"
+                    : String(format: "播放中（引擎没起来，语速 %.2f× 这一趟没生效）", rate)
                 watch(p)
             } else {
                 isPlaying = false
@@ -52,10 +128,11 @@ final class PlayController: NSObject, ObservableObject {
             status = "打不开：\(error.localizedDescription)"
             VoiceJournal.line("AVAudioPlayer 建不出来：\(error.localizedDescription)")
         }
-        measure(url)
     }
 
     func stop() {
+        node.stop()
+        engine.pause()
         player?.stop()
         player = nil
         isPlaying = false
@@ -100,7 +177,25 @@ final class PlayController: NSObject, ObservableObject {
         }
     }
 
-    /// 播完自己把状态收回来。
+    /// 播完自己把状态收回来（引擎那条）。轮询的理由同下面 `watch`：回调在不在主线程没保证。
+    private func watchEngine() {
+        Task { [weak self] in
+            guard let first = self else { return }
+            let mine = first.playingURL
+            while let s = self, s.isPlaying, s.playingURL == mine {
+                try? await Task.sleep(nanoseconds: 100_000_000)
+                if !s.node.isPlaying {
+                    s.isPlaying = false
+                    s.playingURL = nil
+                    s.status = "放完了"
+                    s.engine.pause()
+                    break
+                }
+            }
+        }
+    }
+
+    /// 播完自己把状态收回来（退路那条 `AVAudioPlayer`）。
     ///
     /// 没用 AVAudioPlayerDelegate：那个协议的回调到底在不在主线程没有保证，
     /// 声明成 nonisolated 还是 MainActor 都可能撞上隔离不匹配，编译先过不去。
