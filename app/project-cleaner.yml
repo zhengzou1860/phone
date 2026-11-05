@@ -23,9 +23,12 @@ targets:
         CFBundleExecutable: CleanerBench
         CFBundleIdentifier: com.qoder.cleaner
         CFBundlePackageType: APPL
-        CFBundleShortVersionString: "0.1"
-        CFBundleVersion: "1"
+        CFBundleShortVersionString: "0.4"
+        CFBundleVersion: "4"
         CFBundleInfoDictionaryVersion: "6.0"
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
+        NSLocalNetworkUsageDescription: "要把清理清单发到同一 Wi-Fi 的电脑，并取回核对结论"
         LSRequiresIPhoneOS: true
         UILaunchScreen: {}
         UISupportedInterfaceOrientations:

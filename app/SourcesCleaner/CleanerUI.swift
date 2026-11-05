@@ -26,6 +26,10 @@ final class CleanerModel: ObservableObject {
     @Published private(set) var lastSummary = "还没扫描"
     @Published private(set) var lastScanDate: Date?
     @Published var showDeleteConfirm = false
+    @Published private(set) var verdicts = CleanerVerdictMap()
+    @Published private(set) var verdictAt = ""
+    @Published private(set) var pcBusy = false
+    @Published private(set) var pcStatus = ""
 
     private var scanTask: Task<Void, Never>?
     private var generation = 0
@@ -62,6 +66,56 @@ final class CleanerModel: ObservableObject {
     func selectAll() { selected = Set(items.map(\.id)) }
 
     func clearSelection() { selected.removeAll() }
+
+    func verdict(for item: CleanItem) -> CleanerVerdictEntry? { verdicts[item.id] }
+
+    var recommendedCount: Int {
+        items.reduce(0) { $0 + (verdicts[$1.id]?.kind == .delete ? 1 : 0) }
+    }
+
+    // 只按电脑结论改勾选，删不删还是人按「删除」那一刻决定。
+    func selectRecommended() {
+        selected = Set(items.filter { verdicts[$0.id]?.kind == .delete }.map(\.id))
+    }
+
+    func sendReport() {
+        guard !pcBusy else { return }
+        let items = self.items
+        let notes = self.notes
+        let cats = categories
+        let days = historyDays
+        let lcHome = env.lcHome?.path
+        pcBusy = true
+        pcStatus = "发到电脑中…"
+        Task.detached(priority: .userInitiated) { [weak self] in
+            let text = CleanerReportBuilder.make(
+                items: items, notes: notes, categories: cats, historyDays: days, lcHome: lcHome
+            )
+            let message = text.isEmpty ? "发到电脑：清单生成失败" : CleanerPC.sendReport(text)
+            await MainActor.run {
+                self?.pcBusy = false
+                self?.pcStatus = message
+            }
+        }
+    }
+
+    func fetchVerdict() {
+        guard !pcBusy else { return }
+        pcBusy = true
+        pcStatus = "取回结论中…"
+        Task.detached(priority: .userInitiated) { [weak self] in
+            let result = CleanerPC.fetchVerdict()
+            await MainActor.run {
+                guard let self else { return }
+                self.pcBusy = false
+                self.pcStatus = result.message
+                if let file = result.verdict {
+                    self.verdicts = CleanerVerdictMap(file: file)
+                    self.verdictAt = file.generatedAt ?? ""
+                }
+            }
+        }
+    }
 
     func count(_ cat: CleanCategory) -> Int {
         items.reduce(0) { $0 + ($1.category == cat ? 1 : 0) }
@@ -158,7 +212,7 @@ struct CleanerRootView: View {
                         resultCard
                     }
                     safetyCard
-                    Text("清理助手 0.1｜只清你写在 LiveContainer 里的 app，不碰 LiveContainer 和 SideStore 自己的文件")
+                    Text("清理助手 0.4｜只清你写在 LiveContainer 里的 app，不碰 LiveContainer 和 SideStore 自己的文件")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                         .frame(maxWidth: .infinity, alignment: .center)
@@ -346,6 +400,53 @@ struct CleanerRootView: View {
                     .font(.caption)
                     .disabled(model.scanning || model.deleting)
                 }
+
+                Divider()
+
+                HStack(spacing: 10) {
+                    Button {
+                        model.sendReport()
+                    } label: {
+                        Label("发到电脑", systemImage: "paperplane")
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(model.pcBusy || model.items.isEmpty)
+
+                    Button {
+                        model.fetchVerdict()
+                    } label: {
+                        Label("取回结论", systemImage: "arrow.down.doc")
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(model.pcBusy)
+
+                    Spacer()
+                }
+
+                Text("只发清单（路径、大小、时间），不发文件内容。电脑上的结论只标在行上，不会自动删任何东西；要删还是你核对后按「删除勾选」。")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                if !model.pcStatus.isEmpty {
+                    Text(model.pcStatus)
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+
+                if !model.verdicts.isEmpty {
+                    HStack(spacing: 10) {
+                        Text("电脑结论\(model.verdictAt.isEmpty ? "" : "（\(model.verdictAt)）")：可删 \(model.recommendedCount) 项")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Button("按结论勾选") { model.selectRecommended() }
+                            .font(.caption)
+                            .disabled(model.recommendedCount == 0 || model.scanning || model.deleting)
+                    }
+                }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }
@@ -431,10 +532,27 @@ struct CleanerRootView: View {
                                 .foregroundStyle(.orange)
                                 .clipShape(Capsule())
                         }
+                        if let verdict = model.verdict(for: item) {
+                            Text(verdict.kind.title)
+                                .font(.caption2)
+                                .padding(.horizontal, 5)
+                                .padding(.vertical, 1)
+                                .background(verdictColor(verdict.kind).opacity(0.16))
+                                .foregroundStyle(verdictColor(verdict.kind))
+                                .clipShape(Capsule())
+                        }
                         Text(item.note)
                             .font(.caption2)
                             .foregroundStyle(.secondary)
                             .lineLimit(2)
+                    }
+                    if let verdict = model.verdict(for: item),
+                       let reason = verdict.reason, !reason.isEmpty {
+                        Text("电脑：\(reason)")
+                            .font(.caption2)
+                            .foregroundStyle(verdictColor(verdict.kind))
+                            .fixedSize(horizontal: false, vertical: true)
+                            .frame(maxWidth: .infinity, alignment: .leading)
                     }
                 }
                 Spacer(minLength: 4)
@@ -481,6 +599,14 @@ struct CleanerRootView: View {
         }
     }
 
+    private func verdictColor(_ kind: CleanVerdictKind) -> Color {
+        switch kind {
+        case .keep: return .green
+        case .delete: return .red
+        case .unsure: return .orange
+        }
+    }
+
     private var safetyCard: some View {
         GroupBox {
             VStack(alignment: .leading, spacing: 8) {
@@ -495,6 +621,7 @@ struct CleanerRootView: View {
                 bullet("视频按后缀 .mov / .mp4 / .m4v / .avi / .mkv / .webm / .3gp / .mts / .ts 递归扫，改名、放子目录、落在真实 tmp 里都能列出来；循环选「全部」时不限天数。模型包、nights、voice_models、samples、swap_idents、Cookies、Preferences、SystemData、LCAppGroup、Inbox 不进去。")
                 bullet("换脸只删非当前版本的模型包和编译缓存；fsx_arc / fsx_swap、version.txt、chain.txt、archive.part、swap_idents 和语音模型目录都保留，避免重复下载。")
                 bullet("删除前会按同一套规则重新扫描，只有仍然在清单里的路径才会被删；删掉的文件不进系统「最近删除」。")
+                bullet("「发到电脑」只发清单（路径、大小、时间），不发文件内容。电脑回的「保留／可删／待定」只标在行上，app 不会照着自动删；要删还是人核对后按「删除勾选」，删除时照样重扫和复核容器身份。")
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }

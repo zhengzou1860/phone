@@ -1130,3 +1130,197 @@ final class Cleaner {
         return c.hasPrefix(prefix)
     }
 }
+
+// MARK: - 发到电脑 / 取回结论
+//
+// 只发路径和元数据，不发文件内容；电脑回的结论只做标记，app 不会照着自动删。
+// 电脑上先跑 tools/report_server_cleaner.py（8718），手机和电脑在同一 Wi-Fi。
+
+struct CleanerReportItem: Encodable {
+    let path: String
+    let app: String
+    let bundleID: String
+    let container: String
+    let displayPath: String
+    let category: String
+    let bytes: Int64
+    let modifiedAt: String
+    let isDirectory: Bool
+    let inSharedTmp: Bool
+    let needsConfirm: Bool
+    let note: String
+}
+
+struct CleanerReport: Encodable {
+    let kind = "cleaner-scan"
+    let schema = 1
+    let generatedAt: String
+    let categories: [String]
+    let historyDays: Int
+    let lcHome: String
+    let notes: [String]
+    let items: [CleanerReportItem]
+}
+
+enum CleanerReportBuilder {
+    static func make(
+        items: [CleanItem],
+        notes: [String],
+        categories: Set<CleanCategory>,
+        historyDays: Int,
+        lcHome: String?
+    ) -> String {
+        let fmt = ISO8601DateFormatter()
+        let rows = items.map { item -> CleanerReportItem in
+            let modified = (try? item.url.resourceValues(forKeys: [.contentModificationDateKey]))?
+                .contentModificationDate
+            return CleanerReportItem(
+                path: item.url.standardizedFileURL.path,
+                app: item.appName,
+                bundleID: item.bundleID,
+                container: item.containerName,
+                displayPath: item.displayPath,
+                category: item.category.rawValue,
+                bytes: item.bytes,
+                modifiedAt: modified.map { fmt.string(from: $0) } ?? "",
+                isDirectory: item.isDirectory,
+                inSharedTmp: item.inSharedTmp,
+                needsConfirm: item.needsConfirm,
+                note: item.note
+            )
+        }
+        let report = CleanerReport(
+            generatedAt: fmt.string(from: Date()),
+            categories: CleanCategory.allCases.filter { categories.contains($0) }.map(\.rawValue),
+            historyDays: historyDays,
+            lcHome: lcHome ?? "",
+            notes: notes,
+            items: rows
+        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        guard let data = try? encoder.encode(report),
+              let text = String(data: data, encoding: .utf8) else { return "" }
+        return text
+    }
+}
+
+enum CleanVerdictKind: String {
+    case keep
+    case delete
+    case unsure
+
+    var title: String {
+        switch self {
+        case .keep: return "保留"
+        case .delete: return "可删"
+        case .unsure: return "待定"
+        }
+    }
+}
+
+struct CleanerVerdictEntry: Decodable {
+    let path: String
+    let verdict: String
+    let reason: String?
+
+    var kind: CleanVerdictKind {
+        CleanVerdictKind(rawValue: verdict.lowercased()) ?? .unsure
+    }
+}
+
+struct CleanerVerdictFile: Decodable {
+    let generatedAt: String?
+    let items: [CleanerVerdictEntry]
+}
+
+struct CleanerVerdictMap {
+    private(set) var byPath: [String: CleanerVerdictEntry]
+
+    init(file: CleanerVerdictFile) {
+        var map: [String: CleanerVerdictEntry] = [:]
+        for entry in file.items where !entry.path.isEmpty {
+            map[Self.normalize(entry.path)] = entry
+        }
+        byPath = map
+    }
+
+    init() {
+        byPath = [:]
+    }
+
+    subscript(path: String) -> CleanerVerdictEntry? {
+        byPath[Self.normalize(path)]
+    }
+
+    var isEmpty: Bool { byPath.isEmpty }
+
+    static func normalize(_ path: String) -> String {
+        URL(fileURLWithPath: path).standardizedFileURL.path
+    }
+}
+
+enum CleanerPC {
+    /// 8712 剪辑 / 8714 VR3D / 8715 Voice / 8716 换脸 / 8717 鼾声，这条线走 8718 和自己的接收文件。
+    static let reportEndpoint = "http://192.168.31.99:8718/report"
+    static let verdictEndpoint = "http://192.168.31.99:8718/verdict"
+
+    static func sendReport(_ text: String) -> String {
+        guard let url = URL(string: reportEndpoint) else { return "发到电脑：地址非法" }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json; charset=utf-8", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 15
+        request.httpBody = text.data(using: .utf8)
+
+        let done = DispatchSemaphore(value: 0)
+        var code = -1
+        var reply = ""
+        var failure = ""
+        URLSession.shared.dataTask(with: request) { data, response, error in
+            if let error = error { failure = "\(error)" }
+            if let response = response as? HTTPURLResponse { code = response.statusCode }
+            if let data = data { reply = String(data: data, encoding: .utf8) ?? "?" }
+            done.signal()
+        }.resume()
+
+        if done.wait(timeout: .now() + 20) == .timedOut {
+            return "发到电脑：超时 20 s 没回音（手机到 192.168.31.99:8718 不通？电脑上的 8718 接收端没开？）"
+        }
+        if code < 0 { return "发到电脑：失败 \(failure)" }
+        return "发到电脑：HTTP \(code) 回执 \(reply)（送出 \(text.count) 字符）"
+    }
+
+    static func fetchVerdict() -> (message: String, verdict: CleanerVerdictFile?) {
+        guard let url = URL(string: verdictEndpoint) else { return ("取回结论：地址非法", nil) }
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.timeoutInterval = 15
+
+        let done = DispatchSemaphore(value: 0)
+        var code = -1
+        var data: Data?
+        var failure = ""
+        URLSession.shared.dataTask(with: request) { body, response, error in
+            if let error = error { failure = "\(error)" }
+            if let response = response as? HTTPURLResponse { code = response.statusCode }
+            data = body
+            done.signal()
+        }.resume()
+
+        if done.wait(timeout: .now() + 20) == .timedOut {
+            return ("取回结论：超时 20 s 没回音（电脑上的 8718 接收端没开？）", nil)
+        }
+        if code < 0 { return ("取回结论：失败 \(failure)", nil) }
+        guard code == 200, let body = data else {
+            return ("取回结论：HTTP \(code)", nil)
+        }
+        guard let file = try? JSONDecoder().decode(CleanerVerdictFile.self, from: body) else {
+            return ("取回结论：电脑回的不是结论文件（HTTP \(code)）", nil)
+        }
+        if file.items.isEmpty {
+            return ("取回结论：电脑上还没有结论（先把清单「发到电脑」）", file)
+        }
+        return ("取回结论：\(file.items.count) 条（\(file.generatedAt ?? "未写时间")）", file)
+    }
+}

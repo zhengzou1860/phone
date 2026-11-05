@@ -476,6 +476,37 @@ check(exists(nights.appendingPathComponent("20260103-000000")), "历史删除：
 check(exists(nights.appendingPathComponent("20260104-000000")), "历史删除：最新 3 晚保留（04）")
 check(exists(nights.appendingPathComponent("20260105-000000")), "历史删除：最新 3 晚保留（05）")
 
+// MARK: 发电脑 / 取回结论
+
+let reportItem = CleanItem(
+    category: .history, appName: "剪辑", bundleID: "com.qoder.hellolc",
+    containerName: "22222222-BBBB", url: helloDocs.appendingPathComponent("cut_new.mov"),
+    displayPath: "剪辑｜Documents/cut_new.mov", bytes: 3, note: "test",
+    isDirectory: false, minAgeHours: 720, inSharedTmp: false, containerRoot: hello
+)
+let reportText = CleanerReportBuilder.make(
+    items: [reportItem], notes: ["说明"], categories: [.junk, .history],
+    historyDays: 0, lcHome: "/lc"
+)
+check(reportText.contains("\"kind\" : \"cleaner-scan\""), "发电脑：清单带格式标记")
+check(reportText.contains("\"historyDays\" : 0"), "发电脑：清单带扫描范围")
+check(reportText.contains(helloDocs.appendingPathComponent("cut_new.mov").path), "发电脑：清单带完整路径")
+check(reportText.contains("\"app\" : \"剪辑\""), "发电脑：清单带 app 名")
+
+let verdictJSON = """
+{"generatedAt":"2026-11-05T09:00:00Z","items":[
+ {"path":"\(helloDocs.appendingPathComponent("cut_new.mov").path)","verdict":"keep","reason":"最新成片"},
+ {"path":"\(nights.appendingPathComponent("20260105-000000").path)","verdict":"delete","reason":"旧一晚"}
+]}
+"""
+let verdictFile = verdictJSON.data(using: .utf8)
+    .flatMap { try? JSONDecoder().decode(CleanerVerdictFile.self, from: $0) }
+check(verdictFile?.items.count == 2, "取结论：能解出两条")
+let verdictMap = CleanerVerdictMap(file: verdictFile ?? CleanerVerdictFile(generatedAt: "", items: []))
+check(verdictMap[helloDocs.appendingPathComponent("cut_new.mov").path]?.kind == .keep, "取结论：按完整路径对上「保留」")
+check(verdictMap[nights.appendingPathComponent("20260105-000000").path]?.kind == .delete, "取结论：按完整路径对上「可删」")
+check(verdictMap["/nonexistent"] == nil, "取结论：清单外的路径不认")
+
 // MARK: 判决
 
 if failures == 0 {
