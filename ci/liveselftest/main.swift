@@ -171,7 +171,7 @@ ck("脚本 不整个覆盖页面LiveUI", !shim.contains("window.LiveUI = {"),
    "整赋新对象会把 setPlaying/refreshStream/autoRefresh 一起冲掉")
 ck("脚本 合并到现有LiveUI", shim.contains("var UI = window.LiveUI") && shim.contains("window.LiveUI = UI"))
 ck("脚本 关掉页面30秒盲刷", shim.contains("UI.autoRefresh(false)"))
-ck("脚本 长连接断了会重连", shim.contains("LiveUI.refreshStream") && shim.contains("id === 'video-stream'"))
+ck("脚本 长连接断了会重连", shim.contains("LiveUI.refreshStream") && shim.contains("img.id !== 'video-stream'"))
 ck("脚本 全屏克隆那份也重连", shim.contains("fullscreen-video"), "全屏里是克隆出来的 img，原图被隐藏着")
 ck("转义 引号反斜杠", LiveShim.jsLiteral("a\"b\\c") == "\"a\\\"b\\\\c\"",
    LiveShim.jsLiteral("a\"b\\c"))
