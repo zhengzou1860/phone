@@ -256,7 +256,7 @@ ck("契约 预填那台能解析成地址", LiveHost.base(LiveConfig.suggestedHo
 // 客户端默认值与地址解析共用一条路
 ck("客户端 坏地址建不出来", SwapClient(hostText: "192.168.1.20/login") == nil)
 let c = SwapClient(baseURL: URL(string: "http://192.168.1.9:5000")!)
-ck("客户端 宽度先用兜底640", c.liveWidth == 640)
+ck("客户端 宽度先用兜底800", c.liveWidth == LiveConfig.fallbackMaxWidth)
 ck("客户端 首页URL", c.pageURL.absoluteString == "http://192.168.1.9:5000")
 ck("客户端 结果流URL", c.feedURL.absoluteString == "http://192.168.1.9:5000/video_feed")
 ck("客户端 本地计数从0", c.framesSent == 0 && c.framesDroppedLocal == 0)
