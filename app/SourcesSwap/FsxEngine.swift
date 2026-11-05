@@ -3,7 +3,7 @@ import CoreML
 import CoreVideo
 import Accelerate
 
-/// fsx 那条链路的两张网：脸向量网（112 出 512 维身份证）＋ hyperswap_1a_256（256 进 256 出）。
+/// fsx 那条链路的两张网：脸向量网（112 出 512 维身份证）＋ hyperswap_1c_256（256 进 256 出）。
 /// 换脸网这一格收的就是那张归一化过的 512 维向量本身，不再乘 latent 矩阵——
 /// inswapper 那套 emap 是它自己图上的安排；这一张网没有那一步，喂 emap 出来的东西它不认识。
 enum FsxNets {

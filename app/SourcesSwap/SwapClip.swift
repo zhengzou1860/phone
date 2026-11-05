@@ -171,7 +171,7 @@ final class SwapSource {
 /// → 逐帧 对齐→256 前向→贴回（一帧里有几张目标脸就换几张）→ 编码器写新片。
 /// 每一步的单价、身份余弦、足迹水位全部进流水；跑完存相册，成功才删沙盒那份。
 ///
-/// 这一条链路只有两张网（脸向量网＋hyperswap_1a_256），
+/// 这一条链路只有两张网（脸向量网＋hyperswap_1c_256），
 /// 逐帧的钱全在那一张 30 GMAC 的换脸网上，其余每一步都是几十字节的算术；
 /// 多人换脸加的钱是多张脸各一次前向，检测仍是一帧一次（Vision 本来就是一次出所有脸）。
 enum SwapClip {
@@ -1005,7 +1005,7 @@ enum SwapClip {
         }
         say("足迹 \(mem0)→\(SwapFacts.footprintMB()) MB，本次峰值 \(memMax) MB")
         if !cosList.isEmpty {
-            say("身份复测 \(cosList.count) 次（PC 参照：hyperswap_1a_256 换后<->源 0.735 上下，inswapper 是 0.779；"
+            say("身份复测 \(cosList.count) 次（PC 参照：hyperswap_1c_256 换后<->源 0.79 上下（八帧中位 0.794），inswapper 是 0.779；"
                 + "换前<->源 ≈0.1~0.3）")
             say("      换后<->换前 那一列不吃存档身份，只答「这张脸动没动」：低＝动过，接近 1＝原样交或本来就是同一个人；这一列 PC 上我没量过")
             for c in cosList.suffix(12) { say("  " + c) }

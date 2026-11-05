@@ -96,27 +96,31 @@ jobs:
           exit 0
 
       # 权重不进 git（577 MB），只在这台机器上下一次，字节数钉死：换源就换字节，换字节就换画面。
-      # hyperswap_1a_256.onnx = 402742682，w600k_r50.onnx = 174383860（本机 PC 上验通的那两份，逐字节同一个）。
+      # hyperswap_1c_256.onnx = 402742682，w600k_r50.onnx = 174383860（本机 PC 上验通的那两份，逐字节同一个）。
+      # 这一版特意再钉一道 sha256：hyperswap 的 1a 和 1c 字节数一模一样（都是 402742682），
+      # 只比长度根本分不开这两份——而拿 1c 的标答去对 1a 的网，第①层那关只会报「画面不对」，
+      # 报不出「下错了文件」。sha 一句话就能说清是哪一份。
       # 下在 /tmp/fm 而不是工程里：xcodegen 会扫工程，模型一旦落进 sources 就被当编译输入交给
       # coremlc generate（VR3D 第 5 轮正是这么死在 build 阶段，A valid manifest does not exist）。
-      - name: 下 hyperswap_1a_256（403 MB）
+      - name: 下 hyperswap_1c_256（403 MB）
         run: |
           set +e
           ann() { sed -e 's/%/%25/g' -e 's/:://g' | awk -v p="$1" 'NR<=6{print "::error::" p substr($0,1,230)}'; }
           rec() { tee -a /tmp/model.log; }
           mkdir -p /tmp/fm
           WANT=402742682
-          U=https://github.com/facefusion/facefusion-assets/releases/download/models-3.3.0/hyperswap_1a_256.onnx
-          code=$(curl -sS -L --retry 3 --retry-all-errors --max-time 1200 -o /tmp/fm/hyperswap_1a_256.onnx -w '%{http_code}' "$U")
-          sz=$(wc -c < /tmp/fm/hyperswap_1a_256.onnx 2>/dev/null | tr -d ' ')
-          echo "DL-VERDICT hyperswap http=$code bytes=${sz:-0}（要 $WANT）" | rec
+          WANT_SHA=5528c2d76fe9986c99d829278987ef9f3a630cb606db7628d02b57b330f406a5
+          U=https://github.com/facefusion/facefusion-assets/releases/download/models-3.3.0/hyperswap_1c_256.onnx
+          code=$(curl -sS -L --retry 3 --retry-all-errors --max-time 1200 -o /tmp/fm/hyperswap_1c_256.onnx -w '%{http_code}' "$U")
+          sz=$(wc -c < /tmp/fm/hyperswap_1c_256.onnx 2>/dev/null | tr -d ' ')
+          got=$(shasum -a 256 /tmp/fm/hyperswap_1c_256.onnx 2>/dev/null | awk '{print $1}')
+          echo "DL-VERDICT hyperswap http=$code bytes=${sz:-0}（要 $WANT）sha=${got:-无}（要 $WANT_SHA）" | rec
           # 这里一律 exit 0：下载／转换没成也先把 ipa 编出来，一轮就把两件事都问了（本机没有 Swift，
           # 编译错和模型错挤在一轮里看比分开快得多）。真正的闸门在「publish release」最后那条版本比对上。
-          if [ "${sz:-0}" != "$WANT" ]; then
-            echo "DL-VERDICT hyperswap 字节对不上 ⇒ 这一版不发模型，发布位上那一版对不上号的会被闸门拦下" | rec | ann "DL "
+          if [ "${sz:-0}" != "$WANT" ] || [ "${got:-无}" != "$WANT_SHA" ]; then
+            echo "DL-VERDICT hyperswap 这份不是 PC 验过的那一份 ⇒ 这一版不发模型，发布位上那一版对不上号的会被闸门拦下" | rec | ann "DL "
             exit 0
           fi
-          shasum -a 256 /tmp/fm/hyperswap_1a_256.onnx | rec | ann "DL "
           exit 0
 
       - name: 下 buffalo_l 取 w600k_r50（人脸向量网）
@@ -140,7 +144,7 @@ jobs:
           ls -l /tmp/fm | rec | ann "DL-LS "
           exit 0
 
-      # 这一版整条链路只有两张网：w600k_r50（112→512 维身份证）＋ hyperswap_1a_256（256 进 256 出，
+      # 这一版整条链路只有两张网：w600k_r50（112→512 维身份证）＋ hyperswap_1c_256（256 进 256 出，
       # 源直接吃归一化后的 512 维向量，不再乘 buff2fs 那张 512×512——所以也没有 emap.bin 了）。
       # 发布配方：换脸网 fp16、身份证 fp32。换脸网一帧跑一次，fp16 拿真 fixture 对 PC 标答是
       # PSNR 52.71 dB／max 3.71 灰阶／非有限数 0（与 fp32 同一份数），Mac 上一次推理 184→79 ms；
@@ -245,7 +249,7 @@ jobs:
             echo "整个 app=$(du -sk "$APP" 2>/dev/null | awk '{print $1"KB"}')"
             echo "swap.ipa=$(wc -c < swap.ipa 2>/dev/null | tr -d ' ') 字节"
             echo "models.bin=$(wc -c < SwapModel/models.bin 2>/dev/null | tr -d ' ') 字节"
-            echo "chain.txt=$(cat SwapModel/chain.txt 2>/dev/null)（要 hyperswap-1a-256）"
+            echo "chain.txt=$(cat SwapModel/chain.txt 2>/dev/null)（要 hyperswap-1c-256）"
             echo "models.json=$(wc -c < SwapModel/models.json 2>/dev/null | tr -d ' ') 字节"; } | tee -a /tmp/model.log | ann "B-VERDICT "
           exit 0
 

@@ -8,7 +8,7 @@ import CryptoKit
 /// 版本号＝两张 onnx 的 sha256 再加转换配方那一句（CI 那头算），所以「换模型」和「改程序」这两件事在盘上是分开的：
 /// 程序改完装上去，那一份模型原封不动；只有模型本身（或转换配方）换了，手机上那份才会被换掉。
 ///
-/// 这一版 fsx 那条链路带的两样：fsx_arc.mlpackage／fsx_swap.mlpackage（hyperswap_1a_256）。
+/// 这一版 fsx 那条链路带的两样：fsx_arc.mlpackage／fsx_swap.mlpackage（hyperswap_1c_256）。
 /// 换脸网收的就是归一化后的 512 维向量，不再需要 inswapper 那张 emap 矩阵。
 ///
 /// 发布位：CI 把这些打成两个文件，挂在 channel-swap 这条 release 上：
@@ -41,7 +41,7 @@ enum SwapStore {
     /// 本版链路的口径标记：归档里带一份 chain.txt，内容对得上才算「这一版的模型」。
     /// 两张资源名没变（fsx_swap.mlpackage），旧版装过的那份同名包光看名字分不出来——
     /// 不带这一关，升级后第一次出片会在接口对账那一刻才炸（256 的入参在 128 的包里找不到）。
-    static let chainTag = "hyperswap-1a-256"
+    static let chainTag = "hyperswap-1c-256"
 
     struct Manifest: Decodable {
         struct File: Decodable { let path: String; let size: Int }

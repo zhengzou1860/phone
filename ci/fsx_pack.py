@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""把两张 onnx（w600k_r50＋hyperswap_1a_256）转成手机上的两份 mlpackage，跟 PC 的标准答案对完账，
+"""把两张 onnx（w600k_r50＋hyperswap_1c_256）转成手机上的两份 mlpackage，跟 PC 的标准答案对完账，
 再打成 models.bin＋models.json，外加一份 chain.txt 口径标记。
 
 发布配方：换脸网 fp16、身份证 fp32。换脸网这一格一帧跑一次，fp16 在真 fixture 上与 fp32 同一份答案
@@ -40,15 +40,16 @@ except Exception:
     pass
 
 # 字节数钉死：换源就换字节，换字节就换画面（这两份和 PC 上验通的那两份逐字节同一个）
+# 注意 hyperswap 的 1a 与 1c 字节数完全相同（402742682），光比长度分不开这两份——sha 在 workflow 那一步钉
 WANT_BYTES = {
     'w600k_r50.onnx': 174383860,
-    'hyperswap_1a_256.onnx': 402742682,
+    'hyperswap_1c_256.onnx': 402742682,
 }
-RECIPE = b'fsx-models|hyperswap_1a_256|fp16|mlpackage|v2'
+RECIPE = b'fsx-models|hyperswap_1c_256|fp16|mlpackage|v2'
 ARC_PKG = 'fsx_arc'
 SWAP_PKG = 'fsx_swap'
 # 手机上 haveAll() 认的口径标记：资源名没变（fsx_swap.mlpackage），旧版同名包光看名字分不出来
-CHAIN_TAG = 'hyperswap-1a-256'
+CHAIN_TAG = 'hyperswap-1c-256'
 SIDE = 256
 # 这两条是「还换不换得对那个人」的底线：PC↔CoreML 实测 fp32 是 cos=1.000000／PSNR≈53，
 # fp16 换脸包同样是 PSNR 52.71 dB；闸门放在远低于实测、远高于坏值的地方。
@@ -317,7 +318,7 @@ def pack_archive(base, files_order, out_bin, out_json, version):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--onnx-dir', required=True, help='放 w600k_r50.onnx／hyperswap_1a_256.onnx 的目录')
+    ap.add_argument('--onnx-dir', required=True, help='放 w600k_r50.onnx／hyperswap_1c_256.onnx 的目录')
     ap.add_argument('--fixtures', required=True, help='ci/fsx_fixtures：PC 出的标准答案')
     ap.add_argument('--out-root', default='app/SwapModel',
                     help='两份 mlpackage＋chain.txt＋models.bin/json 落这里（不能落进 SourcesSwap，xcodegen 会把 mlpackage 当编译输入）')
@@ -325,7 +326,7 @@ def main():
     a = ap.parse_args()
 
     arc_onnx = os.path.join(a.onnx_dir, 'w600k_r50.onnx')
-    sw_onnx = os.path.join(a.onnx_dir, 'hyperswap_1a_256.onnx')
+    sw_onnx = os.path.join(a.onnx_dir, 'hyperswap_1c_256.onnx')
     os.makedirs(a.out_root, exist_ok=True)
     logfile = os.path.join(a.out_root, 'fsx_pack.log')
     for p in (arc_onnx, sw_onnx):
