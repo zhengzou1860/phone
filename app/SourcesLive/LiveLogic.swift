@@ -15,9 +15,9 @@ enum LiveConfig {
     static let defaultPort = 5100
 
     /// PC 那边 /live_start 响应里的 max_width 是权威；这个只在读不到响应时兜底。
-    static let fallbackMaxWidth = 640
+    /// 0.14 起 PC 把上限放到 800；640 实测 51–54KB/帧，800 按同质量估 70–81KB。
+    static let fallbackMaxWidth = 800
 
-    /// 640 宽 + q0.7 是 PC 实测过的档位：约 30–50KB/帧，局域网 15fps 不到 4Mbps。
     static let jpegQuality: CGFloat = 0.7
     static let pushFPS: Double = 15
 
@@ -47,7 +47,7 @@ enum LiveConfig {
 
     /// 追加到 WKWebView 默认 UA 末尾：PC 那边看 access log 就知道是手机 app 在访问，
     /// 而不是有人在浏览器里手点。
-    static let userAgentSuffix = "LiveSwap/0.13"
+    static let userAgentSuffix = "LiveSwap/0.14"
 
     /// 第一次启动时地址栏里预填的这台：PC 侧现在监听的就是它。
     /// 只当预填和提示用，不当写死的配置——PC 重连 WiFi 以后 IP 会变，

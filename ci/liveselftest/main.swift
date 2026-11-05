@@ -191,7 +191,7 @@ ck("转义 中文原样", LiveShim.jsLiteral("推流").hasPrefix("\"推流"))
 
 ck("契约 在途上限3", LiveConfig.inflightLimit == 3)
 ck("契约 推送15fps", LiveConfig.pushFPS == 15.0)
-ck("契约 封顶宽640", LiveConfig.fallbackMaxWidth == 640)
+ck("契约 封顶宽800", LiveConfig.fallbackMaxWidth == 800)
 ck("契约 质量0.7", LiveConfig.jpegQuality == 0.7)
 ck("契约 看门狗2500ms", LiveConfig.watchdogMs == 2500, "1500 太紧：收尾那一秒实测到过 1489")
 ck("契约 出帧判据500ms", LiveConfig.warmAgeMs == 500,
