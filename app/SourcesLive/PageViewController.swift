@@ -194,9 +194,12 @@ final class PageViewController: UIViewController {
             self.resumeSeconds = 0
             self.stopMeter()
             self.pushSeek(cur: 0, total: 0)
+            let avg = self.client?.averageFrameBytes ?? 0
             let c = self.client
             Task { await c?.stopLive() }
-            self.status("这一段推完了：再点「播放」从头重推，或选另一段")
+            self.status(avg > 0
+                ? "这一段推完了：再点「播放」从头重推，或选另一段；上行均值 \(max(1, avg / 1024)) KB/帧"
+                : "这一段推完了：再点「播放」从头重推，或选另一段")
         }
     }
 
@@ -228,7 +231,11 @@ final class PageViewController: UIViewController {
         restartTries = 0
         setPageFullscreen(false)
         pushSeek(cur: 0, total: 0)
-        webView.load(URLRequest(url: base))
+        // 页面就是全部界面：PC 改模板后必须一次拿到新的，不能吃 WKWebView 的旧 HTML/JS，
+        // 否则只能卸了重装才看得到修复。
+        webView.load(URLRequest(url: base,
+                                cachePolicy: .reloadIgnoringLocalCacheData,
+                                timeoutInterval: 20))
     }
 
     // MARK: - 状态写回页面
@@ -571,9 +578,11 @@ final class PageViewController: UIViewController {
             // 拿它判首帧会得出「0.0s」这种假读数。这句只是说明，不是超时。
             let warm = LiveWatch.warm(outputAgeMs: client.outputAgeMs)
                 ? "" : "PC 这会儿没出帧（刚起播、刚跳转或模型还没加载完）｜"
+            let avg = client.averageFrameBytes
+            let up = avg > 0 ? "｜上行均值 \(max(1, avg / 1024)) KB/帧" : ""
             status(warm + "手机 \(String(format: "%.1f", fps))fps｜本地丢帧 \(client.framesDroppedLocal)"
                     + "｜PC 拒 \(client.framesRejected)｜PC 收到 \(client.pcFramesIn)、"
-                    + "预热丢 \(client.pcFramesDropped)"
+                    + "预热丢 \(client.pcFramesDropped)" + up
                     + "｜屏幕长按 1.5 秒改 PC 地址")
         }
         // 配了目标脸却一张没换：用 PC 下发的 best_sim/match_thr 说清是“不是同一个人”
