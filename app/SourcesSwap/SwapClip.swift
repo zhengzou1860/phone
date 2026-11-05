@@ -167,11 +167,13 @@ final class SwapSource {
     }
 }
 
-/// 整片真换脸：源身份（新照片跑一次那两步、已存的人从盘上直接装）→ 逐帧 检测→对齐→256 前向→贴回 → 编码器写新片。
+/// 整片真换脸：目标表（视频里要换谁 → 换成谁）→ 预检整片把每张脸挂到轨迹上、每条轨迹认一次人
+/// → 逐帧 对齐→256 前向→贴回（一帧里有几张目标脸就换几张）→ 编码器写新片。
 /// 每一步的单价、身份余弦、足迹水位全部进流水；跑完存相册，成功才删沙盒那份。
 ///
 /// 这一条链路只有两张网（脸向量网＋hyperswap_1a_256），
-/// 逐帧的钱全在那一张 30 GMAC 的换脸网上，其余每一步都是几十字节的算术。
+/// 逐帧的钱全在那一张 30 GMAC 的换脸网上，其余每一步都是几十字节的算术；
+/// 多人换脸加的钱是多张脸各一次前向，检测仍是一帧一次（Vision 本来就是一次出所有脸）。
 enum SwapClip {
     struct Args {
         var units: MLComputeUnits = .cpuOnly  // 0.39 上机四档实测：CPU 890／GPU 1043／all 1045／ANE 815 ms 一格，
@@ -185,13 +187,8 @@ enum SwapClip {
         var footprintStopMB: Int = 1300
     }
 
-    /// 源身份的两条来路：新挑的照片（要跑"每人一次"那两步）或列表里已存的人（直接从盘上装）。
-    enum Person {
-        case photo(UIImage)
-        case saved(String)
-    }
-
-    static func run(person: Person, video: URL, args: Args, onLine: @escaping (String) -> Void) -> (out: URL?, note: String) {
+    static func run(members: [SwapCastMember], video: URL, args: Args,
+                    onLine: @escaping (String) -> Void) -> (out: URL?, note: String) {
         var rep: [String] = []
         func say(_ s: String) { rep.append(s); onLine(s) }
         func fail(_ s: String) -> (out: URL?, note: String) {
@@ -204,83 +201,23 @@ enum SwapClip {
         let got = FsxEngine.load(units: args.units, onLine: onLine)
         guard let engine = got.engine else { return fail("装网失败：\n" + got.note) }
 
-        // —— 2. 源身份：已存的人只读盘装 latent，新照片才跑下面那两步 ——
+        // —— 2. 目标表：视频里要换谁、换成谁（两张身份证在界面上传照片时就算好了；这里只验形状） ——
         let req = VNDetectFaceLandmarksRequest()
-        var srcEmb: [Float] = []
-        switch person {
-        case .saved(let pid):
-            guard let one = SwapIdents.load(id: pid) else {
-                return fail("已存的人「\(SwapIdents.displayName(pid))」的存档读不出来"
-                    + "（不是这一版写的、或字节缺了），重选一张源脸照片")
+        guard !members.isEmpty else { return fail("目标表是空的：先上传目标人脸图片并选一张替换脸") }
+        for (i, m) in members.enumerated() {
+            let tn = FsxEngine.norm(m.targetEmb)
+            guard m.targetEmb.count == FsxNets.embDim, tn > 0.5 else {
+                return fail("\(m.targetLabel) 的目标特征用不了：\(m.targetEmb.count) 维／模长 \(String(format: "%.3f", tn))"
+                    + "——重新选一张视频里那个人的正脸照")
             }
-            let l0 = DispatchTime.now().uptimeNanoseconds
-            let put = engine.useIdentity(emb: one.emb)
-            let lMs = Double(DispatchTime.now().uptimeNanoseconds - l0) / 1_000_000
-            // 身份证是 L2 归一化过的⇒模长本该≈1；掉到 0.5 以下只有"这份包里的数是空的"这一种解释。
-            // 空 latent 出的画面跟没换一样（他这次看到的"还是原视频的脸"），这种趟不许再往下跑。
-            let eNorm = FsxEngine.norm(one.emb)
-            guard put, eNorm > 0.5 else {
-                return fail("已存的人「\(one.name)」用不了：身份证 \(one.emb.count) 维／模长 \(String(format: "%.4f", eNorm))"
-                    + (one.emb.count == FsxNets.embDim ? "" : "（这一版要 \(FsxNets.embDim) 维，这份是旧口径写的）")
-                    + "——不出片，重选一张源脸照片")
+            let sn = FsxEngine.norm(m.sourceEmb)
+            guard m.sourceEmb.count == FsxNets.embDim, sn > 0.5 else {
+                return fail("\(m.targetLabel) 的替换脸「\(m.sourceLabel)」用不了：\(m.sourceEmb.count) 维／模长 \(String(format: "%.3f", sn))"
+                    + "——重新选一个已存的人或一张源脸照片")
             }
-            say("用已存的人「\(one.name)」：读盘＋归一化 \(SwapUtil.ms(lMs))"
-                + "｜身份证从盘上带回来 \(one.emb.count) 维／模长 \(String(format: "%.4f", eNorm))"
-                + "｜跳过 ①（这一格上机实测过，每人一次）｜足迹 \(SwapFacts.footprintMB()) MB")
-            say("  读档自检 \(SwapIdents.probe(id: pid))")
-            srcEmb = one.emb
-        case .photo(let source):
-            // —— 2a. 每人一次的那一步（身份证），这一版第一次在机上量出钱来 ——
-            let up = SwapVision.uprightImage(source)
-            guard let cg = up.cg else { return fail("源脸静帧取不出：\(up.note)") }
-            let (sObs, sErr) = SwapVision.faces(cg, req)
-            if !sErr.isEmpty { say("源脸检测：\(sErr)") }
-            guard let sl = SwapVision.largest(sObs, w: cg.width, h: cg.height) else {
-                return fail("源脸检测：这张图里没检到脸（\(up.note)）")
-            }
-            say("源脸：" + SwapVision.settleOrigin(face: sObs[sl.index]) + "｜短边 \(String(format: "%.0f", sl.shortSide)) px")
-            let (sPts, sSrcTxt) = SwapVision.sendPoints(face: sObs[sl.index], w: cg.width, h: cg.height)
-            guard let srcPlace = FsxGeo.place(pts: sPts, src: sSrcTxt, shortSide: sl.shortSide) else {
-                return fail("源脸对齐失败：5 点映不进模板")
-            }
-            say("源脸对齐 点位=\(srcPlace.src)｜残差 \(String(format: "%.2f", srcPlace.residSwap))（256 内）"
-                + "＝\(String(format: "%.2f", srcPlace.residPx)) px｜缩放 \(String(format: "%.2f", srcPlace.scale))"
-                + "｜手性 \(srcPlace.mirrored ? "与模板相反" : "合")")
-            // 源脸排成镜像＝身份网拿到是一张翻面的人脸，整片都换不对；出片那趟同一格有这道闸，这一路以前没有
-            if srcPlace.mirrored {
-                return fail("源脸对齐 5 点手性与模板相反（y 口径判反）：这张源脸映不进模板，不出片")
-            }
-            let sPb = SwapTech.pixelBuffer(from: cg)
-            guard let sbuf = sPb.pb else { return fail("源静帧 \(sPb.note)") }
-            var crop112 = [Float](repeating: 0, count: 3 * FsxGeo.side112 * FsxGeo.side112)
-            let warpsrc = SwapTech.withPixels(sbuf) { base, bpr -> Bool in
-                FsxGeo.warpCrop(UnsafeRawPointer(base), bytesPerRow: bpr, w: cg.width, h: cg.height,
-                                fwd: srcPlace.fwd112, size: FsxGeo.side112, out: &crop112)
-            }
-            guard warpsrc == true else { return fail("源脸裁不出 112") }
-            let id0 = DispatchTime.now().uptimeNanoseconds
-            let ident = engine.embedding(crop112_01: crop112)
-            let idMs = Double(DispatchTime.now().uptimeNanoseconds - id0) / 1_000_000
-            guard !ident.emb.isEmpty else {
-                return fail("① 身份证失败：\(ident.note)（PC 参照：这一步 CPU 上几百毫秒）")
-            }
-            say("① 身份证 \(SwapUtil.ms(idMs))（纯网 \(SwapUtil.ms(ident.ms))，\(ident.note)）"
-                + "｜模长 \(String(format: "%.1f", ident.rawNorm))｜足迹 \(SwapFacts.footprintMB()) MB"
-                + "｜PC 参照同一步模长 2.84~3.72（逐维 ±0.5 上下；口径错了形状照样合法、只有模长露馅）")
-            let w0 = DispatchTime.now().uptimeNanoseconds
-            let put = engine.useIdentity(emb: ident.emb)
-            let wMs = Double(DispatchTime.now().uptimeNanoseconds - w0) / 1_000_000
-            guard put else { return fail("② 身份向量装不上（身份证 \(ident.emb.count) 维，不是 \(FsxNets.embDim) 维或全零）") }
-            say("② 身份向量已装 \(SwapUtil.ms(wMs))｜这一张网收的就是归一化后的 512 维向量本身"
-                + "（inswapper 那条 emb@emap 这一条链路没有）｜足迹 \(SwapFacts.footprintMB()) MB")
-            srcEmb = ident.emb
-            let sv = SwapIdents.save(emb: ident.emb, taken: SwapIdents.list())
-            say("③ 身份存档：\(sv.note)｜足迹 \(SwapFacts.footprintMB()) MB")
-            if !sv.id.isEmpty {
-                say("  存档自检 盘上：\(SwapIdents.probe(id: sv.id))")
-            }
+            say("目标表 \(i + 1)/\(members.count)：\(m.targetLabel) → 替换「\(m.sourceLabel)」"
+                + "｜认得脸用的余弦闸门 \(String(format: "%.2f", SwapCast.matchCos))｜足迹 \(SwapFacts.footprintMB()) MB")
         }
-        guard engine.hasIdentity else { return fail("整趟跑到这里还没装上身份，不出片") }
 
         // —— 3. 片子 ——
         guard let src = SwapSource(url: video, longEdge: args.longEdge, onLine: onLine) else {
@@ -316,17 +253,63 @@ enum SwapClip {
         let out = dir.appendingPathComponent("swap_\(dfmt.string(from: Date())).mp4")
         try? fm.removeItem(at: out)
 
-        // —— 2.5 预检趟：整片先只解码＋检测，把每帧那 5 个点存下来 ——
-        // 为什么要单跑一趟：对称平滑要往后看 6 帧，出片这趟是单向流水、拿不到未来的点。
-        // 只看过去的滤波本机量过＝每帧把补丁甩在头后面 16.6 px（p95 36 px），快动段直接成重影，所以不用它。
-        // 钱＝这趟多一次解码＋一次检测，出片那趟从此不再检测：一进一出，每帧合计只多一次解码的钱。
-        // 点位按帧号存，出片那趟同一格取；没脸的帧留空位，只为缺口附近的平滑不跳到 0 才拿最近一帧补。
-        var trackPts: [[CGPoint]] = []
-        var trackSide: [Double] = []
-        var trackName: [String] = []
+        // —— 2.5 预检趟：整片先只解码＋检测 ——
+        // ① 对称平滑要往后看 6 帧，出片这趟是单向流水、拿不到未来的点；只看过去的滤波本机量过＝补丁落后
+        //    16.6 px（p95 36 px），快动段成重影。② 多人换脸要认「这一帧这张脸是谁」：检测本来就是一次出所有脸，
+        //    身份只在一条轨迹开头算一次，不能每帧每张脸都过向量网。轨迹按相邻帧的脸框 IoU 串起来；
+        //    新轨迹（换人、出画再回来、切镜头）再认一次。钱＝这趟多一次解码＋一次检测，出片那趟从此不再检测。
+        struct PreFace {
+            var pts: [CGPoint]
+            var side: Double
+            var src: String
+            var box: CGRect
+            var track: Int
+            var member: Int
+        }
+        struct LiveTrack {
+            var id: Int
+            var member: Int
+            var cos: Double
+            var lastBox: CGRect
+            var lastFrame: Int
+            var samples: Int
+            var sampleAt: Int
+        }
+        var preFrames: [[PreFace]] = []
+        var trackMember: [Int: Int] = [:]
+        var active: [LiveTrack] = []
+        var nextTrack = 0
+        var trackLog: [String] = []
         var preDecodeMs: [Double] = [], preDetectMs: [Double] = []
         let pre0 = DispatchTime.now().uptimeNanoseconds
-        say("先跑预检这一趟：整片只解码＋检测，把每帧那 5 个点存下来，再整片对称平滑（出片那趟就不再检测了）")
+        // 从这一帧的像素缓冲裁 112、过向量网，和目标表比一次余弦。两条路用它：预检的新轨迹、预检失败时的现检。
+        func identify(_ pb: CVPixelBuffer, w: Int, h: Int, pts: [CGPoint], src: String, side: Double)
+            -> (member: Int, best: Int, cos: Double, note: String) {
+            guard let pl = FsxGeo.place(pts: pts, src: src, shortSide: side) else {
+                return (-1, -1, -9, "5 点映不进模板")
+            }
+            if pl.mirrored { return (-1, -1, -9, "手性与模板相反") }
+            var crop = [Float](repeating: 0, count: 3 * FsxGeo.side112 * FsxGeo.side112)
+            let ok = SwapTech.withPixels(pb) { base, bpr -> Bool in
+                FsxGeo.warpCrop(UnsafeRawPointer(base), bytesPerRow: bpr, w: w, h: h,
+                                fwd: pl.fwd112, size: FsxGeo.side112, out: &crop)
+            }
+            guard ok == true else { return (-1, -1, -9, "裁不出 112") }
+            let e = engine.embedding(crop112_01: crop)
+            guard !e.emb.isEmpty else { return (-1, -1, -9, "向量网没回话：\(e.note)") }
+            let m = SwapCast.nearest(e.emb, members: members)
+            return (m.cos >= SwapCast.matchCos ? m.index : -1, m.index, m.cos, e.note)
+        }
+        func iou(_ a: CGRect, _ b: CGRect) -> Double {
+            let x0 = max(a.minX, b.minX), y0 = max(a.minY, b.minY)
+            let x1 = min(a.maxX, b.maxX), y1 = min(a.maxY, b.maxY)
+            guard x1 > x0, y1 > y0 else { return 0 }
+            let inter = Double((x1 - x0) * (y1 - y0))
+            let uni = Double(a.width * a.height + b.width * b.height) - inter
+            return uni > 0 ? inter / uni : 0
+        }
+        say("先跑预检这一趟：整片只解码＋检测，按轨迹记下每张脸的 5 点（新轨迹在机上算一次目标身份），"
+            + "再逐轨迹对称平滑（出片那趟就不再检测了）")
         if let pr = try? AVAssetReader(asset: src.asset) {
             let pv = AVAssetReaderVideoCompositionOutput(
                 videoTracks: [src.track],
@@ -341,28 +324,101 @@ enum SwapClip {
                     guard let pb = CMSampleBufferGetImageBuffer(sb) else { break }
                     let pw = CVPixelBufferGetWidth(pb), ph = CVPixelBufferGetHeight(pb)
                     preDecodeMs.append(Double(DispatchTime.now().uptimeNanoseconds - pd0) / 1_000_000)
+                    let frame = preFrames.count
                     let pt0 = DispatchTime.now().uptimeNanoseconds
                     let (pObs, pErr) = SwapVision.faces(pb, req)
                     if !pErr.isEmpty { say("预检检测抛错：\(pErr)") }
                     preDetectMs.append(Double(DispatchTime.now().uptimeNanoseconds - pt0) / 1_000_000)
-                    guard let pl = SwapVision.largest(pObs, w: pw, h: ph) else {
-                        trackPts.append([]); trackSide.append(0); trackName.append("—")
-                        continue
-                    }
                     // y 口径在这一趟就要定下来：定晚了，整条轨迹的 5 点是映反的，平滑只会把它抹得更圆
-                    if SwapVision.yTopLeftOrigin == nil {
-                        say("预检 " + SwapVision.settleOrigin(face: pObs[pl.index]))
+                    if SwapVision.yTopLeftOrigin == nil,
+                       let first = SwapVision.largest(pObs, w: pw, h: ph) {
+                        say("预检 " + SwapVision.settleOrigin(face: pObs[first.index]))
                     }
-                    let (pp, pn) = SwapVision.sendPoints(face: pObs[pl.index], w: pw, h: ph)
-                    trackPts.append(pp.count == 5 ? pp : [])
-                    trackSide.append(pp.count == 5 ? pl.shortSide : 0)
-                    trackName.append(pn)
-                    if trackPts.count % 150 == 0 {
+                    active.removeAll { frame - $0.lastFrame > 2 }
+                    var used = Set<Int>()
+                    var out: [PreFace] = []
+                    for obs in pObs {
+                        let box = SwapVision.pixelBox(obs.boundingBox, pw, ph)
+                        let side = Double(min(box.width, box.height))
+                        if side < 12 { continue }      // 比这还小的不跟踪：检测噪声
+                        let (pp, pn) = SwapVision.sendPoints(face: obs, w: pw, h: ph)
+                        guard pp.count == 5 else { continue }
+                        var best = -1
+                        var bestIoU = 0.0
+                        for (ti, t) in active.enumerated() where !used.contains(t.id) {
+                            let v = iou(box, t.lastBox)
+                            if v > bestIoU { bestIoU = v; best = ti }
+                        }
+                        // 框跳得快（转头、走动）时相邻帧的 IoU 会掉到 0.25 以下：再按中心距离捞一次。
+                        // 不捞的话同一个人被切成好几条轨迹，每条都要重算身份，轨迹边界上人还会来回换。
+                        if best < 0 || bestIoU < 0.25 {
+                            var near = -1
+                            var nearD = Double.greatestFiniteMagnitude
+                            for (ti, t) in active.enumerated() where !used.contains(t.id) {
+                                let dx = Double(box.midX - t.lastBox.midX)
+                                let dy = Double(box.midY - t.lastBox.midY)
+                                let d = (dx * dx + dy * dy).squareRoot()
+                                let lim = 0.6 * max(Double(box.width), Double(box.height), Double(t.lastBox.width))
+                                if d <= lim, d < nearD { nearD = d; near = ti }
+                            }
+                            if near >= 0 { best = near; bestIoU = 0.25 }
+                        }
+                        if best >= 0, bestIoU >= 0.25 {
+                            used.insert(active[best].id)
+                            var t = active[best]
+                            t.lastBox = box
+                            t.lastFrame = frame
+                            // 轨迹开头那一帧可能是运动糊的：在机上再采一次身份，余弦更高的那次说了算
+                            if t.samples < 2, frame >= t.sampleAt {
+                                let got = identify(pb, w: pw, h: ph, pts: pp, src: pn, side: side)
+                                if got.member >= 0, got.cos > t.cos {
+                                    let prev = t.cos
+                                    t.member = got.member
+                                    t.cos = got.cos
+                                    trackMember[t.id] = got.member
+                                    if trackLog.count < 40 {
+                                        trackLog.append("轨迹 \(t.id) 第 \(frame) 帧复采：\(members[got.member].targetLabel)"
+                                            + " 余弦 \(String(format: "%.3f", got.cos))（原来 \(String(format: "%.3f", prev))）")
+                                    }
+                                }
+                                t.samples += 1
+                                t.sampleAt = frame + 10
+                            }
+                            active[best] = t
+                            out.append(PreFace(pts: pp, side: side, src: pn, box: box,
+                                               track: t.id, member: t.member))
+                        } else {
+                            let id = nextTrack
+                            nextTrack += 1
+                            let got = identify(pb, w: pw, h: ph, pts: pp, src: pn, side: side)
+                            let member = got.member
+                            let t = LiveTrack(id: id, member: member, cos: got.cos, lastBox: box,
+                                              lastFrame: frame, samples: 1, sampleAt: frame + 10)
+                            if member >= 0 { trackMember[id] = member }
+                            active.append(t)
+                            if trackLog.count < 40 {
+                                let near: String
+                                if got.cos > -8 {
+                                    near = got.best >= 0
+                                        ? "最近 \(members[got.best].targetLabel) 余弦 \(String(format: "%.3f", got.cos))"
+                                        : "跟目标表都不像（最高 \(String(format: "%.3f", got.cos))）"
+                                } else {
+                                    near = "身份没量成：\(got.note)"
+                                }
+                                trackLog.append("轨迹 \(id) 第 \(frame) 帧起：短边 \(String(format: "%.0f", side)) px｜\(near)"
+                                    + (member >= 0 ? " → 换成「\(members[member].sourceLabel)」" : " → 不动"))
+                            }
+                            out.append(PreFace(pts: pp, side: side, src: pn, box: box,
+                                               track: id, member: member))
+                        }
+                    }
+                    preFrames.append(out)
+                    if preFrames.count % 150 == 0 {
                         let el = Double(DispatchTime.now().uptimeNanoseconds - pre0) / 1_000_000_000
-                        let per = el / Double(trackPts.count)
+                        let per = el / Double(preFrames.count)
                         let estP = Int(src.duration * max(src.fps, 1))
-                        let left = estP > trackPts.count ? String(format: "%.0f", per * Double(estP - trackPts.count)) : "0"
-                        say("  预检到第 \(trackPts.count) 帧｜已用 \(String(format: "%.1f", el)) s｜约还需 \(left) s"
+                        let left = estP > preFrames.count ? String(format: "%.0f", per * Double(estP - preFrames.count)) : "0"
+                        say("  预检到第 \(preFrames.count) 帧｜已用 \(String(format: "%.1f", el)) s｜约还需 \(left) s"
                             + "｜足迹 \(SwapFacts.footprintMB()) MB")
                     }
                 }
@@ -370,48 +426,34 @@ enum SwapClip {
             if pr.status == .reading { pr.cancelReading() }
         }
         let preWall = Double(DispatchTime.now().uptimeNanoseconds - pre0) / 1_000_000_000
-        // 空位拿最近一帧的点填（这些帧本来就不换脸，填只为让缺口两侧的平均不拽向 0）
-        var filled: [[CGPoint]] = trackPts
-        var lastIdx = -1
-        for i in 0..<filled.count {
-            if !filled[i].isEmpty { lastIdx = i }
-            else if lastIdx >= 0 { filled[i] = filled[lastIdx] }
-        }
-        for i in stride(from: filled.count - 1, through: 0, by: -1) where filled[i].isEmpty {
-            var j = i + 1
-            while j < filled.count && filled[j].isEmpty { j += 1 }
-            if j < filled.count { filled[i] = filled[j] }
-        }
-        let smTrack = SwapVision.smoothTrack(filled)
-        // 抖动本身要在机上量：Vision 的点位噪声与 PC 用的 SCRFD 不是一把尺，
-        // 下面这两列就是这一趟的答卷（平滑前＝逐帧现算要吃下的抖动，平滑后＝这一版剩下的）。
-        var hfRaw: [Double] = [], hfSm: [Double] = [], devSm: [Double] = []
-        if filled.count > 2, filled.count == smTrack.count {
-            for i in 1..<(filled.count - 1) {
-                guard filled[i].count == 5 else { continue }
-                var r = 0.0, s = 0.0, dv = 0.0
-                for p in 0..<5 {
-                    let a = filled[i - 1][p], b = filled[i][p], c = filled[i + 1][p], m = smTrack[i][p]
-                    r += hypot(2 * Double(b.x) - Double(a.x) - Double(c.x), 2 * Double(b.y) - Double(a.y) - Double(c.y))
-                    s += hypot(2 * Double(m.x) - Double(smTrack[i - 1][p].x) - Double(smTrack[i + 1][p].x),
-                               2 * Double(m.y) - Double(smTrack[i - 1][p].y) - Double(smTrack[i + 1][p].y))
-                    dv += hypot(Double(b.x - m.x), Double(b.y - m.y))
-                }
-                hfRaw.append(r / 5); hfSm.append(s / 5); devSm.append(dv / 5)
+        // 轨迹定人的最终答案回填到每一帧，再逐轨迹平滑（一条轨迹上的点属于同一张脸；
+        // 平滑只看本轨迹，缺口两边不会拽向 0）
+        var trackFrames: [Int: [(frame: Int, idx: Int)]] = [:]
+        for f in 0..<preFrames.count {
+            for i in 0..<preFrames[f].count {
+                let id = preFrames[f][i].track
+                preFrames[f][i].member = trackMember[id] ?? -1
+                trackFrames[id, default: []].append((f, i))
             }
         }
-        if !trackPts.isEmpty {
-            say("预检 \(trackPts.count) 帧（有脸 \(trackPts.filter { !$0.isEmpty }.count)）"
-                + "｜墙钟 \(String(format: "%.1f", preWall)) s"
+        var smoothedTracks = 0
+        for (tid, seq) in trackFrames {
+            let raw = seq.map { preFrames[$0.frame][$0.idx].pts }
+            let sm = SwapVision.smoothTrack(raw)
+            guard sm.count == raw.count else { continue }
+            for k in 0..<sm.count { preFrames[seq[k].frame][seq[k].idx].pts = sm[k] }
+            smoothedTracks += 1
+        }
+        let faceCount = preFrames.reduce(0) { $0 + $1.count }
+        let matchedCount = preFrames.reduce(0) { $0 + $1.filter { $0.member >= 0 }.count }
+        if !preFrames.isEmpty {
+            say("预检 \(preFrames.count) 帧（脸 \(faceCount) 个／挂上目标 \(matchedCount) 个）｜轨迹 \(nextTrack) 条"
+                + "（平滑 \(smoothedTracks) 条）｜墙钟 \(String(format: "%.1f", preWall)) s"
                 + "｜解码 \(SwapUtil.stat(preDecodeMs))｜检测 \(SwapUtil.stat(preDetectMs)) ms/帧")
-            if !hfRaw.isEmpty {
-                say("      5 点抖动 平滑前 中位 \(String(format: "%.2f", median(hfRaw)))／p90 \(String(format: "%.2f", pct(hfRaw, 0.9))) px"
-                    + "｜平滑后 中位 \(String(format: "%.2f", median(hfSm)))／p90 \(String(format: "%.2f", pct(hfSm, 0.9))) px"
-                    + "｜落点偏离 中位 \(String(format: "%.2f", median(devSm)))／p90 \(String(format: "%.2f", pct(devSm, 0.9))) px（原图像素）"
-                    + "｜PC 参照（SCRFD 点位、同一把尺）：慢段 7.23→1.42／偏离 4.13，快段 7.73→1.68／偏离 4.91")
-            }
+            for line in trackLog.prefix(40) { say("  " + line) }
+            if nextTrack > 40 { say("  （轨迹日志只留前 40 条，其余看逐帧计数）") }
         } else {
-            say("预检没跑成（reader 起不来或 0 帧）⇒ 这一退回逐帧现检、不平滑")
+            say("预检没跑成（reader 起不来或 0 帧）⇒ 这一退回逐帧现检、不平滑，并在当场给每张脸算身份")
         }
 
         guard let reader = try? AVAssetReader(asset: src.asset) else { return fail("AVAssetReader 建不起来") }
@@ -502,10 +544,12 @@ enum SwapClip {
         var warpMs: [Double] = [], frameAllMs: [Double] = []
         var residsSwap: [Double] = [], facePx: [Double] = []
         var cosList: [String] = []
-        var made = 0, swapped = 0, noFace = 0, smallFace = 0, fitFail = 0, mirror = 0, netFail = 0, poolMiss = 0
-        var preHit = 0, liveDetect = 0, trackMiss = 0
-        // preHit＝这帧的点取自预检轨迹｜liveDetect＝当场真跑了 Vision 检测的帧数｜trackMiss＝预检跑了但帧号越界
-        let hasTrack = !trackPts.isEmpty       // 预检整个没跑成时出片这趟退回逐帧现检（不平滑）
+        var made = 0, swapped = 0, swappedFaces = 0, noFace = 0, smallFace = 0, fitFail = 0
+        var mirror = 0, netFail = 0, poolMiss = 0
+        var preHit = 0, preFramesHit = 0, preNoFace = 0, liveDetect = 0, trackMiss = 0, unmatched = 0
+        // preHit／preFramesHit＝这帧的脸取自预检（按张／按帧）｜preNoFace＝预检判这格本来就没脸
+        // trackMiss＝预检跑了但帧号越界｜unmatched＝有脸、但跟目标表都不像（不动的那几张）
+        let hasTrack = !preFrames.isEmpty      // 预检整个没跑成时出片这趟退回逐帧现检（不平滑）
         var probeLeft = 6                       // 「没脸」帧只挑前 6 帧做二次检测对照
         var pointSrc = "—"
         var why = ""
@@ -589,6 +633,7 @@ enum SwapClip {
         var f112 = [Float](repeating: 0, count: 3 * FsxGeo.side112 * FsxGeo.side112)   // 复测：256 缩到 112
         var c112 = [Float](repeating: 0, count: 3 * FsxGeo.side112 * FsxGeo.side112)   // 复测：从成片帧直接裁 112
         var pasteScratch = FsxGeo.PasteScratch()   // 贴回的工作数组一整趟复用（每帧现造是几百 KB 分配＋清零）
+        var usedMember = -1                        // 换脸网里此刻装着哪一位的身份证：同一位连着换就不重装
 
         while why.isEmpty {
             var ended = ""
@@ -616,123 +661,161 @@ enum SwapClip {
 
                 let w = CVPixelBufferGetWidth(dst), h = CVPixelBufferGetHeight(dst)
                 let t1 = DispatchTime.now().uptimeNanoseconds
-                // 点位从预检那一趟的整片轨迹按同一帧号取（已平滑）。
-                // 退回当场检测只留两种：预检整个没跑成（trackPts 空）、帧号越界（两趟读出来的长度不一致）。
+                // 每帧的脸及其目标从预检那一趟按同一帧号取（已平滑、已挂目标）。
+                // 退回当场检测只留两种：预检整个没跑成（preFrames 空）、帧号越界（两趟读出来的长度不一致）。
                 // 预检里这帧没脸＝这帧本来就不换，不重检：同一把尺重检也是 0 张，只多花钱。
-                var ptsIn: [CGPoint] = [], srcIn = "—"
-                var sideIn = 0.0
+                var faces: [PreFace] = []
                 var liveCount = -1          // ≥0 只在当场真检过时有效：给「没脸」那两行对照用
-                if made < trackPts.count && !trackPts[made].isEmpty {
-                    ptsIn = smTrack[made]; srcIn = trackName[made]; sideIn = trackSide[made]
-                    preHit += 1
-                } else if !hasTrack || made >= trackPts.count {
+                if made < preFrames.count {
+                    faces = preFrames[made]
+                    preHit += faces.count
+                    preFramesHit += 1
+                    if faces.isEmpty { preNoFace += 1 }
+                } else {
                     if hasTrack { trackMiss += 1 }
                     liveDetect += 1
                     let (obs, derr) = SwapVision.faces(dst, req)
                     if !derr.isEmpty { say("检测抛错：\(derr)") }
                     liveCount = obs.count
-                    // y 口径没定过就当场判：这一路没有源脸照片时（预检也没跑成），
-                    // 拿默认值当结论会把整片 5 点映成镜像（上机实测 397 帧全被挡、换上人 0 帧）。
+                    // y 口径没定过就当场判：这一路没有源脸照片可判时，默认值当结论会把整片 5 点映成镜像
                     if SwapVision.yTopLeftOrigin == nil {
                         for i in obs.indices {
                             if let line = SwapVision.settleOriginStrict(face: obs[i]) {
-                                say("y 原点靠第 \(made) 帧这一帧判出来（这一趟没有源脸照片可判）：" + line)
+                                say("y 原点靠第 \(made) 帧这一帧判出来（这一趟没有预检轨迹）：" + line)
                                 break
                             }
                         }
                     }
-                    if let l = SwapVision.largest(obs, w: w, h: h) {
-                        let (p, n) = SwapVision.sendPoints(face: obs[l.index], w: w, h: h)
-                        ptsIn = p; srcIn = n; sideIn = l.shortSide
+                    // 现检这条路没有预检轨迹可用：当场给每张脸算一次身份再比目标表（只在预检整趟失败时走）
+                    for obs1 in obs {
+                        let box = SwapVision.pixelBox(obs1.boundingBox, w, h)
+                        let side1 = Double(min(box.width, box.height))
+                        if side1 < 12 { continue }
+                        let (p, n) = SwapVision.sendPoints(face: obs1, w: w, h: h)
+                        guard p.count == 5 else { continue }
+                        let got = identify(dst, w: w, h: h, pts: p, src: n, side: side1)
+                        faces.append(PreFace(pts: p, side: side1, src: n, box: box,
+                                             track: -1, member: got.member))
                     }
                 }
                 detectMs.append(Double(DispatchTime.now().uptimeNanoseconds - t1) / 1_000_000)
 
                 var did = false
-                if ptsIn.count == 5 {
-                    if sideIn < args.minFacePx {
-                        smallFace += 1
-                    } else if let pl = FsxGeo.place(pts: ptsIn, src: srcIn, shortSide: sideIn) {
-                        pointSrc = pl.src
-                        if pl.mirrored {
-                            // 5 点的手性与模板相反＝y 口径判反了，这张脸换出来是一张翻面的脸，宁可这帧不动
-                            // （相似拟合表达不了镜像，det＝a²＋b² 恒正，只能这样判）
-                            mirror += 1
-                            if mirror <= 3 {
-                                let ptTxt = pl.pts.map { String(format: "%.0f,%.0f", $0.x, $0.y) }.joined(separator: " ")
-                                say("第 \(made) 帧 5 点手性与模板相反（y 口径判反）"
-                                    + "｜叉 \(String(format: "%.0f", pl.chir.nose))／\(String(format: "%.0f", pl.chir.mouth))"
-                                    + "｜点位 \(pl.src)｜短边 \(String(format: "%.0f", pl.shortSide)) px｜5 点 \(ptTxt)→这帧不换")
-                            }
-                        } else {
-                            let t2 = DispatchTime.now().uptimeNanoseconds
-                            resids.append(pl.residPx)
-                            residsSwap.append(pl.residSwap)
-                            facePx.append(pl.shortSide)
-                            alignMs.append(Double(DispatchTime.now().uptimeNanoseconds - t2) / 1_000_000)
-                            let tw = DispatchTime.now().uptimeNanoseconds
-                            let took = SwapTech.withPixels(dst) { base, bpr -> Bool in
-                                FsxGeo.warpCrop(UnsafeRawPointer(base), bytesPerRow: bpr, w: w, h: h,
-                                                fwd: pl.fwdSwap, size: side, out: &att)
-                            }
-                            warpMs.append(Double(DispatchTime.now().uptimeNanoseconds - tw) / 1_000_000)
-                            var r: (face: [Float], ms: Double, note: String) =
-                                (face: [], ms: 0.0, note: "裁不出 256")
-                            let tf = DispatchTime.now().uptimeNanoseconds
-                            if took == true { r = engine.swap(cropSwap_01: att) }
-                            frameAllMs.append(Double(DispatchTime.now().uptimeNanoseconds - tf) / 1_000_000)
-                            if r.face.count != 3 * side * side {
-                                // 网没回话：这一帧原样交出去，绝不许丢帧（丢了成片就比素材短）
-                                netFail += 1
-                                if netFail <= 3 { say("第 \(made) 帧网没回话：\(r.note)→这帧原样交") }
-                            } else {
-                                netMs.append(r.ms)
-                                face = r.face
-                                let tm = DispatchTime.now().uptimeNanoseconds
-                                let pasted = SwapTech.withPixels(dst) { base, bpr -> Bool in
-                                    FsxGeo.pasteBack(base, bytesPerRow: bpr, w: w, h: h, face: face,
-                                                     fwd: pl.fwdSwap, scratch: &pasteScratch)
-                                }
-                                pasteMs.append(Double(DispatchTime.now().uptimeNanoseconds - tm) / 1_000_000)
-                                did = pasted == true
-                                if !did {
-                                    netFail += 1
-                                    if netFail <= 3 { say("第 \(made) 帧贴回没成（256 方块映不进这一帧）→这帧原样交") }
-                                }
-
-                                // 每 sampleEvery 帧复测一次"换完这张脸还剩多少源的身份"
-                                if did, made % max(1, args.sampleEvery) == 0 {
-                                    let t4 = DispatchTime.now().uptimeNanoseconds
-                                    // 换后那一张直接从成片帧按同一组点位重裁 112：量的就是最终画面，不是网吐出来的那半张
-                                    var after = (emb: [Float](), rawNorm: 0.0, ms: 0.0, note: "成片裁不出 112")
-                                    let cut = SwapTech.withPixels(dst) { base, bpr -> Bool in
-                                        FsxGeo.warpCrop(UnsafeRawPointer(base), bytesPerRow: bpr, w: w, h: h,
-                                                        fwd: pl.fwd112, size: FsxGeo.side112, out: &c112)
-                                    }
-                                    if cut == true { after = engine.embedding(crop112_01: c112) }
-                                    // 换前那一张＝目标本人这一帧的脸（同一帧的 256 裁片缩到 112）
-                                    FsxGeo.resizePlanar(att, from: side, to: FsxGeo.side112, into: &f112)
-                                    let before = engine.embedding(crop112_01: f112)
-                                    sampleMs.append(Double(DispatchTime.now().uptimeNanoseconds - t4) / 1_000_000)
-                                    // -9 不是「不像」，是这把尺没量成。只印 -9.000 的话「空存档」「维度不对」「全零」
-                                    // 这三种在机上分不开，所以量不成就把量不成的原因写出来。
-                                    let cSrc = FsxMath.cosine(after.emb, srcEmb)
-                                    let cTgt = FsxMath.cosine(before.emb, srcEmb)
-                                    // 换后<->换前 不吃存档身份：专答「这张脸到底动没动」——
-                                    // 低＝动过，接近 1＝网基本原样交（或这人本来就和视频里的是同一个人）。
-                                    let cSelf = FsxMath.cosine(after.emb, before.emb)
-                                    let sSrc = cSrc < -8 ? "量不出（" + FsxMath.whyNot(cSrc, after.emb, srcEmb) + "）" : String(format: "%.3f", cSrc)
-                                    let sTgt = cTgt < -8 ? "量不出（" + FsxMath.whyNot(cTgt, before.emb, srcEmb) + "）" : String(format: "%.3f", cTgt)
-                                    let sSelf = cSelf < -8 ? "量不出（" + FsxMath.whyNot(cSelf, after.emb, before.emb) + "）" : String(format: "%.3f", cSelf)
-                                    cosList.append("第 \(made) 帧 换后<->源 \(sSrc)｜换前<->源 \(sTgt)｜换后<->换前 \(sSelf)\(after.note.isEmpty ? "" : "｜" + after.note)")
-                                    say("  身份 " + cosList.last!)
-                                }
-                            }
-                        }
-                    } else {
-                        fitFail += 1
+                var frameFaces = 0
+                for (fi, ff) in faces.enumerated() {
+                    if ff.member < 0 {
+                        unmatched += 1
+                        continue
                     }
-                } else {
+                    if ff.side < args.minFacePx {
+                        smallFace += 1
+                        continue
+                    }
+                    guard ff.pts.count == 5, let pl = FsxGeo.place(pts: ff.pts, src: ff.src, shortSide: ff.side)
+                    else {
+                        fitFail += 1
+                        continue
+                    }
+                    pointSrc = pl.src
+                    if pl.mirrored {
+                        // 5 点的手性与模板相反＝y 口径判反了，这张脸换出来是一张翻面的脸，宁可这张脸不动
+                        // （相似拟合表达不了镜像，det＝a²＋b² 恒正，只能这样判）
+                        mirror += 1
+                        if mirror <= 3 {
+                            let ptTxt = pl.pts.map { String(format: "%.0f,%.0f", $0.x, $0.y) }.joined(separator: " ")
+                            say("第 \(made) 帧第 \(fi + 1) 张脸 5 点手性与模板相反（y 口径判反）"
+                                + "｜叉 \(String(format: "%.0f", pl.chir.nose))／\(String(format: "%.0f", pl.chir.mouth))"
+                                + "｜点位 \(pl.src)｜短边 \(String(format: "%.0f", pl.shortSide)) px｜5 点 \(ptTxt)→这张不换")
+                        }
+                        continue
+                    }
+                    let t2 = DispatchTime.now().uptimeNanoseconds
+                    resids.append(pl.residPx)
+                    residsSwap.append(pl.residSwap)
+                    facePx.append(pl.shortSide)
+                    alignMs.append(Double(DispatchTime.now().uptimeNanoseconds - t2) / 1_000_000)
+                    let tw = DispatchTime.now().uptimeNanoseconds
+                    let took = SwapTech.withPixels(dst) { base, bpr -> Bool in
+                        FsxGeo.warpCrop(UnsafeRawPointer(base), bytesPerRow: bpr, w: w, h: h,
+                                        fwd: pl.fwdSwap, size: side, out: &att)
+                    }
+                    warpMs.append(Double(DispatchTime.now().uptimeNanoseconds - tw) / 1_000_000)
+                    var r: (face: [Float], ms: Double, note: String) =
+                        (face: [], ms: 0.0, note: "裁不出 256")
+                    let tf = DispatchTime.now().uptimeNanoseconds
+                    if took == true {
+                        // 一张帧里可能有两三个人：换到谁就把谁的身份证装上（几百字节，不是重新读盘）
+                        if usedMember != ff.member {
+                            let put = engine.useIdentity(emb: members[ff.member].sourceEmb)
+                            if !put {
+                                netFail += 1
+                                if netFail <= 3 {
+                                    say("第 \(made) 帧 目标表第 \(ff.member + 1) 位的替换脸装不上→这张脸不动")
+                                }
+                                frameAllMs.append(Double(DispatchTime.now().uptimeNanoseconds - tf) / 1_000_000)
+                                continue
+                            }
+                            usedMember = ff.member
+                        }
+                        r = engine.swap(cropSwap_01: att)
+                    }
+                    frameAllMs.append(Double(DispatchTime.now().uptimeNanoseconds - tf) / 1_000_000)
+                    if r.face.count != 3 * side * side {
+                        // 网没回话：这一帧原样交出去，绝不许丢帧（丢了成片就比素材短）
+                        netFail += 1
+                        if netFail <= 3 { say("第 \(made) 帧网没回话：\(r.note)→这张脸原样交") }
+                        continue
+                    }
+                    netMs.append(r.ms)
+                    face = r.face
+                    let tm = DispatchTime.now().uptimeNanoseconds
+                    let pasted = SwapTech.withPixels(dst) { base, bpr -> Bool in
+                        FsxGeo.pasteBack(base, bytesPerRow: bpr, w: w, h: h, face: face,
+                                         fwd: pl.fwdSwap, scratch: &pasteScratch)
+                    }
+                    pasteMs.append(Double(DispatchTime.now().uptimeNanoseconds - tm) / 1_000_000)
+                    if pasted == true {
+                        did = true
+                        frameFaces += 1
+                    } else {
+                        netFail += 1
+                        if netFail <= 3 { say("第 \(made) 帧贴回没成（256 方块映不进这一帧）→这张脸原样交") }
+                        continue
+                    }
+
+                    // 每 sampleEvery 帧复测一次"换完这张脸还剩多少这张替换脸的身份"
+                    if made % max(1, args.sampleEvery) == 0 {
+                        let t4 = DispatchTime.now().uptimeNanoseconds
+                        let srcEmb = members[ff.member].sourceEmb
+                        // 换后那一张直接从成片帧按同一组点位重裁 112：量的就是最终画面，不是网吐出来的那半张
+                        var after = (emb: [Float](), rawNorm: 0.0, ms: 0.0, note: "成片裁不出 112")
+                        let cut = SwapTech.withPixels(dst) { base, bpr -> Bool in
+                            FsxGeo.warpCrop(UnsafeRawPointer(base), bytesPerRow: bpr, w: w, h: h,
+                                            fwd: pl.fwd112, size: FsxGeo.side112, out: &c112)
+                        }
+                        if cut == true { after = engine.embedding(crop112_01: c112) }
+                        // 换前那一张＝目标本人这一帧的脸（同一帧的 256 裁片缩到 112）
+                        FsxGeo.resizePlanar(att, from: side, to: FsxGeo.side112, into: &f112)
+                        let before = engine.embedding(crop112_01: f112)
+                        sampleMs.append(Double(DispatchTime.now().uptimeNanoseconds - t4) / 1_000_000)
+                        // -9 不是「不像」，是这把尺没量成。只印 -9.000 的话「空存档」「维度不对」「全零」
+                        // 这三种在机上分不开，所以量不成就把量不成的原因写出来。
+                        let cSrc = FsxMath.cosine(after.emb, srcEmb)
+                        let cTgt = FsxMath.cosine(before.emb, srcEmb)
+                        // 换后<->换前 不吃存档身份：专答「这张脸到底动没动」——
+                        // 低＝动过，接近 1＝网基本原样交（或这人本来就和视频里的是同一个人）。
+                        let cSelf = FsxMath.cosine(after.emb, before.emb)
+                        let sSrc = cSrc < -8 ? "量不出（" + FsxMath.whyNot(cSrc, after.emb, srcEmb) + "）" : String(format: "%.3f", cSrc)
+                        let sTgt = cTgt < -8 ? "量不出（" + FsxMath.whyNot(cTgt, before.emb, srcEmb) + "）" : String(format: "%.3f", cTgt)
+                        let sSelf = cSelf < -8 ? "量不出（" + FsxMath.whyNot(cSelf, after.emb, before.emb) + "）" : String(format: "%.3f", cSelf)
+                        cosList.append("第 \(made) 帧 \(members[ff.member].targetLabel)→「\(members[ff.member].sourceLabel)」"
+                            + " 换后<->源 \(sSrc)｜换前<->源 \(sTgt)｜换后<->换前 \(sSelf)"
+                            + (after.note.isEmpty ? "" : "｜" + after.note))
+                        say("  身份 " + cosList.last!)
+                    }
+                }
+                swappedFaces += frameFaces
+                if faces.isEmpty {
                     noFace += 1
                     // 当场对照：默认档 0 张脸的，换老一版检测器（revision1）再检同一帧。
                     // 这个 SDK 的 face 请求已经没有 accuracy 旋钮了，能换口径的只有 revision。
@@ -750,8 +833,8 @@ enum SwapClip {
                     }
                 }
                 if !did && made < 3 {
-                    let whyTxt = liveCount < 0 ? "预检这格没脸"
-                        : "当场检到 \(liveCount) 张脸，最大短边 \(String(format: "%.0f", sideIn)) px"
+                    let whyTxt = faces.isEmpty ? "这一帧没检到脸"
+                        : "检到 \(faces.count) 张脸，挂上目标表 \(frameFaces) 张"
                     say("第 \(made) 帧没换上脸（\(whyTxt)）")
                 }
 
@@ -885,11 +968,12 @@ enum SwapClip {
         say("      每帧合计把 裁脸＋逐帧整次 都计进来了；只算 predict 那一式的口径是 \(String(format: "%.1f", perFrameNet)) ms（跨版比速度用这一格）")
         say("预览试算 单趟不编码每帧 \(String(format: "%.1f", pvUnit)) ms＝解码＋检测＋裁脸＋逐帧整次＋贴回（提交那格去掉＝不进编码器；贴回借整片那一格的数＝上限）"
             + "｜16 帧/秒的格＝62.5 ms/帧，这一趟每播 1 s 要 \(String(format: "%.0f", pvUnit * 16)) ms（一秒 1000 ms）")
-        say("换上人 \(swapped) 帧｜没脸 \(noFace)｜太小 \(smallFace)｜拟合没过 \(fitFail)｜镜像 \(mirror)｜网失败 \(netFail)｜点位 \(pointSrc)")
-        var detSrcTxt = "全部当场真检 \(made)（预检没跑成）"
+        say("换上人 \(swapped) 帧（共换上 \(swappedFaces) 张脸）｜没脸 \(noFace)｜太小 \(smallFace)"
+            + "｜拟合没过 \(fitFail)｜镜像 \(mirror)｜网失败 \(netFail)｜跟目标表都不像 \(unmatched)｜点位 \(pointSrc)")
+        var detSrcTxt = "全部当场真检 \(made) 帧（预检没跑成）"
         if hasTrack {
-            detSrcTxt = "取自预检 \(preHit)｜当场真检 \(liveDetect)｜"
-                      + "预检判这格没脸 \(made - preHit - liveDetect)（帧号越界 \(trackMiss)）"
+            detSrcTxt = "取自预检 \(preFramesHit) 帧／\(preHit) 张脸（其中没脸 \(preNoFace) 帧）｜"
+                      + "帧号越界当场真检 \(trackMiss) 帧｜当场手检 \(liveDetect) 帧"
         }
         say("      点位来路 \(detSrcTxt)")
         if !resids.isEmpty {

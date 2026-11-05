@@ -40,14 +40,28 @@ final class SwapPreviewMirror: ObservableObject {
     @Published var modelText = ""
 }
 
+/// 目标表的一位：视频里要找的那张脸（照片算出来的身份）＋ 要换成的那张脸（已存的人或一张源脸照片）。
+struct SwapCastSlot {
+    var targetImg: UIImage?
+    var targetFile = ""
+    var targetEmb: [Float] = []
+    var targetSide = 0.0
+    var targetNote = ""
+    var sourceId = ""
+    var sourceName = ""
+    var sourceEmb: [Float] = []
+    var sourceNote = ""
+
+    var used: Bool { targetImg != nil || !targetEmb.isEmpty || !sourceEmb.isEmpty }
+}
+
 /// 选片、开始换脸这一摊的状态。界面上不摆处理过程流水（0.25 起按他令撤掉），
 /// 跑起来的实况只落在磁盘流水里、由「发到电脑」整份交出去；后台线程不许直接碰 SwiftUI 的 @State。
 struct SwapContentView: View {
     @State private var facts: [String] = []
-    @State private var faceURL: URL?
-    @State private var faceImg: UIImage?          // 选定时就读进来：tmp 副本当场还掉，重跑不必重选
     @State private var videoURL: URL?
-    @State private var picking: String = ""          // "face" / "video"：谁的选片器开着
+    @State private var picking: String = ""          // "target" / "replace" / "video"：谁的选片器开着
+    @State private var pickSlot = 0                  // 选片器回来落到目标表哪一位
     @State private var running = false
     @State private var unitIdx = 0                   // 默认 units[0] = cpuOnly：0.39 上机四档实测
                                                      // CPU 890／GPU 1043／all 1045／ANE 815（每档 5 格均速），
@@ -62,7 +76,6 @@ struct SwapContentView: View {
     @State private var benchText = ""
 
     @State private var idents: [SwapIdents.Item] = []
-    @State private var chosenIdent: String = ""      // 已存的人：非空就跳过算身份证那一步（源脸照片那一次前向）
     @State private var identNote = ""
     @State private var renaming = false
     @State private var renameId = ""
@@ -70,6 +83,11 @@ struct SwapContentView: View {
     @State private var deleting = false
     @State private var delId = ""
     @State private var delName = ""
+
+    /// 目标表 1–3 位。逐个上传、逐个认脸、逐个配替换脸；预览和整片都按这张表跑
+    @State private var slots: [SwapCastSlot] = [SwapCastSlot(), SwapCastSlot(), SwapCastSlot()]
+    @State private var castBusy = false              // 正在给某一张照片算特征
+    @State private var castText = ""
 
     @State private var sendStatus = ""
     @State private var sending = false
@@ -104,7 +122,7 @@ struct SwapContentView: View {
                             .font(.caption2)
                         Button(modelBusy ? "下模型跑着…" : (SwapStore.haveAll() ? "查模型版本" : "下模型")) { downloadModels() }
                             .buttonStyle(.bordered)
-                            .disabled(modelBusy || running)
+                            .disabled(modelBusy || running || pv.on || castBusy)
                         Text(pv.modelText.isEmpty ? SwapStore.statusLine() : pv.modelText)
                             .font(.caption)
                             .textSelection(.enabled)
@@ -113,17 +131,16 @@ struct SwapContentView: View {
                     Divider()
 
                     VStack(alignment: .leading, spacing: 6) {
-                        Text("已存的人").font(.headline)
-                        Text("一人一份身份；点名字选中，跑片时跳过算身份证那一步（换人只要从盘上把身份证取回来重乘）。")
+                        Text("已存的人（替换脸库）").font(.headline)
+                        Text("一人一份身份。目标表里每一张目标脸都可以从这里点一个当替换脸；"
+                             + "也可以临时选一张源脸照片，选完自动存进来。")
                             .font(.caption2)
                         if idents.isEmpty {
-                            Text("（列表空着。①选一张源脸照片跑一次，跑的时候自动存进来）").font(.caption)
+                            Text("（列表空着。在目标表里上传目标照后，选一张源脸照片当替换脸就会存进来）").font(.caption)
                         }
                         ForEach(idents, id: \.id) { it in
                             HStack(spacing: 6) {
-                                Button((chosenIdent == it.id ? "◉ " : "○ ") + it.name) { pickIdent(it) }
-                                    .buttonStyle(.borderless)
-                                    .disabled(running)
+                                Text(it.name)
                                 Text(it.bytes >= 1_048_576
                                     ? String(format: "%.2f MB", Double(it.bytes) / 1_048_576)
                                     : String(format: "%.1f KB", Double(it.bytes) / 1024))
@@ -131,10 +148,10 @@ struct SwapContentView: View {
                                 Spacer(minLength: 4)
                                 Button("改名") { startRename(it) }
                                     .buttonStyle(.borderless)
-                                    .disabled(running)
+                                    .disabled(castLocked)
                                 Button("删") { startDelete(it) }
                                     .buttonStyle(.borderless)
-                                    .disabled(running)
+                                    .disabled(castLocked)
                             }
                             .font(.caption)
                         }
@@ -149,24 +166,39 @@ struct SwapContentView: View {
                         Button("删", role: .destructive) { commitDelete() }
                         Button("留着", role: .cancel) { delId = "" }
                     } message: {
-                        Text("删了就只能重挑那张照片再算一次身份。")
+                        Text("删了就只能重挑那张照片再算一次身份；目标表里用到它的那一位要重新选。")
                     }
 
                     Divider()
 
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text("整片换脸").font(.headline)
-                        Button(faceURL == nil ? "① 选一张源脸照片" : "① 源脸：\(faceURL!.lastPathComponent)（点它换一张）") {
-                            picking = "face"
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("多人换脸（目标表 1–3 张）").font(.headline)
+                        Text("逐张上传视频里的目标人脸：上传 → 认到那张脸 → 给它选替换脸（已存的人或一张源脸照片）。"
+                             + "视频里认到哪张目标脸，就换上它对应的替换脸；没认到的不动。")
+                            .font(.caption2)
+                        if !castText.isEmpty {
+                            Text(castText).font(.caption).textSelection(.enabled)
                         }
-                        .buttonStyle(.bordered)
-                        .disabled(running)
-                        Text(sourceLine).font(.caption)
-                        Button(videoURL == nil ? "② 选一条要换脸的视频" : "② 视频：\(videoURL!.lastPathComponent)（点它换一条）") {
+
+                        ForEach(0 ..< 3, id: \.self) { i in slotCard(i) }
+
+                        Text("特征表（预览跑着时锁住；停了就能改）").font(.headline)
+                        ForEach(0 ..< 3, id: \.self) { i in
+                            if slots[i].used {
+                                Text(featureRow(i)).font(.caption).textSelection(.enabled)
+                            }
+                        }
+                        let plan = castPlan
+                        if !plan.problem.isEmpty {
+                            Text(plan.problem).font(.caption2).foregroundColor(.orange)
+                        }
+
+                        Button(videoURL == nil ? "② 选一条要换脸的视频（整片和预览共用）"
+                                               : "② 视频：\(videoURL!.lastPathComponent)（点它换一条）") {
                             picking = "video"
                         }
                         .buttonStyle(.bordered)
-                        .disabled(running)
+                        .disabled(castLocked)
 
                         Picker("算力单元", selection: $unitIdx) {
                             ForEach(0 ..< Self.units.count, id: \.self) { i in
@@ -174,14 +206,14 @@ struct SwapContentView: View {
                             }
                         }
                         .pickerStyle(.segmented)
-                        .disabled(running || pv.on)
+                        .disabled(castLocked)
                         Picker("长边上限", selection: $longIdx) {
                             ForEach(0 ..< Self.longs.count, id: \.self) { i in
                                 Text("\(Self.longs[i]) px").tag(i)
                             }
                         }
                         .pickerStyle(.segmented)
-                        .disabled(running)
+                        .disabled(castLocked)
 
                         // 量速不动开始换脸那一步：只把上面那格「算力单元」该点哪一个量出来。
                         // 0.38 上机每帧 1230 ms，钱全在换脸网一次前向，四档各装各跑一遍才知道
@@ -190,17 +222,17 @@ struct SwapContentView: View {
                             startBench()
                         }
                         .buttonStyle(.bordered)
-                        .disabled(running || pv.on || benchBusy)
+                        .disabled(castLocked || benchBusy)
                         if !benchText.isEmpty {
                             Text(benchText).font(.caption).textSelection(.enabled)
                         }
 
                         // 点下去立刻置灰 + 改文案：界面上没有流水，这一下的反馈就在按钮自己身上
-                        Button(running ? "换脸跑着…（跑完这里给一句话）" : "开始换脸") {
+                        Button(running ? "换脸跑着…（跑完这里给一句话）" : "开始整片换脸") {
                             startSwap()
                         }
                         .buttonStyle(.borderedProminent)
-                        .disabled(running || !hasSource || videoURL == nil)
+                        .disabled(running || !castReady || videoURL == nil || castBusy)
 
                         if !result.isEmpty {
                             Text(result).font(.caption).textSelection(.enabled)
@@ -222,7 +254,7 @@ struct SwapContentView: View {
                     VStack(alignment: .leading, spacing: 6) {
                         Text("换脸预览（只看、不导出、手机侧一个字节都不写）").font(.headline)
 
-                        // 这一格约手机屏 1/3 高：逐个「已存的人」贴进来就是在这里比谁像
+                        // 这一格约手机屏 1/3 高：目标表里有几张脸，就在这一格里逐个换成各自的替换脸
                         ZStack {
                             Color(white: 0.10)
                             if let im = pv.img {
@@ -235,23 +267,9 @@ struct SwapContentView: View {
                         .frame(maxWidth: .infinity, minHeight: 190, maxHeight: 300)
                         .clipped()
 
-                        Text("换一个人：点名字选中，然后点下面的「开始预览」。预览跑着时这里改不动，要换人先「停预览」。").font(.caption)
-                        if idents.isEmpty {
-                            Text("（列表空着：预览只吃「已存的人」，先用上面①②跑一次整片换脸存下一个人）")
-                                .font(.caption2)
-                        }
-                        ScrollView(.horizontal, showsIndicators: false) {
-                            HStack(spacing: 8) {
-                                ForEach(idents, id: \.id) { it in
-                                    Button((chosenIdent == it.id ? "◉ " : "○ ") + it.name) { pickIdent(it) }
-                                        .buttonStyle(.bordered)
-                                        .disabled(pv.on || running)
-                                }
-                            }
-                        }
+                        Text("预览吃的就是上面那张目标表。要改表先「停预览」，改完再开。").font(.caption)
                         if pv.on && !pv.person.isEmpty {
-                            Text("画面里现在的人：「\(SwapIdents.displayName(pv.person))」（这一趟就是他，不换）")
-                                .font(.caption)
+                            Text("这一趟目标表：\(pv.person)").font(.caption)
                         }
 
                         HStack(spacing: 6) {
@@ -284,7 +302,6 @@ struct SwapContentView: View {
                 let mirror = pv
                 let eng = SwapContentView.engine
                 eng.render = { img in mirror.img = img }
-                eng.onShow = { s in mirror.status = s }
                 eng.log = { line in
                     SwapJournal.line(line)
                     if line.hasPrefix("模型") {
@@ -295,7 +312,7 @@ struct SwapContentView: View {
                     mirror.dur = d
                     if !mirror.dragging { mirror.pos = s }
                 }
-                eng.onPerson = { pid in mirror.person = pid }
+                eng.onPerson = { label in mirror.person = label }
                 eng.onFinish = { txt, d in
                     mirror.on = false
                     mirror.dragging = false
@@ -304,26 +321,43 @@ struct SwapContentView: View {
                 }
             }
             // cover 不收场就整屏卡在选择页，必须自己关
-            .fullScreenCover(isPresented: Binding(get: { picking == "face" },
+            .fullScreenCover(isPresented: Binding(get: { picking == "target" },
                                                   set: { if !$0 { picking = "" } })) {
                 SwapPickerHost(kind: .image) { url, err in
+                    let who = pickSlot
                     picking = ""
-                    if let u = url {
-                        // 当场读进内存再还掉 tmp 那份：一不留残料，二不让开跑时的清扫把正在用的输入吃掉
-                        let img = UIImage(contentsOfFile: u.path)
-                        if FileManager.default.fileExists(atPath: u.path) { try? FileManager.default.removeItem(at: u) }
-                        faceImg = img
-                        faceURL = img == nil ? nil : u
-                        if img != nil {
-                            chosenIdent = ""
-                            identNote = "这一趟用刚选的这张照片的身份（跑完自动存进「已存的人」）"
-                        }
-                        SwapJournal.line("选了源脸 \(u.lastPathComponent)｜"
-                            + (img == nil ? "这张照片读不进来，重选" : "已读进内存，tmp 副本当场还掉"))
-                    } else {
-                        SwapJournal.line("选源脸没成：\(err ?? "-")")
-                        result = "选源脸没成：\(err ?? "-")"
+                    guard let u = url else {
+                        result = "选目标图没成：\(err ?? "-")"
+                        SwapJournal.line("选目标\(who + 1)图片没成：\(err ?? "-")")
+                        return
                     }
+                    // 当场读进内存再还掉 tmp 那份：一不留残料，二不让开跑时的清扫把正在用的输入吃掉
+                    let img = UIImage(contentsOfFile: u.path)
+                    if FileManager.default.fileExists(atPath: u.path) { try? FileManager.default.removeItem(at: u) }
+                    guard let img = img else {
+                        result = "这张目标图读不进来，重选"
+                        return
+                    }
+                    ingestTarget(who, img: img, file: u.lastPathComponent)
+                }
+            }
+            .fullScreenCover(isPresented: Binding(get: { picking == "replace" },
+                                                  set: { if !$0 { picking = "" } })) {
+                SwapPickerHost(kind: .image) { url, err in
+                    let who = pickSlot
+                    picking = ""
+                    guard let u = url else {
+                        result = "选替换脸没成：\(err ?? "-")"
+                        SwapJournal.line("选目标\(who + 1) 的替换脸没成：\(err ?? "-")")
+                        return
+                    }
+                    let img = UIImage(contentsOfFile: u.path)
+                    if FileManager.default.fileExists(atPath: u.path) { try? FileManager.default.removeItem(at: u) }
+                    guard let img = img else {
+                        result = "这张替换脸读不进来，重选"
+                        return
+                    }
+                    ingestReplacement(who, img: img)
                 }
             }
             .fullScreenCover(isPresented: Binding(get: { picking == "video" },
@@ -344,6 +378,193 @@ struct SwapContentView: View {
         }
     }
 
+    // MARK: - 目标表
+
+    /// 预览／整片／算特征／量速任何一项跑着，这张表都不许改
+    private var castLocked: Bool { running || pv.on || castBusy || benchBusy }
+
+    @ViewBuilder
+    private func slotCard(_ i: Int) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                Button(slots[i].targetEmb.isEmpty
+                       ? "上传目标人脸\(i + 1)图片"
+                       : "目标\(i + 1)：\(slots[i].targetFile)（点它换一张）") {
+                    pickSlot = i
+                    picking = "target"
+                }
+                .buttonStyle(.bordered)
+                .disabled(castLocked)
+                if slots[i].used {
+                    Button("清空") { clearSlot(i) }
+                        .buttonStyle(.borderless)
+                        .disabled(castLocked)
+                }
+            }
+            Text(slots[i].targetNote.isEmpty
+                 ? "还没上传：选一张视频里那个人的正脸照（一个人一张）"
+                 : slots[i].targetNote)
+                .font(.caption2)
+
+            if !slots[i].targetEmb.isEmpty {
+                Text("替换脸：\(slots[i].sourceName.isEmpty ? "还没选（点下面）" : "「\(slots[i].sourceName)」")")
+                    .font(.caption)
+                if !idents.isEmpty {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 6) {
+                            ForEach(idents, id: \.id) { it in
+                                Button((slots[i].sourceId == it.id ? "◉ " : "○ ") + it.name) {
+                                    chooseReplacement(slot: i, ident: it)
+                                }
+                                .buttonStyle(.bordered)
+                                .disabled(castLocked)
+                            }
+                        }
+                    }
+                }
+                Button("或选一张源脸照片当替换脸") {
+                    pickSlot = i
+                    picking = "replace"
+                }
+                .buttonStyle(.bordered)
+                .disabled(castLocked)
+                if !slots[i].sourceNote.isEmpty {
+                    Text(slots[i].sourceNote).font(.caption2)
+                }
+            }
+        }
+        .padding(8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(white: 0.12))
+        .cornerRadius(8)
+    }
+
+    /// 特征表的一行：目标特征多少维／模长，替换的是谁、多少维／模长
+    private func featureRow(_ i: Int) -> String {
+        let s = slots[i]
+        var parts = ["目标\(i + 1)"]
+        if s.targetEmb.isEmpty {
+            parts.append("目标特征：还没有（没认到脸）")
+        } else {
+            parts.append("目标特征 \(s.targetEmb.count) 维·模长 "
+                + String(format: "%.2f", FsxEngine.norm(s.targetEmb))
+                + "（脸短边 \(String(format: "%.0f", s.targetSide)) px）")
+        }
+        if s.sourceEmb.isEmpty {
+            parts.append("替换：没选")
+        } else {
+            parts.append("替换「\(s.sourceName)」\(s.sourceEmb.count) 维·模长 "
+                + String(format: "%.2f", FsxEngine.norm(s.sourceEmb)))
+        }
+        return parts.joined(separator: "｜")
+    }
+
+    /// 界面这张表 → 引擎要的那份。空位跳过；有目标没替换、或只有替换没目标都要说清楚。
+    private var castPlan: (members: [SwapCastMember], problem: String) {
+        var out: [SwapCastMember] = []
+        for (i, s) in slots.enumerated() {
+            if !s.used { continue }
+            if s.targetEmb.isEmpty {
+                return ([], "目标\(i + 1) 还没认到人脸：重新上传那张目标图片")
+            }
+            if s.sourceEmb.isEmpty {
+                return ([], "目标\(i + 1) 还没选替换脸：点一个已存的人，或选一张源脸照片")
+            }
+            out.append(SwapCastMember(targetEmb: s.targetEmb, targetLabel: "目标\(i + 1)",
+                                      sourceEmb: s.sourceEmb, sourceLabel: s.sourceName))
+        }
+        if out.isEmpty {
+            return ([], "目标表是空的：先上传目标人脸1图片，认到脸以后选替换脸")
+        }
+        return (out, "")
+    }
+
+    private var castReady: Bool { castPlan.problem.isEmpty }
+
+    private func castLabel(_ members: [SwapCastMember]) -> String {
+        members.enumerated().map { "\($0.element.targetLabel)→「\($0.element.sourceLabel)」" }.joined(separator: "、")
+    }
+
+    private func ingestTarget(_ i: Int, img: UIImage, file: String) {
+        guard !castLocked else { return }
+        slots[i].targetImg = img
+        slots[i].targetFile = file
+        slots[i].targetEmb = []
+        slots[i].targetSide = 0
+        slots[i].targetNote = "正在检测目标人脸……"
+        castBusy = true
+        castText = "目标\(i + 1) 正在算特征（第一次要先装两张网）"
+        SwapJournal.line("上传目标\(i + 1) \(file)｜开始检测")
+        let slotIndex = i
+        SwapCast.embed(image: img, tag: "目标\(i + 1)",
+                       onLine: { line in SwapJournal.line(line) }) { emb, why in
+            castBusy = false
+            if let e = emb {
+                slots[slotIndex].targetEmb = e.emb
+                slots[slotIndex].targetSide = e.shortSide
+                slots[slotIndex].targetNote = "已检测到目标人脸（\(e.note)）"
+                castText = "目标\(slotIndex + 1) 已认到脸"
+                SwapJournal.line("目标\(slotIndex + 1) 已认到脸｜\(e.note)")
+            } else {
+                slots[slotIndex].targetNote = "没认到可用的人脸：\(why)"
+                castText = "目标\(slotIndex + 1) 没认到脸，换一张正脸照"
+                SwapJournal.line("目标\(slotIndex + 1) 失败：\(why)")
+            }
+        }
+    }
+
+    private func ingestReplacement(_ i: Int, img: UIImage) {
+        guard !castLocked else { return }
+        castBusy = true
+        castText = "目标\(i + 1) 的替换脸正在算特征"
+        SwapJournal.line("目标\(i + 1) 选了一张源脸照片当替换脸")
+        let slotIndex = i
+        SwapCast.embed(image: img, tag: "目标\(i + 1) 的替换脸",
+                       onLine: { line in SwapJournal.line(line) }) { emb, why in
+            castBusy = false
+            guard let e = emb else {
+                slots[slotIndex].sourceNote = "这张替换脸没算成：\(why)"
+                castText = "目标\(slotIndex + 1) 的替换脸没算成"
+                return
+            }
+            let sv = SwapCast.saveSource(emb: e.emb) { line in SwapJournal.line(line) }
+            slots[slotIndex].sourceId = sv.id
+            slots[slotIndex].sourceName = sv.name
+            slots[slotIndex].sourceEmb = e.emb
+            slots[slotIndex].sourceNote = "替换脸＝刚选的照片「\(sv.name)」（已存进「已存的人」）"
+            idents = SwapIdents.list()
+            castText = "目标\(slotIndex + 1) 的替换脸已就位"
+            SwapJournal.line("目标\(slotIndex + 1) 的替换脸已就位：「\(sv.name)」")
+        }
+    }
+
+    private func chooseReplacement(slot i: Int, ident: SwapIdents.Item) {
+        guard !castLocked else { return }
+        guard let one = SwapIdents.load(id: ident.id) else {
+            slots[i].sourceNote = "「\(ident.name)」的存档读不出来"
+            return
+        }
+        let n = FsxEngine.norm(one.emb)
+        guard one.emb.count == FsxNets.embDim, n > 0.5 else {
+            slots[i].sourceNote = "「\(one.name)」这份身份证用不了（\(one.emb.count) 维／模长 "
+                + String(format: "%.3f", n) + "）"
+            return
+        }
+        slots[i].sourceId = ident.id
+        slots[i].sourceName = one.name
+        slots[i].sourceEmb = one.emb
+        slots[i].sourceNote = "替换脸＝已存「\(one.name)」"
+        castText = "目标\(i + 1) 的替换脸＝「\(one.name)」"
+        SwapJournal.line("目标\(i + 1) 替换脸＝已存「\(one.name)」｜模长 \(String(format: "%.2f", n))")
+    }
+
+    private func clearSlot(_ i: Int) {
+        guard !castLocked else { return }
+        slots[i] = SwapCastSlot()
+        castText = "清空了目标\(i + 1)"
+        SwapJournal.line("清空目标\(i + 1)")
+    }
+
     /// 只认自己那批前缀：选片副本一条比一条大，预览又不走出片那条的清扫，
     /// 不在这里还就一直在 tmp 里堆着。半成品（swap_时间戳.mp4）仍归出片那一趟自己清。
     private func reclaimOldPicks(keep: URL) -> Int {
@@ -360,13 +581,9 @@ struct SwapContentView: View {
     }
 
     private func startSwap() {
-        let person: SwapClip.Person
-        if !chosenIdent.isEmpty {
-            person = .saved(chosenIdent)
-        } else if let img = faceImg {
-            person = .photo(img)
-        } else {
-            result = "源身份没在手上了：在「已存的人」里点一个，或者①重选一张源脸照片"
+        let plan = castPlan
+        guard plan.problem.isEmpty else {
+            result = plan.problem
             return
         }
         guard let v = videoURL else {
@@ -387,10 +604,12 @@ struct SwapContentView: View {
         SwapUtil.keepScreenAwake(true)
         let units = Self.units[unitIdx].1
         let longEdge = Self.longs[longIdx]
+        let members = plan.members
         if SwapContentView.engine.isActive {
             SwapJournal.line("开始整片换脸：预览还开着，先叫停它并把两张网交出来（两条同跑＝两份足迹＋互相抢算力）")
         }
-        SwapJournal.line("开始整片换脸 units=\(Self.units[unitIdx].0) 长边=\(longEdge) 源=\(sourceTag) 片=\(v.lastPathComponent)")
+        SwapJournal.line("开始整片换脸 units=\(Self.units[unitIdx].0) 长边=\(longEdge) 目标表="
+            + castLabel(members) + " 片=\(v.lastPathComponent)")
         var args = SwapClip.Args()
         args.units = units
         args.longEdge = longEdge
@@ -405,7 +624,9 @@ struct SwapContentView: View {
             if waited > 0 {
                 SwapJournal.line(String(format: "预览交还网络用了 %.1f s", waited))
             }
-            let r = SwapClip.run(person: person, video: v, args: args) { line in
+            // 注册那两张网也交回去：出片自己还要装一份，两份同时在手＝几百 MB 白吃
+            SwapCast.release()
+            let r = SwapClip.run(members: members, video: v, args: args) { line in
                 SwapJournal.line(line)
                 // 模型下载的进度往界面上递一句：0.33 起模型不在包里，第一次跑要先下几百 MB，
                 // 不递的话界面上只有「换脸跑着…」，看着像卡死
@@ -420,7 +641,7 @@ struct SwapContentView: View {
                     DispatchQueue.main.async { result = head }
                 }
             }
-            // 视频那份拷贝是输入，跑完就该还掉：手机存储不许留残料（源脸那份选定时就还了）
+            // 视频那份拷贝是输入，跑完就该还掉：手机存储不许留残料（选片那份选定时就还了）
             if !FileManager.default.fileExists(atPath: v.path) {
                 SwapJournal.line("视频副本早没了 \(v.lastPathComponent)")
             } else if (try? FileManager.default.removeItem(at: v)) == nil {
@@ -454,6 +675,7 @@ struct SwapContentView: View {
                 Thread.sleep(forTimeInterval: 0.2)
                 waited += 0.2
             }
+            SwapCast.release()
             FsxBench.run { line in
                 SwapJournal.line(line)
                 let head = line.trimmingCharacters(in: .whitespaces)
@@ -471,27 +693,6 @@ struct SwapContentView: View {
 
     // MARK: - 已存的人
 
-    /// 这一趟的源身份是谁：界面贴在 ① 下面，日志里同一句话进流水。
-    private var sourceLine: String {
-        if !chosenIdent.isEmpty { return "源身份：已存的人「\(SwapIdents.displayName(chosenIdent))」，跑的时候跳过算身份证那一步" }
-        if faceImg != nil { return "源身份：刚选的这张照片，要跑算身份证那一步（几百毫秒）" }
-        return "源身份：还没定——在「已存的人」里点一个，或①选一张源脸照片"
-    }
-
-    private var hasSource: Bool { !chosenIdent.isEmpty || faceImg != nil }
-
-    private var sourceTag: String {
-        chosenIdent.isEmpty ? (faceURL?.lastPathComponent ?? "-") : "已存「\(SwapIdents.displayName(chosenIdent))」"
-    }
-
-    private func pickIdent(_ it: SwapIdents.Item) {
-        chosenIdent = it.id
-        faceImg = nil
-        faceURL = nil
-        identNote = "选中「\(it.name)」：这一趟不用照片，身份直接从盘上装"
-        SwapJournal.line(identNote)
-    }
-
     private func startRename(_ it: SwapIdents.Item) {
         renameId = it.id
         renameText = it.name
@@ -501,8 +702,13 @@ struct SwapContentView: View {
     private func commitRename() {
         renaming = false
         guard !renameId.isEmpty else { return }
-        identNote = SwapIdents.rename(id: renameId, to: renameText)
+        let want = renameText
+        identNote = SwapIdents.rename(id: renameId, to: want)
         SwapJournal.line("改名：\(identNote)")
+        for i in slots.indices where slots[i].sourceId == renameId {
+            slots[i].sourceName = want
+            slots[i].sourceNote = "替换脸＝已存「\(want)」"
+        }
         renameId = ""
         idents = SwapIdents.list()
     }
@@ -516,9 +722,15 @@ struct SwapContentView: View {
     private func commitDelete() {
         deleting = false
         guard !delId.isEmpty else { return }
-        identNote = SwapIdents.remove(id: delId)
+        let gone = delId
+        identNote = SwapIdents.remove(id: gone)
         SwapJournal.line("删已存的人：\(identNote)")
-        if chosenIdent == delId { chosenIdent = "" }
+        for i in slots.indices where slots[i].sourceId == gone {
+            slots[i].sourceId = ""
+            slots[i].sourceName = ""
+            slots[i].sourceEmb = []
+            slots[i].sourceNote = "原来选的替换脸被删了，重新选一个"
+        }
         delId = ""
         idents = SwapIdents.list()
     }
@@ -527,12 +739,15 @@ struct SwapContentView: View {
 
     /// 「开始预览」点不下去时，原因就写在按钮旁边
     private var previewBlock: String {
+        if castBusy { return "目标表正在算特征，等这一步收尾" }
+        if benchBusy { return "量速跑着：先等它收尾" }
         if running { return "整片换脸正跑着：这一版预览不和它抢 CPU，先等它收尾" }
         if videoURL == nil { return "还没点②选要预览的视频（预览吃的就是②那一条）" }
-        if chosenIdent.isEmpty { return "预览只吃「已存的人」：先在「已存的人」里点一个名字" }
         if !FileManager.default.fileExists(atPath: videoURL?.path ?? "") {
             return "②那份副本上一趟已经还掉了，重新点②选一条"
         }
+        let plan = castPlan
+        if !plan.problem.isEmpty { return plan.problem }
         return ""
     }
 
@@ -544,9 +759,13 @@ struct SwapContentView: View {
             pv.status = "停预览点了：这一格收尾就停"
             return
         }
-        guard !running else { return }
+        guard !running, !castBusy else { return }
         guard let v = videoURL else { return }
-        guard !chosenIdent.isEmpty else { return }
+        let plan = castPlan
+        guard plan.problem.isEmpty, !plan.members.isEmpty else {
+            pv.status = plan.problem
+            return
+        }
         guard FileManager.default.fileExists(atPath: v.path) else {
             videoURL = nil
             pv.status = "②那份副本上一趟已经还掉了，重新点②选一条"
@@ -556,7 +775,8 @@ struct SwapContentView: View {
         var c = SwapPreview.Cfg()
         c.units = Self.units[unitIdx].1
         c.unitsTxt = Self.units[unitIdx].0
-        let reject = eng.start(video: v, personId: chosenIdent, cfg: c)
+        SwapCast.release()
+        let reject = eng.start(video: v, members: plan.members, cfg: c)
         if !reject.isEmpty {
             pv.status = reject
             SwapJournal.line("预览 开始被挡：\(reject)")
@@ -569,8 +789,7 @@ struct SwapContentView: View {
         pv.dur = 0
         pv.person = ""
         pv.status = "预览开跑：先把两张网装好，第一格还要等它检测到位"
-        SwapJournal.line("开始预览 units=\(c.unitsTxt) "
-            + "人=\(SwapIdents.displayName(chosenIdent)) 片=\(v.lastPathComponent)")
+        SwapJournal.line("开始预览 units=\(c.unitsTxt) 目标表=\(castLabel(plan.members)) 片=\(v.lastPathComponent)")
     }
 
     private func seekPreview(_ sec: Double) {
@@ -586,6 +805,7 @@ struct SwapContentView: View {
         pv.modelText = "下模型跑着…"
         SwapJournal.line("开始下模型")
         Task.detached {
+            SwapCast.release()
             let g = SwapStore.ensure(force: true) { line in
                 SwapJournal.line(line)
                 DispatchQueue.main.async { pv.modelText = line }
@@ -603,7 +823,7 @@ struct SwapContentView: View {
         sending = true
         sendStatus = "发着…"
         let facts = SwapFacts.lines().joined(separator: "\n")
-        let clip = result.isEmpty ? "（整片换脸还没跑过——先点「开始换脸」）" : result
+        let clip = result.isEmpty ? "（整片换脸还没跑过——先点「开始整片换脸」）" : result
         let prev = pv.report.isEmpty ? "（预览还没跑过——先点「开始预览」）" : pv.report
         let text = "—— 环境 ——\n" + facts
             + "\n\n—— 整片换脸 ——\n" + clip
