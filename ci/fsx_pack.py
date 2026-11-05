@@ -12,7 +12,9 @@
   ① onnxruntime 对账：证明 CI 下到的这两份权重和 PC 那两份逐字节是同一个行为（字节数只是第一道）；
      换脸网里 6 个 BatchNormalization 和 16 个 InstanceNormalization 转换器降不了，
      BN 折进前面的 ConvTranspose、IN 拆成基础算子，动完再用同一套标准答案对一遍；
-  ② 转换器自己 --verify：证明 MIL 改写没把数算歪；
+  ② 转换器自己 --verify（只对向量网）：证明 MIL 改写没把数算歪。换脸网不用它——它拿 (0,1) 均匀随机噪声
+     当人脸喂，生成式网的输出在那种输入上本来就没有参考意义（fp32 正品也会被它判 FAIL，见 convert_cli 注释）；
+     换脸网的对账放在第③层，拿 PC 的真 fixture 比像素。
   ③ 落盘读回来的包再预测一遍：手机上用的是这份包，内存里那个转换对象不算数。
 """
 import argparse
@@ -392,11 +394,12 @@ def main():
     # ---- ④ 两张各转 fp32 一遍，转完立刻从盘上读回来对账
     rec = {}
     fails = []
-    plan = [(ARC_PKG, arc_model, arc_fixed, 'arc'), (SWAP_PKG, sw_model, sw_fixed, 'swap')]
-    for pkg_name, model, fixed, which in plan:
+    plan = [(ARC_PKG, arc_model, arc_fixed, 'arc', True),
+            (SWAP_PKG, sw_model, sw_fixed, 'swap', False)]
+    for pkg_name, model, fixed, which, verify in plan:
         pkg = os.path.join(a.out_root, pkg_name + '.mlpackage')
         try:
-            m, el, rel = P.convert(model, pkg, False, fixed, cli)
+            m, el, rel = P.convert(model, pkg, False, fixed, cli, verify=verify)
             ins, outs = P.coreml_io(m)
             if which == 'arc':
                 x112 = (src112.astype(np.float32) - 127.5) / 127.5

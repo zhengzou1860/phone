@@ -206,7 +206,22 @@ def load_onnx_fixed(path):
     return m
 
 
-def convert_cli(onnx_path, out_pkg, fp16, cli):
+def _tail_meaningful(lines, n=6):
+    """真报错不许被进度条淹掉：tqdm 的 \\r 也被 splitlines 切开，一刷就是几十行，
+    上一趟「MIL 转换失败」的尾巴里六行全是 92/92 的进度条，真正的 verify 判据一个字没留下。
+    这里把带 %|、passes/s、<00:00 这类行进度的行滤掉，其余原样取最后 n 行。"""
+    keep = []
+    for l in lines:
+        s = l.strip()
+        if not s:
+            continue
+        if '%|' in s or 'passes/s' in s or 'it/s' in s or 's/it' in s or '<00:00' in s:
+            continue
+        keep.append(s)
+    return keep[-n:]
+
+
+def convert_cli(onnx_path, out_pkg, fp16, cli, verify=True):
     """按这个仓库已经验通的那条路转：onnx2coreml 命令行。
 
     第一轮探针就是栽在这儿：coremltools 9 的 ct.convert 不管递文件路径还是递 ModelProto，
@@ -214,6 +229,10 @@ def convert_cli(onnx_path, out_pkg, fp16, cli):
     而 app 里现在装在手机上跑得好的那四张包，全是 build-swap.yml 里 onnx2coreml convert 出来的，
     所以这里不再跟 ct.convert 较劲，直接走那条已验通的路。
     转完照样从盘上把包读回来——手机上用的就是那份落盘的包。
+
+    verify=False：转换器自带的 --verify 是拿 (0,1) 均匀随机噪声当人脸、随机向量当源喂的，
+    对生成式换脸网没有参考价值（hyperswap fp32 在这套随机输入上 PSNR 47.4 dB、max_abs 9.9e-2，
+    被判 FAIL；同一份包拿真 fixture 对账是另一回事）。换脸网的对账交给 caller 的落盘预测那一层。
     """
     import shutil
     import subprocess
@@ -221,24 +240,31 @@ def convert_cli(onnx_path, out_pkg, fp16, cli):
     if os.path.isdir(out_pkg):
         shutil.rmtree(out_pkg)
     cmd = [cli, 'convert', onnx_path, '-o', out_pkg, '--format', 'mlpackage',
-           '--precision', 'fp16' if fp16 else 'fp32', '--verify']
+           '--precision', 'fp16' if fp16 else 'fp32']
+    if verify:
+        cmd.append('--verify')
     t0 = time.time()
     p = subprocess.run(cmd, capture_output=True, text=True)
     el = time.time() - t0
     lines = ((p.stdout or '') + '\n' + (p.stderr or '')).splitlines()
     pat = ('mismatch', 'max_abs', 'psnr', 'verify', 'error', 'not support',
-           'unsupported', 'renamed', 'fail')
+           'unsupported', 'renamed', 'fail', 'traceback', 'error:')
     hits = [l.strip() for l in lines if any(k in l.lower() for k in pat)]
     log('FSX-CVI', '%s rc=%s 输出 %d 行' % (os.path.basename(out_pkg), p.returncode, len(lines)),
         '|挑出来的判据', ' ⏎ '.join(hits[:6])[:400] or '无')
-    if p.returncode != 0 or not os.path.isdir(out_pkg):
-        raise RuntimeError('onnx2coreml rc=%s 尾部=%s' % (p.returncode, ' ⏎ '.join(lines[-6:])[:300]))
+    # 包在、verify 不过，rc 也是 1：真正算失败的是「没出包」，判据过不过由 caller 拿 fixture 判
+    if not os.path.isdir(out_pkg):
+        tail = _tail_meaningful((p.stdout or '').splitlines(), 4) \
+            + _tail_meaningful((p.stderr or '').splitlines(), 6)
+        raise RuntimeError('onnx2coreml rc=%s 没出包 尾部=%s' % (p.returncode, ' ⏎ '.join(tail)[:400]))
+    if p.returncode != 0:
+        log('FSX-CVI', '%s rc=%s 但包在盘上（多半是 --verify 判据没过）' % (os.path.basename(out_pkg), p.returncode))
     t1 = time.time()
     re = ct.models.MLModel(out_pkg)
     return re, el, (time.time() - t1)
 
 
-def convert(model, out_pkg, fp16, onnx_path=None, cli=None):
+def convert(model, out_pkg, fp16, onnx_path=None, cli=None, verify=True):
     """转 → 存包 → 再从存下来的包读回来预测。
 
     手机上用的是那份包（compileModel 之后加载），内存里那个转换对象不算数：
@@ -246,7 +272,7 @@ def convert(model, out_pkg, fp16, onnx_path=None, cli=None):
     """
     import coremltools as ct
     if cli and onnx_path:
-        return convert_cli(onnx_path, out_pkg, fp16, cli)
+        return convert_cli(onnx_path, out_pkg, fp16, cli, verify=verify)
     kw = {}
     try:
         kw['minimum_deployment_target'] = ct.target.iOS16
