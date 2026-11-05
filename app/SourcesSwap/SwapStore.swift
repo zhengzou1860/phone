@@ -444,7 +444,7 @@ enum SwapStore {
     /// 从一份已经验过 sha256 的归档解到盘上：解成了写版本号、删归档；没成把归档留着，下次只解不重下。
     /// 返回非 nil＝成了（这一句是给人看的结论）。
     private static func finishFromArchive(_ archive: URL, manifest m: Manifest, dir: URL,
-                                          onLine: (String) -> Void) -> String? {
+                                          onLine: @escaping (String) -> Void) -> String? {
         let ex = extract(archive, manifest: m, to: dir, onLine: onLine)
         guard ex.ok else {
             onLine("模型 解包没成：\(ex.note)｜归档留着（\(m.bytes / 1_048_576) MB），再点一次只解不重下")
