@@ -441,13 +441,14 @@ final class PageViewController: UIViewController {
         }
         // 配了目标脸却一张没换：用 PC 下发的 best_sim/match_thr 说清是“不是同一个人”
         // 还是“照片太小太糊”。老 PC 没有这两个字段时 PlanHint 返回 nil，不猜也不报警。
+        // 空表不是故障（PC 本来就不换），别用报错的红色。
         if let hint = PlanHint.explain(planCount: client.planCount,
                                        swappedFaces: client.swappedFaces,
                                        bestSim: client.bestSim,
                                        matchThr: client.matchThr),
            now - lastPlanHintTick >= 12 {
             lastPlanHintTick = now
-            status(hint, "error")
+            status(hint, client.planCount == 0 ? "success" : "error")
         }
     }
 
