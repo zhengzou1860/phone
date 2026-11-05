@@ -72,11 +72,15 @@ enum SnoreAnalyze {
         s.snoreMeanDb = snoreLevels.isEmpty ? -120 : snoreMean(snoreLevels)
 
         s.boutCount = bouts.count
-        s.gapCount = gaps.count
+        // 「停住到收尾都没复鼾」的那一条不进【疑似中断】的计数：它多半是起了床、停止记录，
+        // 而不是呼吸停住。0.6 那晚就有一条 14 min 33 s 的挂在中断统计里，把最长和次/小时都带跑。
+        let gapsOn = gaps.filter { !$0.unresolved }
+        s.gapCount = gapsOn.count
+        s.unresolvedCount = gaps.count - gapsOn.count
         s.vocalCount = vocals.count
         let hours = max(0.01, s.totalSec / 3600.0)
         s.boutsPerHour = Double(bouts.count) / hours
-        s.gapsPerHour = Double(gaps.count) / hours
+        s.gapsPerHour = Double(gapsOn.count) / hours
         if !bouts.isEmpty {
             let durs = bouts.map { $0.dur }
             s.longestBout = durs.max() ?? 0
@@ -84,12 +88,11 @@ enum SnoreAnalyze {
             let rates = bouts.compactMap { $0.ratePerMin }
             s.ratePerMin = snoreMedian(rates)
         }
-        if !gaps.isEmpty {
-            let durs = gaps.map { $0.dur }
+        if !gapsOn.isEmpty {
+            let durs = gapsOn.map { $0.dur }
             s.longestGap = durs.max() ?? 0
             s.meanGap = snoreMean(durs)
-            s.arousalCount = gaps.filter { $0.arousal }.count
-            s.unresolvedCount = gaps.filter { $0.unresolved }.count
+            s.arousalCount = gapsOn.filter { $0.arousal }.count
         }
         return s
     }
@@ -108,7 +111,7 @@ enum SnoreAnalyze {
     /// 一晚上 28 800 格，别每格都调 Calendar（那是几百次 dateComponents 的量级）：
     /// 只在开头问一次「会话起点落在这一小时的第几秒」，后面纯加法。国内没有夏令时，
     /// 真跨了调令的那一晚最坏是把一格归到相邻小时里，不影响总时长。
-    static func hourly(buckets: [SnoreSecond], start: Date) -> [(hourDate: Date, coverage: Double, seconds: Double)] {
+    static func hourly(buckets: [SnoreSecond], start: Date) -> [(hourDate: Date, coverage: Double, snoreSeconds: Double)] {
         var out: [(Date, Double, Double)] = []
         guard !buckets.isEmpty else { return out }
         let cal = Calendar.current
@@ -122,7 +125,7 @@ enum SnoreAnalyze {
         for b in buckets {
             let s = Int((Double(b.t0) + intoHour) / 3600.0)
             if s != slot {
-                if slot >= 0 { out.append((slotDate, total > 0 ? snore / total : 0, total)) }
+                if slot >= 0 { out.append((slotDate, total > 0 ? snore / total : 0, snore)) }
                 slot = s
                 snore = 0
                 total = 0
@@ -133,7 +136,7 @@ enum SnoreAnalyze {
                 snore += b.snoreSec
             }
         }
-        out.append((slotDate, total > 0 ? snore / total : 0, total))
+        out.append((slotDate, total > 0 ? snore / total : 0, snore))
         return out
     }
 
@@ -167,7 +170,13 @@ enum SnoreAnalyze {
         lines.append("【疑似中断】≥\(Int(config.interruptGapSec)) s 的鼾声停住：\(s.gapCount) 次，"
                      + "每小时 \(String(format: "%.1f", s.gapsPerHour)) 次")
         lines.append("　　　　　最长 \(snoreDurText(s.longestGap))，平均 \(snoreDurText(s.meanGap))；"
-                     + "其中 \(s.arousalCount) 次以明显更响的复鼾结束，\(s.unresolvedCount) 次停住后再没复鼾")
+                     + "其中 \(s.arousalCount) 次以明显更响的复鼾结束")
+        if s.unresolvedCount > 0 {
+            // 这几条只列在【中断明细】里，不进上面那些数：停住到收尾都没复鼾，
+            // 十有八九是鼾段本来结束了、或者人起床停止记录，不是呼吸停住。
+            lines.append("　　　　　另有 \(s.unresolvedCount) 次停住到收尾都没复鼾，不算进中断统计"
+                         + "（多半是鼾段结束或起床，见【中断明细】里标「未复鼾」的那几条）")
+        }
         lines.append("【其他发声】说话/咳嗽样 \(s.vocalCount) 次")
         lines.append("【看一眼】\(advice(s, config))")
         if s.staleSec > 0 {
@@ -177,19 +186,27 @@ enum SnoreAnalyze {
         let hour = hourly(buckets: buckets, start: start)
         if hour.count > 1 {
             var row = "【逐小时】"
-            for (date, cov, _) in hour {
+            for (date, cov, sec) in hour {
                 let h = DateFormatter()
                 h.dateFormat = "HH"
-                row += " \(h.string(from: date))时\(Int((cov * 100).rounded()))%"
+                // 光给整数百分比会把轻的那几小时全四舍五入成 0%（一小时 50 s 鼾才 1.4%），
+                // 所以留一位小数，再带上这一小时里究竟有多少秒判成了鼾
+                row += " \(h.string(from: date))时\(String(format: "%.1f", cov * 100))%/\(Int(sec.rounded()))s"
             }
             lines.append(row)
         }
 
-        // 最要紧的几条中断单独列出来：医生问「最长那次几点」的时候要能马上答
-        let shown = events.filter { $0.kind == .gap }.sorted { $0.dur > $1.dur }.prefix(8)
+        // 最要紧的几条中断单独列出来：医生问「最长那次几点」的时候要能马上答。
+        // 未复鼾的那几条排到最后——它们往往最长（鼾段结束后没人再打），摆在头一行会把人吓一跳。
+        let shown = events.filter { $0.kind == .gap }
+            .sorted { a, b in
+                if a.unresolved != b.unresolved { return !a.unresolved }
+                return a.dur > b.dur
+            }
+            .prefix(8)
         if !shown.isEmpty {
             lines.append("")
-            lines.append("【中断明细】（按停住的时长从长到短，最多 8 条）")
+            lines.append("【中断明细】（按停住的时长从长到短，最多 8 条；标「未复鼾」的排在最后、不算进上面的次数）")
             for e in shown {
                 let d = start.addingTimeInterval(e.t0)
                 let f2 = DateFormatter()

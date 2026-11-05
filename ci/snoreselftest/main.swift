@@ -89,6 +89,21 @@ do {
         bad += 1
         print("CASE FAIL 稀疏鼾那段判成 \(sparse.count) 段（要 1）／节律 \(sparseRates)（要有一段落在 6–12）")
     }
+    // 收尾那一条「停住到 900 s 都没复鼾」要留在事件表里（【中断明细】要能看到几点结束的），
+    // 但不进【疑似中断】的计数：用户 0.6 那晚就是被这种尾巴挂出一条 14 min 33 s，把最长和
+    // 次/小时全带跑了。这里两头都钉住：少一条不行，混进计数也不行。
+    let gapEvents = got.events.filter { $0.kind == .gap }
+    let unresolvedEvents = gapEvents.filter { $0.unresolved }
+    if unresolvedEvents.isEmpty {
+        bad += 1
+        print("CASE FAIL 合成样例收尾没留「未复鼾」那条事件（最后一段鼾到 900 s 空了 40 s）")
+    }
+    if summary.gapCount != gapEvents.count - unresolvedEvents.count
+        || summary.unresolvedCount != unresolvedEvents.count {
+        bad += 1
+        print("CASE FAIL 中断记账串了：计数 \(summary.gapCount)／未复鼾 \(summary.unresolvedCount)"
+            + "／事件共 \(gapEvents.count) 条（其中未复鼾 \(unresolvedEvents.count)）")
+    }
 }
 
 print("SNORE-VERDICT \(bad == 0 ? "PASS" : "FAIL") 用例 \(results.count - badCases)/\(results.count)"

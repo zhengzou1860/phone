@@ -471,10 +471,14 @@ final class SnoreTracker {
                          unresolved: Bool) {
         let dur = max(0, t1 - t0)
         guard dur >= config.interruptGapSec else { return }
-        if dur > longestGap { longestGap = dur }
+        // 未复鼾的那一条不进「中断」的账：鼾段结束了、人起床了、停止记录了，都不是呼吸停住。
+        // 事件还是要留（【中断明细】里能看到几点结束），只是别把最长和次/小时带跑。
+        if !unresolved {
+            if dur > longestGap { longestGap = dur }
+            gapCount += 1
+        }
         let pre = lastRunMean > -119 ? lastRunMean : nil
         let arous = (resumeDb ?? -120.0) > (pre ?? -120.0) + 3.0
-        gapCount += 1
         let e = SnoreEvent(id: nextId, kind: .gap, t0: t0, t1: t1, dur: dur,
                            peakDb: resumeDb ?? -120.0, meanDb: -120.0, ratePerMin: nil, peakHz: nil,
                            preDb: pre, resumeDb: resumeDb, arousal: arous,

@@ -374,11 +374,16 @@ struct NightDetailView: View {
                                span: Double(max(120, detail.meta.seconds)))
 
                     VStack(alignment: .leading, spacing: 6) {
-                        Text("中断在哪几点（从长到短，最多 12 条）").font(.headline)
-                        if detail.summary.gapCount == 0 {
+                        // 未复鼾的排到最后：它往往是「鼾段结束了」那条最长的，摆头一行容易吓人
+                        let gapRows = detail.events.filter { $0.kind == .gap }.sorted { a, b in
+                            if a.unresolved != b.unresolved { return !a.unresolved }
+                            return a.dur > b.dur
+                        }
+                        Text("中断在哪几点（从长到短，最多 12 条；「之后没复鼾」的排最后、不计入疑似中断）").font(.headline)
+                        if gapRows.isEmpty {
                             Text("这一晚没判出鼾声停住。").font(.footnote).foregroundColor(.secondary)
                         }
-                        ForEach(detail.events.filter { $0.kind == .gap }.sorted { $0.dur > $1.dur }.prefix(12)) { e in
+                        ForEach(gapRows.prefix(12)) { e in
                             HStack {
                                 Text(snoreWallClock(detail.meta.startDate, e.t0))
                                     .font(.system(size: 12, design: .monospaced))
