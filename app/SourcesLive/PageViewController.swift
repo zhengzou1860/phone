@@ -484,10 +484,8 @@ final class PageViewController: UIViewController {
             if let flying = self.pendingStop { _ = await flying.value }
             guard gen == self.pushGen else { return }
             if needStart {
-                // PC 的 is_playing 只有 /stop_playback 会清。0.18 把「播放」交回页面以后，
-                // 一次 PC 本地播放留下的 true 会让 /api/target_face_* 永远吃 409——
-                // 用户看到的就是「特征改几次以后就再也改不了」。进推流模式前先松一次。
-                await client.stopPCPlayback()
+                // PC 的 /live_start 现在自己会把 is_playing 清掉并置 stop_requested，
+                // 进推流模式不用再先补一发 /stop_playback。
                 do {
                     let w = try await client.startLive()
                     video.targetWidth = w

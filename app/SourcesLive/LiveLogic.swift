@@ -17,10 +17,11 @@ enum LiveConfig {
     /// PC 那边 /live_start 响应里的 max_width 是权威；这个既是请求值，也是读不到响应时的兜底。
     /// 0.14 试过 800，实测不是带宽先崩：PC 挂 3 张目标脸只算到 3–8fps，手机上看到的就是卡。
     /// 0.19 起退回 640（实测 51–54KB/帧），让 PC 先跟上节奏；再要高清等 PC 那边算力跟上。
+    /// 0.20 仍是 640：这一版改的是全屏交互，不动推流参数。
     static let fallbackMaxWidth = 640
 
-    static let appVersion = "0.19"
-    static let appBuild = "19"
+    static let appVersion = "0.20"
+    static let appBuild = "20"
 
     static let jpegQuality: CGFloat = 0.7
     static let pushFPS: Double = 15
@@ -731,6 +732,63 @@ enum LiveShim {
         ev.stopPropagation();
       }, true);
 
+      // —— 全屏时控件平时收起，点一下画面再出来 ——
+      // 页面全屏只留播放行、进度条和「发日志」，三样常驻会一直压着画面。
+      // 手机上的习惯是点一下才出现，几秒不动再自己收起。只往 <html> 上加一个类，
+      // 退出全屏立刻还原，不碰页面自己的 .fs 语义。
+      var FS_IDLE = 'live-fs-idle';
+      var FS_HIDE_MS = 4000;
+      var fsHideTimer = null;
+      function fsOn() {
+        try { return document.documentElement.classList.contains('fs'); } catch (e) { return false; }
+      }
+      function fsIdle(on) {
+        try {
+          if (on && fsOn()) document.documentElement.classList.add(FS_IDLE);
+          else document.documentElement.classList.remove(FS_IDLE);
+        } catch (e) {}
+      }
+      function fsShow() {
+        if (!fsOn()) return;
+        fsIdle(false);
+        clearTimeout(fsHideTimer);
+        fsHideTimer = setTimeout(function () { fsIdle(true); }, FS_HIDE_MS);
+      }
+      (function addFsStyle() {
+        try {
+          var st = document.createElement('style');
+          st.id = 'live-fs-style';
+          // 页面在全屏里点亮了播放行和进度条，这里只在收起态把它们整行盖掉；
+          // 要用 !important：页面那条 visibility:visible 是直接声明，只靠继承压不住。
+          st.textContent =
+            'html.fs.live-fs-idle .controls.play-row,'
+            + 'html.fs.live-fs-idle .controls.play-row *,'
+            + 'html.fs.live-fs-idle #live-seek-row.on,'
+            + 'html.fs.live-fs-idle #live-seek-row.on *,'
+            + 'html.fs.live-fs-idle #live-log-btn'
+            + '{visibility:hidden !important;}';
+          (document.head || document.documentElement).appendChild(st);
+        } catch (e) {}
+      })();
+      document.addEventListener('click', function (ev) {
+        if (!fsOn()) return;
+        var t = ev.target;
+        // 点在控件上不是“唤画面”：保持展开，只把自动收起往后推。
+        if (t && t.closest) {
+          if (t.closest('.controls.play-row') || t.closest('#live-seek-row')
+              || t.closest(LOG_SEL)) { fsShow(); return; }
+        }
+        if (document.documentElement.classList.contains(FS_IDLE)) fsShow();
+        else fsIdle(true);
+      }, true);
+      // 拖进度条不会有 click：手指按着走的时候一直重置收起计时，别把条从手指底下抽走。
+      document.addEventListener('input', function (ev) {
+        if (!fsOn()) return;
+        var t = ev.target;
+        if (t && t.closest && (t.closest('.controls.play-row')
+            || t.closest('#live-seek-row') || t.closest(LOG_SEL))) fsShow();
+      }, true);
+
       // —— 页面侧日志 ——
       // 1) 命令回话：非轮询 fetch 的路径/状态码/耗时/响应体前一段。
       //    「特征改几次以后改不了」时，PC 的 409 响应体里写的才是原因。
@@ -942,12 +1000,19 @@ enum LiveShim {
 
       // 全屏只靠 <html class="fs"> 表达；页面不会额外调原生，这里盯 class 变化再上报。
       // 原生只拿它来藏/恢复状态栏，不参与画面布局。
+      // 进全屏先把控件收起来（点画面才出来）；退出去时把收起态和定时器一起还原。
       var lastFs = null;
       function noteFullscreen() {
         var on = false;
         try { on = document.documentElement.classList.contains('fs'); } catch (e) {}
         if (on === lastFs) return;
         lastFs = on;
+        if (on) {
+          fsIdle(true);
+        } else {
+          clearTimeout(fsHideTimer);
+          fsIdle(false);
+        }
         send({ action: FS, on: on });
       }
       try {

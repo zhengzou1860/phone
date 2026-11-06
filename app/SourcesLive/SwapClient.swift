@@ -281,27 +281,6 @@ final class SwapClient: ObservableObject {
         return ok
     }
 
-    /// PC 的 is_playing 只有 /stop_playback 会清（/live_start、/live_stop 都不碰）。
-    /// 进推流模式前松一次：0.18 把「播放」交回页面以后，一次 PC 本地播放留下的 true
-    /// 会让 /api/target_face_* 永远吃 409——症状就是「特征改几次以后再也改不了」。
-    @discardableResult
-    func stopPCPlayback() async -> Bool {
-        do {
-            let (_, resp) = try await callWithAuthRetry("/stop_playback", body: Data(),
-                                                        contentType: nil)
-            guard let http = resp as? HTTPURLResponse else {
-                AppLog.shared.log("pc", "/stop_playback 没有 HTTP 回应")
-                return false
-            }
-            let ok = (200..<300).contains(http.statusCode) && !LiveAuth.lost(http)
-            AppLog.shared.log("pc", "/stop_playback HTTP \(http.statusCode)\(ok ? "" : "（没成功）")")
-            return ok
-        } catch {
-            AppLog.shared.log("pc", "/stop_playback 没送到：\(error.localizedDescription)")
-            return false
-        }
-    }
-
     /// 跳转以后必须调：PC 会丢掉队列里的旧帧和上一姿势的检测缓存，否则糊到跳转之后。
     func seek() async {
         _ = try? await callWithAuthRetry("/live_seek", body: Data(), contentType: nil)

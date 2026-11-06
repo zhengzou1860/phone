@@ -197,6 +197,23 @@ ck("脚本 全屏不再克隆第二路流", !shim.contains("fullscreen-video"),
    "0.11 起页面只用 html.fs 铺满，同一路 #video-stream")
 ck("脚本 全屏态上报原生", shim.contains("action: FS") && LiveShim.hookFullscreen == "fullscreen",
    "原生靠它藏/恢复状态栏")
+// 0.20：全屏里控件平时收起，点画面唤出，几秒不动自己收；退出全屏一起还原。
+ck("脚本 全屏控件默认收起", shim.contains("FS_IDLE = 'live-fs-idle'")
+   && shim.contains("if (on) {\n          fsIdle(true);"),
+   "页面全屏会点亮播放行和进度条，注入层要在进入那一刻就盖掉")
+ck("脚本 收起样式压得住页面", shim.contains("html.fs.live-fs-idle .controls.play-row")
+   && shim.contains("html.fs.live-fs-idle #live-seek-row.on")
+   && shim.contains("visibility:hidden !important"),
+   "页面那条 visibility:visible 是直接声明，不用 !important 压不住")
+ck("脚本 点画面唤出控件", shim.contains("function fsShow") && shim.contains("fsShow();")
+   && shim.contains("setTimeout(function () { fsIdle(true); }, FS_HIDE_MS)"))
+ck("脚本 控件上的点击不收起", shim.contains("t.closest('.controls.play-row')")
+   && shim.contains("t.closest(LOG_SEL)"))
+ck("脚本 拖进度条不收起", shim.contains("addEventListener('input'")
+   && shim.contains("t.closest('#live-seek-row')"),
+   "拖 range 只发 input，不发 click，不重置计时就会把条从手指底下抽走")
+ck("脚本 退出全屏还原控件", shim.contains("clearTimeout(fsHideTimer)")
+   && shim.contains("fsIdle(false)") && shim.contains("html.fs.live-fs-idle #live-log-btn"))
 
 // 停止握手：点停止到 PC 确认之间，按钮和特征下拉框必须一直锁着；
 // /live_stop 没送到就停在 failed，不许假装停了——那正是用户撞 409 的那条路。
@@ -287,10 +304,10 @@ ck("账目 未知源不标", LivePerf.sourceLabel(0).isEmpty)
 
 ck("契约 在途上限3", LiveConfig.inflightLimit == 3)
 ck("契约 推送15fps", LiveConfig.pushFPS == 15.0)
-// 0.19 退回 640：PC 挂 3 张目标脸只算到 3–8fps，先让 PC 跟上节奏，不是手机上行不够。
+// 0.20 仍是 640：全屏交互改在脚本层，推流参数这一版不动。
 ck("契约 请求宽640", LiveConfig.fallbackMaxWidth == 640)
-ck("契约 UA带版本", LiveConfig.userAgentSuffix == "LiveSwap/0.19"
-   && LiveConfig.appVersion == "0.19" && LiveConfig.appBuild == "19")
+ck("契约 UA带版本", LiveConfig.userAgentSuffix == "LiveSwap/0.20"
+   && LiveConfig.appVersion == "0.20" && LiveConfig.appBuild == "20")
 ck("契约 质量0.7", LiveConfig.jpegQuality == 0.7)
 ck("契约 看门狗2500ms", LiveConfig.watchdogMs == 2500, "1500 太紧：收尾那一秒实测到过 1489")
 ck("契约 出帧判据500ms", LiveConfig.warmAgeMs == 500,
