@@ -17,11 +17,11 @@ enum LiveConfig {
     /// PC 那边 /live_start 响应里的 max_width 是权威；这个既是请求值，也是读不到响应时的兜底。
     /// 0.14 试过 800，实测不是带宽先崩：PC 挂 3 张目标脸只算到 3–8fps，手机上看到的就是卡。
     /// 0.19 起退回 640（实测 51–54KB/帧），让 PC 先跟上节奏；再要高清等 PC 那边算力跟上。
-    /// 0.21 仍是 640：这一版修的是停止/重进时的闪退，不动推流参数。
+    /// 0.22 仍是 640：这一版修的是忙闸吞掉页面自绘确认框，推流参数不动。
     static let fallbackMaxWidth = 640
 
-    static let appVersion = "0.21"
-    static let appBuild = "21"
+    static let appVersion = "0.22"
+    static let appBuild = "22"
 
     static let jpegQuality: CGFloat = 0.7
     static let pushFPS: Double = 15
@@ -472,6 +472,11 @@ enum LiveShim {
     /// 必须在捕获阶段截下来改成“跳到第几秒”。
     static let pathSelector = "#video-path"
 
+    /// PC 页面自绘确认框的容器（0.21 起替代原生 confirm/prompt）。
+    /// 忙闸只该拦「发给 PC 的命令」；框里的确定/取消/输入是页面自己的界面，
+    /// 拦掉的表现就是「点了退出没反应」「重命名特征打不了字」。认 class 不认 id。
+    static let dialogSelector = ".qdialog"
+
     /// 点击挂子只剩两个：三条挂子的选择器就是 PC 页面 templates/index.html 里已有的元素，
     /// 手机上不新增任何控件，只把已有按钮接到原生。跳转走 keydown，不进这张表。
     static let hooks: [LiveHook] = [
@@ -510,6 +515,7 @@ enum LiveShim {
                           .replacingOccurrences(of: "__CMDLOG__", with: jsLiteral(hookCmdLog))
                           .replacingOccurrences(of: "__PAGESTATE__", with: jsLiteral(hookPageState))
                           .replacingOccurrences(of: "__LOGSEL__", with: jsLiteral(logButtonSelector))
+                          .replacingOccurrences(of: "__DIALOG__", with: jsLiteral(dialogSelector))
     }
 
     private static let template = #"""
@@ -527,6 +533,7 @@ enum LiveShim {
       var CMDLOG = __CMDLOG__;
       var PAGESTATE = __PAGESTATE__;
       var LOG_SEL = __LOGSEL__;
+      var QD_SEL = __DIALOG__;
 
       function send(payload) {
         try {
@@ -546,6 +553,9 @@ enum LiveShim {
         if (!t || !t.closest) return;
         // 「发日志」不是 PC 命令，忙的时候也得点得动：它自己有监听，这里放行。
         if (t.closest(LOG_SEL)) return;
+        // 页面自绘确认框同理：确定/取消/输入都只是页面自己的界面，不是发给 PC 的命令。
+        // 整个框一起放行——只放按钮会让「点遮罩取消」失效，只放遮罩又会让输入框打不了字。
+        if (t.closest(QD_SEL)) return;
         // 忙闸先拦：这条监听注册得比后面的忙闸早，不看一眼就会在等 PC 回话时
         // 把「选择文件 / 播放」再送一遍（样式只挡鼠标，挡不住程序化的 click）。
         if (busyNow()) { ev.preventDefault(); ev.stopPropagation(); return; }
@@ -706,6 +716,10 @@ enum LiveShim {
             // 发日志同理：它不跟 PC 对话，等回话的时候正好是用户想发日志的时候。
             + 'html.pc-busy #live-log-btn'
             + '{pointer-events:auto !important;opacity:1 !important;}'
+            // 页面自绘确认框也不跟 PC 对话。它的确定/取消是 <button>，上面那条
+            // pc-busy button 会连 pointer-events 一起关掉，这里按整框恢复（含输入框）。
+            + 'html.pc-busy .qdialog,html.pc-busy .qdialog *'
+            + '{pointer-events:auto !important;opacity:1 !important;}'
             + 'html.pc-busy,html.pc-busy body{cursor:progress !important;}';
           (document.head || document.documentElement).appendChild(st);
         } catch (e) {}
@@ -723,7 +737,8 @@ enum LiveShim {
       // 光靠样式挡不干净：忙时在捕获阶段把点击整个截下来，不让它进页面自己的处理。
       document.addEventListener('click', function (ev) {
         if (!busyNow()) return;
-        if (ev.target && ev.target.closest && ev.target.closest(LOG_SEL)) return;
+        if (ev.target && ev.target.closest
+            && (ev.target.closest(LOG_SEL) || ev.target.closest(QD_SEL))) return;
         var a = (ev.target && ev.target.closest) ? ev.target.closest('a') : null;
         // 下载不是命令：页面在 iOS 上把它改成 window.location.href 顶层导航，
         // 交给原生 WKDownload 接，不存在“等 PC 回话”这件事。
