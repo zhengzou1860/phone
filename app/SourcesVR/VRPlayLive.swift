@@ -644,53 +644,6 @@ final class VRLive {
 
 // MARK: - 播放页的界面
 
-/// 播放页的宿主：根层就是 AVSampleBufferDisplayLayer，上面盖一层点播才出现的控制条。
-/// sbs=false 走「普通视频 → 实时形变」，sbs=true 走「相册里已经是左右眼的那条 → 原样上屏、只做半幅平移」。
-struct VRLiveHost: UIViewRepresentable {
-    let url: URL
-    let eyeLong: Int
-    let bpct: Float
-    let units: MLComputeUnits
-    let rot: Bool
-    let sbs: Bool
-    let onEnd: (String) -> Void
-
-    func makeUIView(context: Context) -> VRLiveView {
-        let v = VRLiveView()
-        let live = VRLive(url: url, eyeLong: eyeLong, bpct: bpct, zp: 0.15, smooth: 0.4,
-                          units: units, rot: rot, sbs: sbs)
-        let cb = onEnd
-        live.onEnd = cb
-        context.coordinator.live = live
-        v.attach(live)
-        // 起手（Metal + 模型加载）要两三秒，不抱着主线程：后台起，起不来把原因交回界面顺手关掉这页
-        DispatchQueue.global(qos: .userInitiated).async { [weak v] in
-            guard let vv = v else { return }
-            let err = live.start(layer: vv.displayLayer, label: vv.stats)
-            guard !err.isEmpty else { return }
-            DispatchQueue.main.async {
-                vv.stats.text = err
-                cb(err)
-            }
-        }
-        return v
-    }
-
-    func updateUIView(_ v: VRLiveView, context: Context) {
-        if let l = context.coordinator.live { v.attach(l) }
-    }
-
-    func makeCoordinator() -> Coordinator { Coordinator() }
-
-    static func dismantleUIView(_ v: VRLiveView, coordinator: Coordinator) {
-        v.teardown()
-    }
-
-    final class Coordinator {
-        var live: VRLive?
-    }
-}
-
 /// 实时播放的容器视图：底下上屏、顶上三行实测、底下一条点播才出现的控制栏
 final class VRLiveView: UIView {
     /// 顶部实测那几行（一直显示，测速要看）

@@ -19,10 +19,20 @@ struct VR3DApp: App {
 }
 
 /// 系统每次要转屏都来问这里。返回的是「此刻」允许的朝向：播放页把横屏放开，出来就收回去。
+/// 这一版开始把「到底有没有人来问过」也记下来：0.18~0.21 三版横屏都不动，
+/// 分不清是这道闸没放开、还是压根没人来问（LiveContainer 里我们这份 delegate 未必是本进程的应用代理）。
 final class VRAppDelegate: NSObject, UIApplicationDelegate {
+    /// 只记前 8 次，免得播着播着把日志刷满
+    private static var asked = 0
     func application(_ application: UIApplication,
                      supportedInterfaceOrientationsFor window: UIWindow?) -> UIInterfaceOrientationMask {
-        VROrientation.current
+        let m = VROrientation.current
+        if VRAppDelegate.asked < 8 {
+            VRAppDelegate.asked += 1
+            VRJournal.line("朝向 delegate 第 \(VRAppDelegate.asked) 次被问，交回 \(VROrientation.name(m))"
+                + "｜窗 \(window.map { String(describing: type(of: $0)) } ?? "没给")")
+        }
+        return m
     }
 }
 
@@ -36,6 +46,36 @@ enum VROrientation {
         return mask
     }
 
+    static func name(_ m: UIInterfaceOrientationMask) -> String {
+        var parts: [String] = []
+        if m.contains(.portrait) { parts.append("竖") }
+        if m.contains(.landscapeLeft) { parts.append("左横") }
+        if m.contains(.landscapeRight) { parts.append("右横") }
+        if m.contains(.portraitUpsideDown) { parts.append("倒竖") }
+        return parts.isEmpty ? "空" : parts.joined(separator: "+")
+    }
+
+    /// 把「场景有几个、角色是什么、现在朝哪儿」摊开记一行。
+    /// 横屏不成时这三样能分清：没有窗口场景（LiveContainer 把场景给了宿主）、几何更新被拒、
+    /// 还是闸放开了系统也不转（那是 delegate 没人问 / 最上面的控制器不支持）。
+    static func report(_ tag: String) {
+        DispatchQueue.main.async {
+            var n = 0
+            var txt = ""
+            for scene in UIApplication.shared.connectedScenes {
+                n += 1
+                guard let ws = scene as? UIWindowScene else {
+                    txt += "[\(n) 不是 UIWindowScene]"
+                    continue
+                }
+                let role = scene.session.role == .windowApplication ? "主窗" : "其它角色"
+                let ori = ws.interfaceOrientation
+                txt += "[\(n) \(role) 朝向\(ori.rawValue) 窗\(ws.windows.count) 通知\(Int(ws.effectiveGeometryPriority.rawValue))]"
+            }
+            VRJournal.line("朝向 盘点 \(tag)：闸=\(name(current))｜场景 \(n) 个 \(txt)")
+        }
+    }
+
     /// 改完闸还得自己催一次几何更新：手机本来就横着进播放页时，系统不会重新算一次朝向，
     /// 页面就一直竖着（iOS 16 起 UIDevice.orientation 也不让直接设了）。
     static func allowLandscape(_ on: Bool) {
@@ -43,25 +83,24 @@ enum VROrientation {
         mask = on ? [.portrait, .landscapeLeft, .landscapeRight] : .portrait
         let want = mask
         lock.unlock()
-        VRJournal.line("朝向 \(on ? "播放页放开横屏" : "收回只留竖屏")")
+        VRJournal.line("朝向 \(on ? "播放页放开横屏" : "收回只留竖屏") 闸现在 \(name(mask))")
+        report("闸刚改")
         DispatchQueue.main.async {
+            var sent = 0
             for scene in UIApplication.shared.connectedScenes {
                 guard let ws = scene as? UIWindowScene else { continue }
                 // 那个 C 常量在 Swift 侧已改名成 UISceneSession.Role.windowApplication（CI 报的）；
                 // 外部显示场景也在 connectedScenes 里，不认角色就会把几何更新发给错的那个
                 guard scene.session.role == .windowApplication else { continue }
+                sent += 1
                 ws.requestGeometryUpdate(.iOS(interfaceOrientations: want)) { e in
                     VRJournal.line("朝向 几何更新被拒 \(e.localizedDescription)")
                 }
             }
+            VRJournal.line("朝向 几何更新发出 \(sent) 个场景（主窗角色几个就是几个，0 个说明这进程里没有我们的窗口场景）")
+            report("几何更新后")
         }
     }
-}
-
-/// fullScreenCover(item:) 要 Identifiable，URL 自己不是 ⇒ 套一层。id 用绝对路径，同一个文件不会重开两次
-struct VRPlayItem: Identifiable {
-    let url: URL
-    var id: String { url.absoluteString }
 }
 
 struct VRMainView: View {
@@ -92,6 +131,10 @@ struct VRMainView: View {
                     }
                     .pickerStyle(.segmented)
                     .font(.footnote)
+
+                    Toggle(isOn: $job.withAudio) {
+                        Text("带声音 源片音轨搬进成片（AAC，只认 1、2 声道）").font(.footnote)
+                    }
 
                     Text("全片不限时长：一趟扫（深度落盘 0.77 MB/帧＝518x392 的 Float32，按 30 fps 约 23 MB/秒素材）"
                          + "＋每条一趟出片。开跑前先看磁盘闸门报的那一行：够就往下跑，不够就直接告诉你还能塞多少秒。"
@@ -234,20 +277,8 @@ struct VRMainView: View {
         .fullScreenCover(isPresented: $job.showVideoPicker) {
             VRPickerHost { url, msg in job.finishPick(url: url, failMessage: msg) }
         }
-        .fullScreenCover(item: $job.liveItem) { item in
-            ZStack(alignment: .topTrailing) {
-                VRLiveHost(url: item.url, eyeLong: job.eyeLong, bpct: Float(job.bpct),
-                           units: VRJob.unit(job.unitTag), rot: job.feedRot, sbs: job.liveSbs) {
-                    r in job.liveEnd(r)
-                }
-                Button("停止") { job.stopLive() }
-                    .buttonStyle(.borderedProminent)
-                    .padding(10)
-            }
-            .background(Color.black)
-            .onAppear { VROrientation.allowLandscape(true) }
-            .onDisappear { VROrientation.allowLandscape(false) }
-        }
+        // 播放页不再用 fullScreenCover：改成自己那个 UIViewController（VRPlayPage.swift），
+        // 转屏和全屏都由我们自己呈现，理由写在那份文件头上
     }
 }
 
@@ -257,8 +288,6 @@ final class VRJob: ObservableObject {
     @Published var busy = false
     @Published var status = ""
     @Published var showVideoPicker = false
-    /// 播放那一个全屏页：两条去向（相册里已是左右眼的、要实时形变的）都开这一页，靠 liveSbs 分野
-    @Published var liveItem: VRPlayItem?
     /// 真放进这一页的是不是「原样左右眼」：true=相册那条已经是 SBS，false=普通视频实时形变
     @Published var liveSbs = false
     /// 下一次选片的去向：0=拿去转，1=拿去播（已是左右眼，原样上屏），2=拿去实时播（普通视频）
@@ -276,6 +305,8 @@ final class VRJob: ObservableObject {
     @Published var fullMode = false
     /// 1 条 = PC m6 那个出货档 zp0.15；3 条 = 上中下三个零视差面对比
     @Published var fullZps = 1
+    /// 全片默认带源片音轨。留这一档是给「编码器不收料」那条排查用的对照：关掉就只挂视频输入。
+    @Published var withAudio = true
     @Published var fullRunning = false
     @Published var stopPressed = false
     /// 「删除历史视频」的第一击只列清单、置 armed；第二击才真删
@@ -288,6 +319,24 @@ final class VRJob: ObservableObject {
         let info = Bundle.main.infoDictionary ?? [:]
         VRJournal.line("=== 启动 v\(info["CFBundleShortVersionString"] ?? "-") ===")
         VRPressure.start()
+        // 「全片跑到一半没账了」得先分清是不是被挂起：11-06 17:01 那条第 31 帧报 Operation Interrupted，
+        // 前面正好空了 98 秒一行没出。这四个通知谁来了都记一行，下次一看就知道。
+        for (one, tag) in [(UIApplication.willResignActiveNotification, "失活跃（锁屏/下拉/切走）"),
+                           (UIApplication.didEnterBackgroundNotification, "进后台"),
+                           (UIApplication.didBecomeActiveNotification, "变活跃"),
+                           (UIApplication.willEnterForegroundNotification, "回前台")] {
+            NotificationCenter.default.addObserver(forName: one, object: nil, queue: .main) { _ in
+                VRJournal.line("前台 \(tag)")
+            }
+        }
+    }
+
+    /// 跑片期间把「屏幕自己黑掉」这条路堵上：屏一黑系统就挂起我们，AVAssetWriter 当场
+    /// Operation Interrupted，这条片子就废了（11-06 那次正是这么没跑完）。finish() 里必还回去。
+    /// ⚠️ 播放页的 attach/teardown 也动同一个开关；两条本来就被 playGate/VRFull.isBusy 互斥挡着。
+    private func keepAwake(_ on: Bool) {
+        UIApplication.shared.isIdleTimerDisabled = on
+        VRJournal.line("常亮 \(on ? "跑片期间不许自动锁屏" : "还给系统")")
     }
 
     static func unit(_ tag: Int) -> MLComputeUnits {
@@ -303,6 +352,7 @@ final class VRJob: ObservableObject {
         ticker?.invalidate()
         ticker = nil
         fullRunning = false
+        keepAwake(false)
         log.append(report)
         if log.count > 8 { log.removeFirst(log.count - 8) }
         busy = false
@@ -409,6 +459,7 @@ final class VRJob: ObservableObject {
         let rot = feedRot
         let rn = rot ? "转90°" : "摆正"
         VRPressure.reset()
+        keepAwake(true)
         status = "出试片中…（抽 \(n) 帧 × 3 个零视差面；送检\(rn)；深度单元 \(VRPilot.unitsName(u))，单价见上方实测那行）"
         Task.detached { [weak self] in
             let r = VRPilot.run(url: url, frames: n, bpct: b, eyeLong: eye,
@@ -427,7 +478,9 @@ final class VRJob: ObservableObject {
         let u = VRJob.unit(unitTag)
         let rot = feedRot
         let zps: [Float] = fullZps == 3 ? [0.15, 0.50, 0.85] : [0.15]
+        VRFull.wantAudio = withAudio
         VRPressure.reset()
+        keepAwake(true)
         status = "全片起手…（读几何、载模型、过磁盘闸门）"
         ticker = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
             Task { @MainActor in
@@ -471,13 +524,24 @@ final class VRJob: ObservableObject {
         showVideoPicker = true
     }
 
-    func stopLive() {
-        VRLive.requestStopCurrent()
+    /// 把播放页呈现出去。两条去向（相册里已是左右眼的、要实时形变的）都进同一个页，靠 sbs 分野。
+    private func openLive(_ url: URL) {
+        let ok = VRPage.present(url: url, eyeLong: eyeLong, bpct: Float(bpct),
+                                units: VRJob.unit(unitTag), rot: feedRot, sbs: liveSbs) { r in
+            self.liveEnd(r)
+        }
+        if ok {
+            log.append("播放页已呈现（转屏由这一页自己说：竖+左横+右横）")
+        } else {
+            log.append("播放页没开起来：找不到窗口根控制器（详情见日志「页面」那几行）")
+            dropPickCopy(url)
+            liveCopy = nil
+        }
     }
 
     /// 实时页收兵后由 VRLive 把报告送回这里：关页面、进日志、删那份 tmp 副本
     func liveEnd(_ report: String) {
-        liveItem = nil
+        VROrientation.allowLandscape(false)
         log.append(report)
         if log.count > 8 { log.removeFirst(log.count - 8) }
         VRJournal.line("界面 " + report.replacingOccurrences(of: "\n", with: " ／ "))
@@ -501,7 +565,7 @@ final class VRJob: ObservableObject {
             }
             liveSbs = asIs
             liveCopy = url
-            liveItem = VRPlayItem(url: url)
+            openLive(url)
             return
         }
         // 选片回调是异步的：拷一条一分钟的片子要好几秒，这期间按钮的 busy 还没置上，

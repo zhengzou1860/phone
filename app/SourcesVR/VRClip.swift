@@ -630,6 +630,11 @@ final class VRAudioPass {
         self.detail = detail
     }
 
+    /// 报告用：此刻手上摁着几份、最后一个写进去的是第几秒。
+    /// 界面卡在「编码器不收料」上时靠这两个数分清到底是视频不收货还是音频拖住了复用器。
+    var queuedNow: Int { pending == nil ? 0 : 1 }
+    var lastSecNow: Double { lastSec }
+
     /// 视频那一圈每写完一帧调一次：能塞就塞，队列满就把手上这份留到下一次。
     /// cutSeconds 是此刻视频写到第几秒：音频不许跑到视频前面去，追上就摁住这一份等下一帧。
     /// ⚠️ 这里绝不能收口：一个 PCM 块只有 20 多毫秒，视频写到第 1 帧时 cut 就是 0.033 s，

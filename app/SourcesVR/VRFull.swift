@@ -24,6 +24,9 @@ enum VRFull {
     static var doneFrames = 0
     static var totalFrames = 0
     static var cancelRequested = false
+    /// 界面上「带声音」那一档（VRJob.withAudio 在 startFull 里写进来）：假就整条不挂音轨。
+    /// 跟 progress 一样是跨线程的一读一写，只在起片前定、跑起来不再改。
+    static var wantAudio = true
 
     static func requestCancel() {
         cancelRequested = true
@@ -334,9 +337,20 @@ enum VRFull {
                 outs.append("zp\(String(format: "%.2f", zp)): canAdd 为假，这套 outputSettings 本机不支持"); break
             }
             writer.add(input)
-            // 音轨要在 startWriting 之前挂上去：源片有声音就跟着原 PTS 一起搬，
-            // 全片是按源 fps 一帧不落地写的，所以视频时间轴 = 源时间轴，音频一个点都不用改。
-            let (ap, audioWhy) = VRAudioPass.make(writer: writer, src: src)
+            let (ap, audioWhy): (VRAudioPass?, String)
+            if wantAudio {
+                // 音轨要在 startWriting 之前挂上去：源片有声音就跟着原 PTS 一起搬，
+                // 全片是按源 fps 一帧不落地写的，所以视频时间轴 = 源时间轴，音频一个点都不用改。
+                let one = VRAudioPass.make(writer: writer, src: src)
+                ap = one.pass
+                audioWhy = one.why
+            } else {
+                // 界面上「带声音」关着：音轨压根不挂到 writer 上，这条纯视频。
+                // 留这个开关是为了分清「编码器不收料」到底是谁拖住的——音频复用器和视频共用一个 writer。
+                ap = nil
+                audioWhy = "界面把「带声音」关了，这条只写视频"
+                VRJournal.line("音频 「带声音」关着，这条不挂音轨")
+            }
             let tHead0 = DispatchTime.now().uptimeNanoseconds
             do { try writer.startWriting() } catch {
                 str2.close()
@@ -400,11 +414,34 @@ enum VRFull {
                 holes += rr.holes
                 let tw = DispatchTime.now().uptimeNanoseconds
                 var spins = 0
+                var starved = false
                 while !input.isReadyForMoreMediaData {
                     Thread.sleep(forTimeInterval: 0.005)
                     spins += 1
+                    // 队列满一般几百毫秒就开闸；writer 已经死了的话这道闸永远不再开。
+                    // 11-06 17:01 那条就是死在这儿：屏幕一黑被挂起，醒来还在空转，
+                    // 98 秒里「背压」一路涨到 98312 ms 才走到 append 报失败。20 秒封顶，早收早留账。
+                    if writer.status == .failed || writer.status == .cancelled || spins > 4000 {
+                        starved = true
+                        break
+                    }
+                    // 卡住的这 20 秒不能只留最后一行：第 1/2/4/8 秒各递一条，
+                    // 把音轨那边「手上摁着几份、写到第几秒」一起报出来——
+                    // 视频编码器和音轨复用同一个 writer，下次一看就知道拖住这道闸的是哪一头。
+                    if spins == 200 || spins == 400 || spins == 800 || spins == 1600 {
+                        let a = ap == nil ? audioWhy
+                            : "手上摁着 \(ap!.queuedNow) 份、最后写进 \(String(format: "%.1f", ap!.lastSecNow)) s"
+                        VRJournal.line("全片 zp\(String(format: "%.2f", zp)) 第 \(k + 1) 帧等开闸 \(spins * 5) ms"
+                            + "｜writer.status=\(writer.status.rawValue) \(writer.error?.localizedDescription ?? "-")"
+                            + "｜视频这头还是不收｜音轨：\(a)")
+                    }
                 }
                 waitMs.append(Double(DispatchTime.now().uptimeNanoseconds - tw) / 1_000_000)
+                if starved {
+                    why = "第 \(k + 1) 帧编码器不收料（等了 \(spins * 5) ms；writer.status=\(writer.status.rawValue)"
+                        + " \(writer.error?.localizedDescription ?? "-")）；这段多半被挂起过（锁屏/切走）"
+                    break
+                }
                 if spins > 0 && k % 60 == 0 {
                     VRJournal.line("全片 zp\(String(format: "%.2f", zp)) 第 \(k) 帧等到过队列满 \(spins) 轮")
                 }
