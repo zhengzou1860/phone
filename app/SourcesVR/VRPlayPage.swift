@@ -73,6 +73,8 @@ final class VRPlayVC: UIViewController {
             let e = vc.live.start(layer: vc.surface.displayLayer, label: vc.surface.stats)
             guard !e.isEmpty else { return }
             DispatchQueue.main.async {
+                // 起不来的那句要看得见：实测那几行平时跟着控制栏收着，这一条单独放行
+                vc.surface.stats.isHidden = false
                 vc.surface.stats.text = e
                 vc.onEnd(e)
                 if vc.presentingViewController != nil { vc.dismiss(animated: true) }
