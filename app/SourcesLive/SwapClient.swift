@@ -39,6 +39,9 @@ final class SwapClient: ObservableObject {
     @Published var swappedFaces = 0             // 当前帧真正换了几张
     @Published var bestSim: Double?             // 画面里最像绑定表的那张脸的余弦；缺字段就是 nil
     @Published var matchThr: Double?            // PC 下发的判定门槛；手机上不写死
+    /// 上面 plan/swapped/best 这组数取样成功的时刻：轮询每秒一次、请求本身还要走一个往返，
+    /// 日志里不写清是几秒前的数，就会把上一段的旧值当成现在的（PC 那边换完目标脸后尤其容易）
+    private(set) var statusAt = Date(timeIntervalSince1970: 0)
     @Published var pcLiveMode = false          // PC 静默 10 秒会自己退出推流模式，手机靠这个知道要重来
     @Published var saw409 = 0                  // 被 PC 判「不在推流模式」的次数，恢复逻辑的触发信号
     @Published var sessionLost = false          // 搬完 cookie 还吃 401：页面那边得重登了
@@ -351,6 +354,7 @@ final class SwapClient: ObservableObject {
         swappedFaces = snap.swappedFaces
         bestSim = snap.bestSim
         matchThr = snap.matchThr
+        statusAt = Date()
     }
 
     // MARK: - 数据面（每帧一次，回调式，不为每帧起一个 Task）

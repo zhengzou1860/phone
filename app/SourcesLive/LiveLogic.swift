@@ -17,11 +17,11 @@ enum LiveConfig {
     /// PC 那边 /live_start 响应里的 max_width 是权威；这个既是请求值，也是读不到响应时的兜底。
     /// 0.14 试过 800，实测不是带宽先崩：PC 挂 3 张目标脸只算到 3–8fps，手机上看到的就是卡。
     /// 0.19 起退回 640（实测 51–54KB/帧），让 PC 先跟上节奏；再要高清等 PC 那边算力跟上。
-    /// 0.22 仍是 640：这一版修的是忙闸吞掉页面自绘确认框，推流参数不动。
+    /// 0.23 仍是 640：这一版加「页面要改特征先停一下」的桥接动作，推流参数不动。
     static let fallbackMaxWidth = 640
 
-    static let appVersion = "0.22"
-    static let appBuild = "22"
+    static let appVersion = "0.23"
+    static let appBuild = "23"
 
     static let jpegQuality: CGFloat = 0.7
     static let pushFPS: Double = 15
@@ -465,6 +465,10 @@ enum LiveShim {
     static let hookCmdLog = "cmdlog"
     /// /get_playback_state 变了才报：前台按钮和后台状态对不上时，这里是两边的时间线。
     static let hookPageState = "pagestate"
+    /// 页面在推流中要改特征：先发这个动作，让原生按用户点「停止」的同一条握手
+    /// 把 PC 停下；页面自己轮询 /get_playback_state，确认 live_mode/edit_locked
+    /// 都落了再提交修改。不是按钮挂子，不进 actionNames（就绪对账只对按钮）。
+    static let hookStopForEdit = "stopedit"
     static let logButtonSelector = "#live-log-btn"
 
     /// 跳转没有按钮了：PC 撤掉了「设置视频路径」，现在由这一格的回车触发。

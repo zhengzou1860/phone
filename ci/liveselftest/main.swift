@@ -310,10 +310,15 @@ ck("账目 未知源不标", LivePerf.sourceLabel(0).isEmpty)
 
 ck("契约 在途上限3", LiveConfig.inflightLimit == 3)
 ck("契约 推送15fps", LiveConfig.pushFPS == 15.0)
-// 0.22 仍是 640：修忙闸吞确认框，推流参数这一版不动。
+// 0.23 仍是 640：这一版加「页面要改特征先停一下」，推流参数不动。
 ck("契约 请求宽640", LiveConfig.fallbackMaxWidth == 640)
-ck("契约 UA带版本", LiveConfig.userAgentSuffix == "LiveSwap/0.22"
-   && LiveConfig.appVersion == "0.22" && LiveConfig.appBuild == "22")
+ck("契约 UA带版本", LiveConfig.userAgentSuffix == "LiveSwap/0.23"
+   && LiveConfig.appVersion == "0.23" && LiveConfig.appBuild == "23")
+// 页面在推流中改特征时发的动作：是命令，不是按钮挂子，所以不进 actionNames
+//（就绪对账只该对页面里那三个按钮）。
+ck("契约 改特征先停动作", LiveShim.hookStopForEdit == "stopedit"
+   && !LiveShim.actionNames.contains(LiveShim.hookStopForEdit),
+   "\(LiveShim.hookStopForEdit) / \(LiveShim.actionNames)")
 ck("契约 质量0.7", LiveConfig.jpegQuality == 0.7)
 ck("契约 看门狗2500ms", LiveConfig.watchdogMs == 2500, "1500 太紧：收尾那一秒实测到过 1489")
 ck("契约 出帧判据500ms", LiveConfig.warmAgeMs == 500,

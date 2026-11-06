@@ -431,6 +431,29 @@ final class PageViewController: UIViewController {
         }
     }
 
+    /// 页面在推流中改了特征：先按用户点「停止」的同一条路把 PC 停下。
+    /// PC 的 edit_locked 只有 /live_stop 落地后才会放开；页面等它变 false 再提交修改，
+    /// 提交完停在停止态，等用户自己按「播放」。不是热改，流水线不会边跑边换 plan。
+    private func onStopForEdit() {
+        switch stopGate {
+        case .stopping:
+            AppLog.shared.log("ui", "页面要改特征：停止握手还在走，等它落地")
+            return
+        case .failed:
+            AppLog.shared.log("ui", "页面要改特征：上次停止没送到，重试一次")
+            sendStopAndSettle(report: nil)
+            return
+        case .idle:
+            break
+        }
+        guard phase == .pushing || phase == .paused else {
+            AppLog.shared.log("ui", "页面要改特征：原生没在推流，不用停")
+            return
+        }
+        stopPush("已停止推流：可以改特征了（再点「播放」接着推）",
+                 source: "页面要改特征，先停推流")
+    }
+
     /// 手机还没选片时点「播放」：先问 PC 手上有没有片。
     /// 剪辑页「用于换脸」会把路径交给 PC（/set_video），这时该由 PC 自己放，
     /// 页面原有的 /start_playback 就是那条路；只有 PC 也没片才弹手机相册。
@@ -597,8 +620,8 @@ final class PageViewController: UIViewController {
         }
     }
 
-    private func stopPush(_ note: String) {
-        AppLog.shared.log("ui", "用户点了停止（从 \(phaseName)）")
+    private func stopPush(_ note: String, source: String = "用户点了停止") {
+        AppLog.shared.log("ui", "\(source)（从 \(phaseName)）")
         pushGen += 1
         video.stop()
         AppLog.shared.log("frame", "停止：reader 已作废，暂停声音")
@@ -814,11 +837,16 @@ final class PageViewController: UIViewController {
             let outAge = client.outputAgeMs.map { String($0) } ?? "-"
             let best = client.bestSim.map { String(format: "%.2f", $0) } ?? "-"
             let thr = client.matchThr.map { String(format: "%.2f", $0) } ?? "-"
+            // 轮询慢一拍时这组只会是上一段的旧值；带上取样时刻，才不会被当成「现在」。
+            let sampledAt = client.statusAt.timeIntervalSince1970 < 1
+                ? "从未"
+                : String(format: "%.0fs 前", -client.statusAt.timeIntervalSinceNow)
             AppLog.shared.log("perf", "手机 \(String(format: "%.1f", fps))fps｜\(perf)"
                               + "｜编码失败 \(encFail)"
                               + "｜本地丢 \(client.framesDroppedLocal)｜PC拒 \(client.framesRejected)"
                               + "｜PC收 \(client.pcFramesIn) 预热丢 \(client.pcFramesDropped)"
                               + "｜in_age \(inAge) out_age \(outAge)"
+                              + "｜状态采样 \(sampledAt)"
                               + "｜plan \(client.planCount) swapped \(client.swappedFaces)"
                               + " best \(best) thr \(thr)")
         }
@@ -1072,6 +1100,8 @@ extension PageViewController: WKScriptMessageHandler {
             onPick()
         case LiveShim.hookPlay:
             onPlay()
+        case LiveShim.hookStopForEdit:
+            onStopForEdit()
         case LiveShim.hookSeek:
             onSeek()
         case LiveShim.hookFullscreen:
