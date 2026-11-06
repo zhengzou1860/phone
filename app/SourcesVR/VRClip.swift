@@ -563,10 +563,14 @@ final class VRAudioPass {
         }
         var rate = 0.0
         var ch = 0
-        if let fd = at.formatDescriptions.first as? CMFormatDescription,
-           let p = CMAudioFormatDescriptionGetStreamBasicDescription(fd) {
-            rate = Double(p.pointee.mSampleRate)
-            ch = Int(p.pointee.mChannelsPerFrame)
+        // formatDescriptions 交出来那份本来就是 CMFormatDescription，写条件转换在这套工具链里直接是编译错误。
+        // 音轨的这份必然是 CMAudioFormatDescription（不是它这条轨就压根不会被列为音频），所以强转取 ASBD。
+        if !at.formatDescriptions.isEmpty {
+            let fd = at.formatDescriptions[0] as! CMAudioFormatDescription
+            if let p = CMAudioFormatDescriptionGetStreamBasicDescription(fd) {
+                rate = Double(p.pointee.mSampleRate)
+                ch = Int(p.pointee.mChannelsPerFrame)
+            }
         }
         guard ch == 1 || ch == 2 else {
             VRJournal.line("音频 不搬：\(ch) 声道（这版只认 1、2 声道，重混没做）")
