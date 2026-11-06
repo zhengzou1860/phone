@@ -47,7 +47,9 @@ enum VROrientation {
         DispatchQueue.main.async {
             for scene in UIApplication.shared.connectedScenes {
                 guard let ws = scene as? UIWindowScene else { continue }
-                guard scene.session.role == UIWindowSceneSessionRoleApplication else { continue }
+                // 那个 C 常量在 Swift 侧已改名成 UISceneSession.Role.windowApplication（CI 报的）；
+                // 外部显示场景也在 connectedScenes 里，不认角色就会把几何更新发给错的那个
+                guard scene.session.role == .windowApplication else { continue }
                 ws.requestGeometryUpdate(.iOS(interfaceOrientations: want)) { e in
                     VRJournal.line("朝向 几何更新被拒 \(e.localizedDescription)")
                 }
