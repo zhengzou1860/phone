@@ -223,5 +223,7 @@ kernel void kSbsFish(texture2d<float, access::sample> src [[texture(0)]],
         dst.write(float4(0.0, 0.0, 0.0, 0.0), g);
         return;
     }
-    dst.write(src.sample(lin, float2(sx / float(W), sy / float(H))), g);
+    // uv 按整张纹理归一，所以 x 要先把「自家半幅」的局部列换回成片里的绝对列（base 就是左/右眼的起点）。
+    // 少加这个 base、或除数写成 W：每只眼都会把两只眼拼起来的整幅塞进自己那半个枕形 ⇒ 左右眼都是双图。
+    dst.write(src.sample(lin, float2((float(base) + sx) / float(P.SW), sy / float(H))), g);
 }
