@@ -528,7 +528,8 @@ final class VRFrameStream {
             videoSettings: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA])
         o.videoComposition = src.vc
         if seconds > 0.05 {
-            o.timeRange = CMTimeRange(start: CMTime(seconds: seconds, preferredTimescale: 600),
+            // timeRange 挂在 reader 上，不在 output 上（output 没这个属性，CI 报的）
+            r.timeRange = CMTimeRange(start: CMTime(seconds: seconds, preferredTimescale: 600),
                                       end: src.asset.duration)
         }
         r.add(o)

@@ -221,7 +221,7 @@ final class VRLive {
             }
             if fmtDesc == nil {
                 var fd: CMFormatDescription?
-                if CVVideoFormatDescriptionCreateForImageBuffer(allocator: kCFAllocatorDefault,
+                if CMVideoFormatDescriptionCreateForImageBuffer(allocator: kCFAllocatorDefault,
                                                                 imageBuffer: pb,
                                                                 formatDescriptionOut: &fd) == noErr {
                     fmtDesc = fd
@@ -453,11 +453,23 @@ final class VRLive {
 
     private func sample(_ pb: CVPixelBuffer, k: Int, fps: Double) -> CMSampleBuffer? {
         guard let fd = fmtDesc else { return nil }
-        var timing = CMSampleTimingInfo(duration: CMTime(value: 1, timescale: Int32(fps * 1000)),
-                                        presentationTimeStamp: CMTime(value: Int64(k), timescale: Int32(fps * 1000)),
+        let ts = Int32(max(1.0, fps * 1000.0))
+        var timing = CMSampleTimingInfo(duration: CMTime(value: 1, timescale: ts),
+                                        presentationTimeStamp: CMTime(value: Int64(k), timescale: ts),
                                         decodeTimeStamp: .invalid)
         var sb: CMSampleBuffer?
-        let st = CMSampleBufferCreateReady(kCFAllocatorDefault, nil, pb, fd, 1, &timing, 0, nil, &sb)
+        // 这个 C 函数的参数顺序是 时间戳在前、像素缓冲在最后（imageBuffer:），
+        // 照着 CMSampleBufferCreate 的位置写会把 pb 当成格式描述，CI 就是这么报的
+        let st = CMSampleBufferCreateReady(allocator: kCFAllocatorDefault,
+                                           dataBuffer: nil,
+                                           formatDescription: fd,
+                                           sampleCount: 1,
+                                           sampleTimingEntryCount: 1,
+                                           sampleTimingArray: &timing,
+                                           sampleSizeEntryCount: 0,
+                                           sampleSizeArray: nil,
+                                           imageBuffer: pb,
+                                           sampleBufferOut: &sb)
         return st == noErr ? sb : nil
     }
 
@@ -657,9 +669,9 @@ final class VRLiveView: UIView {
         playBtn.addTarget(self, action: #selector(tappedPlay), for: .touchUpInside)
         seekSl.addTarget(self, action: #selector(seekStart), for: .touchDown)
         seekSl.addTarget(self, action: #selector(seekMoved), for: .valueChanged)
-        seekSl.addTarget(self, action: #selector(seekEnd), for: [.touchUpInside, .touchUpOutside, .cancel])
+        seekSl.addTarget(self, action: #selector(seekEnd), for: [.touchUpInside, .touchUpOutside, .touchCancel])
         shiftSl.addTarget(self, action: #selector(shiftMoved), for: .valueChanged)
-        shiftSl.addTarget(self, action: #selector(shiftEnd), for: [.touchUpInside, .touchUpOutside, .cancel])
+        shiftSl.addTarget(self, action: #selector(shiftEnd), for: [.touchUpInside, .touchUpOutside, .touchCancel])
     }
 
     required init?(coder: NSCoder) { fatalError("这块不用 xib") }
