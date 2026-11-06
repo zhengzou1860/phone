@@ -100,7 +100,8 @@ struct SnoreFeature {
     var tonality: Double     // dB：最低频那一带的峰/均，鼾声是谐波堆⇒高
     var stability: Double    // 与上一帧五个频带向量的余弦相似（说话共振峰在跑⇒低）
     var modDepth: Double     // 最近 4 s 低频能量的起伏（dB）：steady 的冰箱嗡鸣靠它筛掉
-    var score: Double        // 0…1「频谱像鼾」的程度；是不是鼾要等 SnoreTracker 在那声响完后一起算（段长＋稳定＋邻鼾）
+    var score: Double        // 0…1「频谱像鼾」的程度（含响度那一项，且没过响度门的帧这里就是 0）；是不是鼾要等 SnoreTracker 在那声响完后一起算（段长＋稳定＋邻鼾）
+    var scoreNoGate: Double  // 0…1「只看频谱形状像不像鼾」，响度门不参与：给 −58 dBFS 以下那片盲区留的证据
     var voiced: Bool         // 高于本底门限的任何声音（鼾、说话、咳嗽都算）
 }
 
@@ -281,38 +282,44 @@ final class SnoreAnalyzer {
             modDepth = sqrt(v / Double(envRing.count))
         }
 
-        // ⑦ 门限与打分（频谱像不像鼾；「够不够一口气的长短」由 SnoreTracker 在那一声响完后算）
+        // ⑦ 门限与打分。
+        //
+        // 门只管「这帧算不算有声音」（⇒ 要不要开一声、要不要拿去判定），不管「频谱像不像鼾」。
+        // 老写法把两者绑在一起：过不了门的帧 score 恒 0 ⇒ 比 −58 dBFS 轻的那一晚将近九成时间
+        // 连「像不像鼾」都没被算过，于是「是不是因为太轻才漏判」这个问题在数据里根本问不出来
+        // （峰值都在 −58 以下、必然没过门的秒格：11-05 那晚 23 296 格、11-06 那晚 22 156 格，
+        //  占夜八成半到九成——这些格子里是「真安静」还是「轻鼾」，0.7 以前看不出来）。
+        // 现在两条分开：判定用的 score 一个数都不变（voiced 那一半还是原式），
+        // 另外留下一份不含响度的 scoreNoGate，让盲区里的声音自己说像不像鼾——为的是下一版
+        // 敢不敢把 absGateDb 从 −58 往下挪有数据可依，不是先猜。
         let gate = max(floorDb + 4.0, config.absGateDb)
         let voiced = level > gate
-        let score: Double
-        if voiced {
-            let sLevel = snoreClamp01((level - gate) / 12.0)
-            let sLow = snoreClamp01((lowRatio - 0.30) / 0.40)
-            let sTon = snoreClamp01((tonality - 3.0) / 9.0)
-            let sHi = snoreClamp01((0.55 - hiRatio) / 0.25)
-            let sStab = snoreClamp01((stability - 0.78) / 0.18)
-            let sMod = snoreClamp01((modDepth - 2.0) / 4.0)
-            let sFreq: Double
-            if peakHz < 30 {
-                sFreq = 0.0
-            } else if peakHz < 50 {
-                sFreq = (peakHz - 30.0) / 20.0
-            } else if peakHz <= 330 {
-                sFreq = 1.0
-            } else if peakHz <= 500 {
-                sFreq = (500.0 - peakHz) / 170.0
-            } else {
-                sFreq = 0.0
-            }
-            score = 0.20 * sLevel + 0.20 * sLow + 0.14 * sTon + 0.16 * sFreq
-                + 0.10 * sHi + 0.08 * sStab + 0.12 * sMod
+        let sLevel = snoreClamp01((level - gate) / 12.0)
+        let sLow = snoreClamp01((lowRatio - 0.30) / 0.40)
+        let sTon = snoreClamp01((tonality - 3.0) / 9.0)
+        let sHi = snoreClamp01((0.55 - hiRatio) / 0.25)
+        let sStab = snoreClamp01((stability - 0.78) / 0.18)
+        let sMod = snoreClamp01((modDepth - 2.0) / 4.0)
+        let sFreq: Double
+        if peakHz < 30 {
+            sFreq = 0.0
+        } else if peakHz < 50 {
+            sFreq = (peakHz - 30.0) / 20.0
+        } else if peakHz <= 330 {
+            sFreq = 1.0
+        } else if peakHz <= 500 {
+            sFreq = (500.0 - peakHz) / 170.0
         } else {
-            score = 0.0
+            sFreq = 0.0
         }
+        // 去掉响度那 0.20 的权重后自己归一 ⇒ 和 score 同一条 0…1，能直接跟判定线 0.60 比
+        let shapeOnly = 0.20 * sLow + 0.14 * sTon + 0.16 * sFreq + 0.10 * sHi + 0.08 * sStab + 0.12 * sMod
+        let scoreNoGate = shapeOnly / 0.80
+        let score = voiced ? snoreClamp01(0.20 * sLevel + shapeOnly) : 0.0
 
         return SnoreFeature(t: t, level: level, peak: peakDb, floor: floorDb, lowRatio: lowRatio,
                             hiRatio: hiRatio, peakHz: peakHz, tonality: tonality,
                             stability: stability, modDepth: modDepth,
-                            score: score, voiced: voiced)
+                            score: score, scoreNoGate: scoreNoGate, voiced: voiced)
     }
 }

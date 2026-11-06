@@ -73,9 +73,10 @@ final class SnoreNightStore {
     }
 
     func writeCurve() {
-        var s = "t0,maxDb,meanDb,snoreSec,vocalSec,maxScore,floorDb,stale\n"
+        var s = "t0,maxDb,meanDb,snoreSec,vocalSec,maxScore,floorDb,stale,maxScoreNoGate\n"
         for b in buckets {
-            s += "\(b.t0),\(f2(b.maxDb)),\(f2(b.meanDb)),\(f3(b.snoreSec)),\(f3(b.vocalSec)),\(f3(b.maxScore)),\(f2(b.floorDb)),\(b.stale ? 1 : 0)\n"
+            s += "\(b.t0),\(f2(b.maxDb)),\(f2(b.meanDb)),\(f3(b.snoreSec)),\(f3(b.vocalSec)),"
+                + "\(f3(b.maxScore)),\(f2(b.floorDb)),\(b.stale ? 1 : 0),\(f3(b.maxScoreNoGate))\n"
         }
         if let d = s.data(using: .utf8) { try? d.write(to: curveURL, options: .atomic) }
     }
@@ -126,14 +127,17 @@ final class SnoreNightStore {
             if first { first = false; continue }        // 表头
             let c = raw.split(separator: ",").map(String.init)
             guard c.count >= 8, let t0 = Int(c[0]) else { continue }
-            buckets.append(SnoreSecond(t0: t0,
-                                       maxDb: Double(c[1]) ?? -120,
-                                       meanDb: Double(c[2]) ?? -120,
-                                       snoreSec: Double(c[3]) ?? 0,
-                                       vocalSec: Double(c[4]) ?? 0,
-                                       maxScore: Double(c[5]) ?? 0,
-                                       floorDb: Double(c[6]) ?? -75,
-                                       stale: c[7] == "1"))
+            var b = SnoreSecond(t0: t0,
+                               maxDb: Double(c[1]) ?? -120,
+                               meanDb: Double(c[2]) ?? -120,
+                               snoreSec: Double(c[3]) ?? 0,
+                               vocalSec: Double(c[4]) ?? 0,
+                               maxScore: Double(c[5]) ?? 0,
+                               floorDb: Double(c[6]) ?? -75,
+                               stale: c[7] == "1")
+            // 第 9 列是 0.8 才加的：老晚上的 curve.csv 没有它，按「这一晚没记」处理（报告里那一行会写明）
+            if c.count >= 9 { b.maxScoreNoGate = Double(c[8]) ?? 0 }
+            buckets.append(b)
         }
     }
 

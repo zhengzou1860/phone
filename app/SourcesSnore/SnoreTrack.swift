@@ -37,6 +37,12 @@ struct SnoreSecond: Codable {
     var maxScore: Double     // 这一秒里最高的那次「逐帧频谱像鼾分」（0…1，不含节律：判定在收口时做）
     var floorDb: Double
     var stale: Bool          // 这一秒一个分析帧都没等到：引擎断了/被系统暂停，图上留白
+    /// 同一秒里「不看响度门」的那份频谱分的最大值（0…1）。响度门以下的秒这里照样有数，
+    /// 而 maxScore 是 0 —— 两者一比就是「这片时间是真安静，还是轻到门以下没敢判」。
+    ///
+    /// 这一列必须留在 CSV 的最后一格：curve.csv 按位置解析，老晚上的文件没有第 9 列，
+    /// 加在中间会把后面每一列都读错位。
+    var maxScoreNoGate: Double = 0
 }
 
 // MARK: - 判定单位是「一次发声」，不是「一帧」
@@ -200,6 +206,7 @@ final class SnoreTracker {
     private var secLevelSum = 0.0
     private var secLevelMax = -120.0
     private var secScoreMax = 0.0
+    private var secScoreNoGateMax = 0.0
     private var secFloor = -75.0
 
     init(frameSec: Double, config: SnoreConfig) {
@@ -529,6 +536,7 @@ final class SnoreTracker {
         secLevelSum += f.level
         if f.peak > secLevelMax { secLevelMax = f.peak }
         if f.score > secScoreMax { secScoreMax = f.score }
+        if f.scoreNoGate > secScoreNoGateMax { secScoreNoGateMax = f.scoreNoGate }
         secFloor = f.floor
         // 回填窗口之外的格子丢掉：再晚收口的声音也照不到它们（除非一整段十几秒的长响，
         // 那种判不成鼾，形状分先否了）
@@ -541,6 +549,7 @@ final class SnoreTracker {
         secLevelSum = 0.0
         secLevelMax = -120.0
         secScoreMax = 0.0
+        secScoreNoGateMax = 0.0
     }
 
     private func emitSecond(index: Int, stale: Bool) {
@@ -559,7 +568,8 @@ final class SnoreTracker {
                             vocalSec: min(1.0, vc),
                             maxScore: secScoreMax,
                             floorDb: secFloor,
-                            stale: stale)
+                            stale: stale,
+                            maxScoreNoGate: secScoreNoGateMax)
         // 整段都在这一格以前的，后面再没有格子会叠到它，扔了
         marks = marks.filter { $0.t1 > Double(index + 1) }
         recent[index] = b

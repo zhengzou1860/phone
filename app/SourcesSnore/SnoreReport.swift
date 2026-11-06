@@ -24,6 +24,11 @@ struct SnoreSummary {
     var peakDb: Double = -120
     var snoreMeanDb: Double = -120
     var floorMedianDb: Double = -120
+    var blindCells: Int = 0             // 「频谱过了盲区线、可整秒一帧都没过响度门」的秒格数
+    var blindBaseline: Double = 0       // 门以下那些秒自己的频谱分中位（= 这一晚的本底打多少分）
+    var blindPeakDb: Double = -120      // 盲区秒格里最响的那一格的峰值（dBFS）
+    var blindHasColumn = false          // 这一晚的记录里有没有 maxScoreNoGate 那一列（0.8 以前的晚上没有）
+    var gateDb: Double = -58            // 报告里把门限本身也写出来，读的人才知道「盲区」是从哪条线往下的
     var staleSec: Int = 0               // 没数据的秒（引擎断过、被系统暂停过）
     var grade: String = "—"
     var tooShort = false                // 不足 1 分钟的场次：占比和分级不给（试录半分钟不该被判成「中度鼾」，
@@ -41,6 +46,14 @@ struct SnoreSummary {
 }
 
 enum SnoreAnalyze {
+    /// 盲区线：门以下那些秒要「频谱分至少这么高」才被数成「可能有轻鼾被门挡住了」。
+    ///
+    /// 这条线不能就用判定线 0.60。频谱那几项全是比例，跟响度无关，门以下少了 sLevel 那一票照样能凑分：
+    /// 合成床噪（本底 −84 dBFS）115 个秒格的格子最大分是 p50 0.65／p90 0.69／天花板 0.72，
+    /// 而比 −58 轻 8 dB 的合成鼾是 p10 0.79／中位 1.00。0.75 是这两堆中间那条缝，
+    /// 不是拍脑袋——CI 用例⑫两头都钉着（轻鼾抓到 ≥60%、纯本底误报 ≤10%）。
+    static let blindBar = 0.75
+
     static func summarize(buckets: [SnoreSecond], events: [SnoreEvent], config: SnoreConfig) -> SnoreSummary {
         let bouts = events.filter { $0.kind == .bout }
         let gaps = events.filter { $0.kind == .gap }
@@ -52,19 +65,36 @@ enum SnoreAnalyze {
         var floors: [Double] = []
         var peak = -120.0
         var stale = 0
+        var blind: [Double] = []         // 门以下那些「频谱过盲区线」的秒的峰值
+        var belowGate: [Double] = []     // 门以下所有秒的频谱分（不看响度那一份）：这一晚本底自己的分数
+        var noGateSeen = 0
         for b in buckets {
             if b.stale { stale += 1; continue }
             snoreSec += b.snoreSec
             levels.append(b.maxDb)
             if b.floorDb > -119 { floors.append(b.floorDb) }
             if b.maxDb > peak { peak = b.maxDb }
+            if b.maxScoreNoGate > 0 { noGateSeen += 1 }
+            // 「整秒没一帧过门」看 maxScore 是不是 0：0.8 起 score 只在过门的帧上算，所以 0 就是
+            // 「这一秒连一次都没够着门」；配上 maxScoreNoGate 才知道这一秒的频谱到底像不像鼾。
+            if b.maxScore == 0 {
+                belowGate.append(b.maxScoreNoGate)
+                if b.snoreSec == 0 && b.vocalSec == 0 && b.maxScoreNoGate >= SnoreAnalyze.blindBar {
+                    blind.append(b.maxDb)
+                }
+            }
         }
+        s.blindCells = blind.count
+        s.blindPeakDb = blind.max() ?? -120
+        s.blindBaseline = snoreMedian(belowGate) ?? 0
+        s.blindHasColumn = noGateSeen > 0
         s.staleSec = stale
         s.snoreSec = snoreSec
         s.tooShort = s.totalSec <= 60
         s.coverage = s.tooShort ? 0 : snoreSec / max(1.0, Double(buckets.count - stale))
         s.peakDb = peak
         s.floorMedianDb = snorePercentile(floors, 0.5) ?? -120
+        s.gateDb = max(s.floorMedianDb + 4.0, config.absGateDb)
         s.grade = s.tooShort ? "" : gradeText(s.coverage)
 
         // 鼾声期间的响度：只取那些确有鼾的秒，本底和翻身不该拉低这个数
@@ -72,8 +102,8 @@ enum SnoreAnalyze {
         s.snoreMeanDb = snoreLevels.isEmpty ? -120 : snoreMean(snoreLevels)
 
         s.boutCount = bouts.count
-        // 「停住到收尾都没复鼾」的那一条不进【疑似中断】的计数：它多半是起了床、停止记录，
-        // 而不是呼吸停住。0.6 那晚就有一条 14 min 33 s 的挂在中断统计里，把最长和次/小时都带跑。
+        // 「停住到收尾都没复鼾」的那一条不进【疑似中断】的计数：那是鼾自己停了（不打了、或停止记录），
+        // 不是呼吸停住。0.6 那晚就有一条 14 min 33 s 的挂在中断统计里，把最长和次/小时都带跑。
         let gapsOn = gaps.filter { !$0.unresolved }
         s.gapCount = gapsOn.count
         s.unresolvedCount = gaps.count - gapsOn.count
@@ -166,16 +196,18 @@ enum SnoreAnalyze {
         }
         lines.append("【响度】峰值 \(SnoreCalib.text(s.peakDb, config))｜鼾声期均值 \(SnoreCalib.text(s.snoreMeanDb, config))"
                      + "｜本底中位 \(SnoreCalib.text(s.floorMedianDb, config))")
+        if !s.tooShort { lines.append(contentsOf: blindLines(s, config)) }
         lines.append("")
         lines.append("【疑似中断】≥\(Int(config.interruptGapSec)) s 的鼾声停住：\(s.gapCount) 次，"
                      + "每小时 \(String(format: "%.1f", s.gapsPerHour)) 次")
         lines.append("　　　　　最长 \(snoreDurText(s.longestGap))，平均 \(snoreDurText(s.meanGap))；"
                      + "其中 \(s.arousalCount) 次以明显更响的复鼾结束")
         if s.unresolvedCount > 0 {
-            // 这几条只列在【中断明细】里，不进上面那些数：停住到收尾都没复鼾，
-            // 十有八九是鼾段本来结束了、或者人起床停止记录，不是呼吸停住。
-            lines.append("　　　　　另有 \(s.unresolvedCount) 次停住到收尾都没复鼾，不算进中断统计"
-                         + "（多半是鼾段结束或起床，见【中断明细】里标「未复鼾」的那几条）")
+            // 这几条只列在【中断明细】里，不进上面那些数。措辞别写成「起床」：用户是整晚睡到醒的，
+            // 0.6 那晚那句「多半是鼾段结束或起床」直接把人的记录带偏了——这里唯一站得住的说法是
+            // 「鼾自己停了，一直到停止记录都没再出现」，为什么停交给手表/人来对，不在这里猜。
+            lines.append("　　　　　另有 \(s.unresolvedCount) 条是鼾自己停了：一直到停止记录都没再出现鼾，"
+                         + "不算进中断统计（见【中断明细】里标「未复鼾」的那几条）")
         }
         lines.append("【其他发声】说话/咳嗽样 \(s.vocalCount) 次")
         lines.append("【看一眼】\(advice(s, config))")
@@ -227,8 +259,9 @@ enum SnoreAnalyze {
         lines.append("  · 判鼾按「一声」来判：声音一收口（安静满 0.3 s）就结一次账，这一声要同时过三关——"
                      + "时长像一次呼吸里的鼾（零点几秒到两秒）、频谱形状过判定线、声内频率稳得住（说话会滑来滑去，过不了）。"
                      + "过了还得跟最近的上一声配成对（间隔 1–10 s，一鼾一口气）；实在响得离谱才允许单独算鼾。")
-        lines.append("  · 这套口径认「一鼾一口气」的稀鼾，也认得密鼾；代价是持续的嗡鸣、空调声、单独一两声咳嗽都不算鼾，"
-                     + "极轻或隔着被子的鼾可能整段漏判。")
+        lines.append("  · 这套口径认「一鼾一口气」的稀鼾，也认得密鼾；代价是持续的嗡鸣、空调声、单独一两声咳嗽都不算鼾。")
+        lines.append("  · 响度门（本底+4 与 \(String(format: "%.0f", config.absGateDb)) dBFS 取大）以下的声音还是不判成鼾——"
+                     + "隔着被子、离得远的那种极轻鼾会漏。0.8 起门以下的频谱照样要评，漏多少看【轻鼾盲区】那一行。")
         lines.append("  · 距离、枕头、体位、同床者翻身都会改变读数；本 App 统计的是「采到的声音」，不是「你打得多厉害」的绝对量。")
         lines.append("  · 真要看有没有睡眠呼吸暂停，去做多导睡眠监测（PSG）或医生开的便携睡眠呼吸监测。")
         if !facts.isEmpty {
@@ -237,6 +270,34 @@ enum SnoreAnalyze {
             for f in facts { lines.append("  " + f) }
         }
         return lines.joined(separator: "\n")
+    }
+
+    /// 「响度门以下那一片究竟有没有鼾」这两行。
+    ///
+    /// 判定单位换到「一声」以后，剩下的最大不确定性不是算法，是门：门 = max(本底+4, absGateDb)，
+    /// 本底整晚 −85 上下 ⇒ 门死在 −58 dBFS，比它轻的声音以前连频谱都不评（0.5/0.6 那两晚想查
+    /// 「是不是太轻才漏判」，数据里根本问不出来——那些秒的分数就是 0，而 0 分不清「安静」和「没评」）。
+    /// 0.8 起打分跟门脱钩：门以下照样算一份不看响度的频谱分，这里就能把三种情况分开：
+    /// ①这一晚的记录里没这一列（0.8 以前）②门以下确实只有本底 ③门以下有一堆像鼾的轻声音。
+    static func blindLines(_ s: SnoreSummary, _ config: SnoreConfig) -> [String] {
+        guard s.blindHasColumn else {
+            return ["【轻鼾盲区】这一晚的记录里没有「不看响度门的频谱分」那一列（0.8 以前的晚上不评），"
+                    + "比门还轻的声音在这一晚的数据里看不了。"]
+        }
+        let gate = String(format: "%.0f", s.gateDb)
+        let bar = String(format: "%.2f", SnoreAnalyze.blindBar)
+        if s.blindCells == 0 {
+            return ["【轻鼾盲区】比响度门（\(gate) dBFS）还轻、频谱分却过了 \(bar) 的秒：0 s"
+                    + "｜门以下那一片的频谱分中位只有 \(String(format: "%.2f", s.blindBaseline))（就是本底）"
+                    + " ⇒ 这一晚的门没挡住鼾，轻的那头没什么可捞的。"]
+        }
+        let pct = 100.0 * Double(s.blindCells) / max(1.0, s.totalSec - Double(s.staleSec))
+        return ["【轻鼾盲区】比响度门（\(gate) dBFS）还轻、频谱分却过了 \(bar) 的秒：\(s.blindCells) s"
+                + "（占夜 \(String(format: "%.1f", pct))%）｜这些秒里最响 \(SnoreCalib.text(s.blindPeakDb, config))"
+                + "｜门以下整片的频谱分中位 \(String(format: "%.2f", s.blindBaseline))",
+                "　　　　　这条线画在判定线（\(String(format: "%.2f", config.enterScore))）之上是有原因的：频谱那几项都是比例，"
+                    + "本底噪声自己就能拿 0.65~0.72。上面那个中位数就是这一晚的本底分，只有明显高过它的秒才算证据。"
+                    + "连着几晚这一堆都不小，才谈把门往下挪一档（−63／−68）再对照着记。"]
     }
 
     /// 一句「接下来做什么」。界面上顶在第一行，报告里跟着【看一眼】。

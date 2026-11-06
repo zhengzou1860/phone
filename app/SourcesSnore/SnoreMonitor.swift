@@ -428,8 +428,10 @@ final class SnoreMonitor: NSObject, ObservableObject {
             s += "【meta.json】\n" + (meta.isEmpty ? "（读不到）\n" : meta)
             s += "\n【report.txt】\n" + (reportText.isEmpty ? "（这一晚没报告文本；数字看下面两份原始数据）\n" : reportText)
             s += "\n【events.jsonl】一行一个事件，t0/t1 是会话内第几秒\n" + (eventsText.isEmpty ? "（没有事件）\n" : eventsText)
-            s += "\n【curve.csv】t0,maxDb,meanDb,snoreSec,vocalSec,maxScore,floorDb,stale"
-              + "（maxScore＝这一秒里最高的逐帧频谱像鼾分，不含形状/邻鼾那两关；判定在一声响完后才做）\n" + curve
+            s += "\n【curve.csv】t0,maxDb,meanDb,snoreSec,vocalSec,maxScore,floorDb,stale,maxScoreNoGate"
+              + "（maxScore＝这一秒里最高的逐帧频谱像鼾分，不含形状/邻鼾那两关，判定在一声响完后才做；"
+              + "maxScoreNoGate＝同一秒里不看响度门的那份频谱分——0.8 起才有这一列，"
+              + "maxScore 为 0 而这一列过判定线，就是「轻到门以下、没敢判」的那片）\n" + curve
             return s
         }
     }

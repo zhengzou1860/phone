@@ -435,6 +435,39 @@ enum SnoreCases {
                                        detail: String(format: "发作 %d 段（要 ≥1）／鼾声占 %.1f%%（要 >3%%）／中断 %d（要 0）／节律 %.1f 次/分（7 s 一鼾＝8.6）",
                                                       bouts.count, cov * 100, gaps.count, med)))
         }
+
+        // ⑫ 比响度门还轻的鼾：还是不判成鼾（判定一个字没改），但曲线上要留下「频谱像鼾」的证据。
+        //    0.8 把打分跟门脱钩，守的就是这两头：
+        //      证据那头少了 ⇒ 下一版想决定「absGateDb 要不要从 −58 往下挪」仍然没数据可依；
+        //      判定那头多了 ⇒ 本底噪声开始冒充鼾，那一行【轻鼾盲区】就废了。
+        //    0.004 这份合成鼾的峰值在 −52 dBFS 上下、整段一帧都过不了 −58 的门（见 ⑪ 同形状但响 20 倍）。
+        //    盲区线 0.75 不是判定线：频谱那几项都是比例，纯本底也能拿 0.65~0.72，所以两头分开各数一遍。
+        do {
+            var s = SnoreSynth.bed(count: Int(sr * 60), level: 0.0006, seed: 101)
+            SnoreSynth.add(&s, SnoreSynth.snore(count: s.count, sampleRate: sr, periodSec: 3.0,
+                                                f0: 140, level: 0.004, startAt: 8.0, seed: 7))
+            let r = SnoreTracker(frameSec: 4096.0 / sr, config: config)
+            let got = run(samples: s, sampleRate: sr, config: config, into: r)
+            let bouts = got.events.filter { $0.kind == .bout }
+            let snoreCells = got.seconds.reduce(0.0) { $0 + $1.snoreSec }
+
+            /// 门以下（这一秒没一帧过门 ⇒ maxScore 是 0）的秒里，频谱分过盲区线的有几格
+            func overBar(_ lo: Int, _ hi: Int) -> (hit: Int, cells: Int) {
+                let cells = got.seconds.filter { $0.t0 >= lo && $0.t0 < hi && $0.maxScore == 0 }
+                return (cells.filter { $0.maxScoreNoGate >= SnoreAnalyze.blindBar }.count, cells.count)
+            }
+            let quiet = overBar(10, 55)      // 轻鼾那一段（整段都在门以下）
+            let bedOnly = overBar(1, 8)      // 鼾还没来：这一段只有本底，不许冒充证据
+            let ok = bouts.isEmpty && snoreCells == 0
+                && quiet.cells >= 30 && Double(quiet.hit) >= 0.60 * Double(quiet.cells)
+                && Double(bedOnly.hit) <= 0.15 * Double(max(1, bedOnly.cells))
+            out.append(SnoreCaseResult(name: "门以下的轻鼾：不判成鼾，但要留下频谱证据", ok: ok,
+                                       detail: String(format: "发作 %d 段／鼾秒 %.1f s（都要 0：门还是那道门）"
+                                                        + "｜轻鼾段里频谱过盲区线 %.2f 的秒 %d/%d（要 ≥60%%）"
+                                                        + "｜纯本底段误报 %d/%d（要 ≤15%%）",
+                                                        bouts.count, snoreCells, SnoreAnalyze.blindBar,
+                                                        quiet.hit, quiet.cells, bedOnly.hit, bedOnly.cells)))
+        }
         return out
     }
 
