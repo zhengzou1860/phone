@@ -161,11 +161,26 @@ enum VRSound {
     @discardableResult
     static func enable(_ tag: String) -> Bool {
         let s = AVAudioSession.sharedInstance()
+        // 一档一档往下试，越往下越素：11-06 15:34 实测这一整套（.playback + moviePlayback + defaultToSpeaker）
+        // 当场回 Code=-50，而类别其实已经翻成 Playback 了——分不清是 mode 还是 options 被拒，
+        // 所以每一档的错都单独留一行，配上就收手。
+        let tries: [(String, () throws -> Void)] = [
+            ("category+mode+defaultToSpeaker",
+             { try s.setCategory(.playback, mode: .moviePlayback, options: [.defaultToSpeaker]) }),
+            ("category+mode",
+             { try s.setCategory(.playback, mode: .moviePlayback) }),
+            ("只有 category",
+             { try s.setCategory(.playback) }),
+        ]
         var err = ""
-        do {
-            try s.setCategory(.playback, mode: .moviePlayback, options: [.defaultToSpeaker])
-        } catch {
-            err = "setCategory 抛错 \(error)"
+        var hit = ""
+        for (name, one) in tries {
+            do {
+                try one(); hit = name; err = ""; break
+            } catch {
+                VRJournal.line("声音 \(tag) 档「\(name)」被拒 \(error)")
+                err = "三档 setCategory 全被拒，最后一次 \(error)"
+            }
         }
         if err.isEmpty {
             do {
@@ -175,7 +190,7 @@ enum VRSound {
             }
         }
         let on = err.isEmpty
-        VRJournal.line("声音 \(tag) 起用 .playback \(on ? "成" : "败")"
+        VRJournal.line("声音 \(tag) 起用 .playback \(on ? "成（\(hit)）" : "败")"
             + (on ? "" : "：\(err)")
             + "｜现在这条 \(s.category.rawValue)")
         return on

@@ -90,7 +90,9 @@ final class VRLive {
     private var showPBs: [CVPixelBuffer] = []
     private var fmtDesc: CMFormatDescription?
     private var layer: AVSampleBufferDisplayLayer?
-    private var audio: AVAudioPlayer?
+    /// 声音：只能走 AVPlayer。AVAudioPlayer 认的是 CAF/WAV/MP3/M4A 这类纯音频文件，
+    /// 相册里这条是 .mov（QuickTime 容器），0.18/0.19 两次日志都是「AVAudioPlayer 建不出来」⇒ 那不是类别没配，是这个类压根读不了。
+    private var audio: AVPlayer?
     private weak var label: UILabel?
 
     private var note = ""
@@ -148,7 +150,7 @@ final class VRLive {
         let hold = isPausedNow
         DispatchQueue.main.async { [weak self] in
             guard let s = self, let a = s.audio else { return }
-            a.currentTime = t
+            a.seek(to: CMTime(seconds: t, preferredTimescale: 600), completionHandler: nil)
             if !hold { a.play() }
         }
     }
@@ -243,8 +245,13 @@ final class VRLive {
             handPB = b
         }
         // 显示缓冲按轮转用固定的 6 份：每帧新造的话，纹理缓存里会一份一份攒着不回来（全片实测 1.65 MB/帧）
+        // ⚠️ 上屏这一份的宽不跟 s.frameW 走：实时那条是形变把两只眼并排写出来，宽 = 每眼 ×2；
+        // 只有 sbs 那条整幅本来就带着两只眼。0.18 我把这里统一写成 s.frameW（=每眼宽），
+        // VRWarp 照样按 2×每眼 去建纹理，手上却是半宽的缓冲 ⇒ 第 1 帧就 -6684，整页退回主页像闪退（11-06 15:34 实测）。
+        let outW = sbs ? s.frameW : s.eyeW * 2
+        let outH = sbs ? s.frameH : s.eyeH
         for _ in 0..<6 {
-            guard let pb = VRTech.pixelBuffer(width: s.frameW, height: s.frameH).pb else {
+            guard let pb = VRTech.pixelBuffer(width: outW, height: outH).pb else {
                 return "显示缓冲造不出来（已造 \(showPBs.count) 份）"
             }
             if fmtDesc == nil {
@@ -263,14 +270,9 @@ final class VRLive {
         dLock.lock()
         shiftPct = Float(max(-0.12, min(0.12, VRLive.storedShiftPct)))
         dLock.unlock()
-        // 声音尽力而为：读不出来（没音轨或格式不认）就退回墙钟，画面照走
-        if let ap = try? AVAudioPlayer(contentsOf: url) {
-            let ready = ap.prepareToPlay()
-            audio = ap
-            VRJournal.line("声音 AVAudioPlayer 建好 时长\(String(format: "%.1f", ap.duration))s"
-                + " 声道\(Int(ap.numberOfChannels)) 备播\(ready ? "成" : "败")")
-        } else {
-            VRJournal.line("声音 AVAudioPlayer 建不出来（这条没音轨或格式不认），走墙钟")
+        // 声音尽力而为：起不来就退回墙钟，画面照走
+        if let p = soundPlayer() {
+            audio = p
         }
         let audioName = audio == nil ? "没有（走墙钟）" : "接上（走声钟）"
         let shiftName = String(format: "%+.1f", Double(shiftPct) * 100)
@@ -439,15 +441,34 @@ final class VRLive {
         finish("")
     }
 
+    /// 用 AVPlayer 出这条片子的声音：不挂 AVPlayerLayer 就是不画视频，只出声，
+    /// 画面仍由我们自己那条解码器管。音轨在不在、时长多少都留一行账，好跟「类别没配上」分清。
+    private func soundPlayer() -> AVPlayer? {
+        let asset = AVURLAsset(url: url)
+        let na = asset.tracks(withMediaType: .audio).count
+        let d = CMTimeGetSeconds(asset.duration)
+        guard na > 0 else {
+            VRJournal.line("声音 这条没有音轨（音频轨 0 条），走墙钟")
+            return nil
+        }
+        let p = AVPlayer(url: url)
+        p.isMuted = false
+        VRJournal.line("声音 AVPlayer 起用 音频轨 \(na) 条 素材时长"
+            + "\(String(format: "%.1f", d.isNumeric ? d : -1)) s")
+        return p
+    }
+
     /// 起音频。这一步能不能出声是这版最要紧的一件事，所以每一支都留一行账：
-    /// 类别没配上（VRSound 那行）、player 没建起来（setup 那行）、play() 返回假（这行）三样分开看。
+    /// 类别没配上（VRSound 那行）、player 没建起来（soundPlayer 那行）、play() 后 rate 还是 0（这行）三样分开看。
     private func playAudio() {
-        guard let a = audio else {
+        guard let p = audio else {
             VRJournal.line("声音 没有 player，这一条走墙钟")
             return
         }
-        a.play()
-        VRJournal.line("声音 play() 返回 \(a.isPlaying ? "真，在放" : "假，没放起来")")
+        p.play()
+        let at = CMTimeGetSeconds(p.currentTime())
+        VRJournal.line("声音 play() 后 rate \(p.rate) 位置 \(String(format: "%.2f", at.isNumeric ? at : -1)) s"
+            + " 静音\(p.isMuted ? "是" : "否")")
     }
 
     /// 拖进度落到解码器上：重开 reader、两种钟都对到新起点、把屏上的旧样本冲掉
@@ -468,10 +489,11 @@ final class VRLive {
         clock0 = DispatchTime.now().uptimeNanoseconds
         lay.flush()
         if !hold {
-            audio?.currentTime = t
+            audio?.seek(to: CMTime(seconds: t, preferredTimescale: 600), completionHandler: nil)
             playAudio()
         }
-        let acPos = String(format: "%.1f", audio?.currentTime ?? -1)
+        let acSec = audio.map { CMTimeGetSeconds($0.currentTime()) } ?? -1
+        let acPos = String(format: "%.1f", acSec.isNumeric ? acSec : -1)
         let tPos = String(format: "%.1f", t)
         VRJournal.line("实时 拖到 \(tPos) s（声钟 \(acPos) s）")
         return true
@@ -539,7 +561,7 @@ final class VRLive {
         return st == noErr ? sb : nil
     }
 
-    /// 有声音跟声钟，没声音跟墙钟。落后了就继续走（顺序解码器seek 一次 54 ms，不划算），滞后写进统计。
+    /// 有声音跟声钟，没声音跟墙钟。落后了就继续走（顺序解码器 seek 一次 54 ms，不划算），滞后写进统计。
     /// 两边都对到 t0sec 这个起点上：拖完进度 t0sec 变了，暂停那段由 pausedAccum 扣掉。
     private func pace(k: Int, fps: Double) {
         dLock.lock()
@@ -548,8 +570,13 @@ final class VRLive {
         dLock.unlock()
         let target = base + Double(k) / fps
         let now: Double
-        if let a = audio, a.isPlaying { now = a.currentTime }
-        else { now = base + Double(DispatchTime.now().uptimeNanoseconds &- clock0) / 1_000_000_000.0 - acc }
+        // rate>0 才算在放（AVPlayer 播到头 rate 归 0，那时退回墙钟，别让画面卡在最后一帧等一个不来的钟）
+        if let p = audio, p.rate > 0 {
+            let s = CMTimeGetSeconds(p.currentTime())
+            now = s.isNumeric ? s : target
+        } else {
+            now = base + Double(DispatchTime.now().uptimeNanoseconds &- clock0) / 1_000_000_000.0 - acc
+        }
         let ahead = target - now
         if ahead > 0.001 { Thread.sleep(forTimeInterval: min(ahead, 0.25)) }
     }
@@ -586,7 +613,9 @@ final class VRLive {
 
     private func finish(_ extra: String) {
         requestStop()
-        audio?.stop()
+        // AVPlayer 没有 stop()：pause 完再撒手，让那条音频解码器跟着释放
+        audio?.pause()
+        audio = nil
         if let lay = layer { lay.flush() }
         let wall = Double(DispatchTime.now().uptimeNanoseconds - clock0) / 1_000_000_000.0
         dLock.lock()
