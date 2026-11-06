@@ -155,7 +155,8 @@ ck("挂子 三条都有名字", LiveShim.actionNames == [LiveShim.hookPick, Live
    "\(LiveShim.actionNames)")
 ck("挂子 名字是页面里那几个", LiveConfig.bridgeName == "livebridge")
 ck("脚本 占位符全替换掉了", !shim.contains("__HOOKS__") && !shim.contains("__BRIDGE__")
-   && !shim.contains("__SEEK__") && !shim.contains("__FULLSCREEN__"))
+   && !shim.contains("__SEEK__") && !shim.contains("__FULLSCREEN__")
+   && !shim.contains("__STOPPING__") && !shim.contains("__FAILED__"))
 for hook in LiveShim.hooks {
     // 脚本里注入的是 JSON 字面量（选择器带引号），所以按编码后的形态找
     ck("脚本 带挂子 \(hook.name)",
@@ -181,6 +182,26 @@ ck("脚本 全屏不再克隆第二路流", !shim.contains("fullscreen-video"),
    "0.11 起页面只用 html.fs 铺满，同一路 #video-stream")
 ck("脚本 全屏态上报原生", shim.contains("action: FS") && LiveShim.hookFullscreen == "fullscreen",
    "原生靠它藏/恢复状态栏")
+
+// 停止握手：点停止到 PC 确认之间，按钮和特征下拉框必须一直锁着；
+// /live_stop 没送到就停在 failed，不许假装停了——那正是用户撞 409 的那条路。
+ck("停止 按下即锁", LiveStopGate.stopping.blocksPlay && LiveStopGate.stopping.holdsEditingLock)
+ck("停止 失败仍锁", LiveStopGate.failed.blocksPlay && LiveStopGate.failed.holdsEditingLock)
+ck("停止 待命才放开", !LiveStopGate.idle.blocksPlay && !LiveStopGate.idle.holdsEditingLock)
+var gate = LiveStopGate.idle
+gate.begin()
+ck("停止 进停止中", gate == .stopping)
+gate.settle(ok: false)
+ck("停止 没送到停在失败", gate == .failed && gate.holdsEditingLock)
+gate.begin()
+gate.settle(ok: true)
+ck("停止 确认成功回待命", gate == .idle)
+ck("停止 脚本有握手法", shim.contains("setStopPending"))
+ck("停止 握手中拦轮询", shim.contains("if (STOP_HOLD)"),
+   "轮询读到的是 PC 上一秒的状态，不许把「停止中…」改回「停止」")
+ck("停止 状态字进脚本", shim.contains(LiveShim.jsLiteral(LiveStopGate.stoppingState))
+   && shim.contains(LiveShim.jsLiteral(LiveStopGate.failedState)))
+ck("停止 两个状态字不同", LiveStopGate.stoppingState != LiveStopGate.failedState)
 ck("桥名 进度条独立", LiveConfig.seekBridgeName == "liveSeek"
    && LiveConfig.seekBridgeName != LiveConfig.bridgeName)
 ck("转义 引号反斜杠", LiveShim.jsLiteral("a\"b\\c") == "\"a\\\"b\\\\c\"",

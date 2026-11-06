@@ -60,6 +60,14 @@ final class PageViewController: UIViewController {
     /// 免得后台的 startLive 回来把用户刚停掉的流又 resurrect 起来。
     private var pushGen = 0
 
+    /// 停止握手：点停止到 PC 确认之间，按钮和特征下拉框都锁着；没送到就停在 failed。
+    private var stopGate: LiveStopGate = .idle
+    /// 还在飞的那次 /live_stop。重开推流前必须先等它落地，否则停止可能后到、
+    /// 把刚开起来的新一轮推流又关掉。
+    private var pendingStop: Task<Bool, Never>?
+    /// 每次停/重开都自增：旧的完成回调凭它认出自己已经作废。
+    private var stopGen = 0
+
     // MARK: - 生命周期
 
     override func viewDidLoad() {
@@ -122,9 +130,7 @@ final class PageViewController: UIViewController {
         resumeSeconds = clampSeconds(CMTimeGetSeconds(video.currentPTS))
         stopMeter()
         phase = .paused
-        let c = client
-        Task { await c?.stopLive() }
-        status("手机退到后台，已停推流；回前台会自己接着推")
+        sendStopAndSettle(report: "手机退到后台，已停推流；回前台会自己接着推")
     }
 
     /// 回前台先问一次 /live_status：PC 那 10 秒空闲看门狗多半已经把推流模式关掉了。
@@ -134,6 +140,9 @@ final class PageViewController: UIViewController {
         let from = resumeSeconds
         let gen = pushGen
         Task { @MainActor in
+            // 退后台那一笔停止可能还在飞：先等它落地再问状态，
+            // 否则拿旧读数决定 needStart，停止可能后到把新一轮推流又关掉。
+            if let flying = self.pendingStop { _ = await flying.value }
             guard gen == self.pushGen else { return }
             let snap = await client.fetchStatusOnce()
             guard gen == self.pushGen else { return }
@@ -195,9 +204,7 @@ final class PageViewController: UIViewController {
             self.stopMeter()
             self.pushSeek(cur: 0, total: 0)
             let avg = self.client?.averageFrameBytes ?? 0
-            let c = self.client
-            Task { await c?.stopLive() }
-            self.status(avg > 0
+            self.sendStopAndSettle(report: avg > 0
                 ? "这一段推完了：再点「播放」从头重推，或选另一段；上行均值 \(max(1, avg / 1024)) KB/帧"
                 : "这一段推完了：再点「播放」从头重推，或选另一段")
         }
@@ -219,6 +226,11 @@ final class PageViewController: UIViewController {
         c.attachCookieStore(webView.configuration.websiteDataStore.httpCookieStore)
         client = c
         pushGen += 1
+        // 旧主机的停止请求还可能在飞：它属于上一个 client，这里不再等；新页面加载完
+        // 会自己按 PC 的状态刷按钮和下拉框，握手锁必须先清掉。
+        stopGen += 1
+        pendingStop = nil
+        stopGate = .idle
         // 换地址可能发生在推流中：旧 reader 会继续往新 client 发帧（没 /live_start 只会吃 409），
         // 声音也得一起停。
         video.stop()
@@ -334,6 +346,18 @@ final class PageViewController: UIViewController {
     }
 
     private func onPlay() {
+        // 停止握手没走完，这颗按钮不许把推流又开起来：stopping 时它是灰的，
+        // 正常点不到；failed 时它写着「重试停止」，点了就再送一次停止。
+        switch stopGate {
+        case .stopping:
+            status(LiveStopGate.stoppingNote)
+            return
+        case .failed:
+            sendStopAndSettle(report: nil)
+            return
+        case .idle:
+            break
+        }
         switch phase {
         case .pushing:
             stopPush("已停止推流（再点一次「播放」接着推）")
@@ -379,6 +403,9 @@ final class PageViewController: UIViewController {
                : "\(reason)：PC 还在推流模式，直接接着出帧…")
 
         Task { @MainActor in
+            // 上一笔 /live_stop 还没落地就开新一轮：停止可能后到，把刚开的推流又关掉。
+            if let flying = self.pendingStop { _ = await flying.value }
+            guard gen == self.pushGen else { return }
             if needStart {
                 do {
                     let w = try await client.startLive()
@@ -395,10 +422,17 @@ final class PageViewController: UIViewController {
             guard self.video.start(from: CMTime(seconds: seconds, preferredTimescale: 600)) else {
                 self.phase = .loaded
                 self.stopMeter()
-                if needStart { await client.stopLive() }
+                // 推流模式已经开起来了却出不了帧：把它停回去。走握手是因为停止也可能失败，
+                // 失败时界面得停在「重试停止」，不能假装 PC 已经停了。
+                if needStart {
+                    self.sendStopAndSettle(report: "这一段没能起播，已把 PC 的推流模式停回去")
+                }
                 return            // 起不来的原因 video 已经通过 onError 报过了
             }
             self.phase = .pushing
+            // 真在出帧以后才交回按钮：之前解除的话，页面会先把按钮刷成「停止」，
+            // 而原生还停在 loaded，用户点下去会被当成「开始」再开一轮。
+            self.disarmStopGate()
             self.lastSeen409 = client.saw409
             self.lastWarnKey = ""
             self.startMeter()
@@ -478,9 +512,83 @@ final class PageViewController: UIViewController {
         pushSeek(cur: 0, total: 0)
         restartTries = 0
         let avg = client?.averageFrameBytes ?? 0
-        let c = client
-        Task { await c?.stopLive() }
-        status(avg > 0 ? note + "；上行均值 \(max(1, avg / 1024)) KB/帧" : note)
+        sendStopAndSettle(report: avg > 0
+            ? note + "；上行均值 \(max(1, avg / 1024)) KB/帧"
+            : note)
+    }
+
+    // MARK: - 停止握手
+
+    private func pushStopUI(_ gate: LiveStopGate) {
+        guard webView != nil else { return }
+        let state: String
+        switch gate {
+        case .idle: state = ""
+        case .stopping: state = LiveStopGate.stoppingState
+        case .failed: state = LiveStopGate.failedState
+        }
+        let js = "window.LiveUI && window.LiveUI.setStopPending && "
+            + "window.LiveUI.setStopPending(\(LiveShim.jsLiteral(state)))"
+        webView.evaluateJavaScript(js, completionHandler: nil)
+    }
+
+    /// 所有「真的要把 PC 停掉」的路径都走这里：点停止、退后台、这一段放完。
+    /// 先把界面锁上再发请求；PC 回成功才解，失败停在「重试停止」等用户再送一次。
+    private func sendStopAndSettle(report: String?) {
+        guard let client = client else {
+            stopGate = .idle
+            pushStopUI(stopGate)
+            if let report = report { status(report) }
+            return
+        }
+        stopGen += 1
+        let gen = stopGen
+        stopGate.begin()
+        pushStopUI(stopGate)
+        status(LiveStopGate.stoppingNote)
+        let task: Task<Bool, Never>
+        if let flying = pendingStop {
+            task = flying
+        } else {
+            task = Task { await client.stopLive() }
+            pendingStop = task
+        }
+        Task { @MainActor in
+            let ok = await task.value
+            // 等待期间又开推了、或换了地址：这一次的结果已经作废，别再拿它锁/解锁界面。
+            guard gen == self.stopGen else { return }
+            self.pendingStop = nil
+            self.stopGate.settle(ok: ok)
+            self.pushStopUI(self.stopGate)
+            if ok {
+                self.status(report ?? "已停止推流：PC 已确认，可以改特征了")
+            } else {
+                self.status(LiveStopGate.failedNote, "error")
+            }
+        }
+    }
+
+    /// 会话已经失效时停推：/live_stop 多半也会吃 401，不拿它锁界面——该做的是重新登录，
+    /// 不是「重试停止」。但仍记在 pendingStop 上，重开推流前要等它落地。
+    private func stopQuietly() {
+        guard let client = client, pendingStop == nil else { return }
+        stopGen += 1
+        let gen = stopGen
+        let task = Task { await client.stopLive() }
+        pendingStop = task
+        Task { @MainActor in
+            _ = await task.value
+            guard gen == self.stopGen else { return }
+            self.pendingStop = nil
+        }
+    }
+
+    /// 新一轮推流已经接上：之前的停止握手作废，按钮交回页面按 live_mode 刷。
+    private func disarmStopGate() {
+        stopGen += 1
+        pendingStop = nil
+        stopGate = .idle
+        pushStopUI(stopGate)
     }
 
     private func clampSeconds(_ s: Double) -> Double {
@@ -538,8 +646,7 @@ final class PageViewController: UIViewController {
             stopMeter()
             phase = .loaded
             pushSeek(cur: 0, total: 0)
-            let c = client
-            Task { await c.stopLive() }
+            stopQuietly()
             status(LiveAuth.lostMessage, "error")
             return
         }
@@ -771,6 +878,9 @@ extension PageViewController: WKNavigationDelegate {
         guard let client = client else { return }
         client.importCookies { [weak self] in
             guard let self = self else { return }
+            // 页面重载会把握手锁一起刷掉：还在 stopping/failed 就重新锁上，
+            // 别让用户在新页面上看到一颗能点的「播放」。
+            if self.stopGate != .idle { self.pushStopUI(self.stopGate) }
             let host = LiveHost.display(client.baseURL)
             guard self.greetedHost != host else { return }
             self.greetedHost = host

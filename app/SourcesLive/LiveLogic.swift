@@ -47,7 +47,7 @@ enum LiveConfig {
 
     /// 追加到 WKWebView 默认 UA 末尾：PC 那边看 access log 就知道是手机 app 在访问，
     /// 而不是有人在浏览器里手点。
-    static let userAgentSuffix = "LiveSwap/0.14"
+    static let userAgentSuffix = "LiveSwap/0.15"
 
     /// 第一次启动时地址栏里预填的这台：PC 侧现在监听的就是它。
     /// 只当预填和提示用，不当写死的配置——PC 重连 WiFi 以后 IP 会变，
@@ -315,6 +315,31 @@ enum LiveWatch {
     }
 }
 
+// MARK: - 停止握手
+
+/// 「点了停止」到「PC 确认停止」之间那一段。页面自己每秒才轮询一次，这段时间界面
+/// 不能先装作停了：按钮灰着写「停止中…」、特征下拉框全灰，等 /live_stop 明确回成功
+/// 才解。请求没送到就停在 failed，按钮换成「重试停止」，下拉框继续锁着——PC 那边
+/// 可能还在跑，这时候解锁就是让用户去撞 409，症状和这次要修的一模一样。
+enum LiveStopGate: Equatable {
+    case idle
+    case stopping
+    case failed
+
+    /// 注入脚本认的两个状态字：Swift 和 JS 共用这一份，别各写各的。
+    static let stoppingState = "stopping"
+    static let failedState = "failed"
+
+    static let stoppingNote = "正在停 PC 的推流…等它回话"
+    static let failedNote = "停止没送到 PC：推流可能还在跑，点「重试停止」再试一次"
+
+    var blocksPlay: Bool { self != .idle }
+    var holdsEditingLock: Bool { self != .idle }
+
+    mutating func begin() { self = .stopping }
+    mutating func settle(ok: Bool) { self = ok ? .idle : .failed }
+}
+
 // MARK: - 原声跟播的对齐量
 
 enum LiveAudio {
@@ -427,6 +452,8 @@ enum LiveShim {
                           .replacingOccurrences(of: "__PATH__", with: jsLiteral(pathSelector))
                           .replacingOccurrences(of: "__SEEK__", with: jsLiteral(hookSeek))
                           .replacingOccurrences(of: "__FULLSCREEN__", with: jsLiteral(hookFullscreen))
+                          .replacingOccurrences(of: "__STOPPING__", with: jsLiteral(LiveStopGate.stoppingState))
+                          .replacingOccurrences(of: "__FAILED__", with: jsLiteral(LiveStopGate.failedState))
                           .replacingOccurrences(of: "__BRIDGE__", with: jsLiteral(LiveConfig.bridgeName))
     }
 
@@ -438,6 +465,8 @@ enum LiveShim {
       var PATH_SEL = __PATH__;
       var SEEK = __SEEK__;
       var FS = __FULLSCREEN__;
+      var STOP_STOPPING = __STOPPING__;
+      var STOP_FAILED = __FAILED__;
 
       function send(payload) {
         try {
@@ -481,7 +510,7 @@ enum LiveShim {
       // 不另外盖一层浮标：界面上看到的字和 PC 上同一格是一个来源。
       //
       // PC 页面自己也有 LiveUI（setPlaying / refreshStream / autoRefresh），
-      // 这里只能在它上面补 App 用的四个方法：整个赋一个新对象会把页面那三个冲掉，
+      // 这里只能在它上面补 App 用的几个方法：整个赋一个新对象会把页面那三个冲掉，
       // 暂停态改完绑定以后那次 re_rendered 自动重连就再也调用不到，画面定在原处。
       var UI = window.LiveUI;
       if (!UI || typeof UI !== 'object') UI = {};
@@ -511,6 +540,86 @@ enum LiveShim {
         send({ action: 'ready', hooks: have, title: t ? String(t.textContent || '') : '' });
       };
       window.LiveUI = UI;
+
+      // —— 停止握手 ——
+      // 页面每秒才轮询一次 /get_playback_state，最长晚一秒才认「停了」。原生在点停止的
+      // 那一刻调 setStopPending('stopping')：按钮灰着写「停止中…」、特征下拉框全灰；
+      // /live_stop 回成功再调 '' 交回页面按 edit_locked 判；没送到就调 'failed'，
+      // 按钮变「重试停止」、下拉框继续锁着。
+      var STOP_HOLD = null;
+
+      function stopButton(text, enabled) {
+        var b = document.getElementById('start-button');
+        if (!b) return;
+        if (text) b.textContent = text;
+        b.disabled = !enabled;
+      }
+
+      function stopSelects(lock) {
+        try {
+          if (typeof faceSetPlaying === 'function') { faceSetPlaying(!!lock); return; }
+        } catch (e) {}
+        try {
+          var l = document.querySelectorAll('#face-pick-list select');
+          for (var i = 0; i < l.length; i++) l[i].disabled = !!lock;
+        } catch (e) {}
+      }
+
+      function stopFaceNote(stage) {
+        try {
+          var el = document.getElementById('face-pick-state');
+          if (!el) return;
+          if (stage === 'hold') {
+            el.textContent = '正在停推流：等 PC 确认停下再改特征';
+            el.style.color = '#c60';
+          } else if (stage === 'failed') {
+            el.textContent = '停止没送到 PC：推流可能还在跑，先点「重试停止」';
+            el.style.color = '#c00';
+          } else {
+            var t = String(el.textContent || '');
+            if (t.indexOf('正在停推流') === 0 || t.indexOf('停止没送到') === 0) {
+              el.textContent = '';
+              el.style.color = '#666';
+            }
+          }
+        } catch (e) {}
+      }
+
+      UI.setStopPending = function (state) {
+        var s = String(state || '');
+        if (s === STOP_STOPPING || s === STOP_FAILED) {
+          STOP_HOLD = s;
+          stopButton(s === STOP_FAILED ? '重试停止' : '停止中…', s === STOP_FAILED);
+          stopSelects(true);
+          stopFaceNote(s === STOP_FAILED ? 'failed' : 'hold');
+          return s;
+        }
+        // 确认停了：按钮马上回到「播放」，下拉框解不解交给页面按 PC 的 edit_locked 判。
+        STOP_HOLD = null;
+        stopButton('播放', true);
+        stopFaceNote('release');
+        try {
+          if (typeof checkPlaybackState === 'function') { checkPlaybackState(); return 'sync'; }
+        } catch (e) {}
+        stopSelects(false);
+        return 'released';
+      };
+
+      // 握手期间轮询来的 setPlaying 一律不落地：它读到的是 PC 上一秒的状态，
+      // 会把「停止中…」改回「停止」、把刚锁上的下拉框又解开，用户会以为没点上。
+      if (typeof UI.setPlaying === 'function') {
+        var pageSetPlaying = UI.setPlaying;
+        UI.setPlaying = function (on, manual, lock) {
+          if (STOP_HOLD) {
+            stopButton(STOP_HOLD === STOP_FAILED ? '重试停止' : '停止中…',
+                       STOP_HOLD === STOP_FAILED);
+            stopSelects(true);
+            stopFaceNote(STOP_HOLD === STOP_FAILED ? 'failed' : 'hold');
+            return;
+          }
+          return pageSetPlaying.call(UI, on, manual, lock);
+        };
+      }
 
       function refreshFeed() {
         try {

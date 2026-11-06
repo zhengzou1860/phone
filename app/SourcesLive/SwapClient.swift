@@ -198,11 +198,35 @@ final class SwapClient: ObservableObject {
         return liveWidth
     }
 
-    func stopLive() async {
+    /// 只有 PC 明确回了成功才算停：2xx 的 JSON 里 status=success（老接口回 204/空 200
+    /// 就认 HTTP 码）。失败不能装作停了——界面那边要靠这个返回值决定锁不放开。
+    @discardableResult
+    func stopLive() async -> Bool {
         statusTask?.cancel()
         statusTask = nil
-        _ = try? await callWithAuthRetry("/live_stop", body: Data(), contentType: nil)
+        let ok: Bool
+        do {
+            let (data, resp) = try await callWithAuthRetry("/live_stop", body: Data(),
+                                                           contentType: nil)
+            if let http = resp as? HTTPURLResponse {
+                guard (200..<300).contains(http.statusCode), !LiveAuth.lost(http) else {
+                    return false
+                }
+            } else {
+                return false
+            }
+            if data.isEmpty {
+                ok = true
+            } else if let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                ok = (j["status"] as? String) == "success"
+            } else {
+                ok = false
+            }
+        } catch {
+            return false
+        }
         await MainActor.run { self.pcLiveMode = false }
+        return ok
     }
 
     /// 跳转以后必须调：PC 会丢掉队列里的旧帧和上一姿势的检测缓存，否则糊到跳转之后。
