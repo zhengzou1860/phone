@@ -39,27 +39,13 @@ final class VRLive {
     /// 两图之间的距离存这一档：眼镜的镜片间距是硬件定的，一次对好就一直用（没存过＝0＝两半正好挨在中缝）
     static let gapKey = "vr3d.live.gap"
     static var storedGapPct: Double { UserDefaults.standard.double(forKey: gapKey) }
-    /// 镜片视窗的形状与大小：透过眼镜看出去，矩形画面的四角本来就在视场外面，
-    /// 所以播放时把每半幅遮成一片视窗；这两档也是一次对好就一直用。
-    /// 形状 0=方（不遮，整幅矩形）1=椭圆 2=胶囊；大小是相对「内切在每半幅里」的比例
-    static let lensShapeKey = "vr3d.live.lensShape"
-    static let lensSizeKey = "vr3d.live.lensSize"
-    /// 没存过默认 1＝椭圆：这条本来就是给戴镜看的，第一次进来就该看见视场的样子（0 是「方」＝不遮）
-    static var storedLensShape: Int {
-        UserDefaults.standard.object(forKey: lensShapeKey) == nil ? 1 : UserDefaults.standard.integer(forKey: lensShapeKey)
-    }
-    /// 没存过要当 1.00，不能读 integer/double 的默认 0（那会把视窗缩成一个点）
-    static var storedLensSize: Double {
-        UserDefaults.standard.object(forKey: lensSizeKey) == nil ? 1.0 : UserDefaults.standard.double(forKey: lensSizeKey)
-    }
-
-    /// 视窗形状：名字要上界面和上机日志，两处共用一份
-    static func lensName(_ shape: Int) -> String {
-        switch shape {
-        case 1: return "椭圆"
-        case 2: return "胶囊"
-        default: return "方"
-        }
+    /// 鱼眼强度存这一档：镜片是硬件，弯多少一次对好就一直用（0~1；0＝不弯＝手持直看）。
+    /// 弯的是像素不是画框：画面外圈挤向中心，直边的中段才看着往外弓，而且源图一个像素都不裁（见 kSbsFish）。
+    static let fishKey = "vr3d.live.fish"
+    static let fishMax: Double = 1.0
+    /// 没存过默认 0.35：这页本来就是塞进眼镜里看的，第一次进来就该是镜片里那个样子
+    static var storedFish: Double {
+        UserDefaults.standard.object(forKey: fishKey) == nil ? 0.35 : UserDefaults.standard.double(forKey: fishKey)
     }
 
     let url: URL
@@ -100,7 +86,9 @@ final class VRLive {
     /// 两图之间的距离（占每眼宽的比例）：正=两只眼互相离远（中缝多出黑带来），负=互相靠近；
     /// 每张图自己多大始终不动，也永不越过中缝 ⇒ 这个旋钮只改距离，不改大小、不串眼
     private var gapPct: Float = 0
-    /// 位移/间距每变一次 +1：显示线程看到它变了先把 6 块显示缓冲抹一次黑、再把静止这帧重画
+    /// 鱼眼强度（0~1，0=不弯）：只作用在上屏那一趟，深度和成片都不碰它
+    private var fishPct: Float = 0
+    /// 位移/间距/鱼眼每变一次 +1：显示线程看到它变了先把 6 块显示缓冲抹一次黑、再把静止这帧重画
     private var shiftSeq = 0
     /// 已经放到第几秒（界面每 0.25 s 来取一次，画进度条）
     private var posSeen = 0.0
@@ -210,6 +198,19 @@ final class VRLive {
         VRJournal.line("实时 间距 \(String(format: "%+.1f", Double(v) * 100))%")
     }
 
+    /// 鱼眼强度（0~1）：把每只眼那半幅按桶形往中心挤一遍，戴镜看直边就往外弓，内容一个像素不裁。
+    /// 落地方式跟位移、间距一样松手才发：变一次要重画一轮；出片那条完全不受它影响
+    func setFish(_ pct: Double) {
+        let v = Float(max(0, min(VRLive.fishMax, pct)))
+        dLock.lock()
+        if abs(v - fishPct) < 1e-4 { dLock.unlock(); return }
+        fishPct = v
+        shiftSeq += 1
+        dLock.unlock()
+        UserDefaults.standard.set(Double(v), forKey: VRLive.fishKey)
+        VRJournal.line("实时 鱼眼 \(String(format: "%.0f", Double(v) * 100))%")
+    }
+
     /// 起头。成功返回空串并把两条线程放出去；失败返回那句原因，界面直接显示，不用等线程。
     func start(layer: AVSampleBufferDisplayLayer, label: UILabel) -> String {
         VRLive.door.lock()
@@ -313,6 +314,7 @@ final class VRLive {
         dLock.lock()
         shiftPct = Float(max(-0.12, min(0.12, VRLive.storedShiftPct)))
         gapPct = Float(max(-0.25, min(0.25, VRLive.storedGapPct)))
+        fishPct = Float(max(0, min(VRLive.fishMax, VRLive.storedFish)))
         dLock.unlock()
         // 声音尽力而为：起不来就退回墙钟，画面照走
         if let p = soundPlayer() {
@@ -321,19 +323,18 @@ final class VRLive {
         let audioName = audio == nil ? "没有（走墙钟）" : "接上（走声钟）"
         let shiftName = String(format: "%+.1f", Double(shiftPct) * 100)
         let gapName = String(format: "%+.1f", Double(gapPct) * 100)
-        let lensTag = "视窗\(VRLive.lensName(VRLive.storedLensShape))"
-            + "×\(String(format: "%.2f", VRLive.storedLensSize))"
+        let fishTag = "鱼眼\(String(format: "%.0f", VRLive.storedFish * 100))%"
         // 这块是在后台线程跑的： UILabel 只能主线程碰，起手那行也一样交回主线程写
         // 「上屏」那对数才是真正进眼睛的尺寸：实时形变拼出来的是 每眼×2，sbs 那条就是原片整幅
         let headName = sbs ? "左右眼原样起手" : "实时起手"
         let startLine = "\(headName)：每眼 \(s.eyeW)x\(s.eyeH)｜上屏 \(outW)x\(outH)"
             + "｜\(String(format: "%.1f", s.fps)) fps\(depthTag)\(modelTag)"
-            + "｜声音\(audioName)｜一起移\(shiftName)% 间距\(gapName)%\(lensTag)｜点屏幕出控件"
+            + "｜声音\(audioName)｜一起移\(shiftName)% 间距\(gapName)%\(fishTag)｜点屏幕出控件"
         DispatchQueue.main.async { [weak self] in self?.label?.text = startLine }
         let modeTag = sbs ? "左右眼原样（不跑深度）" : "实时形变 视差\(bpct)% zp\(zp) 朝向\(rot ? "转90°" : "摆正")"
         VRJournal.line("播放 开始 \(url.lastPathComponent) \(modeTag) 每眼 \(s.eyeW)x\(s.eyeH)"
             + " 上屏 \(outW)x\(outH) \(String(format: "%.1f", s.fps)) fps"
-            + " 一起移\(shiftName)% 间距\(gapName)% \(lensTag)")
+            + " 一起移\(shiftName)% 间距\(gapName)% \(fishTag)")
         return ""
     }
 
@@ -422,6 +423,7 @@ final class VRLive {
             let wantSeq = shiftSeq
             let xo = shiftPct * eyeWf
             let gp = gapPct * eyeWf
+            let fh = 2.0 * fishPct
             dLock.unlock()
             if !go { note = "按了停止"; break }
             if let t = sd {
@@ -462,11 +464,11 @@ final class VRLive {
             let outPB = showPBs[n % showPBs.count]
             var gpuMs = 0.0
             if sbs {
-                let rr = sh!.render(srcPB: f, xoff: xo, gap: gp, outPB: outPB)
+                let rr = sh!.render(srcPB: f, xoff: xo, gap: gp, fish: fh, outPB: outPB)
                 if let e = rr.err { note = "第 \(k + 1) 帧平移失败：\(e)"; break }
                 gpuMs = rr.gpu
             } else {
-                let rr = w!.render(srcPB: f, dn: dn, zp: zp, xoff: xo, gap: gp, outPB: outPB)
+                let rr = w!.render(srcPB: f, dn: dn, zp: zp, xoff: xo, gap: gp, fish: fh, outPB: outPB)
                 if let e = rr.err { note = "第 \(k + 1) 帧形变失败：\(e)"; break }
                 gpuMs = rr.gpu
                 holes += rr.holes
@@ -478,7 +480,7 @@ final class VRLive {
                 break
             }
             n += 1
-            // 停住期间只有刚拖完位移或间距那一下走到这里：把静止这一帧按新数值重画一遍就回去
+            // 停住期间只有刚拖完位移、间距或鱼眼那一下走到这里：把静止这一帧按新数值重画一遍就回去
             if hold { Thread.sleep(forTimeInterval: 1.0 / fps); continue }
             gpuSum += gpuMs
             k += 1
@@ -675,6 +677,7 @@ final class VRLive {
         let takes = depthTakes
         let err = depthErr
         let fmt = depthFmt
+        let fish = fishPct
         dLock.unlock()
         var rep = "\(sbs ? "左右眼原样" : "实时") 收兵：出帧 \(frames) 帧、跑了 \(String(format: "%.1f", wall)) s"
         if sbs {
@@ -688,7 +691,7 @@ final class VRLive {
         if !extra.isEmpty { rep += "｜\(extra)" }
         if !err.isEmpty { rep += "｜深度错 \(err)" }
         if takes > 0 && !fmt.isEmpty { rep += "｜深度读法 \(fmt)" }
-        rep += "｜视窗 \(VRLive.lensName(VRLive.storedLensShape))×\(String(format: "%.2f", VRLive.storedLensSize))"
+        rep += "｜鱼眼 \(String(format: "%.0f", Double(fish) * 100))%"
         VRJournal.line(rep)
         VRLive.door.lock()
         VRLive.inside = false
@@ -701,62 +704,12 @@ final class VRLive {
 
 // MARK: - 播放页的界面
 
-/// 镜片视窗遮罩：整幅涂黑，只在左右两半各开一片视窗。
-/// 手机塞进 VR 眼镜后，矩形画面的四角本来就在镜片视场外面，遮掉才是实际看到的样子。
-/// 两片洞的落点跟着「一起移」「间距」这两档走：GPU 把画面挪到哪儿，洞就画在哪儿，
-/// 于是这两条滑杆变成一件事——把两洞对到自己两只镜片上，对了就没有黑边压住画面。
-/// 换算：每眼在成片里占半幅宽（2W 里的 W），洞中心 = 半幅中心 + (一起移 ± 间距)×半宽，
-/// 与 kSbsShift 里 `left ? xoff - gap : xoff + gap` 那个符号一致。
-/// 这一层只在看的时候盖，不烧进成片文件——跟「间距」同一个道理。
-final class VRLensMask: UIView {
-    /// 0=方（不遮）1=椭圆 2=胶囊；跟 VRLive.lensName 那档一个数
-    var shape = 1 { didSet { isHidden = shape == 0; setNeedsDisplay() } }
-    /// 相对「内切在每半幅里」的比例，0.6~1.0：1.0 顶到该半幅的四条边
-    var size: CGFloat = 1.0 { didSet { setNeedsDisplay() } }
-    /// 已落地的两档（占半幅宽的比例），方向与 kSbsShift 一致
-    var shiftPct: CGFloat = 0 { didSet { setNeedsDisplay() } }
-    var gapPct: CGFloat = 0 { didSet { setNeedsDisplay() } }
-
-    override init(frame: CGRect) {
-        super.init(frame: frame)
-        isUserInteractionEnabled = false
-        backgroundColor = .clear
-        // 假横屏那一转改的是 bounds：洞要跟着这副尺寸重画，不能留旧的那张
-        layer.needsDisplayOnBoundsChange = true
-    }
-
-    required init?(coder: NSCoder) { fatalError("这块不用 xib") }
-
-    override func draw(_ rect: CGRect) {
-        guard shape != 0, bounds.width > 1, bounds.height > 1 else { return }
-        let half = bounds.width / 2.0
-        let a = half / 2.0 * size
-        let b = bounds.height / 2.0 * size
-        let cy = bounds.height / 2.0
-        // 奇偶填：外圈那个矩形和两片视窗叠在一起，重叠处才算洞
-        let path = UIBezierPath(rect: bounds)
-        for i in 0..<2 {
-            let side: CGFloat = i == 0 ? -1 : 1
-            let cx = half * (CGFloat(i) + 0.5) + half * shiftPct + side * half * gapPct
-            let win = CGRect(x: cx - a, y: cy - b, width: a * 2.0, height: b * 2.0)
-            path.append(shape == 2
-                ? UIBezierPath(roundedRect: win, cornerRadius: min(a, b))
-                : UIBezierPath(ovalIn: win))
-        }
-        path.usesEvenOddFillRule = true
-        UIColor.black.setFill()
-        path.fill()
-    }
-}
-
-/// 实时播放的容器视图：底下上屏、上面盖一片镜片视窗遮罩、点播才出控制栏（实测那几行跟着它一起出）
+/// 实时播放的容器视图：自己这一层上屏，点播才出控制栏（实测那几行跟着它一起出）
 final class VRLiveView: UIView {
     /// 实测那几行：平时不收眼睛看，点播跟控制栏一起出来（横屏戴镜时它一直亮着最碍事）
     let stats = UILabel()
     private var live: VRLive?
     private let tapCatch = UIView()
-    /// 盖在画面上、控件下的那片视窗遮罩
-    private let lens = VRLensMask()
     private let bar = UIView()
     private let playBtn = UIButton(type: .system)
     private let seekSl = UISlider()
@@ -765,9 +718,8 @@ final class VRLiveView: UIView {
     private let shiftLbl = UILabel()
     private let gapSl = UISlider()
     private let gapLbl = UILabel()
-    private let lensBtn = UIButton(type: .system)
-    private let lensSl = UISlider()
-    private let lensLbl = UILabel()
+    private let fishSl = UISlider()
+    private let fishLbl = UILabel()
     private let hintLbl = UILabel()
     private var ticker: Timer?
     private var hider: Timer?
@@ -780,8 +732,8 @@ final class VRLiveView: UIView {
 
     /// 间距滑杆的档位是「占每眼宽的百分比」，±25% 封顶：拉到 +25% 中缝空出半只眼的四分之一宽
     private let gapRange: Double = 0.25
-    /// 视窗大小是相对内切的比例：0.6 起步（遮得多），1.0 顶到半幅的边——再大就压到另一只眼那半幅去了
-    private let lensMin: Double = 0.6
+    /// 鱼眼滑杆是强度 0~1（送进 GPU 折成 k=2·强度）：1 顶格时画面缩到半幅的七成半径，黑边最厚
+    private let fishRange: Double = VRLive.fishMax
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -791,8 +743,6 @@ final class VRLiveView: UIView {
         displayLayer.videoGravity = .resize
         tapCatch.backgroundColor = .clear
         addSubview(tapCatch)
-        // 遮罩压在画面（自己这一层）上、控件下：先加它，后面那些自然浮在它上面
-        addSubview(lens)
         stats.numberOfLines = 0
         stats.font = UIFont.monospacedSystemFont(ofSize: 9, weight: .regular)
         stats.textColor = .systemGreen
@@ -831,23 +781,17 @@ final class VRLiveView: UIView {
         gapLbl.textColor = .white
         gapLbl.font = UIFont.systemFont(ofSize: 12)
         bar.addSubview(gapLbl)
-        lensBtn.setTitle("视窗", for: .normal)
-        lensBtn.setTitleColor(.white, for: .normal)
-        lensBtn.backgroundColor = UIColor(white: 1, alpha: 0.16)
-        lensBtn.layer.cornerRadius = 8
-        lensBtn.titleLabel?.font = UIFont.systemFont(ofSize: 13)
-        bar.addSubview(lensBtn)
-        lensSl.tintColor = .systemTeal
-        lensSl.minimumValue = Float(lensMin)
-        lensSl.maximumValue = 1.0
-        bar.addSubview(lensSl)
-        lensLbl.textColor = .white
-        lensLbl.font = UIFont.systemFont(ofSize: 12)
-        lensLbl.textAlignment = .right
-        bar.addSubview(lensLbl)
+        fishSl.tintColor = .systemTeal
+        fishSl.minimumValue = 0
+        fishSl.maximumValue = Float(fishRange)
+        bar.addSubview(fishSl)
+        fishLbl.textColor = .white
+        fishLbl.font = UIFont.systemFont(ofSize: 12)
+        fishLbl.textAlignment = .right
+        bar.addSubview(fishLbl)
         hintLbl.textColor = UIColor(white: 1, alpha: 0.6)
         hintLbl.font = UIFont.systemFont(ofSize: 10)
-        hintLbl.text = "第一条拖进度｜第二条「一起移」=两张图同方向挪，对准两只镜片中心｜第三条「间距」=把两张图互相推远或拉近，图本身大小不变（+ 拉开、中缝出黑边；− 靠近、外侧各裁一条）｜第四条「视窗」=镜片那两片洞，按按钮换 椭圆/胶囊/方（方＝不遮，整幅矩形），滑杆调多大（1.00＝顶到每半幅的边）｜这些都存下来下次照用"
+        hintLbl.text = "第一条拖进度｜第二条「一起移」=两张图同方向挪，对准两只镜片中心｜第三条「间距」=把两张图互相推远或拉近，图本身大小不变（+ 拉开、中缝出黑边；− 靠近、外侧各裁一条）｜第四条「鱼眼」=把每只眼那半幅按镜片的桶形弯一遍：画面外圈挤向中心，直边的中段就往外弓，黑只落在画框外，源图一个像素都不裁（拉到 0＝不弯＝手持直看；顶格黑边最厚）｜这些都存下来下次照用"
         bar.addSubview(hintLbl)
         tapCatch.addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(tapped)))
         playBtn.addTarget(self, action: #selector(tappedPlay), for: .touchUpInside)
@@ -858,9 +802,8 @@ final class VRLiveView: UIView {
         shiftSl.addTarget(self, action: #selector(shiftEnd), for: [.touchUpInside, .touchUpOutside, .touchCancel])
         gapSl.addTarget(self, action: #selector(gapMoved), for: .valueChanged)
         gapSl.addTarget(self, action: #selector(gapEnd), for: [.touchUpInside, .touchUpOutside, .touchCancel])
-        lensBtn.addTarget(self, action: #selector(lensShapeTapped), for: .touchUpInside)
-        lensSl.addTarget(self, action: #selector(lensSizeMoved), for: .valueChanged)
-        lensSl.addTarget(self, action: #selector(lensSizeEnd), for: [.touchUpInside, .touchUpOutside, .touchCancel])
+        fishSl.addTarget(self, action: #selector(fishMoved), for: .valueChanged)
+        fishSl.addTarget(self, action: #selector(fishEnd), for: [.touchUpInside, .touchUpOutside, .touchCancel])
     }
 
     required init?(coder: NSCoder) { fatalError("这块不用 xib") }
@@ -869,7 +812,6 @@ final class VRLiveView: UIView {
         super.layoutSubviews()
         let w = bounds.width, h = bounds.height
         tapCatch.frame = bounds
-        lens.frame = bounds
         // 右边留出 100 pt：那格是 SwiftUI 那枚「停止」的落点，别把实测那几行铺到它底下去
         // 高 120：起手那行要绕两三行，实测连「深度读法」「深度出错」一起最多六行，写死 56 会把尾巴裁掉
         stats.frame = CGRect(x: 6, y: 6, width: max(40, w - 112), height: 120)
@@ -883,9 +825,8 @@ final class VRLiveView: UIView {
         shiftSl.frame = CGRect(x: 130, y: 60, width: max(30, bw - 130 - 12), height: 22)
         gapLbl.frame = CGRect(x: 8, y: 88, width: 118, height: 30)
         gapSl.frame = CGRect(x: 130, y: 92, width: max(30, bw - 130 - 12), height: 22)
-        lensBtn.frame = CGRect(x: 8, y: 120, width: 100, height: 32)
-        lensLbl.frame = CGRect(x: bw - 118, y: 122, width: 110, height: 30)
-        lensSl.frame = CGRect(x: 116, y: 126, width: max(30, bw - 116 - 126), height: 22)
+        fishLbl.frame = CGRect(x: 8, y: 120, width: 118, height: 30)
+        fishSl.frame = CGRect(x: 130, y: 124, width: max(30, bw - 130 - 12), height: 22)
         hintLbl.frame = CGRect(x: 8, y: 156, width: max(40, bw - 16), height: 46)
     }
 
@@ -900,13 +841,9 @@ final class VRLiveView: UIView {
         shiftLbl.text = shiftText(Double(shiftSl.value))
         gapSl.value = Float(max(-gapRange, min(gapRange, VRLive.storedGapPct)))
         gapLbl.text = gapText(Double(gapSl.value))
-        // 视窗那两档也读存档；遮罩这一层从第一次起就在，别等用户去点播才发现形状变了
-        lens.shape = VRLive.storedLensShape
-        lensSl.value = Float(max(lensMin, min(1.0, VRLive.storedLensSize)))
-        lens.size = CGFloat(lensSl.value)
-        lensLbl.text = lensText(Double(lensSl.value))
-        lensBtn.setTitle(lensTitle(VRLive.storedLensShape), for: .normal)
-        syncLens()
+        // 鱼眼这档也读存档：滑杆藏在控制栏里，但戴镜进来的第一眼就该已经是弯好的（setup 已经把同一档发给 GPU）
+        fishSl.value = Float(max(0, min(fishRange, VRLive.storedFish)))
+        fishLbl.text = fishText(Double(fishSl.value))
         UIApplication.shared.isIdleTimerDisabled = true
     }
 
@@ -951,7 +888,6 @@ final class VRLiveView: UIView {
     @objc private func shiftEnd() {
         live?.setShift(Double(shiftSl.value))
         shiftLbl.text = shiftText(Double(shiftSl.value))
-        syncLens()
         armHide()
     }
 
@@ -963,45 +899,24 @@ final class VRLiveView: UIView {
     @objc private func gapEnd() {
         live?.setGap(Double(gapSl.value))
         gapLbl.text = gapText(Double(gapSl.value))
-        syncLens()
         armHide()
     }
 
-    /// 形状只在点播这一下轮转：方（不遮）→ 椭圆 → 胶囊 → 方
-    @objc private func lensShapeTapped() {
-        let next = (VRLive.storedLensShape + 1) % 3
-        UserDefaults.standard.set(next, forKey: VRLive.lensShapeKey)
-        lens.shape = next
-        lensBtn.setTitle(lensTitle(next), for: .normal)
-        VRJournal.line("实时 视窗形状 \(VRLive.lensName(next))")
+    @objc private func fishMoved() {
+        fishLbl.text = fishText(Double(fishSl.value))
+    }
+
+    /// 鱼眼跟位移、间距一样松手才落地：落一次显示线程重画一轮（存档和日志在 setFish 里记）
+    @objc private func fishEnd() {
+        let v = max(0, min(fishRange, Double(fishSl.value)))
+        live?.setFish(v)
+        fishLbl.text = fishText(v)
         armHide()
     }
 
-    @objc private func lensSizeMoved() {
-        lensLbl.text = lensText(Double(lensSl.value))
-    }
-
-    @objc private func lensSizeEnd() {
-        let v = max(lensMin, min(1.0, Double(lensSl.value)))
-        UserDefaults.standard.set(v, forKey: VRLive.lensSizeKey)
-        lens.size = CGFloat(v)
-        lensLbl.text = lensText(v)
-        VRJournal.line("实时 视窗大小 \(String(format: "%.2f", v))")
-        armHide()
-    }
-
-    private func lensTitle(_ shape: Int) -> String {
-        "视窗 " + VRLive.lensName(shape)
-    }
-
-    private func lensText(_ v: Double) -> String {
-        "大小 " + String(format: "%.2f", v)
-    }
-
-    /// 遮罩那两片洞跟到已落地的那两档上：滑杆松手时画面挪一寸，洞也挪一寸
-    private func syncLens() {
-        lens.shiftPct = CGFloat(max(-0.12, min(0.12, VRLive.storedShiftPct)))
-        lens.gapPct = CGFloat(max(-gapRange, min(gapRange, VRLive.storedGapPct)))
+    /// 到底那一格要说人话：它不是「弯得小一点」，是完全不弯
+    private func fishText(_ v: Double) -> String {
+        "鱼眼 " + (v < 0.005 ? "不弯" : String(format: "%.0f%%", v * 100))
     }
 
     private func shiftText(_ pct: Double) -> String {

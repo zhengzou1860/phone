@@ -22,6 +22,7 @@ struct VRP {
     uint  rot;      // 0=摆正送检；1=顺时针转 90° 送检（只有 kScale 读它）
     float xoff;     // 左右眼画面在各自半幅里再整体水平移这么多像素（正=两只眼一起右移）
     float gap;      // 两图之间的距离（像素）：左眼往左、右眼往右各挪这么多，图本身大小不动
+    float fish;     // 鱼眼强度 k（0=不弯）：屏幕半径 v 读源图 u=v·(1+k·v²)，见 kSbsFish
 };
 
 constexpr sampler lin(coord::normalized, filter::linear, address::clamp_to_edge);
@@ -191,4 +192,36 @@ kernel void kSbsShift(texture2d<float, access::read>  src [[texture(0)]],
         return;
     }
     dst.write(src.read(uint2(base + uint(lx), g.y)), g);
+}
+
+// 7) 播放上屏的鱼眼那一趟：把每只眼那半幅按桶形（鱼眼）重采样一遍，顺手把摆位（xoff/gap）也一起做了。
+// 为什么是弯像素而不是遮形状：镜片里看着像鱼眼，是因为画面外圈的角度被压向中心——
+// 一条直边的中段离光轴近、原地不动，两头被挤回来 ⇒ 中段就显出往外弓。这是径向重采样，
+// 把画框遮成什么形状都代替不了它，而且遮形状必然先丢掉框外的内容，方向正相反。
+// 换算（每眼以自家半幅中心为原点，半径按半幅对角的一半归一，所以源图角点正好是 1）：
+//   屏幕这一格 v 读源图 u = v·(1 + fish·v²)。fish>0 时 u>v ⇒ 整幅画面往内侧挤，
+//   黑只落在画框**外**那一圈，源图一个像素都不丢；fish=0 时 u=v 恒等。
+//   fish 就是这里的那个 k（界面 0~1 的强度，Swift 那边翻倍送进来），没弯时仍走 kSbsShift 那条整数照搬的老路。
+// 出界判的是自家半幅的 0.5~W-0.5：贴着中缝的半格若交给线性插值，会咬进对面那只眼。
+kernel void kSbsFish(texture2d<float, access::sample> src [[texture(0)]],
+                     texture2d<float, access::write>  dst [[texture(1)]],
+                     constant VRP& P [[buffer(0)]],
+                     uint2 g [[thread_position_in_grid]]) {
+    if (g.x >= P.SW || g.y >= P.H) return;
+    uint W = P.W, H = P.H;
+    bool left = g.x < W;
+    uint base = left ? 0u : W;
+    // 先把摆位还原成「自家半幅中心为原点」的偏移，符号与 kSbsShift 一致
+    int sh = int(rint(left ? P.xoff - P.gap : P.xoff + P.gap));
+    float dx = float(int(g.x - base) - sh) + 0.5 - float(W) / 2.0;
+    float dy = float(g.y) + 0.5 - float(H) / 2.0;
+    float R = 0.5 * sqrt(float(W * W + H * H));
+    float sc = 1.0 + P.fish * (dx * dx + dy * dy) / (R * R);
+    float sx = dx * sc + float(W) / 2.0;
+    float sy = dy * sc + float(H) / 2.0;
+    if (sx < 0.5 || sx > float(W) - 0.5 || sy < 0.5 || sy > float(H) - 0.5) {
+        dst.write(float4(0.0, 0.0, 0.0, 0.0), g);
+        return;
+    }
+    dst.write(src.sample(lin, float2(sx / float(W), sy / float(H))), g);
 }

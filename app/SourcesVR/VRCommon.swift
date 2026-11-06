@@ -321,7 +321,7 @@ enum VRTech {
             return false
         }
         var bad: [String] = []
-        for name in ["kScale", "kBack", "kSplatDepth", "kSplatColor", "kCombine", "kCopy", "kSbsShift"] {
+        for name in ["kScale", "kBack", "kSplatDepth", "kSplatColor", "kCombine", "kCopy", "kSbsShift", "kSbsFish"] {
             guard let fn = library.makeFunction(name: name) else {
                 bad.append(name + "(没这个函数)")
                 continue

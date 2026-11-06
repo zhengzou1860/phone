@@ -5,7 +5,7 @@ import CoreVideo
 import CoreML
 import Metal
 
-/// Swift 侧的 VRP，字段顺序和 Shaders.metal 里那个 struct 一字不差（52 字节，全 4 字节对齐）。
+/// Swift 侧的 VRP，字段顺序和 Shaders.metal 里那个 struct 一字不差（56 字节，全 4 字节对齐）。
 struct VRParams {
     var W: UInt32 = 0
     var H: UInt32 = 0
@@ -22,6 +22,8 @@ struct VRParams {
     var xoff: Float = 0
     /// 两图之间的距离（像素）：左眼往左、右眼往右各挪这么多，图本身大小不动，绝不串眼
     var gap: Float = 0
+    /// 鱼眼强度 k（0=不弯）：只在播放上屏那一趟用，出片那条一律 0（弯法是镜片的属性，不是片子的）
+    var fish: Float = 0
 }
 
 extension VRTech {
@@ -261,8 +263,9 @@ final class VRWarp {
     let bestR: MTLBuffer
     let dnBuf: MTLBuffer
     let holesBuf: MTLBuffer
-    /// 间距滑杆拉开时用的中间那张整幅：形变先写这里，再照它摆两只眼的位置。
-    /// 只在 gap≠0 时才造——出片那条和没动滑杆的播放都不该多占这一份内存和多跑一趟 GPU。
+    /// 播放上屏那两档（间距、鱼眼）要挪/要弯的是「已经拼好的整幅」，形变那四趟只认自家半幅，
+    /// 所以先拼到 comp 再走最后一趟。只在真要有这一趟时才造——出片那条和两档都没动的播放
+    /// 不该多占这一份内存和多跑一趟 GPU。
     var comp: MTLTexture?
 
     init?(eyeW: Int, eyeH: Int, bpct: Float, note: inout String) {
@@ -296,9 +299,10 @@ final class VRWarp {
 
     /// 一帧。dn 是已归一化到 0..1 的眼格深度；outPB 是 2W×H 的 BGRA 像素缓冲（成片的这一帧）。
     /// xoff = 每眼画面在自家半幅里的水平位移（像素），只对实时播放的对镜片有用，出片那条一律传 0。
-    /// gap = 两图之间的距离（像素），只有播放上屏用；传 0 就少跑一趟，出片那条一律 0（间距是看的时候调的，不烧进文件）。
+    /// gap = 两图之间的距离（像素），fish = 鱼眼强度 k（0=不弯），两个都只有播放上屏用；
+    /// 都传 0 就少跑最后一趟。出片那条一律 0：间距和弯法都是戴镜看的时候的事，不烧进文件。
     func render(srcPB: CVPixelBuffer, dn: [Float], zp: Float, xoff: Float = 0,
-                gap: Float = 0, outPB: CVPixelBuffer)
+                gap: Float = 0, fish: Float = 0, outPB: CVPixelBuffer)
         -> (upload: Double, gpu: Double, holes: Double, err: String?) {
         VRTech.gate.lock()
         defer { VRTech.gate.unlock() }
@@ -309,21 +313,21 @@ final class VRWarp {
         }
         let px = eyeW * eyeH
         guard dn.count == px else { return (0, 0, 0, "深度数组 \(dn.count) 与眼格 \(px) 不符") }
-        // 间距要挪的是「已经拼好的整幅」，形变那四趟只认自家半幅，所以先拼到 comp 再摆位。
-        // gap=0（出片、没碰滑杆的播放）不建这张、不多跑一趟。
+        // 间距和鱼眼都要动「已经拼好的整幅」，形变那四趟只认自家半幅，所以先拼到 comp 再走最后一趟。
+        // 两档都是 0（出片、没碰滑杆的播放）不建这张、不多跑一趟。
         var dstTex = outTex
-        if gap != 0 {
+        if gap != 0 || fish != 0 {
             if comp == nil {
-                guard let dev = VRTech.device else { return (0, 0, 0, "没有 Metal 设备，间距这趟起不来") }
+                guard let dev = VRTech.device else { return (0, 0, 0, "没有 Metal 设备，上屏那一趟起不来") }
                 let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm,
                                                                  width: sbsW, height: eyeH, mipmapped: false)
                 d.usage = [.shaderRead, .shaderWrite]
                 guard let t = dev.makeTexture(descriptor: d) else {
-                    return (0, 0, 0, "间距中转纹理建不出来")
+                    return (0, 0, 0, "上屏中转纹理建不出来")
                 }
                 comp = t
             }
-            guard let c = comp else { return (0, 0, 0, "间距中转纹理是空的") }
+            guard let c = comp else { return (0, 0, 0, "上屏中转纹理是空的") }
             dstTex = c
         }
         var p = VRParams()
@@ -357,16 +361,19 @@ final class VRWarp {
             }
             enc.endEncoding()
         }
-        if gap != 0 {
-            // 这一趟只做摆位：xoff 已经烧进 comp 了，这里传的 xoff=0、gap=gap
+        if fish != 0 || gap != 0 {
+            // 最后一趟只做摆位（鱼眼还要加弯）：xoff 已经烧进 comp 了，这里传的 xoff=0、gap=gap。
+            // 弯这一趟顺手把 gap 也做了，所以有鱼眼时不再单跑 kSbsShift；没鱼眼时仍走那条整数照搬的老路。
             var q = p
             q.xoff = 0
             q.gap = gap
-            guard let enc = VRTech.encode("kSbsShift", textures: [dstTex, outTex], params: q,
+            q.fish = fish
+            let kn = fish != 0 ? "kSbsFish" : "kSbsShift"
+            guard let enc = VRTech.encode(kn, textures: [dstTex, outTex], params: q,
                                           buffers: [], width: sbsW, height: eyeH) else {
                 VRTech.currentCommand = nil
                 VRTech.keep.removeAll()
-                return (uploadMs, 0, 0, "kSbsShift 没编出来")
+                return (uploadMs, 0, 0, "\(kn) 没编出来")
             }
             enc.endEncoding()
         }
@@ -380,8 +387,9 @@ final class VRWarp {
     }
 }
 
-/// 相册里已经是左右眼的那条用的极简一趟：不跑深度、不形变，只把两张图各自摆到屏幕上哪一格（kSbsShift）。
-/// 实时形变那条跑完四趟后如果间距不是 0，也借用这同一个 kernel 再摆一次位。
+/// 相册里已经是左右眼的那条用的极简上屏：不跑深度、不形变，只把两张图各自摆到屏幕上哪一格（kSbsShift），
+/// 要鱼眼就换成同时做弯的那一趟（kSbsFish）。
+/// 实时形变那条跑完四趟后如果间距或鱼眼不是 0，也走同一对 kernel。
 /// 跟 VRWarp 一样吃 VRTech 那份静态 command buffer 和 keep 表，所以整段照样在 gate 里。
 final class VRSbsShift {
     let frameW: Int
@@ -390,16 +398,18 @@ final class VRSbsShift {
     let eyeW: Int
 
     init?(frameW: Int, frameH: Int, eyeW: Int, note: inout String) {
-        guard VRTech.libs["kSbsShift"] != nil else { note = "kSbsShift 不在管线里"; return nil }
+        guard VRTech.libs["kSbsShift"] != nil, VRTech.libs["kSbsFish"] != nil else {
+            note = "kSbsShift/kSbsFish 不在管线里"; return nil
+        }
         self.frameW = frameW
         self.frameH = frameH
         self.eyeW = eyeW
     }
 
     /// 源和成片是同一尺寸的整幅左右眼；xoff 是两个半幅一起水平平移的像素数（正=右移），
-    /// gap 是把两张图互相拉开的像素数（各挪一半，图自己大小不动）。
-    /// 这里不数洞：平移腾出来的那一头本来就该发黑，不是补洞失败。
-    func render(srcPB: CVPixelBuffer, xoff: Float, gap: Float = 0, outPB: CVPixelBuffer)
+    /// gap 是把两张图互相拉开的像素数（各挪一半，图自己大小不动），fish 是鱼眼强度 k（0=不弯）。
+    /// 这里不数洞：平移和鱼眼腾出来的那一头本来就该发黑，不是补洞失败。
+    func render(srcPB: CVPixelBuffer, xoff: Float, gap: Float = 0, fish: Float = 0, outPB: CVPixelBuffer)
         -> (gpu: Double, err: String?) {
         VRTech.gate.lock()
         defer { VRTech.gate.unlock() }
@@ -414,13 +424,15 @@ final class VRSbsShift {
         p.SW = UInt32(frameW)
         p.xoff = xoff
         p.gap = gap
+        p.fish = fish
+        let kn = fish != 0 ? "kSbsFish" : "kSbsShift"
         let t0 = DispatchTime.now().uptimeNanoseconds
-        guard let enc = VRTech.encode("kSbsShift", textures: [srcTex, outTex], params: p,
+        guard let enc = VRTech.encode(kn, textures: [srcTex, outTex], params: p,
                                       buffers: [], width: frameW, height: frameH) else {
             // 开在半路的 commandBuffer 不能留给下一帧：它的 encoder 已经没了
             VRTech.currentCommand = nil
             VRTech.keep.removeAll()
-            return (0, "kSbsShift 没编出来")
+            return (0, "\(kn) 没编出来")
         }
         enc.endEncoding()
         VRTech.commitWait()
