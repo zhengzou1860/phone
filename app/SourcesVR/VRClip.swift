@@ -537,6 +537,150 @@ final class VRSource {
     }
 }
 
+/// 把源片的音轨搬进成片：解成交错 16 位 PCM 交给 AAC 编码器，时间戳原样走。
+/// 能这么省事是因为全片那条按 1:1 帧率出片（视频 PTS＝帧号 ÷ 源 fps），源片什么时间点，成片就什么时间点。
+/// 中途收兵（按停止、内存压力）就按 cutSeconds 裁多出来的那段，不然尾部只剩声没有画。
+/// 音轨出问题不影响片子：建不出来就 return nil，视频照写，原因如实写进报告那一行。
+final class VRAudioPass {
+    private let reader: AVAssetReader
+    private let out: AVAssetReaderTrackOutput
+    private let input: AVAssetWriterInput
+    private let writer: AVAssetWriter
+    /// 编码器队列满了先摁住手上这一份（copyNextSampleBuffer 取出来就不能扔），下一次 pump 再试
+    private var pending: CMSampleBuffer?
+    private var closed = false
+    private var appended = 0
+    private var lastSec = 0.0
+    private var fail = ""
+    let detail: String
+
+    /// 只有 1、2 声道才搬：5.1 那种要重混成立体声，这版不做，宁可不带声音也不能把整条片子写坏。
+    /// 返回 (pass, 报告用那句话)：pass 为 nil 时第二项就是「为什么这条没声音」。
+    static func make(writer: AVAssetWriter, src: VRSource) -> (pass: VRAudioPass?, why: String) {
+        guard let at = src.asset.tracks(withMediaType: .audio).first else {
+            VRJournal.line("音频 这条没有音轨，成片只写视频")
+            return (nil, "源片没有音轨")
+        }
+        var rate = 0.0
+        var ch = 0
+        if let fd = at.formatDescriptions.first as? CMFormatDescription,
+           let p = CMAudioFormatDescriptionGetStreamBasicDescription(fd) {
+            rate = Double(p.pointee.mSampleRate)
+            ch = Int(p.pointee.mChannelsPerFrame)
+        }
+        guard ch == 1 || ch == 2 else {
+            VRJournal.line("音频 不搬：\(ch) 声道（这版只认 1、2 声道，重混没做）")
+            return (nil, "\(ch) 声道的音轨这版不搬（只认 1、2 声道）")
+        }
+        if !(rate > 0 && rate <= 48000) {
+            VRJournal.line("音频 采样率读出来 \(rate)，按 44100 试")
+            rate = 44100
+        }
+        let pcm: [String: Any] = [
+            AVFormatIDKey: kAudioFormatLinearPCM,
+            AVLinearPCMBitDepthKey: 16,
+            AVLinearPCMIsFloatKey: false,
+            AVLinearPCMIsBigEndianKey: false,
+            AVLinearPCMIsNonInterleaved: false,
+        ]
+        let aac: [String: Any] = [
+            AVFormatIDKey: kAudioFormatMPEG4AAC,
+            AVSampleRateKey: Int(rate.rounded()),
+            AVNumberOfChannelsKey: ch,
+            AVEncoderBitRateKey: ch == 1 ? 96_000 : 128_000,
+        ]
+        guard let r = try? AVAssetReader(asset: src.asset) else {
+            VRJournal.line("音频 reader 建不出来")
+            return (nil, "音频 reader 建不出来")
+        }
+        let made: AVAssetReaderTrackOutput? = AVAssetReaderTrackOutput(track: at, outputSettings: pcm)
+        guard let o = made else {
+            VRJournal.line("音频 TrackOutput 建不出来（这套 PCM 参数本机不认）")
+            return (nil, "音频解码通道建不出来")
+        }
+        r.add(o)
+        let inp = AVAssetWriterInput(mediaType: .audio, outputSettings: aac)
+        inp.expectsMediaDataInRealTime = false
+        guard writer.canAdd(inp) else {
+            VRJournal.line("音频 canAdd 为假：AAC \(Int(rate)) Hz \(ch) 声道这套参数本机不认")
+            return (nil, "这套 AAC 参数本机不认（\(Int(rate)) Hz \(ch) 声道）")
+        }
+        writer.add(inp)
+        guard r.startReading() else {
+            inp.markAsFinished()
+            VRJournal.line("音频 startReading 失败 \(r.error?.localizedDescription ?? "-")")
+            return (nil, "音频 startReading 失败")
+        }
+        let one = VRAudioPass(reader: r, out: o, input: inp, writer: writer,
+                              detail: "AAC \(Int(rate.rounded())) Hz \(ch) 声道")
+        VRJournal.line("音频 通道接上 \(one.detail)")
+        return (one, one.detail)
+    }
+
+    private init(reader: AVAssetReader, out: AVAssetReaderTrackOutput, input: AVAssetWriterInput,
+                 writer: AVAssetWriter, detail: String) {
+        self.reader = reader
+        self.out = out
+        self.input = input
+        self.writer = writer
+        self.detail = detail
+    }
+
+    /// 视频那一圈每写完一帧调一次：能塞就塞，队列满就把手上这份留到下一次。
+    /// cutSeconds 是此刻视频写到第几秒，音频一越过这个点就当场收尾。
+    func pump(cutSeconds: Double) {
+        guard !closed else { return }
+        var spins = 0
+        while spins < 4000 {
+            spins += 1
+            if pending == nil {
+                guard reader.status == .reading, let sb = out.copyNextSampleBuffer() else { shut(); return }
+                pending = sb
+            }
+            guard let sb = pending else { return }
+            if CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sb)) >= cutSeconds {
+                pending = nil
+                shut()
+                return
+            }
+            guard input.isReadyForMoreMediaData else { return }
+            if input.append(sb) {
+                lastSec = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sb))
+                pending = nil
+                appended += 1
+            } else {
+                fail = "append 被拒（writer.status=\(writer.status.rawValue) \(writer.error?.localizedDescription ?? "-")）"
+                pending = nil
+                VRJournal.line("音频 \(fail)")
+                shut()
+                return
+            }
+        }
+    }
+
+    /// 收尾：把剩下的挤进编码器（视频已经写完，音频不该再排在队尾等），然后 markAsFinished。
+    /// 返回给报告那一句：搬成了写「搬了 N 个样本 到 X s」，一个都没搬成就把原因摊开。
+    func finish(cutSeconds: Double) -> String {
+        var tries = 0
+        while !closed && tries < 4000 {
+            pump(cutSeconds: cutSeconds)
+            if closed { break }
+            Thread.sleep(forTimeInterval: 0.002)
+            tries += 1
+        }
+        if !closed { shut() }
+        if appended == 0 { return fail.isEmpty ? "音轨一个样本都没搬进去" : fail }
+        return "\(detail) 搬了 \(appended) 个样本、到 \(String(format: "%.1f", lastSec)) s"
+    }
+
+    private func shut() {
+        guard !closed else { return }
+        closed = true
+        input.markAsFinished()
+        if reader.status == .reading { reader.cancelReading() }
+    }
+}
+
 extension VRUtil {
     /// 逐行拷像素（两张都是 BGRA，行宽可能不同）
     static func copyRows(from src: CVPixelBuffer, to dst: CVPixelBuffer) {

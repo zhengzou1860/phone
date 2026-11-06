@@ -334,9 +334,13 @@ enum VRFull {
                 outs.append("zp\(String(format: "%.2f", zp)): canAdd 为假，这套 outputSettings 本机不支持"); break
             }
             writer.add(input)
+            // 音轨要在 startWriting 之前挂上去：源片有声音就跟着原 PTS 一起搬，
+            // 全片是按源 fps 一帧不落地写的，所以视频时间轴 = 源时间轴，音频一个点都不用改。
+            let (ap, audioWhy) = VRAudioPass.make(writer: writer, src: src)
             let tHead0 = DispatchTime.now().uptimeNanoseconds
             do { try writer.startWriting() } catch {
                 str2.close()
+                ap?.finish(cutSeconds: 0)
                 outs.append("zp\(String(format: "%.2f", zp)): startWriting 抛错 \(error)"); break
             }
             writer.startSession(atSourceTime: .zero)
@@ -411,6 +415,8 @@ enum VRFull {
                 appendMs.append(Double(DispatchTime.now().uptimeNanoseconds - ta) / 1_000_000)
                 k += 1
                 doneFrames = k
+                // 音频跟着视频往前走：写完第 k 帧就允许音频推进到 k/fps 秒
+                ap?.pump(cutSeconds: Double(k) / fps)
                 if k % 60 == 0 {
                     let el = Double(DispatchTime.now().uptimeNanoseconds - wall0) / 1_000_000_000
                     progress = "全片 第 \(zi + 1)/\(zps.count) 档 zp\(String(format: "%.2f", zp))"
@@ -426,6 +432,8 @@ enum VRFull {
             }
             cacheMap = Data()
             str2.close()
+            // 音频在视频收口前自己先挤完：视频已全写完，编解码器不会再卡在队尾
+            let audioMsg = ap?.finish(cutSeconds: Double(k) / fps) ?? audioWhy
             input.markAsFinished()
             let tTail0 = DispatchTime.now().uptimeNanoseconds
             let esem = DispatchSemaphore(value: 0)
@@ -443,8 +451,9 @@ enum VRFull {
             outs.append("\(out.lastPathComponent) \(k) 帧≈\(String(format: "%.1f", secs)) s"
                 + " \(String(format: "%.1f", Double(size) / 1048576)) MB｜补洞 \(String(format: "%.2f", rate))%"
                 + "｜成片缓冲\(bufFrom)"
+                + "｜声音 \(audioMsg)"
                 + (why.isEmpty ? "" : "｜\(why)"))
-            VRJournal.line("全片 zp\(String(format: "%.2f", zp)) 出完 \(k) 帧 \(String(format: "%.1f", Double(size) / 1048576)) MB")
+            VRJournal.line("全片 zp\(String(format: "%.2f", zp)) 出完 \(k) 帧 \(String(format: "%.1f", Double(size) / 1048576)) MB｜声音 \(audioMsg)")
             let saved = VRPilot.toPhotos(out)
             outs.append("  存相册 " + saved)
             if saved.hasPrefix("已存") {
