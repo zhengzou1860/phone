@@ -401,8 +401,12 @@ final class PageViewController: UIViewController {
         status(needStart
                ? "\(reason)：正在接上 PC 的推流模式…"
                : "\(reason)：PC 还在推流模式，直接接着出帧…")
+        // 进推流模式也是一条要等 PC 回话的命令：这期间整页不接点击，
+        // 否则连点会把 /live_start 和 reader 重建叠成几轮。
+        setPageBusy(true)
 
         Task { @MainActor in
+            defer { self.setPageBusy(false) }
             // 上一笔 /live_stop 还没落地就开新一轮：停止可能后到，把刚开的推流又关掉。
             if let flying = self.pendingStop { _ = await flying.value }
             guard gen == self.pushGen else { return }
@@ -529,6 +533,15 @@ final class PageViewController: UIViewController {
         }
         let js = "window.LiveUI && window.LiveUI.setStopPending && "
             + "window.LiveUI.setStopPending(\(LiveShim.jsLiteral(state)))"
+        webView.evaluateJavaScript(js, completionHandler: nil)
+    }
+
+    /// 整页忙闸：原生这条命令（起播/跳转/停止）在等 PC 回话时，页面所有按钮都不接点击。
+    /// 停止那条走 setStopPending，这里只给起播和跳转用；两路在页面里分开计数，互不覆盖。
+    private func setPageBusy(_ on: Bool) {
+        guard webView != nil else { return }
+        let js = "window.LiveUI && window.LiveUI.setBusy && window.LiveUI.setBusy("
+            + (on ? "true" : "false") + ")"
         webView.evaluateJavaScript(js, completionHandler: nil)
     }
 

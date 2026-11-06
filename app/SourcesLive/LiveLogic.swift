@@ -47,7 +47,7 @@ enum LiveConfig {
 
     /// 追加到 WKWebView 默认 UA 末尾：PC 那边看 access log 就知道是手机 app 在访问，
     /// 而不是有人在浏览器里手点。
-    static let userAgentSuffix = "LiveSwap/0.16"
+    static let userAgentSuffix = "LiveSwap/0.17"
 
     /// 第一次启动时地址栏里预填的这台：PC 侧现在监听的就是它。
     /// 只当预填和提示用，不当写死的配置——PC 重连 WiFi 以后 IP 会变，
@@ -506,6 +506,9 @@ enum LiveShim {
       document.addEventListener('click', function (ev) {
         var t = ev.target;
         if (!t || !t.closest) return;
+        // 忙闸先拦：这条监听注册得比后面的忙闸早，不看一眼就会在等 PC 回话时
+        // 把「选择文件 / 播放」再送一遍（样式只挡鼠标，挡不住程序化的 click）。
+        if (busyNow()) { ev.preventDefault(); ev.stopPropagation(); return; }
         for (var i = 0; i < HOOKS.length; i++) {
           var el = find(HOOKS[i][1]);
           if (!el || !el.contains(t)) continue;
@@ -523,6 +526,8 @@ enum LiveShim {
         if (ev.key !== 'Enter') return;
         var el = find(PATH_SEL);
         if (!el || ev.target !== el) return;
+        // 忙的时候路径格可能还留着焦点：回车同样不许把跳转叠进正在等的那一轮。
+        if (busyNow()) { ev.preventDefault(); ev.stopPropagation(); return; }
         ev.preventDefault();
         ev.stopPropagation();
         send({ action: SEEK });
@@ -562,6 +567,84 @@ enum LiveShim {
         send({ action: 'ready', hooks: have, title: t ? String(t.textContent || '') : '' });
       };
       window.LiveUI = UI;
+
+      // —— 整页忙闸 ——
+      // 手机和 PC 是一问一答的单进程：命令发出到 PC 回话之间，整页不再接点击。
+      // 不灰的话用户会一直补点，同一件事在 PC 上排成几份，前后状态互相打架。
+      // 只挡命令，不挡每秒轮询——把心跳也挡进去，整页会跟着一秒一闪。
+      var BUSY_POLL = ['/get_playback_state', '/api/record/status', '/api/edit/progress'];
+      var BUSY_MAX_MS = 15000;  // PC 彻底不回话时别把页面永远锁死，到点放开让用户重试
+      var busyFetches = 0;      // 页面自己发出的命令请求
+      var busyHold = false;     // 停止握手挂住（原生 setStopPending）
+      var busyNative = 0;       // 原生起播/跳转在等 PC（计数：两轮叠在一起也不互相解闸）
+
+      function busyNow() { return busyHold || busyNative > 0 || busyFetches > 0; }
+
+      (function addBusyStyle() {
+        try {
+          var st = document.createElement('style');
+          st.id = 'live-busy-style';
+          st.textContent = 'html.pc-busy button,html.pc-busy select,html.pc-busy input,'
+            + 'html.pc-busy a[href],html.pc-busy [onclick],html.pc-busy .edit-mode'
+            + '{pointer-events:none !important;opacity:.45 !important;}'
+            + 'html.pc-busy,html.pc-busy body{cursor:progress !important;}';
+          (document.head || document.documentElement).appendChild(st);
+        } catch (e) {}
+      })();
+
+      function busySync() {
+        try {
+          var h = document.documentElement;
+          if (busyNow()) h.classList.add('pc-busy');
+          else h.classList.remove('pc-busy');
+        } catch (e) {}
+      }
+
+      // 有些能点的地方不是 button（剪辑页两个模式格是 div，动态加的行也可能不是），
+      // 光靠样式挡不干净：忙时在捕获阶段把点击整个截下来，不让它进页面自己的处理。
+      document.addEventListener('click', function (ev) {
+        if (!busyNow()) return;
+        ev.preventDefault();
+        ev.stopPropagation();
+      }, true);
+
+      if (window.fetch) {
+        var rawFetch = window.fetch.bind(window);
+        var isPoll = function (url) {
+          var p = String(url || '');
+          for (var i = 0; i < BUSY_POLL.length; i++) {
+            if (p.indexOf(BUSY_POLL[i]) >= 0) return true;
+          }
+          return false;
+        };
+        window.fetch = function (input, init) {
+          var url = '';
+          try { url = typeof input === 'string' ? input : (input && input.url) || ''; } catch (e) {}
+          if (isPoll(url)) return rawFetch(input, init);
+          busyFetches += 1;
+          busySync();
+          var settled = false;
+          var done = function () {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            busyFetches = Math.max(0, busyFetches - 1);
+            busySync();
+          };
+          var timer = setTimeout(done, BUSY_MAX_MS);
+          var p;
+          try { p = rawFetch(input, init); }
+          catch (e) { done(); return Promise.reject(e); }
+          return p.then(function (r) { done(); return r; },
+                        function (e) { done(); throw e; });
+        };
+      }
+
+      UI.setBusy = function (on) {
+        busyNative = Math.max(0, busyNative + (on ? 1 : -1));
+        busySync();
+        return busyNative;
+      };
 
       // —— 停止握手 ——
       // 页面每秒才轮询一次 /get_playback_state，最长晚一秒才认「停了」。原生在点停止的
@@ -611,6 +694,10 @@ enum LiveShim {
         var s = String(state || '');
         if (s === STOP_STOPPING || s === STOP_FAILED) {
           STOP_HOLD = s;
+          // 只有「还在等 PC 回话」才把整页灰上；失败态已经不在等，
+          // 灰住的话用户点不到「重试停止」，就真卡死了。
+          busyHold = (s === STOP_STOPPING);
+          busySync();
           stopButton(s === STOP_FAILED ? '重试停止' : '停止中…', s === STOP_FAILED);
           stopSelects(true);
           stopFaceNote(s === STOP_FAILED ? 'failed' : 'hold');
@@ -618,6 +705,8 @@ enum LiveShim {
         }
         // 确认停了：按钮马上回到「播放」，下拉框解不解交给页面按 PC 的 edit_locked 判。
         STOP_HOLD = null;
+        busyHold = false;
+        busySync();
         stopButton('播放', true);
         stopFaceNote('release');
         try {

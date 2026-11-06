@@ -214,6 +214,19 @@ ck("停止 握手中拦轮询", shim.contains("if (STOP_HOLD)"),
 ck("停止 状态字进脚本", shim.contains(LiveShim.jsLiteral(LiveStopGate.stoppingState))
    && shim.contains(LiveShim.jsLiteral(LiveStopGate.failedState)))
 ck("停止 两个状态字不同", LiveStopGate.stoppingState != LiveStopGate.failedState)
+
+// 整页忙闸：命令发出到 PC 回话之间，所有可点的东西一起灰；每秒轮询不许进闸，
+// 否则页面会跟着心跳一秒一闪。
+ck("忙闸 有整页灰样式", shim.contains("pc-busy") && shim.contains("pointer-events:none"))
+ck("忙闸 命令包了fetch", shim.contains("window.fetch = function") && shim.contains("busyFetches"))
+ck("忙闸 心跳不进闸", shim.contains("/get_playback_state") && shim.contains("/api/record/status")
+   && shim.contains("/api/edit/progress"))
+ck("忙闸 非按钮也挡", shim.contains("busyNow()") && shim.contains("ev.stopPropagation"),
+   "剪辑页模式格是 div，只靠样式挡不住")
+ck("忙闸 原生能开关", shim.contains("UI.setBusy") && shim.contains("busyNative = Math.max"))
+ck("忙闸 停止失败可重试", shim.contains("busyHold = (s === STOP_STOPPING)"),
+   "失败态还灰住整页，用户就点不到「重试停止」")
+ck("忙闸 PC没回话到点放开", shim.contains("BUSY_MAX_MS") && shim.contains("clearTimeout(timer)"))
 ck("桥名 进度条独立", LiveConfig.seekBridgeName == "liveSeek"
    && LiveConfig.seekBridgeName != LiveConfig.bridgeName)
 ck("转义 引号反斜杠", LiveShim.jsLiteral("a\"b\\c") == "\"a\\\"b\\\\c\"",
