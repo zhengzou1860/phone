@@ -46,6 +46,7 @@ jobs:
             app/SourcesLive/LiveLogic.swift \
             app/SourcesLive/FrameSource.swift \
             app/SourcesLive/SwapClient.swift \
+            app/SourcesLive/AppLog.swift \
             ci/liveselftest/main.swift \
             -o /tmp/livetest 2>&1 | rec
           if [ ! -x /tmp/livetest ]; then echo "LIVE-VERDICT FAIL 自测没编出来，见上面编译错" | rec; exit 1; fi

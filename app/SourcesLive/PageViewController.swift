@@ -29,6 +29,23 @@ final class PageViewController: UIViewController {
         case paused     // 退到后台停住了，回前台自动接着推
     }
     private var phase: Phase = .none
+    private var phaseName: String {
+        switch phase {
+        case .none: return "没选片"
+        case .loaded: return "已选片"
+        case .pushing: return "推流中"
+        case .paused: return "后台暂停"
+        }
+    }
+    private var stopGateName: String {
+        switch stopGate {
+        case .idle: return "待命"
+        case .stopping: return "停止中"
+        case .failed: return "停止失败"
+        }
+    }
+    /// 崩溃补发只试一次：PC 没开的时候不必每次回前台都撞。
+    private var crashUploadTried = false
     private var resumeSeconds: Double = 0
     private var greetedHost = ""
     /// 页面给 <html> 加 .fs 时置 true：原生藏状态栏/Home 指示条，横屏铺满。
@@ -89,7 +106,11 @@ final class PageViewController: UIViewController {
         NotificationCenter.default.addObserver(
             self, selector: #selector(becomeActive),
             name: UIApplication.didBecomeActiveNotification, object: nil)
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(appWillTerminate),
+            name: UIApplication.willTerminateNotification, object: nil)
 
+        AppLog.shared.log("life", "界面起来了：版本 \(LiveConfig.appVersion)(\(LiveConfig.appBuild))")
         loadPage()
     }
 
@@ -122,9 +143,22 @@ final class PageViewController: UIViewController {
             forName: LiveConfig.seekBridgeName)
     }
 
+    @objc private func appWillTerminate() {
+        AppLog.shared.markCleanExit()
+    }
+
+    override func didReceiveMemoryWarning() {
+        super.didReceiveMemoryWarning()
+        AppLog.shared.log("mem", "收到系统内存警告：前台足迹 \(AppLog.footprintMB())MB")
+    }
+
     /// 手机不能一边在后台一边解 1080p 还指望它推帧：先停手，把 PC 的锁也放开。
     @objc private func resignActive() {
-        guard phase == .pushing else { return }
+        guard phase == .pushing else {
+            AppLog.shared.log("life", "退到后台（\(phaseName)）")
+            return
+        }
+        AppLog.shared.log("life", "退到后台，正在停推")
         pushGen += 1
         video.stop()
         audio.pause()
@@ -137,6 +171,7 @@ final class PageViewController: UIViewController {
 
     /// 回前台先问一次 /live_status：PC 那 10 秒空闲看门狗多半已经把推流模式关掉了。
     @objc private func becomeActive() {
+        AppLog.shared.log("life", "回到前台（\(phaseName)）")
         guard phase == .paused, video.hasClip else { return }
         guard let client = client else { phase = .loaded; return }
         let from = resumeSeconds
@@ -222,6 +257,7 @@ final class PageViewController: UIViewController {
     }
 
     private func connect(to base: URL) {
+        AppLog.shared.log("net", "连 PC \(LiveHost.display(base))")
         let c = SwapClient(baseURL: base)
         // 页面和原生盯的是同一个 base（下面 load 的就是它），cookie 按主机匹配才不会错位；
         // store 也取这个 webView 自己的，不碰别的 WebView / 其他 app 的会话。
@@ -255,6 +291,8 @@ final class PageViewController: UIViewController {
     // MARK: - 状态写回页面
 
     private func status(_ msg: String, _ kind: String = "success") {
+        // 用户在屏幕上看到的那一行，日志里也要有：事后对时间线靠它。
+        AppLog.shared.log(kind == "error" ? "err" : "ui", msg)
         let js = "window.LiveUI && window.LiveUI.status(\(LiveShim.jsLiteral(msg)), "
             + "\(LiveShim.jsLiteral(kind)))"
         webView.evaluateJavaScript(js, completionHandler: nil)
@@ -338,6 +376,7 @@ final class PageViewController: UIViewController {
     // MARK: - 三条挂子的原生侧
 
     private func onPick() {
+        AppLog.shared.log("ui", "打开相册选片")
         var cfg = PHPickerConfiguration()
         cfg.selectionLimit = 1
         cfg.filter = .videos
@@ -388,6 +427,7 @@ final class PageViewController: UIViewController {
             defer { self.setPageBusy(false) }
             let path = await client.fetchVideoPathOnce()
             guard self.client === client else { return }
+            AppLog.shared.log("ui", "点播放时手机没片；PC 上的片：\(path ?? "（空）")")
             guard LivePlaySource.usesPCVideo(hasLocalClip: self.video.hasClip, pcPath: path) else {
                 self.onPick()
                 return
@@ -444,6 +484,10 @@ final class PageViewController: UIViewController {
             if let flying = self.pendingStop { _ = await flying.value }
             guard gen == self.pushGen else { return }
             if needStart {
+                // PC 的 is_playing 只有 /stop_playback 会清。0.18 把「播放」交回页面以后，
+                // 一次 PC 本地播放留下的 true 会让 /api/target_face_* 永远吃 409——
+                // 用户看到的就是「特征改几次以后就再也改不了」。进推流模式前先松一次。
+                await client.stopPCPlayback()
                 do {
                     let w = try await client.startLive()
                     video.targetWidth = w
@@ -539,6 +583,7 @@ final class PageViewController: UIViewController {
     }
 
     private func stopPush(_ note: String) {
+        AppLog.shared.log("ui", "用户点了停止（从 \(phaseName)）")
         pushGen += 1
         video.stop()
         audio.pause()
@@ -737,14 +782,29 @@ final class PageViewController: UIViewController {
             // 这三个数摆在一行里，一看就知道该动哪处，不再靠猜。
             let send = video.takeSendStats()
             let net = client.takeNetworkStats()
+            let encFail = video.takeEncodeFailures()
             let perf = LivePerf.line(sourceFPS: video.sourceFPS, encodeMs: send.costMs,
                                      gapMs: send.gapMs, rttAvgMs: net.avgMs, rttMaxMs: net.maxMs)
             status(warm + "手机 \(String(format: "%.1f", fps))fps"
                     + (perf.isEmpty ? "" : "｜" + perf)
+                    + (encFail > 0 ? "｜编码失败 \(encFail)" : "")
                     + "｜本地丢帧 \(client.framesDroppedLocal)"
                     + "｜PC 拒 \(client.framesRejected)｜PC 收到 \(client.pcFramesIn)、"
                     + "预热丢 \(client.pcFramesDropped)" + up
                     + "｜屏幕长按 1.5 秒改 PC 地址")
+            // 同一组数进日志，且多带 PC 侧的输入/输出年龄和换脸相似度：
+            // 「卡顿」到底卡在手机发、链路、还是 PC 算，看这一行。
+            let inAge = client.inputAgeMs.map { String($0) } ?? "-"
+            let outAge = client.outputAgeMs.map { String($0) } ?? "-"
+            let best = client.bestSim.map { String(format: "%.2f", $0) } ?? "-"
+            let thr = client.matchThr.map { String(format: "%.2f", $0) } ?? "-"
+            AppLog.shared.log("perf", "手机 \(String(format: "%.1f", fps))fps｜\(perf)"
+                              + "｜编码失败 \(encFail)"
+                              + "｜本地丢 \(client.framesDroppedLocal)｜PC拒 \(client.framesRejected)"
+                              + "｜PC收 \(client.pcFramesIn) 预热丢 \(client.pcFramesDropped)"
+                              + "｜in_age \(inAge) out_age \(outAge)"
+                              + "｜plan \(client.planCount) swapped \(client.swappedFaces)"
+                              + " best \(best) thr \(thr)")
         }
         // 配了目标脸却一张没换：用 PC 下发的 best_sim/match_thr 说清是“不是同一个人”
         // 还是“照片太小太糊”。老 PC 没有这两个字段时 PlanHint 返回 nil，不猜也不报警。
@@ -884,10 +944,97 @@ final class PageViewController: UIViewController {
         let dur = CMTimeGetSeconds(video.duration)
         let durText = dur.isFinite ? LiveTime.clock(dur) : "-"
         let size = video.naturalSize
+        AppLog.shared.log("ui", "选中 \(name)：\(durText) \(Int(size.width))×\(Int(size.height))"
+                          + " 源 \(Int(video.sourceFPS))fps")
         status("已选中 \(name)（\(durText)·\(Int(size.width))×\(Int(size.height))"
                + LivePerf.sourceLabel(video.sourceFPS) + "）："
                + "点「播放」开始推流｜那一格里输 秒数或 mm:ss 再按回车 = 跳到那儿"
                + (audio.hasTrack ? "｜原声在手机上跟播" : "｜这一段没有音轨，只有画面"))
+    }
+
+    // MARK: - 把运行日志发到 PC
+
+    /// 界面左下角那颗「发日志」。日志压成几段 GET 发到 PC 的 /app_log?…：
+    /// PC 不需要新接口，它的启动日志会把请求行连同查询串记下来，换脸服务重启也不丢。
+    private func sendLogs(auto: Bool) {
+        let base = client?.baseURL ?? storedHost().flatMap { LiveHost.base($0) }
+        guard let base = base else {
+            if !auto { status("还没连上 PC：先填地址，日志才有地方发", "error") }
+            return
+        }
+        if !auto {
+            webView.evaluateJavaScript(
+                "window.LiveUI && LiveUI.logSending && LiveUI.logSending()",
+                completionHandler: nil)
+        }
+        AppLog.shared.log("ui", auto ? "启动时自动补发上一轮的日志" : "用户点了「发日志」")
+        let payload = AppLog.shared.snapshot()
+        let id = AppLog.sessionID()
+        Task {
+            let report = await withCheckedContinuation {
+                (cont: CheckedContinuation<AppLog.UploadReport, Never>) in
+                AppLog.upload(payload: payload, to: base, session: id,
+                              version: LiveConfig.appVersion) { cont.resume(returning: $0) }
+            }
+            await MainActor.run {
+                if report.ok {
+                    AppLog.shared.clearCrashFlag()
+                    self.status("日志已发到电脑：编号 \(id)（\(report.chunks) 段）", "success")
+                } else {
+                    AppLog.shared.log("err", "日志发送失败：\(report.message)")
+                    self.status("日志没发出去：\(report.message)｜确认手机和电脑在同一张网", "error")
+                }
+                let js = "window.LiveUI && LiveUI.logDone && LiveUI.logDone("
+                    + (report.ok ? "true" : "false") + ", \(LiveShim.jsLiteral(id)))"
+                self.webView.evaluateJavaScript(js, completionHandler: nil)
+            }
+        }
+    }
+
+    /// 上一轮是被杀掉/闪退的：启动后自动补发一次，用户不用先发现再手动点。
+    private func maybeAutoSendCrashLog() {
+        guard !crashUploadTried, AppLog.shared.needsAutoUpload else { return }
+        crashUploadTried = true
+        AppLog.shared.log("boot", "上一轮没正常收尾：自动补发一次")
+        sendLogs(auto: true)
+    }
+
+    // MARK: - 页面日志（JS 错误、命令回话、播放状态）
+
+    private func clipped(_ body: [String: Any], _ key: String, _ max: Int = 600) -> String {
+        let s = (body[key] as? String) ?? ""
+        return s.count > max ? String(s.prefix(max)) + "…" : s
+    }
+
+    private func logJsMessage(_ body: [String: Any]) {
+        let level = clipped(body, "level", 20)
+        let msg = clipped(body, "msg")
+        let src = clipped(body, "src", 160)
+        let line = (body["line"] as? NSNumber)?.intValue ?? 0
+        var text = "[\(level)] \(msg)"
+        if !src.isEmpty { text += " @\(src):\(line)" }
+        AppLog.shared.log("js", text)
+    }
+
+    private func logCommand(_ body: [String: Any]) {
+        let url = clipped(body, "url", 120)
+        let status = (body["status"] as? NSNumber)?.intValue ?? 0
+        let ms = (body["ms"] as? NSNumber)?.intValue ?? 0
+        let text = clipped(body, "body", 300)
+        var line = "\(url) \(status == 0 ? "网络错" : "HTTP \(status)") \(ms)ms"
+        if !text.isEmpty { line += " \(text)" }
+        AppLog.shared.log("cmd", line)
+    }
+
+    /// 页面读到的 PC 状态变了才报。和原生 phase 摆在一行：
+    /// 「按钮说停了、PC 还在播」这种前后台不一致，靠这条时间线定位。
+    private func logPageState(_ body: [String: Any]) {
+        func flag(_ key: String) -> Int { (body[key] as? Bool) == true ? 1 : 0 }
+        let plan = (body["plan"] as? NSNumber)?.intValue ?? 0
+        let fps = (body["fps"] as? NSNumber)?.intValue ?? 0
+        AppLog.shared.log("page", "live=\(flag("live")) playing=\(flag("playing")) "
+                           + "locked=\(flag("locked")) plan=\(plan) fps=\(fps)"
+                           + "｜原生 \(phaseName) 停止闸 \(stopGateName)")
     }
 }
 
@@ -913,9 +1060,19 @@ extension PageViewController: WKScriptMessageHandler {
             onSeek()
         case LiveShim.hookFullscreen:
             setPageFullscreen((body["on"] as? Bool) ?? false)
+        case LiveShim.hookSendLog:
+            sendLogs(auto: false)
+        case LiveShim.hookJsLog:
+            logJsMessage(body)
+        case LiveShim.hookCmdLog:
+            logCommand(body)
+        case LiveShim.hookPageState:
+            logPageState(body)
         case LiveShim.hookReady:
             let hooks = body["hooks"] as? [String: Bool] ?? [:]
             let missing = LiveShim.actionNames.filter { hooks[$0] != true }
+            AppLog.shared.log("page", "页面加载完：\(clipped(body, "title", 80))"
+                              + (missing.isEmpty ? "｜挂子齐" : "｜缺 \(missing.joined(separator: "、"))"))
             if !missing.isEmpty {
                 status("界面对不上：缺 \(missing.joined(separator: "、")) 这几个按钮"
                        + "（PC 那边改过页面？）", "error")
@@ -931,6 +1088,11 @@ extension PageViewController: WKScriptMessageHandler {
 extension PageViewController: WKNavigationDelegate {
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         guard let client = client else { return }
+        AppLog.shared.log("page", "页面加载完：\(webView.url?.path ?? "/")")
+        // 上一轮是被闪退/杀掉的：等页面稳定两秒自动补发一次日志。
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+            self?.maybeAutoSendCrashLog()
+        }
         client.importCookies { [weak self] in
             guard let self = self else { return }
             // 页面重载会把握手锁一起刷掉：还在 stopping/failed 就重新锁上，
@@ -1014,6 +1176,7 @@ extension PageViewController: WKNavigationDelegate {
     private func reportFailure(_ error: Error) {
         let ns = error as NSError
         guard ns.code != NSURLErrorCancelled else { return }
+        AppLog.shared.log("net", "页面加载失败：\(ns.domain) \(ns.code) \(ns.localizedDescription)")
         let host = client.map { LiveHost.display($0.baseURL) } ?? "（没地址）"
         status("连不上 \(host)：\(ns.localizedDescription)｜确认手机和电脑在同一张网，"
                + "并且这台手机的「本地网络」权限是开的", "error")
@@ -1051,6 +1214,9 @@ extension PageViewController: WKDownloadDelegate {
 
     func downloadDidFinish(_ download: WKDownload) {
         guard let url = downloadTargets.removeValue(forKey: ObjectIdentifier(download)) else { return }
+        let bytes = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?
+            .intValue ?? 0
+        AppLog.shared.log("download", "落到临时目录：\(url.lastPathComponent) \(bytes / 1024)KB")
         status("已下载 \(url.lastPathComponent)：选「存储到文件」或相册", "success")
         let sheet = UIActivityViewController(activityItems: [url], applicationActivities: nil)
         sheet.popoverPresentationController?.sourceView = view
@@ -1139,6 +1305,11 @@ final class LiveChrome: ObservableObject {
 @main
 struct LiveApp: App {
     @StateObject private var chrome = LiveChrome.shared
+
+    init() {
+        // 第一件事就把日志接上：后面无论页面起没起来、有没有闪退，都有记录可发。
+        AppLog.shared.boot(version: LiveConfig.appVersion, build: LiveConfig.appBuild)
+    }
 
     var body: some Scene {
         WindowGroup {

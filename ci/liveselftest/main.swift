@@ -4,7 +4,7 @@
 //  地址解析、跳转解析、抽帧节奏、vImage+ImageIO 那条编码通路真的出不出得来 JPEG、
 //  注入脚本里的挂子名和 Swift 分发器对不对得上、以及和 PC 契约绑死的那几个数。
 //
-//  只编 LiveLogic / FrameSource / SwapClient 三个文件：界面那个文件要 UIKit，
+//  只编 LiveLogic / FrameSource / SwapClient / AppLog 四个文件：界面那个文件要 UIKit，
 //  它在 xcodebuild 那一跑被真编译器过一遍。
 //
 
@@ -168,7 +168,10 @@ ck("挂子 三条都有名字", LiveShim.actionNames == [LiveShim.hookPick, Live
 ck("挂子 名字是页面里那几个", LiveConfig.bridgeName == "livebridge")
 ck("脚本 占位符全替换掉了", !shim.contains("__HOOKS__") && !shim.contains("__BRIDGE__")
    && !shim.contains("__SEEK__") && !shim.contains("__FULLSCREEN__")
-   && !shim.contains("__STOPPING__") && !shim.contains("__FAILED__"))
+   && !shim.contains("__STOPPING__") && !shim.contains("__FAILED__")
+   && !shim.contains("__LOG__") && !shim.contains("__JSLOG__")
+   && !shim.contains("__CMDLOG__") && !shim.contains("__PAGESTATE__")
+   && !shim.contains("__LOGSEL__"))
 for hook in LiveShim.hooks {
     // 脚本里注入的是 JSON 字面量（选择器带引号），所以按编码后的形态找
     ck("脚本 带挂子 \(hook.name)",
@@ -230,6 +233,31 @@ ck("忙闸 PC没回话到点放开", shim.contains("BUSY_MAX_MS") && shim.contai
 ck("忙闸 下载链接不拦", shim.contains("downloadFile") && shim.contains("pointer-events:auto"),
    "下载是顶层导航交给 WKDownload，没有回话可等，灰住就点不了")
 
+// 发日志：界面左下角那颗按钮 → 原生把日志压成几段 GET 发到 PC 的 /app_log?…。
+// 等 PC 回话的忙闸不许挡它（用户往往正是卡住时才想发日志）。
+ck("日志 界面有按钮", shim.contains("live-log-btn")
+   && shim.contains(LiveShim.jsLiteral(LiveShim.hookSendLog)))
+ck("日志 忙时也点得动", shim.contains("html.pc-busy #live-log-btn")
+   && shim.contains("closest(LOG_SEL)"))
+ck("日志 按钮有回显", shim.contains("logDone") && shim.contains("logSending"))
+ck("日志 页面JS错误进日志", shim.contains("unhandledrejection") && shim.contains("console.error"))
+ck("日志 播放状态变化进日志", shim.contains("/get_playback_state")
+   && shim.contains(LiveShim.jsLiteral(LiveShim.hookPageState)))
+ck("日志 命令回话带响应体", shim.contains(LiveShim.jsLiteral(LiveShim.hookCmdLog))
+   && shim.contains("observeCommand"), "特征改不了多半是 409 的响应体在说话")
+ck("日志 分段纯函数", AppLog.chunks("abcdef", size: 2) == ["ab", "cd", "ef"],
+   "\(AppLog.chunks("abcdef", size: 2))")
+ck("日志 base64url 只含免转义字符", AppLog.base64URL(Data([0xfb, 0xff])) == "-_8",
+   AppLog.base64URL(Data([0xfb, 0xff])))
+ck("日志 编号12位十六进制", AppLog.sessionID().count == 12
+   && AppLog.sessionID().allSatisfy { $0.isHexDigit }, AppLog.sessionID())
+let logSample = Data(String(repeating: "手机推流日志 ", count: 400).utf8)
+if let packed = AppLog.compress(logSample) {
+    ck("日志 压缩真的变小", packed.count < logSample.count, "\(packed.count)/\(logSample.count)")
+} else {
+    ck("日志 压缩真的变小", false, "压缩返回 nil（会落回明文，不算致命）")
+}
+
 // 点「播放」时 PC 手上已有片（剪辑页「用于换脸」）就交回页面自己的 /start_playback；
 // 两边都没片才是手机上选片的时机。
 ck("播放 手机有片自己推", !LivePlaySource.usesPCVideo(hasLocalClip: true,
@@ -259,7 +287,10 @@ ck("账目 未知源不标", LivePerf.sourceLabel(0).isEmpty)
 
 ck("契约 在途上限3", LiveConfig.inflightLimit == 3)
 ck("契约 推送15fps", LiveConfig.pushFPS == 15.0)
-ck("契约 封顶宽800", LiveConfig.fallbackMaxWidth == 800)
+// 0.19 退回 640：PC 挂 3 张目标脸只算到 3–8fps，先让 PC 跟上节奏，不是手机上行不够。
+ck("契约 请求宽640", LiveConfig.fallbackMaxWidth == 640)
+ck("契约 UA带版本", LiveConfig.userAgentSuffix == "LiveSwap/0.19"
+   && LiveConfig.appVersion == "0.19" && LiveConfig.appBuild == "19")
 ck("契约 质量0.7", LiveConfig.jpegQuality == 0.7)
 ck("契约 看门狗2500ms", LiveConfig.watchdogMs == 2500, "1500 太紧：收尾那一秒实测到过 1489")
 ck("契约 出帧判据500ms", LiveConfig.warmAgeMs == 500,
@@ -324,7 +355,7 @@ ck("契约 预填那台能解析成地址", LiveHost.base(LiveConfig.suggestedHo
 // 客户端默认值与地址解析共用一条路
 ck("客户端 坏地址建不出来", SwapClient(hostText: "192.168.1.20/login") == nil)
 let c = SwapClient(baseURL: URL(string: "http://192.168.1.9:5000")!)
-ck("客户端 宽度先用兜底800", c.liveWidth == LiveConfig.fallbackMaxWidth)
+ck("客户端 宽度先用兜底640", c.liveWidth == LiveConfig.fallbackMaxWidth)
 ck("客户端 首页URL", c.pageURL.absoluteString == "http://192.168.1.9:5000")
 ck("客户端 结果流URL", c.feedURL.absoluteString == "http://192.168.1.9:5000/video_feed")
 ck("客户端 本地计数从0", c.framesSent == 0 && c.framesDroppedLocal == 0)

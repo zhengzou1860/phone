@@ -58,6 +58,20 @@ final class SwapClient: ObservableObject {
     private var rttCount = 0
     private var rttMaxMs: Double = 0
 
+    // 每帧被拒时写日志的节流：PC 一旦持续拒帧，15fps 会把同一句刷爆。
+    private let logLock = NSLock()
+    private var lastLogAt: [String: TimeInterval] = [:]
+
+    private func logThrottled(_ key: String, _ message: String, every: TimeInterval = 2) {
+        let now = CFAbsoluteTimeGetCurrent()
+        logLock.lock()
+        let last = lastLogAt[key] ?? 0
+        let write = now - last >= every
+        if write { lastLogAt[key] = now }
+        logLock.unlock()
+        if write { AppLog.shared.log("frame", message) }
+    }
+
     /// 取走一个窗口的往返时延（取完清零）。只算拿到了 HTTP 回应的帧，
     /// 被取消或网络错误的不进来——那不是链路慢，是这一帧没发成。
     func takeNetworkStats() -> (avgMs: Double, maxMs: Double) {
@@ -80,7 +94,7 @@ final class SwapClient: ObservableObject {
     }
 
     let baseURL: URL
-    /// /live_start 响应里下发的生效宽度，手机按它缩放（PC 的硬上限是 640）。
+    /// /live_start 响应里下发的生效宽度，手机按它缩放（PC 硬上限 800，0.19 主动要 640）。
     private(set) var liveWidth = LiveConfig.fallbackMaxWidth
 
     private let session: URLSession
@@ -201,11 +215,13 @@ final class SwapClient: ObservableObject {
         rttMaxMs = 0
         rttLock.unlock()
         let body = try JSONSerialization.data(withJSONObject: ["max_width": LiveConfig.fallbackMaxWidth])
+        AppLog.shared.log("pc", "/live_start 请求宽 \(LiveConfig.fallbackMaxWidth)")
         // 登录很可能就发生在刚才那一页：发之前先搬一次，401 再搬一次重试（见 callWithAuthRetry）。
         let (data, resp) = try await callWithAuthRetry("/live_start", body: body,
                                                        contentType: "application/json",
                                                        refreshBefore: true)
         let code = (resp as? HTTPURLResponse)?.statusCode ?? -1
+        AppLog.shared.log("pc", "/live_start HTTP \(code)")
         if let http = resp as? HTTPURLResponse, LiveAuth.lost(http) {
             await MainActor.run { self.sessionLost = true }
             // 页面 store 里一条 cookie 都没有：多半是在别的浏览器登录的，或者在别的页面上。
@@ -217,11 +233,13 @@ final class SwapClient: ObservableObject {
         guard code == 200, let j = j, (j["status"] as? String) == "success" else {
             let why = (j?["message"] as? String)
                 ?? (j == nil ? "PC 回的不是 JSON（多半是没登录，被弹到登录页）" : "HTTP \(code)")
+            AppLog.shared.log("pc", "/live_start 失败：\(why)")
             throw SwapError(message: why)
         }
         if let w = (j["max_width"] as? NSNumber)?.intValue, w > 0 {
             liveWidth = w
         }
+        AppLog.shared.log("pc", "/live_start 生效宽 \(liveWidth)")
         await MainActor.run {
             self.pcLiveMode = true
             self.sessionLost = false        // 能进得推流模式就说明 cookie 是好用的
@@ -255,10 +273,33 @@ final class SwapClient: ObservableObject {
                 ok = false
             }
         } catch {
+            AppLog.shared.log("pc", "/live_stop 没送到：\(error.localizedDescription)")
             return false
         }
+        AppLog.shared.log("pc", "/live_stop \(ok ? "成功" : "失败")")
         await MainActor.run { self.pcLiveMode = false }
         return ok
+    }
+
+    /// PC 的 is_playing 只有 /stop_playback 会清（/live_start、/live_stop 都不碰）。
+    /// 进推流模式前松一次：0.18 把「播放」交回页面以后，一次 PC 本地播放留下的 true
+    /// 会让 /api/target_face_* 永远吃 409——症状就是「特征改几次以后再也改不了」。
+    @discardableResult
+    func stopPCPlayback() async -> Bool {
+        do {
+            let (_, resp) = try await callWithAuthRetry("/stop_playback", body: Data(),
+                                                        contentType: nil)
+            guard let http = resp as? HTTPURLResponse else {
+                AppLog.shared.log("pc", "/stop_playback 没有 HTTP 回应")
+                return false
+            }
+            let ok = (200..<300).contains(http.statusCode) && !LiveAuth.lost(http)
+            AppLog.shared.log("pc", "/stop_playback HTTP \(http.statusCode)\(ok ? "" : "（没成功）")")
+            return ok
+        } catch {
+            AppLog.shared.log("pc", "/stop_playback 没送到：\(error.localizedDescription)")
+            return false
+        }
     }
 
     /// 跳转以后必须调：PC 会丢掉队列里的旧帧和上一姿势的检测缓存，否则糊到跳转之后。
@@ -349,13 +390,15 @@ final class SwapClient: ObservableObject {
         req.setValue("image/jpeg", forHTTPHeaderField: "Content-Type")
         req.httpBody = jpeg
         authorize(&req)
-        session.dataTask(with: req) { [weak self] _, resp, err in
+        session.dataTask(with: req) { [weak self] data, resp, err in
             guard let self = self else { return }
             self.inflight.signal()
             if let err = err {
                 let ns = err as NSError
                 // 手机侧网络抖一下不值得占一整行状态栏，计数留给自测和后台日志
                 if ns.code != NSURLErrorCancelled {
+                    self.logThrottled("neterr", "发帧失败：\(ns.domain) \(ns.code) "
+                                                    + ns.localizedDescription, every: 5)
                     DispatchQueue.main.async {
                         self.lastError = "live_frame: \(ns.domain) \(ns.code)"
                     }
@@ -369,6 +412,8 @@ final class SwapClient: ObservableObject {
             case .sessionLost:
                 if authRetried {
                     // 搬过一次还是 401：页面那边确实没登录了，停下来让人重登。
+                    self.logThrottled("auth", "帧被弹回登录页：会话失效（HTTP \(http.statusCode)）",
+                                      every: 10)
                     DispatchQueue.main.async {
                         self.sessionLost = true
                         self.lastError = LiveAuth.lostMessage
@@ -381,12 +426,18 @@ final class SwapClient: ObservableObject {
                 }
             case .notLive:
                 // 409 = PC 已退出推流模式（10 秒空闲看门狗或那边重启），必须重新 /live_start
+                self.logThrottled("409", "发帧吃 409：PC 已退出推流模式")
                 DispatchQueue.main.async {
                     self.saw409 += 1
                     self.lastError = "PC 已退出推流模式（静默超时或重启）"
                 }
             case .rejected(let code):
-                // 400 解不开、413 超 2MB、503 流水线没起、405 方法不对：这些都不算送到
+                // 400 解不开、413 超 2MB、503 流水线没起、405 方法不对：这些都不算送到。
+                // PC 的响应体写着到底是「空帧」还是「JPEG 解码失败」——身体不能扔。
+                let body = data.map { String(decoding: $0.prefix(240), as: UTF8.self) } ?? ""
+                let why = body.trimmingCharacters(in: .whitespacesAndNewlines)
+                self.logThrottled("reject", "PC 拒了这一帧：HTTP \(code)"
+                                                + (why.isEmpty ? "" : " \(why)"))
                 DispatchQueue.main.async {
                     self.framesRejected += 1
                     self.lastError = "PC 拒了这一帧：HTTP \(code)"

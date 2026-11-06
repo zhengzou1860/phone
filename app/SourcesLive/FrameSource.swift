@@ -101,15 +101,44 @@ final class VideoFrameSource {
     var onError: ((String) -> Void)?
 
     private(set) var duration: CMTime = .zero
-    private(set) var currentPTS: CMTime = .zero
     private(set) var naturalSize: CGSize = .zero
     private(set) var sourceFPS: Double = 0
 
     private var asset: AVURLAsset?
     private var track: AVAssetTrack?
     private var reader: AVAssetReader?
-    private var running = false
     private let queue = DispatchQueue(label: "live.frame.video")
+
+    /// 读线程写、主线程每秒读：CMTime 不是原子类型，裸读写属于数据竞争（真机上偶发崩溃）。
+    /// running 同理，stop() 在主线程写、reader 循环在后台读。
+    private let stateLock = NSLock()
+    private var _currentPTS = CMTime.zero
+    private var _running = false
+
+    var currentPTS: CMTime {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return _currentPTS
+    }
+
+    private var running: Bool {
+        get {
+            stateLock.lock()
+            defer { stateLock.unlock() }
+            return _running
+        }
+        set {
+            stateLock.lock()
+            _running = newValue
+            stateLock.unlock()
+        }
+    }
+
+    private func setPTS(_ pts: CMTime) {
+        stateLock.lock()
+        _currentPTS = pts
+        stateLock.unlock()
+    }
 
     // 出帧账目：读线程写、主线程每 10 秒取一次，中间必须加锁。
     private let statLock = NSLock()
@@ -117,6 +146,7 @@ final class VideoFrameSource {
     private var costCount = 0
     private var gapMaxMs: Double = 0
     private var lastEmitWall: TimeInterval = 0
+    private var encodeFailures = 0
 
     var isRunning: Bool { running }
     var hasClip: Bool { asset != nil && track != nil }
@@ -133,6 +163,15 @@ final class VideoFrameSource {
         gapMaxMs = 0
         statLock.unlock()
         return (cost, gap)
+    }
+
+    /// 编码失败是「画面卡住但链路没断」的一条隐藏原因：失败不报错，只是那一帧没发。
+    func takeEncodeFailures() -> Int {
+        statLock.lock()
+        defer { statLock.unlock() }
+        let n = encodeFailures
+        encodeFailures = 0
+        return n
     }
 
     private func noteEncode(costMs: Double) {
@@ -154,12 +193,13 @@ final class VideoFrameSource {
         costCount = 0
         gapMaxMs = 0
         lastEmitWall = 0
+        encodeFailures = 0
         statLock.unlock()
     }
 
     func load(url: URL) {
         stop()
-        currentPTS = .zero
+        setPTS(.zero)
         let a = AVURLAsset(url: url)
         guard let t = a.tracks(withMediaType: .video).first else {
             onError?("这个文件里没有视频轨")
@@ -208,7 +248,7 @@ final class VideoFrameSource {
         }
         reader = r
         running = true
-        currentPTS = from
+        setPTS(from)
         resetStats()
 
         queue.async { [weak self] in
@@ -226,23 +266,38 @@ final class VideoFrameSource {
                                            interval: interval)
                 guard pace.emit else { continue }
                 nextEmit = pace.nextEmitSeconds
-                let encodeStart = CFAbsoluteTimeGetCurrent()
-                guard let pb = CMSampleBufferGetImageBuffer(sb),
-                      let jpeg = FrameCodec.jpeg(pb, maxWidth: self.targetWidth,
-                                                 quality: self.jpegQuality) else { continue }
-                self.noteEncode(costMs: (CFAbsoluteTimeGetCurrent() - encodeStart) * 1000)
+                // ImageIO/CGImage 在同一轮里会挂一批 autorelease 对象；这条队列没有
+                // 系统自动池，不显式兜住会一路涨到被系统杀掉（看起来就是闪退）。
+                let jpeg: Data? = autoreleasepool {
+                    let encodeStart = CFAbsoluteTimeGetCurrent()
+                    guard let pb = CMSampleBufferGetImageBuffer(sb),
+                          let out = FrameCodec.jpeg(pb, maxWidth: self.targetWidth,
+                                                    quality: self.jpegQuality) else { return nil }
+                    self.noteEncode(costMs: (CFAbsoluteTimeGetCurrent() - encodeStart) * 1000)
+                    return out
+                }
+                guard let jpeg = jpeg else {
+                    self.statLock.lock()
+                    self.encodeFailures += 1
+                    self.statLock.unlock()
+                    continue
+                }
                 if originPTS == nil {
                     originWall = CFAbsoluteTimeGetCurrent()
                     originPTS = pts
                 }
                 self.onJPEG?(jpeg)
-                self.currentPTS = pts
+                self.setPTS(pts)
 
                 // 按 PTS 对齐墙钟：推流节奏 = 视频真实播放节奏，
                 // 落后了就跟着当前 PTS 重新对齐，不欠账堆积。
-                let due = originWall + (sec - CMTimeGetSeconds(originPTS!))
+                let start = originPTS ?? pts
+                let due = originWall + (sec - CMTimeGetSeconds(start))
                 let delay = due - CFAbsoluteTimeGetCurrent()
-                if delay > 0 { usleep(UInt32(delay * 1_000_000)) }
+                // 源时间戳偶尔会给出半个世纪这种值：直接 UInt32 会在真机上 trap。
+                if delay.isFinite, delay > 0 {
+                    usleep(useconds_t(min(delay, 0.5) * 1_000_000))
+                }
             }
             // cancelReading 以后 status 是 .cancelled，只有真读到片尾才 .completed
             if self.running, r.status == .completed {

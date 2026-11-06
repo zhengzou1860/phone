@@ -14,9 +14,13 @@ import CoreGraphics
 enum LiveConfig {
     static let defaultPort = 5100
 
-    /// PC 那边 /live_start 响应里的 max_width 是权威；这个只在读不到响应时兜底。
-    /// 0.14 起 PC 把上限放到 800；640 实测 51–54KB/帧，800 按同质量估 70–81KB。
-    static let fallbackMaxWidth = 800
+    /// PC 那边 /live_start 响应里的 max_width 是权威；这个既是请求值，也是读不到响应时的兜底。
+    /// 0.14 试过 800，实测不是带宽先崩：PC 挂 3 张目标脸只算到 3–8fps，手机上看到的就是卡。
+    /// 0.19 起退回 640（实测 51–54KB/帧），让 PC 先跟上节奏；再要高清等 PC 那边算力跟上。
+    static let fallbackMaxWidth = 640
+
+    static let appVersion = "0.19"
+    static let appBuild = "19"
 
     static let jpegQuality: CGFloat = 0.7
     static let pushFPS: Double = 15
@@ -47,7 +51,7 @@ enum LiveConfig {
 
     /// 追加到 WKWebView 默认 UA 末尾：PC 那边看 access log 就知道是手机 app 在访问，
     /// 而不是有人在浏览器里手点。
-    static let userAgentSuffix = "LiveSwap/0.18"
+    static let userAgentSuffix = "LiveSwap/" + appVersion
 
     /// 第一次启动时地址栏里预填的这台：PC 侧现在监听的就是它。
     /// 只当预填和提示用，不当写死的配置——PC 重连 WiFi 以后 IP 会变，
@@ -450,6 +454,18 @@ enum LiveShim {
     /// 不是按钮，是页面加载完主动报上来的一行：界面挂子上没对上号就在这里说出口
     static let hookReady = "ready"
 
+    /// 界面左下角那颗「发日志」：不是页面原有控件，是 App 自己加的
+    /// （用户要求不用一段段截图，点一下把运行日志发到电脑）。
+    static let hookSendLog = "sendlog"
+    /// 页面脚本里的 JS 错误/rejection/console.error，原生写进日志。
+    static let hookJsLog = "jslog"
+    /// 页面命令（非轮询 fetch）的回话：路径、状态码、耗时、响应体前一段。
+    /// 「特征改几次以后改不了」多半是一条 409 的响应体在说话。
+    static let hookCmdLog = "cmdlog"
+    /// /get_playback_state 变了才报：前台按钮和后台状态对不上时，这里是两边的时间线。
+    static let hookPageState = "pagestate"
+    static let logButtonSelector = "#live-log-btn"
+
     /// 跳转没有按钮了：PC 撤掉了「设置视频路径」，现在由这一格的回车触发。
     /// 页面自己的回车会直接 POST /set_video，手机上那是本地文件名，
     /// 必须在捕获阶段截下来改成“跳到第几秒”。
@@ -488,6 +504,11 @@ enum LiveShim {
                           .replacingOccurrences(of: "__STOPPING__", with: jsLiteral(LiveStopGate.stoppingState))
                           .replacingOccurrences(of: "__FAILED__", with: jsLiteral(LiveStopGate.failedState))
                           .replacingOccurrences(of: "__BRIDGE__", with: jsLiteral(LiveConfig.bridgeName))
+                          .replacingOccurrences(of: "__LOG__", with: jsLiteral(hookSendLog))
+                          .replacingOccurrences(of: "__JSLOG__", with: jsLiteral(hookJsLog))
+                          .replacingOccurrences(of: "__CMDLOG__", with: jsLiteral(hookCmdLog))
+                          .replacingOccurrences(of: "__PAGESTATE__", with: jsLiteral(hookPageState))
+                          .replacingOccurrences(of: "__LOGSEL__", with: jsLiteral(logButtonSelector))
     }
 
     private static let template = #"""
@@ -500,6 +521,11 @@ enum LiveShim {
       var FS = __FULLSCREEN__;
       var STOP_STOPPING = __STOPPING__;
       var STOP_FAILED = __FAILED__;
+      var LOG_HOOK = __LOG__;
+      var JSLOG = __JSLOG__;
+      var CMDLOG = __CMDLOG__;
+      var PAGESTATE = __PAGESTATE__;
+      var LOG_SEL = __LOGSEL__;
 
       function send(payload) {
         try {
@@ -517,6 +543,8 @@ enum LiveShim {
       document.addEventListener('click', function (ev) {
         var t = ev.target;
         if (!t || !t.closest) return;
+        // 「发日志」不是 PC 命令，忙的时候也得点得动：它自己有监听，这里放行。
+        if (t.closest(LOG_SEL)) return;
         // 忙闸先拦：这条监听注册得比后面的忙闸早，不看一眼就会在等 PC 回话时
         // 把「选择文件 / 播放」再送一遍（样式只挡鼠标，挡不住程序化的 click）。
         if (busyNow()) { ev.preventDefault(); ev.stopPropagation(); return; }
@@ -576,8 +604,80 @@ enum LiveShim {
         have[SEEK] = !!find(PATH_SEL);
         var t = document.querySelector('h1');
         send({ action: 'ready', hooks: have, title: t ? String(t.textContent || '') : '' });
+        addLogButton();
       };
       window.LiveUI = UI;
+
+      // —— 界面上的「发日志」 ——
+      // 用户不用再一段段截图：点一下，原生把 App 和页面这一轮的运行日志压成几段
+      // GET 发到 PC。按钮放左下角，不挡页面顶部状态行和中间的播放区。
+      function addLogButton() {
+        if (find(LOG_SEL) || !document.body) return;
+        var b = document.createElement('button');
+        b.id = 'live-log-btn';
+        b.type = 'button';
+        b.textContent = '发日志';
+        b.title = '把 App 的运行日志发到电脑';
+        b.setAttribute('style',
+          'position:fixed;left:12px;bottom:calc(12px + env(safe-area-inset-bottom));'
+          + 'z-index:2147483000;padding:6px 10px;border-radius:14px;'
+          + 'border:1px solid rgba(255,255,255,.45);background:rgba(0,0,0,.55);'
+          + 'color:#fff;font-size:12px;line-height:1;'
+          + '-webkit-user-select:none;user-select:none;touch-action:manipulation;');
+        b.addEventListener('click', function (ev) {
+          ev.preventDefault();
+          ev.stopPropagation();
+          send({ action: LOG_HOOK });
+        }, true);
+        document.body.appendChild(b);
+      }
+      UI.logSending = function () {
+        var b = find(LOG_SEL);
+        if (b) { b.disabled = true; b.textContent = '发送中…'; }
+      };
+      UI.logDone = function (ok, id) {
+        var b = find(LOG_SEL);
+        if (b) {
+          b.disabled = false;
+          b.textContent = ok ? ('已发 ' + String(id || '')) : '发日志';
+        }
+      };
+
+      // 页面自己的 JS 错误也要进同一份日志：很多「点了没反应」是页面脚本抛了异常。
+      function jsText(v) {
+        try { return typeof v === 'string' ? v : JSON.stringify(v); }
+        catch (e) { return String(v); }
+      }
+      // 页面要是陷在报错循环里，日志不能被它刷爆：10 秒最多 40 条。
+      var jsLogWindow = 0;
+      var jsLogCount = 0;
+      function sendJsLog(level, msg, src, line) {
+        var now = Date.now();
+        if (now - jsLogWindow > 10000) { jsLogWindow = now; jsLogCount = 0; }
+        if (++jsLogCount > 40) return;
+        send({ action: JSLOG, level: String(level || ''),
+               msg: String(msg || '').slice(0, 600),
+               src: String(src || '').slice(0, 160), line: line || 0 });
+      }
+      window.addEventListener('error', function (ev) {
+        if (!ev || !ev.message) return;
+        sendJsLog('error', ev.message, ev.filename, ev.lineno);
+      }, true);
+      window.addEventListener('unhandledrejection', function (ev) {
+        var r = ev ? ev.reason : null;
+        sendJsLog('reject', (r && (r.message || r)) || 'unhandledrejection');
+      });
+      try {
+        var rawConsoleError = console.error;
+        console.error = function () {
+          try {
+            var parts = [];
+            for (var i = 0; i < arguments.length; i++) parts.push(jsText(arguments[i]));
+            sendJsLog('console', parts.join(' '));
+          } catch (e) {}
+          return rawConsoleError.apply(console, arguments);
+        };
+      } catch (e) {}
 
       // —— 整页忙闸 ——
       // 手机和 PC 是一问一答的单进程：命令发出到 PC 回话之间，整页不再接点击。
@@ -602,6 +702,9 @@ enum LiveShim {
             // 忙的时候也让它点得动，否则用户点下载会被灰到 15 秒兜底。
             + 'html.pc-busy a[onclick*="downloadFile"]'
             + '{pointer-events:auto !important;opacity:1 !important;}'
+            // 发日志同理：它不跟 PC 对话，等回话的时候正好是用户想发日志的时候。
+            + 'html.pc-busy #live-log-btn'
+            + '{pointer-events:auto !important;opacity:1 !important;}'
             + 'html.pc-busy,html.pc-busy body{cursor:progress !important;}';
           (document.head || document.documentElement).appendChild(st);
         } catch (e) {}
@@ -619,6 +722,7 @@ enum LiveShim {
       // 光靠样式挡不干净：忙时在捕获阶段把点击整个截下来，不让它进页面自己的处理。
       document.addEventListener('click', function (ev) {
         if (!busyNow()) return;
+        if (ev.target && ev.target.closest && ev.target.closest(LOG_SEL)) return;
         var a = (ev.target && ev.target.closest) ? ev.target.closest('a') : null;
         // 下载不是命令：页面在 iOS 上把它改成 window.location.href 顶层导航，
         // 交给原生 WKDownload 接，不存在“等 PC 回话”这件事。
@@ -626,6 +730,41 @@ enum LiveShim {
         ev.preventDefault();
         ev.stopPropagation();
       }, true);
+
+      // —— 页面侧日志 ——
+      // 1) 命令回话：非轮询 fetch 的路径/状态码/耗时/响应体前一段。
+      //    「特征改几次以后改不了」时，PC 的 409 响应体里写的才是原因。
+      // 2) 播放状态：/get_playback_state 只在变化时上报，前台按钮和后台对不上时留时间线。
+      function pathOnly(url) {
+        try { return new URL(String(url || ''), location.href).pathname.slice(0, 120); }
+        catch (e) { return String(url || '').slice(0, 120); }
+      }
+      function isStateCall(url) {
+        try { return new URL(String(url || ''), location.href).pathname === '/get_playback_state'; }
+        catch (e) { return false; }
+      }
+      var lastPageState = '';
+      function observeState(r) {
+        try {
+          r.clone().json().then(function (j) {
+            var sig = [(j.live_mode ? 1 : 0), (j.playing ? 1 : 0), (j.edit_locked ? 1 : 0),
+                       (j.plan_count || 0), (j.live_fps || 0)].join(',');
+            if (sig === lastPageState) return;
+            lastPageState = sig;
+            send({ action: PAGESTATE, live: !!j.live_mode, playing: !!j.playing,
+                   locked: !!j.edit_locked, plan: j.plan_count || 0, fps: j.live_fps || 0 });
+          }, function () {});
+        } catch (e) {}
+      }
+      function observeCommand(url, r, started) {
+        var body = function (text) {
+          send({ action: CMDLOG, url: pathOnly(url), status: r.status,
+                 ms: Date.now() - started, body: String(text || '').slice(0, 300) });
+        };
+        try {
+          r.clone().text().then(body, function () { body(''); });
+        } catch (e) {}
+      }
 
       if (window.fetch) {
         var rawFetch = window.fetch.bind(window);
@@ -639,7 +778,12 @@ enum LiveShim {
         window.fetch = function (input, init) {
           var url = '';
           try { url = typeof input === 'string' ? input : (input && input.url) || ''; } catch (e) {}
-          if (isPoll(url)) return rawFetch(input, init);
+          var state = isStateCall(url);
+          if (isPoll(url)) {
+            var rp = rawFetch(input, init);
+            if (state) rp.then(function (r) { observeState(r); return r; }, function () {});
+            return rp;
+          }
           busyFetches += 1;
           busySync();
           var settled = false;
@@ -651,11 +795,26 @@ enum LiveShim {
             busySync();
           };
           var timer = setTimeout(done, BUSY_MAX_MS);
+          var started = Date.now();
           var p;
           try { p = rawFetch(input, init); }
-          catch (e) { done(); return Promise.reject(e); }
-          return p.then(function (r) { done(); return r; },
-                        function (e) { done(); throw e; });
+          catch (e) {
+            done();
+            send({ action: CMDLOG, url: pathOnly(url), status: 0,
+                   ms: Date.now() - started, body: 'ERR ' + String(e && (e.message || e)) });
+            return Promise.reject(e);
+          }
+          return p.then(function (r) {
+            done();
+            observeCommand(url, r, started);
+            return r;
+          }, function (e) {
+            done();
+            send({ action: CMDLOG, url: pathOnly(url), status: 0,
+                   ms: Date.now() - started,
+                   body: 'ERR ' + String((e && (e.name || e.message)) || e).slice(0, 200) });
+            throw e;
+          });
         };
       }
 
