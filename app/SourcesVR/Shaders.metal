@@ -20,7 +20,8 @@ struct VRP {
     float budget;   // 最大视差（像素，按每眼宽算）
     uint  SW;       // 成片宽 = 2W
     uint  rot;      // 0=摆正送检；1=顺时针转 90° 送检（只有 kScale 读它）
-    float xoff;     // 左右眼画面在各自半幅里再整体水平移这么多像素（对镜片中心用，正=右移）
+    float xoff;     // 左右眼画面在各自半幅里再整体水平移这么多像素（正=两只眼一起右移）
+    float gap;      // 两图之间的距离（像素）：左眼往左、右眼往右各挪这么多，图本身大小不动
 };
 
 constexpr sampler lin(coord::normalized, filter::linear, address::clamp_to_edge);
@@ -142,21 +143,20 @@ kernel void kCombine(texture2d<float, access::read>  fbL [[texture(0)]],
                      uint2 g [[thread_position_in_grid]]) {
     if (g.x >= P.W || g.y >= P.H) return;
     uint idx = g.y * P.W + g.x;
-    // z 缓冲这一格是「平移后的落点」，而 fbL/fbR 是按「没平移的落点」铺的 ⇒ 取格子要减回 xoff。
-    // 平移推出的那几列（dx 越界）谁都不写，由 Swift 侧在位移一变时把显示缓冲抹一次黑，
-    // 不清的话那几列会露出轮转缓冲里上一轮（6 帧前）的残影。
+    // g 就是成片里的目标列，z 缓冲那两格也是按目标列编的号 ⇒ 两边同一个坐标系，取格子不做二次换算。
+    // （0.23 之前这里写成 dx = g + xoff，等于把平移加了第二遍：位移一小看不出来，
+    //  一拖滑杆到 ±10% 就是六十多列的双影，正好落在中缝上——用户报的「重叠」有一半是它。）
+    // fbL/fbR 是「没平移」那份铺的 ⇒ 减回 xoff 才是它对应的格子；减出界的说明这段被推出了半幅，写黑。
     int xf = int(rint(P.xoff));
-    int dx = int(g.x) + xf;
     int fs = int(g.x) - xf;
-    if (fs < 0) fs = 0;
-    if (fs > int(P.W) - 1) fs = int(P.W) - 1;
-    bool fits = (dx >= 0 && uint(dx) < P.W);
+    bool fits = (fs >= 0 && fs < int(P.W));
     if (atomic_load_explicit(bestL + idx, memory_order_relaxed) == 0u) {
-        if (fits) sbs.write(fbL.read(uint2(uint(fs), g.y)), uint2(uint(dx), g.y));
+        sbs.write(fits ? fbL.read(uint2(uint(fs), g.y), 0) : float4(0.0, 0.0, 0.0, 0.0), uint2(g.x, g.y));
         atomic_fetch_add_explicit(holes, 1u, memory_order_relaxed);
     }
     if (atomic_load_explicit(bestR + idx, memory_order_relaxed) == 0u) {
-        if (fits) sbs.write(fbR.read(uint2(uint(fs), g.y)), uint2(P.W + uint(dx), g.y));
+        sbs.write(fits ? fbR.read(uint2(uint(fs), g.y), 0) : float4(0.0, 0.0, 0.0, 0.0),
+                  uint2(P.W + uint(g.x), g.y));
         atomic_fetch_add_explicit(holes, 1u, memory_order_relaxed);
     }
 }
@@ -170,9 +170,11 @@ kernel void kCopy(texture2d<float, access::read>  src [[texture(0)]],
     dst.write(src.read(g), g);
 }
 
-// 6) 相册里已经是左右眼的成片：不跑深度不形变，只在各自半幅里整体水平平移（对镜片中心用）。
-// 整数位移、逐格照搬：这里要是用线性采样，半幅边界那半格会取到对面那只眼，
-// 而那几列正好落在镜片视场的中间，串了眼的脏边比黑边难看得多。
+// 6) 播放上屏的最后一趟：两只眼各自的整幅摆到屏幕上哪一格。两个控件分开管：
+// xoff＝两只眼一起水平移（对镜片中心）；gap＝两图之间的距离——左眼往左挪、右眼往右挪各 gap，
+// 每张图自己多大不动，也谁都不越过半幅中间那道缝（越过就是串眼，串眼的脏边比黑边难看得多）。
+// gap 挪出来的空档落在中缝两头，纯黑；被推出屏幕外的那几列只能丢掉，这是「把两图拉开」的代价。
+// 整数位移、逐格照搬：这里要是用线性采样，半幅边界那半格会取到对面那只眼。
 // 平移腾出来的那一头留纯黑，SW=成片宽=2W，P.W 是半幅（每眼）宽。
 kernel void kSbsShift(texture2d<float, access::read>  src [[texture(0)]],
                       texture2d<float, access::write> dst [[texture(1)]],
@@ -180,8 +182,10 @@ kernel void kSbsShift(texture2d<float, access::read>  src [[texture(0)]],
                       uint2 g [[thread_position_in_grid]]) {
     if (g.x >= P.SW || g.y >= P.H) return;
     uint W = P.W;
-    uint base = (g.x < W) ? 0u : W;
-    int lx = int(g.x - base) - int(rint(P.xoff));
+    bool left = g.x < W;
+    uint base = left ? 0u : W;
+    int sh = int(rint(left ? P.xoff - P.gap : P.xoff + P.gap));
+    int lx = int(g.x - base) - sh;
     if (lx < 0 || uint(lx) >= W) {
         dst.write(float4(0.0, 0.0, 0.0, 0.0), g);
         return;

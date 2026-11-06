@@ -36,6 +36,9 @@ final class VRLive {
     /// 左右眼水平位移存这一档：下次进来直接沿用，省得每部片子重对镜片
     static let shiftKey = "vr3d.live.xshift"
     static var storedShiftPct: Double { UserDefaults.standard.double(forKey: shiftKey) }
+    /// 两图之间的距离存这一档：眼镜的镜片间距是硬件定的，一次对好就一直用（没存过＝0＝两半正好挨在中缝）
+    static let gapKey = "vr3d.live.gap"
+    static var storedGapPct: Double { UserDefaults.standard.double(forKey: gapKey) }
 
     let url: URL
     let eyeLong: Int
@@ -70,7 +73,10 @@ final class VRLive {
     private var pausedAccum = 0.0
     /// 每眼水平位移（占每眼宽的比例，正=两只眼一起右移）
     private var shiftPct: Float = 0
-    /// 位移每变一次 +1：显示线程看到它变了先把 6 块显示缓冲抹一次黑
+    /// 两图之间的距离（占每眼宽的比例）：正=两只眼互相离远（中缝多出黑带来），负=互相靠近；
+    /// 每张图自己多大始终不动，也永不越过中缝 ⇒ 这个旋钮只改距离，不改大小、不串眼
+    private var gapPct: Float = 0
+    /// 位移/间距每变一次 +1：显示线程看到它变了先把 6 块显示缓冲抹一次黑、再把静止这帧重画
     private var shiftSeq = 0
     /// 已经放到第几秒（界面每 0.25 s 来取一次，画进度条）
     private var posSeen = 0.0
@@ -155,7 +161,7 @@ final class VRLive {
         }
     }
 
-    /// 左右眼画面的水平位移（±12% 每眼宽封顶）。滑杆松手才调这里，一次抹一次缓冲
+    /// 两张图一起水平移（±12% 每眼宽封顶，对镜片中心用）。滑杆松手才调这里，一次抹一次缓冲
     func setShift(_ pct: Double) {
         let v = Float(max(-0.12, min(0.12, pct)))
         dLock.lock()
@@ -164,7 +170,20 @@ final class VRLive {
         shiftSeq += 1
         dLock.unlock()
         UserDefaults.standard.set(Double(v), forKey: VRLive.shiftKey)
-        VRJournal.line("实时 水平位移 \(String(format: "%+.1f", Double(v) * 100))%")
+        VRJournal.line("实时 一起移 \(String(format: "%+.1f", Double(v) * 100))%")
+    }
+
+    /// 两图之间的距离（±25% 每眼宽封顶）：只把两张图互相推远/拉近，各自大小不动。
+    /// 和位移一样松手才落地：一变就要重画一轮，拖着连续发等于白白重画几十轮
+    func setGap(_ pct: Double) {
+        let v = Float(max(-0.25, min(0.25, pct)))
+        dLock.lock()
+        if abs(v - gapPct) < 1e-4 { dLock.unlock(); return }
+        gapPct = v
+        shiftSeq += 1
+        dLock.unlock()
+        UserDefaults.standard.set(Double(v), forKey: VRLive.gapKey)
+        VRJournal.line("实时 间距 \(String(format: "%+.1f", Double(v) * 100))%")
     }
 
     /// 起头。成功返回空串并把两条线程放出去；失败返回那句原因，界面直接显示，不用等线程。
@@ -266,9 +285,10 @@ final class VRLive {
         }
         guard fmtDesc != nil else { return "显示缓冲的格式描述建不出来" }
         duration = s.duration
-        // 上一轮对镜片对出来的位移直接续上
+        // 上一轮对镜片对出来的位移、对出来的间距直接续上
         dLock.lock()
         shiftPct = Float(max(-0.12, min(0.12, VRLive.storedShiftPct)))
+        gapPct = Float(max(-0.25, min(0.25, VRLive.storedGapPct)))
         dLock.unlock()
         // 声音尽力而为：起不来就退回墙钟，画面照走
         if let p = soundPlayer() {
@@ -276,16 +296,18 @@ final class VRLive {
         }
         let audioName = audio == nil ? "没有（走墙钟）" : "接上（走声钟）"
         let shiftName = String(format: "%+.1f", Double(shiftPct) * 100)
+        let gapName = String(format: "%+.1f", Double(gapPct) * 100)
         // 这块是在后台线程跑的： UILabel 只能主线程碰，起手那行也一样交回主线程写
+        // 「上屏」那对数才是真正进眼睛的尺寸：实时形变拼出来的是 每眼×2，sbs 那条就是原片整幅
         let headName = sbs ? "左右眼原样起手" : "实时起手"
-        let startLine = "\(headName)：每眼 \(s.eyeW)x\(s.eyeH)｜整幅 \(s.frameW)x\(s.frameH)"
+        let startLine = "\(headName)：每眼 \(s.eyeW)x\(s.eyeH)｜上屏 \(outW)x\(outH)"
             + "｜\(String(format: "%.1f", s.fps)) fps\(depthTag)\(modelTag)"
-            + "｜声音\(audioName)｜水平位移\(shiftName)%｜点屏幕出控件"
+            + "｜声音\(audioName)｜一起移\(shiftName)% 间距\(gapName)%｜点屏幕出控件"
         DispatchQueue.main.async { [weak self] in self?.label?.text = startLine }
         let modeTag = sbs ? "左右眼原样（不跑深度）" : "实时形变 视差\(bpct)% zp\(zp) 朝向\(rot ? "转90°" : "摆正")"
         VRJournal.line("播放 开始 \(url.lastPathComponent) \(modeTag) 每眼 \(s.eyeW)x\(s.eyeH)"
-            + " 整幅 \(s.frameW)x\(s.frameH) \(String(format: "%.1f", s.fps)) fps"
-            + " 水平位移\(shiftName)%")
+            + " 上屏 \(outW)x\(outH) \(String(format: "%.1f", s.fps)) fps"
+            + " 一起移\(shiftName)% 间距\(gapName)%")
         return ""
     }
 
@@ -338,7 +360,7 @@ final class VRLive {
     }
 
     /// 显示线程：解码→（形变｜半幅平移）→上屏，按帧号排节奏；
-    /// 界面发的暂停/拖进度/水平位移都在这一圈里落。sbs 那条深度整趟不参与。
+    /// 界面发的暂停/拖进度/一起移/间距都在这一圈里落。sbs 那条深度整趟不参与。
     private func pump() {
         guard let s = src, let f = framePB, let lay = layer, let st = stream else {
             finish("实时 内部状态没建起来（setup 提前退了）")
@@ -372,6 +394,7 @@ final class VRLive {
             let hold = paused
             let wantSeq = shiftSeq
             let xo = shiftPct * eyeWf
+            let gp = gapPct * eyeWf
             dLock.unlock()
             if !go { note = "按了停止"; break }
             if let t = sd {
@@ -412,11 +435,11 @@ final class VRLive {
             let outPB = showPBs[n % showPBs.count]
             var gpuMs = 0.0
             if sbs {
-                let rr = sh!.render(srcPB: f, xoff: xo, outPB: outPB)
+                let rr = sh!.render(srcPB: f, xoff: xo, gap: gp, outPB: outPB)
                 if let e = rr.err { note = "第 \(k + 1) 帧平移失败：\(e)"; break }
                 gpuMs = rr.gpu
             } else {
-                let rr = w!.render(srcPB: f, dn: dn, zp: zp, xoff: xo, outPB: outPB)
+                let rr = w!.render(srcPB: f, dn: dn, zp: zp, xoff: xo, gap: gp, outPB: outPB)
                 if let e = rr.err { note = "第 \(k + 1) 帧形变失败：\(e)"; break }
                 gpuMs = rr.gpu
                 holes += rr.holes
@@ -428,7 +451,7 @@ final class VRLive {
                 break
             }
             n += 1
-            // 停住期间只有刚拖完水平位移那一下走到这里：把静止这一帧按新位移重画一遍就回去
+            // 停住期间只有刚拖完位移或间距那一下走到这里：把静止这一帧按新数值重画一遍就回去
             if hold { Thread.sleep(forTimeInterval: 1.0 / fps); continue }
             gpuSum += gpuMs
             k += 1
@@ -656,6 +679,8 @@ final class VRLiveView: UIView {
     private let timeLbl = UILabel()
     private let shiftSl = UISlider()
     private let shiftLbl = UILabel()
+    private let gapSl = UISlider()
+    private let gapLbl = UILabel()
     private let hintLbl = UILabel()
     private var ticker: Timer?
     private var hider: Timer?
@@ -663,15 +688,18 @@ final class VRLiveView: UIView {
     private var shown = false
 
     override class var layerClass: AnyClass { AVSampleBufferDisplayLayer.self }
+    /// 上屏的就是这一层：整幅铺满，两图之间的距离由 GPU 在画面里挪，图层自己不缩
     var displayLayer: AVSampleBufferDisplayLayer { layer as! AVSampleBufferDisplayLayer }
+
+    /// 间距滑杆的档位是「占每眼宽的百分比」，±25% 封顶：拉到 +25% 中缝空出半只眼的四分之一宽
+    private let gapRange: Double = 0.25
 
     override init(frame: CGRect) {
         super.init(frame: frame)
         backgroundColor = .black
         isMultipleTouchEnabled = false
-        // 显示层的这两样在这里定，不放 setup()：setup 跑在后台线程，图层配置该在主线程做
-        displayLayer.videoGravity = .resizeAspect
-        displayLayer.backgroundColor = UIColor.black.cgColor
+        // 这一样在 init 定，不放 setup()：setup 跑在后台线程，图层配置该在主线程做
+        displayLayer.videoGravity = .resize
         tapCatch.backgroundColor = .clear
         addSubview(tapCatch)
         stats.numberOfLines = 0
@@ -704,9 +732,16 @@ final class VRLiveView: UIView {
         shiftLbl.textColor = .white
         shiftLbl.font = UIFont.systemFont(ofSize: 12)
         bar.addSubview(shiftLbl)
+        gapSl.tintColor = .systemPurple
+        gapSl.minimumValue = Float(-gapRange)
+        gapSl.maximumValue = Float(gapRange)
+        bar.addSubview(gapSl)
+        gapLbl.textColor = .white
+        gapLbl.font = UIFont.systemFont(ofSize: 12)
+        bar.addSubview(gapLbl)
         hintLbl.textColor = UIColor(white: 1, alpha: 0.6)
         hintLbl.font = UIFont.systemFont(ofSize: 10)
-        hintLbl.text = "上面那条拖进度｜下面那条调左右眼水平位置（对镜片中心，存下来下次照用）｜手机横过来即横屏全屏"
+        hintLbl.text = "第一条拖进度｜第二条「一起移」=两张图同方向挪，对准两只镜片中心｜第三条「间距」=把两张图互相推远或拉近，图本身大小不变（+ 拉开、中缝出黑边；− 靠近、外侧各裁一条）｜两档都存下来下次照用"
         bar.addSubview(hintLbl)
         tapCatch.addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(tapped)))
         playBtn.addTarget(self, action: #selector(tappedPlay), for: .touchUpInside)
@@ -715,6 +750,8 @@ final class VRLiveView: UIView {
         seekSl.addTarget(self, action: #selector(seekEnd), for: [.touchUpInside, .touchUpOutside, .touchCancel])
         shiftSl.addTarget(self, action: #selector(shiftMoved), for: .valueChanged)
         shiftSl.addTarget(self, action: #selector(shiftEnd), for: [.touchUpInside, .touchUpOutside, .touchCancel])
+        gapSl.addTarget(self, action: #selector(gapMoved), for: .valueChanged)
+        gapSl.addTarget(self, action: #selector(gapEnd), for: [.touchUpInside, .touchUpOutside, .touchCancel])
     }
 
     required init?(coder: NSCoder) { fatalError("这块不用 xib") }
@@ -725,15 +762,17 @@ final class VRLiveView: UIView {
         tapCatch.frame = bounds
         // 右边留出 100 pt：那格是 SwiftUI 那枚「停止」的落点，别把实测那几行铺到它底下去
         stats.frame = CGRect(x: 6, y: 6, width: max(40, w - 112), height: 56)
-        let bh: CGFloat = 132
+        let bh: CGFloat = 172
         bar.frame = CGRect(x: 6, y: h - bh - 6, width: max(40, w - 12), height: bh)
         let bw = bar.bounds.width
         playBtn.frame = CGRect(x: 8, y: 14, width: 56, height: 32)
         timeLbl.frame = CGRect(x: bw - 118, y: 14, width: 110, height: 32)
         seekSl.frame = CGRect(x: 72, y: 20, width: max(30, bw - 72 - 126), height: 22)
-        shiftLbl.frame = CGRect(x: 8, y: 58, width: 118, height: 30)
-        shiftSl.frame = CGRect(x: 130, y: 62, width: max(30, bw - 130 - 12), height: 22)
-        hintLbl.frame = CGRect(x: 8, y: 96, width: max(40, bw - 16), height: 30)
+        shiftLbl.frame = CGRect(x: 8, y: 56, width: 118, height: 30)
+        shiftSl.frame = CGRect(x: 130, y: 60, width: max(30, bw - 130 - 12), height: 22)
+        gapLbl.frame = CGRect(x: 8, y: 88, width: 118, height: 30)
+        gapSl.frame = CGRect(x: 130, y: 92, width: max(30, bw - 130 - 12), height: 22)
+        hintLbl.frame = CGRect(x: 8, y: 122, width: max(40, bw - 16), height: 44)
     }
 
     /// 起好的一条交进来（同一条重复交不做任何事）
@@ -742,9 +781,11 @@ final class VRLiveView: UIView {
         live = l
         seekSl.maximumValue = Float(max(1.0, l.duration))
         seekSl.value = 0
-        // attach 比 setup 早到，那条上存着的还是 0 ⇒ 位移直接读存档，跟 setup 用的是同一档
+        // attach 比 setup 早到，那条上存着的还是 0 ⇒ 位移、间距直接读存档，跟 setup 用的是同一档
         shiftSl.value = Float(max(-0.12, min(0.12, VRLive.storedShiftPct)))
         shiftLbl.text = shiftText(Double(shiftSl.value))
+        gapSl.value = Float(max(-gapRange, min(gapRange, VRLive.storedGapPct)))
+        gapLbl.text = gapText(Double(gapSl.value))
         UIApplication.shared.isIdleTimerDisabled = true
     }
 
@@ -792,8 +833,23 @@ final class VRLiveView: UIView {
         armHide()
     }
 
+    @objc private func gapMoved() {
+        gapLbl.text = gapText(Double(gapSl.value))
+    }
+
+    /// 间距和位移一样松手才落地：落一次显示线程重画一轮
+    @objc private func gapEnd() {
+        live?.setGap(Double(gapSl.value))
+        gapLbl.text = gapText(Double(gapSl.value))
+        armHide()
+    }
+
     private func shiftText(_ pct: Double) -> String {
-        "水平 " + String(format: "%+.1f%%", pct * 100)
+        "一起移 " + String(format: "%+.1f%%", pct * 100)
+    }
+
+    private func gapText(_ pct: Double) -> String {
+        "间距 " + String(format: "%+.1f%%", pct * 100)
     }
 
     private func fmt(_ t: Double) -> String {
