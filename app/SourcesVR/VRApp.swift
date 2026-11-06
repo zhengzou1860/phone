@@ -22,16 +22,20 @@ struct VR3DApp: App {
 /// 这一版开始把「到底有没有人来问过」也记下来：0.18~0.21 三版横屏都不动，
 /// 分不清是这道闸没放开、还是压根没人来问（LiveContainer 里我们这份 delegate 未必是本进程的应用代理）。
 final class VRAppDelegate: NSObject, UIApplicationDelegate {
-    /// 只记前 8 次，免得播着播着把日志刷满
+    /// 0.22 只记前 8 次，结果 8 次全落在启动那一秒（17:56:06~17:56:16），
+    /// 闸放开以后系统到底还来不来问就看不清了。现在：交回的档位一变就记，不变最多记 24 次。
     private static var asked = 0
+    private static var lastName = ""
     func application(_ application: UIApplication,
                      supportedInterfaceOrientationsFor window: UIWindow?) -> UIInterfaceOrientationMask {
         let m = VROrientation.current
-        if VRAppDelegate.asked < 8 {
+        let n = VROrientation.name(m)
+        if n != VRAppDelegate.lastName || VRAppDelegate.asked < 24 {
             VRAppDelegate.asked += 1
-            VRJournal.line("朝向 delegate 第 \(VRAppDelegate.asked) 次被问，交回 \(VROrientation.name(m))"
+            VRJournal.line("朝向 delegate 第 \(VRAppDelegate.asked) 次被问，交回 \(n)"
                 + "｜窗 \(window.map { String(describing: type(of: $0)) } ?? "没给")")
         }
+        VRAppDelegate.lastName = n
         return m
     }
 }

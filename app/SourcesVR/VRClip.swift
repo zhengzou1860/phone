@@ -630,15 +630,18 @@ final class VRAudioPass {
         self.detail = detail
     }
 
-    /// 报告用：此刻手上摁着几份、最后一个写进去的是第几秒。
-    /// 界面卡在「编码器不收料」上时靠这两个数分清到底是视频不收货还是音频拖住了复用器。
+    /// 报告用：此刻手上摁着几份、最后一个写进去的是第几秒、它自己这道闸开不开。
+    /// 界面卡在「编码器不收料」上时靠这三样分清到底是视频不收货还是音轨拖住了复用器。
     var queuedNow: Int { pending == nil ? 0 : 1 }
     var lastSecNow: Double { lastSec }
+    var readyNow: Bool { input.isReadyForMoreMediaData }
 
     /// 视频那一圈每写完一帧调一次：能塞就塞，队列满就把手上这份留到下一次。
-    /// cutSeconds 是此刻视频写到第几秒：音频不许跑到视频前面去，追上就摁住这一份等下一帧。
+    /// cutSeconds 是允许音频跑到的上限（调用方给的是「视频此刻那一秒 + 几秒余量」），追上就摁住这一份等下一次。
     /// ⚠️ 这里绝不能收口：一个 PCM 块只有 20 多毫秒，视频写到第 1 帧时 cut 就是 0.033 s，
     /// 第二块就越过它了——0.19 第一版在这里 shut()，结果整条片子只剩开头几十毫秒的声音（11-06 他实测「没完整声音」）。
+    /// ⚠️ cut 也不能等于视频那一秒本身：11-06 17:58 实测那样两边一起停在 1.2 s
+    /// （复用器不许音轨落后视频太多，我们又死卡着音频不许超过视频），整条片子就只出 30 帧。
     func pump(cutSeconds: Double) { _ = drain(cutSeconds: cutSeconds, final: false) }
 
     /// 挤一份算一份。final=true 才是真收尾：越过 cutSeconds 就丢、解码器干了就收。

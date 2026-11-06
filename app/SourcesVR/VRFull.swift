@@ -418,19 +418,20 @@ enum VRFull {
                 while !input.isReadyForMoreMediaData {
                     Thread.sleep(forTimeInterval: 0.005)
                     spins += 1
-                    // 队列满一般几百毫秒就开闸；writer 已经死了的话这道闸永远不再开。
-                    // 11-06 17:01 那条就是死在这儿：屏幕一黑被挂起，醒来还在空转，
-                    // 98 秒里「背压」一路涨到 98312 ms 才走到 append 报失败。20 秒封顶，早收早留账。
+                    // 队列满一般几百毫秒就开闸；这道闸一直不开就是死局，20 秒封顶早收兵留账。
+                    // 11-06 17:58 那条把死因写清楚了：writer.status=1（还是 .writing，没死），
+                    // 前后也没有「进后台」记账 ⇒ 不是挂起，是音轨和视频互相等死（见下面 pump 那段）。
                     if writer.status == .failed || writer.status == .cancelled || spins > 4000 {
                         starved = true
                         break
                     }
                     // 卡住的这 20 秒不能只留最后一行：第 1/2/4/8 秒各递一条，
-                    // 把音轨那边「手上摁着几份、写到第几秒」一起报出来——
+                    // 把音轨那边「手上摁着几份、写到第几秒、它自己收不收料」一起报出来——
                     // 视频编码器和音轨复用同一个 writer，下次一看就知道拖住这道闸的是哪一头。
                     if spins == 200 || spins == 400 || spins == 800 || spins == 1600 {
                         let a = ap == nil ? audioWhy
                             : "手上摁着 \(ap!.queuedNow) 份、最后写进 \(String(format: "%.1f", ap!.lastSecNow)) s"
+                            + "、音轨这道闸\(ap!.readyNow ? "开" : "也关着")"
                         VRJournal.line("全片 zp\(String(format: "%.2f", zp)) 第 \(k + 1) 帧等开闸 \(spins * 5) ms"
                             + "｜writer.status=\(writer.status.rawValue) \(writer.error?.localizedDescription ?? "-")"
                             + "｜视频这头还是不收｜音轨：\(a)")
@@ -439,7 +440,8 @@ enum VRFull {
                 waitMs.append(Double(DispatchTime.now().uptimeNanoseconds - tw) / 1_000_000)
                 if starved {
                     why = "第 \(k + 1) 帧编码器不收料（等了 \(spins * 5) ms；writer.status=\(writer.status.rawValue)"
-                        + " \(writer.error?.localizedDescription ?? "-")）；这段多半被挂起过（锁屏/切走）"
+                        + " \(writer.error?.localizedDescription ?? "-")）；已出的 \(k) 帧照样存相册"
+                        + "（要分清是不是音轨拖住的，把界面「带声音」关掉再跑同一条）"
                     break
                 }
                 if spins > 0 && k % 60 == 0 {
@@ -452,8 +454,14 @@ enum VRFull {
                 appendMs.append(Double(DispatchTime.now().uptimeNanoseconds - ta) / 1_000_000)
                 k += 1
                 doneFrames = k
-                // 音频跟着视频往前走：写完第 k 帧就允许音频推进到 k/fps 秒
-                ap?.pump(cutSeconds: Double(k) / fps)
+                // 音频跟着视频往前走，但不许拿视频这一秒去卡它：
+                // 11-06 17:58 那条就是卡在这儿死的——视频写到第 30 帧（1.2 s）时把音频也按在 1.2 s，
+                // 而复用器要求音轨不能比视频落后太久（一个分片的交叠窗口），于是它的闸也不开：
+                // 音频等视频、视频等音频，两边一起停在 1.2 s，writer.status 还是 1（.writing）。
+                // 0.19 那版音频提前收口，反而整条视频写完了（只是只剩开头一点声音）——正好是这个死局的另一头。
+                // 所以跑的过程中让音频最多领先 4 秒（比一个分片的交叠窗口宽得多，死局就此打开；
+                // 也不让它无限冲到片尾，那样音轨编码器的队列会先满），中途收兵才在 finish 里按视频已写到的那一秒裁掉尾巴。
+                ap?.pump(cutSeconds: Double(k) / fps + 4.0)
                 if k % 60 == 0 {
                     let el = Double(DispatchTime.now().uptimeNanoseconds - wall0) / 1_000_000_000
                     progress = "全片 第 \(zi + 1)/\(zps.count) 档 zp\(String(format: "%.2f", zp))"

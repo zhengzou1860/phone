@@ -2,16 +2,19 @@ import AVFoundation
 import CoreML
 import UIKit
 
-/// 播放页自己做控制器，不再借 SwiftUI 的 fullScreenCover。
-/// 理由：能不能转屏，系统最后问的是「最上面那个控制器」的 supportedInterfaceOrientations，
-/// 而 SwiftUI 那层宿主在 LiveContainer 里认不认我们这份 app delegate 没人能保证——
-/// 0.18 到 0.21 三版「播放页放开横屏」的账都记上了，手机横过来纹丝不动（11-06 17:02 实测）。
-/// 这层控制器是我们自己造、自己 present 的，说支持横屏就支持横屏，全屏也不带卡片缩边。
+/// 播放页自己做控制器，不再借 SwiftUI 的 fullScreenCover：全屏不带卡片缩边，能不能横屏由这一页自己报给系统。
+/// ⚠️ 但系统那条路在这个进程里是死的：0.22 实测 delegate 确实被问到、也确实交回了「竖+左横+右横」，
+/// requestGeometryUpdate 也没报错，场景朝向一路都是 朝向1＝竖（11-06 17:59、18:00 两轮）。
+/// 所以横屏这回事由下面 applyOri() 自己转内容来做；哪天系统真给转起来了，那段自动让路。
 final class VRPlayVC: UIViewController {
+    private let shell = UIView()
     private let surface = VRLiveView()
     private let live: VRLive
     private let onEnd: (String) -> Void
     private let stopBtn = UIButton(type: .system)
+    /// 假横屏那行账只在前 6 次和状态真变的时候记：applyOri 每轮布局都会走
+    private var oriSeen = 0
+    private var oriLast = ""
 
     init(url: URL, eyeLong: Int, bpct: Float, units: MLComputeUnits, rot: Bool, sbs: Bool,
          onEnd: @escaping (String) -> Void) {
@@ -32,7 +35,11 @@ final class VRPlayVC: UIViewController {
     override var prefersHomeIndicatorAutoHidden: Bool { true }
 
     override func loadView() {
-        view = surface
+        view = shell
+        shell.backgroundColor = .black
+        // surface 的框全由 applyOri 定：交给系统自动缩放会把转好的框改回竖的
+        shell.autoresizesSubviews = false
+        shell.addSubview(surface)
         let cb = onEnd
         // 线程自己收兵时也会走到这里：先把报告交回界面，再关掉这一页（inside 归位在 finish 里已经做过）
         live.onEnd = { [weak self] text in
@@ -50,8 +57,9 @@ final class VRPlayVC: UIViewController {
         surface.addSubview(stopBtn)
     }
 
-    override func viewWillLayoutSubviews() {
-        super.viewWillLayoutSubviews()
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        applyOri()
         // 右上角那一格就是 VRLiveView 给「停止」留出来的 100 pt，实测那几行避开它
         let b = surface.bounds
         stopBtn.frame = CGRect(x: max(8, b.maxX - 96), y: 8, width: 84, height: 34)
@@ -78,10 +86,17 @@ final class VRPlayVC: UIViewController {
         setNeedsUpdateOfSupportedInterfaceOrientations()
         VROrientation.allowLandscape(true)
         VROrientation.report("页面在场")
+        // 设备朝向的监听归这一页：不在的时候没人替我们转内容
+        UIDevice.current.beginGeneratingDeviceOrientationNotifications()
+        NotificationCenter.default.addObserver(self, selector: #selector(oriChanged),
+                                               name: UIDevice.orientationDidChangeNotification, object: nil)
+        applyOri()
     }
 
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
+        NotificationCenter.default.removeObserver(self, name: UIDevice.orientationDidChangeNotification, object: nil)
+        UIDevice.current.endGeneratingDeviceOrientationNotifications()
         VROrientation.allowLandscape(false)
     }
 
@@ -89,6 +104,46 @@ final class VRPlayVC: UIViewController {
     override func viewDidDisappear(_ animated: Bool) {
         super.viewDidDisappear(animated)
         surface.teardown()
+    }
+
+    @objc private func oriChanged() { applyOri() }
+
+    /// 横屏自己来：手机横过来就把整页内容转 ±90°、宽高对调，铺满物理屏（各眼正好占半屏）。
+    /// 只在「窗还是竖的那块尺寸、系统界面也没转」时动手；系统真给横屏了这段就让路，不会转两遍。
+    private func applyOri() {
+        let dev = UIDevice.current.orientation
+        let scene = shell.window?.windowScene?.interfaceOrientation ?? .unknown
+        let base = shell.window?.bounds ?? UIScreen.main.bounds
+        let sysLandscape = scene == .landscapeLeft || scene == .landscapeRight
+        let fake = (dev == .landscapeLeft || dev == .landscapeRight) && !sysLandscape && base.width <= base.height
+        // 两套枚举是反的：设备 landscapeRight（顶边转到用户右手那边）时，内容上方要对准设备的左边
+        let deg: CGFloat = dev == .landscapeRight ? -90 : 90
+        let size = fake ? CGSize(width: base.height, height: base.width) : base.size
+        surface.bounds = CGRect(origin: .zero, size: size)
+        surface.center = CGPoint(x: base.width / 2.0, y: base.height / 2.0)
+        surface.transform = fake
+            ? CGAffineTransform(rotationAngle: deg * .pi / 180.0)
+            : .identity
+        let state = "设备\(VRPlayVC.oriName(dev)) 界面\(scene.rawValue) 窗\(Int(base.width))x\(Int(base.height))"
+            + " → 内容 \(Int(size.width))x\(Int(size.height))\(fake ? " 转 \(Int(deg))°" : " 不转")"
+        if state != oriLast {
+            oriLast = state
+            oriSeen += 1
+            if oriSeen <= 6 { VRJournal.line("假横屏 \(state)") }
+        }
+        surface.setNeedsLayout()
+    }
+
+    private static func oriName(_ o: UIDeviceOrientation) -> String {
+        switch o {
+        case .portrait: return "竖"
+        case .portraitUpsideDown: return "倒竖"
+        case .landscapeLeft: return "左横"
+        case .landscapeRight: return "右横"
+        case .faceUp: return "面朝上"
+        case .faceDown: return "面朝下"
+        default: return "未知"
+        }
     }
 
     @objc private func tappedStop() {
