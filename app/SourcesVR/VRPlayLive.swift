@@ -150,7 +150,7 @@ final class VRLive {
         let hold = isPausedNow
         DispatchQueue.main.async { [weak self] in
             guard let s = self, let a = s.audio else { return }
-            a.seek(to: CMTime(seconds: t, preferredTimescale: 600), completionHandler: nil)
+            a.seek(to: CMTime(seconds: t, preferredTimescale: 600))
             if !hold { a.play() }
         }
     }
@@ -454,7 +454,7 @@ final class VRLive {
         let p = AVPlayer(url: url)
         p.isMuted = false
         VRJournal.line("声音 AVPlayer 起用 音频轨 \(na) 条 素材时长"
-            + "\(String(format: "%.1f", d.isNumeric ? d : -1)) s")
+            + "\(String(format: "%.1f", d.isFinite ? d : -1)) s")
         return p
     }
 
@@ -467,7 +467,7 @@ final class VRLive {
         }
         p.play()
         let at = CMTimeGetSeconds(p.currentTime())
-        VRJournal.line("声音 play() 后 rate \(p.rate) 位置 \(String(format: "%.2f", at.isNumeric ? at : -1)) s"
+        VRJournal.line("声音 play() 后 rate \(p.rate) 位置 \(String(format: "%.2f", at.isFinite ? at : -1)) s"
             + " 静音\(p.isMuted ? "是" : "否")")
     }
 
@@ -489,11 +489,11 @@ final class VRLive {
         clock0 = DispatchTime.now().uptimeNanoseconds
         lay.flush()
         if !hold {
-            audio?.seek(to: CMTime(seconds: t, preferredTimescale: 600), completionHandler: nil)
+            audio?.seek(to: CMTime(seconds: t, preferredTimescale: 600))
             playAudio()
         }
         let acSec = audio.map { CMTimeGetSeconds($0.currentTime()) } ?? -1
-        let acPos = String(format: "%.1f", acSec.isNumeric ? acSec : -1)
+        let acPos = String(format: "%.1f", acSec.isFinite ? acSec : -1)
         let tPos = String(format: "%.1f", t)
         VRJournal.line("实时 拖到 \(tPos) s（声钟 \(acPos) s）")
         return true
@@ -573,7 +573,7 @@ final class VRLive {
         // rate>0 才算在放（AVPlayer 播到头 rate 归 0，那时退回墙钟，别让画面卡在最后一帧等一个不来的钟）
         if let p = audio, p.rate > 0 {
             let s = CMTimeGetSeconds(p.currentTime())
-            now = s.isNumeric ? s : target
+            now = s.isFinite ? s : target
         } else {
             now = base + Double(DispatchTime.now().uptimeNanoseconds &- clock0) / 1_000_000_000.0 - acc
         }
