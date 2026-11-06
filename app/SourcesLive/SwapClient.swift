@@ -52,6 +52,33 @@ final class SwapClient: ObservableObject {
         sessionFrames > 0 ? sessionBytes / sessionFrames : 0
     }
 
+    // 每帧往返账目：URLSession 回调线程写、主线程每 10 秒取，必须加锁。
+    private let rttLock = NSLock()
+    private var rttSumMs: Double = 0
+    private var rttCount = 0
+    private var rttMaxMs: Double = 0
+
+    /// 取走一个窗口的往返时延（取完清零）。只算拿到了 HTTP 回应的帧，
+    /// 被取消或网络错误的不进来——那不是链路慢，是这一帧没发成。
+    func takeNetworkStats() -> (avgMs: Double, maxMs: Double) {
+        rttLock.lock()
+        let avg = rttCount > 0 ? rttSumMs / Double(rttCount) : 0
+        let max = rttMaxMs
+        rttSumMs = 0
+        rttCount = 0
+        rttMaxMs = 0
+        rttLock.unlock()
+        return (avg, max)
+    }
+
+    private func noteRTT(_ ms: Double) {
+        rttLock.lock()
+        rttSumMs += ms
+        rttCount += 1
+        if ms > rttMaxMs { rttMaxMs = ms }
+        rttLock.unlock()
+    }
+
     let baseURL: URL
     /// /live_start 响应里下发的生效宽度，手机按它缩放（PC 的硬上限是 640）。
     private(set) var liveWidth = LiveConfig.fallbackMaxWidth
@@ -168,6 +195,11 @@ final class SwapClient: ObservableObject {
             self.sessionBytes = 0
             self.sessionFrames = 0
         }
+        rttLock.lock()
+        rttSumMs = 0
+        rttCount = 0
+        rttMaxMs = 0
+        rttLock.unlock()
         let body = try JSONSerialization.data(withJSONObject: ["max_width": LiveConfig.fallbackMaxWidth])
         // 登录很可能就发生在刚才那一页：发之前先搬一次，401 再搬一次重试（见 callWithAuthRetry）。
         let (data, resp) = try await callWithAuthRetry("/live_start", body: body,
@@ -294,6 +326,7 @@ final class SwapClient: ObservableObject {
             DispatchQueue.main.async { self.framesDroppedLocal += 1 }
             return
         }
+        let sentAt = CFAbsoluteTimeGetCurrent()
         var req = URLRequest(url: url("/live_frame"))
         req.httpMethod = "POST"
         req.setValue("image/jpeg", forHTTPHeaderField: "Content-Type")
@@ -313,6 +346,8 @@ final class SwapClient: ObservableObject {
                 return
             }
             guard let http = resp as? HTTPURLResponse else { return }
+            // 拿到回应才记：往返慢说明链路/PC 在拖，和手机编码是两笔账。
+            self.noteRTT((CFAbsoluteTimeGetCurrent() - sentAt) * 1000)
             switch LiveAuth.judge(http) {
             case .sessionLost:
                 if authRetried {

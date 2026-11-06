@@ -687,7 +687,15 @@ final class PageViewController: UIViewController {
                 ? "" : "PC 这会儿没出帧（刚起播、刚跳转或模型还没加载完）｜"
             let avg = client.averageFrameBytes
             let up = avg > 0 ? "｜上行均值 \(max(1, avg / 1024)) KB/帧" : ""
-            status(warm + "手机 \(String(format: "%.1f", fps))fps｜本地丢帧 \(client.framesDroppedLocal)"
+            // 眼睛看到的卡顿只有三种来源：抽帧规则、编码太慢、链路太慢。
+            // 这三个数摆在一行里，一看就知道该动哪处，不再靠猜。
+            let send = video.takeSendStats()
+            let net = client.takeNetworkStats()
+            let perf = LivePerf.line(sourceFPS: video.sourceFPS, encodeMs: send.costMs,
+                                     gapMs: send.gapMs, rttAvgMs: net.avgMs, rttMaxMs: net.maxMs)
+            status(warm + "手机 \(String(format: "%.1f", fps))fps"
+                    + (perf.isEmpty ? "" : "｜" + perf)
+                    + "｜本地丢帧 \(client.framesDroppedLocal)"
                     + "｜PC 拒 \(client.framesRejected)｜PC 收到 \(client.pcFramesIn)、"
                     + "预热丢 \(client.pcFramesDropped)" + up
                     + "｜屏幕长按 1.5 秒改 PC 地址")
@@ -830,7 +838,8 @@ final class PageViewController: UIViewController {
         let dur = CMTimeGetSeconds(video.duration)
         let durText = dur.isFinite ? LiveTime.clock(dur) : "-"
         let size = video.naturalSize
-        status("已选中 \(name)（\(durText)·\(Int(size.width))×\(Int(size.height))）："
+        status("已选中 \(name)（\(durText)·\(Int(size.width))×\(Int(size.height))"
+               + LivePerf.sourceLabel(video.sourceFPS) + "）："
                + "点「播放」开始推流｜那一格里输 秒数或 mm:ss 再按回车 = 跳到那儿"
                + (audio.hasTrack ? "｜原声在手机上跟播" : "｜这一段没有音轨，只有画面"))
     }

@@ -47,7 +47,7 @@ enum LiveConfig {
 
     /// 追加到 WKWebView 默认 UA 末尾：PC 那边看 access log 就知道是手机 app 在访问，
     /// 而不是有人在浏览器里手点。
-    static let userAgentSuffix = "LiveSwap/0.15"
+    static let userAgentSuffix = "LiveSwap/0.16"
 
     /// 第一次启动时地址栏里预填的这台：PC 侧现在监听的就是它。
     /// 只当预填和提示用，不当写死的配置——PC 重连 WiFi 以后 IP 会变，
@@ -338,6 +338,28 @@ enum LiveStopGate: Equatable {
 
     mutating func begin() { self = .stopping }
     mutating func settle(ok: Bool) { self = ok ? .idle : .failed }
+}
+
+// MARK: - 状态行的性能读数
+
+enum LivePerf {
+    /// 状态行里那一截。读数为 0 的一律省掉：还没出帧、还没测到往返时，
+    /// 一屏 0 只会让人以为坏了。
+    static func line(sourceFPS: Double, encodeMs: Double, gapMs: Double,
+                     rttAvgMs: Double, rttMaxMs: Double) -> String {
+        var parts: [String] = []
+        if sourceFPS >= 1 { parts.append(String(format: "源 %.0ffps", sourceFPS)) }
+        if encodeMs > 0 { parts.append(String(format: "编码 %.0fms", encodeMs)) }
+        if gapMs > 0 { parts.append(String(format: "发间隔峰 %.0fms", gapMs)) }
+        if rttAvgMs > 0 { parts.append(String(format: "往返 %.0f/%.0fms", rttAvgMs, rttMaxMs)) }
+        return parts.joined(separator: "｜")
+    }
+
+    /// 选片时那一行。源帧率决定按 15fps 抽帧时实际能到多少：
+    /// 30fps 素材每两帧取一帧是 15fps，24fps 素材每两帧取一帧只有 12fps。
+    static func sourceLabel(_ fps: Double) -> String {
+        fps >= 1 ? String(format: "·源 %.0ffps", fps) : ""
+    }
 }
 
 // MARK: - 原声跟播的对齐量

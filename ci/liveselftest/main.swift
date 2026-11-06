@@ -93,6 +93,18 @@ for i in 0..<10 {
 }
 ck("节奏 慢源全发", slow == 10, "实发 \(slow)，要 10")
 
+// 24fps 源 + 15fps 目标：上一格是 pts+1/15，落在两帧之间，只能隔一帧发一次 → 实际 12fps。
+// 用户看到的「明显停顿」先查这个：素材是 24/25fps 时抽帧规则本身就只给 12~12.5fps。
+next = nil
+var q24 = 0
+for i in 0..<72 {                        // 3 秒
+    let pts = Double(i) / 24.0
+    let d = LivePace.decide(ptsSeconds: pts, nextEmitSeconds: next, interval: 1.0 / 15.0)
+    if d.emit { q24 += 1 }
+    next = d.nextEmitSeconds
+}
+ck("节奏 24fps源只到12fps", q24 == 36, "实发 \(q24)，3 秒应 36 帧（每两帧取一帧）")
+
 // 落后了重新对齐：下一格时刻在身后，这一帧必须发出去，不能欠账堆积
 let behind = LivePace.decide(ptsSeconds: 5.0, nextEmitSeconds: 4.0, interval: 1.0 / 15.0)
 ck("节奏 落后重对齐", behind.emit && eq(behind.nextEmitSeconds, 5.0 + 1.0 / 15.0),
@@ -207,6 +219,16 @@ ck("桥名 进度条独立", LiveConfig.seekBridgeName == "liveSeek"
 ck("转义 引号反斜杠", LiveShim.jsLiteral("a\"b\\c") == "\"a\\\"b\\\\c\"",
    LiveShim.jsLiteral("a\"b\\c"))
 ck("转义 中文原样", LiveShim.jsLiteral("推流").hasPrefix("\"推流"))
+
+// MARK: - 状态行里的出帧账目
+
+let perfAll = LivePerf.line(sourceFPS: 24, encodeMs: 18.4, gapMs: 312, rttAvgMs: 40, rttMaxMs: 180)
+ck("账目 四项齐全", perfAll.contains("源 24fps") && perfAll.contains("编码 18ms")
+   && perfAll.contains("发间隔峰 312ms") && perfAll.contains("往返 40/180ms"), perfAll)
+ck("账目 零值全省", LivePerf.line(sourceFPS: 0, encodeMs: 0, gapMs: 0,
+                                  rttAvgMs: 0, rttMaxMs: 0).isEmpty)
+ck("账目 选片标源帧率", LivePerf.sourceLabel(24) == "·源 24fps", LivePerf.sourceLabel(24))
+ck("账目 未知源不标", LivePerf.sourceLabel(0).isEmpty)
 
 // MARK: - 和 PC 契约绑死的几个数
 

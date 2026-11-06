@@ -111,8 +111,51 @@ final class VideoFrameSource {
     private var running = false
     private let queue = DispatchQueue(label: "live.frame.video")
 
+    // 出帧账目：读线程写、主线程每 10 秒取一次，中间必须加锁。
+    private let statLock = NSLock()
+    private var costSumMs: Double = 0
+    private var costCount = 0
+    private var gapMaxMs: Double = 0
+    private var lastEmitWall: TimeInterval = 0
+
     var isRunning: Bool { running }
     var hasClip: Bool { asset != nil && track != nil }
+
+    /// 取走一个窗口的出帧账目（取完清零，看的是这 10 秒而不是整段）。
+    /// 编码耗时只算 FrameCodec 本身，间隔算两次编码完成之间——用户看到的卡顿
+    /// 就落在这两个数上：编码慢会顶高耗时，节奏断会顶高间隔。
+    func takeSendStats() -> (costMs: Double, gapMs: Double) {
+        statLock.lock()
+        let cost = costCount > 0 ? costSumMs / Double(costCount) : 0
+        let gap = gapMaxMs
+        costSumMs = 0
+        costCount = 0
+        gapMaxMs = 0
+        statLock.unlock()
+        return (cost, gap)
+    }
+
+    private func noteEncode(costMs: Double) {
+        let now = CFAbsoluteTimeGetCurrent()
+        statLock.lock()
+        costSumMs += costMs
+        costCount += 1
+        if lastEmitWall > 0 {
+            let gap = (now - lastEmitWall) * 1000
+            if gap > gapMaxMs { gapMaxMs = gap }
+        }
+        lastEmitWall = now
+        statLock.unlock()
+    }
+
+    private func resetStats() {
+        statLock.lock()
+        costSumMs = 0
+        costCount = 0
+        gapMaxMs = 0
+        lastEmitWall = 0
+        statLock.unlock()
+    }
 
     func load(url: URL) {
         stop()
@@ -166,6 +209,7 @@ final class VideoFrameSource {
         reader = r
         running = true
         currentPTS = from
+        resetStats()
 
         queue.async { [weak self] in
             guard let self = self else { return }
@@ -182,9 +226,11 @@ final class VideoFrameSource {
                                            interval: interval)
                 guard pace.emit else { continue }
                 nextEmit = pace.nextEmitSeconds
+                let encodeStart = CFAbsoluteTimeGetCurrent()
                 guard let pb = CMSampleBufferGetImageBuffer(sb),
                       let jpeg = FrameCodec.jpeg(pb, maxWidth: self.targetWidth,
                                                  quality: self.jpegQuality) else { continue }
+                self.noteEncode(costMs: (CFAbsoluteTimeGetCurrent() - encodeStart) * 1000)
                 if originPTS == nil {
                     originWall = CFAbsoluteTimeGetCurrent()
                     originPTS = pts
