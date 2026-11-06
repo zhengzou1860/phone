@@ -458,18 +458,16 @@ final class VRLive {
                                         presentationTimeStamp: CMTime(value: Int64(k), timescale: ts),
                                         decodeTimeStamp: .invalid)
         var sb: CMSampleBuffer?
-        // 这个 C 函数的参数顺序是 时间戳在前、像素缓冲在最后（imageBuffer:），
-        // 照着 CMSampleBufferCreate 的位置写会把 pb 当成格式描述，CI 就是这么报的
-        let st = CMSampleBufferCreateReady(allocator: kCFAllocatorDefault,
-                                           dataBuffer: nil,
-                                           formatDescription: fd,
-                                           sampleCount: 1,
-                                           sampleTimingEntryCount: 1,
-                                           sampleTimingArray: &timing,
-                                           sampleSizeEntryCount: 0,
-                                           sampleSizeArray: nil,
-                                           imageBuffer: pb,
-                                           sampleBufferOut: &sb)
+        // CMSampleBufferCreateReady 压根没有 imageBuffer 这一项（CI 报的 extra argument）；
+        // 从像素缓冲起样本要用带 ForImageBuffer 的那条，八项标签一个都不能少
+        let st = CMSampleBufferCreateForImageBuffer(allocator: kCFAllocatorDefault,
+                                                    imageBuffer: pb,
+                                                    dataReady: true,
+                                                    makeDataReadyCallback: nil,
+                                                    refcon: nil,
+                                                    formatDescription: fd,
+                                                    sampleTiming: &timing,
+                                                    sampleBufferOut: &sb)
         return st == noErr ? sb : nil
     }
 
