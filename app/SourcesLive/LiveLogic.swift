@@ -47,7 +47,7 @@ enum LiveConfig {
 
     /// 追加到 WKWebView 默认 UA 末尾：PC 那边看 access log 就知道是手机 app 在访问，
     /// 而不是有人在浏览器里手点。
-    static let userAgentSuffix = "LiveSwap/0.17"
+    static let userAgentSuffix = "LiveSwap/0.18"
 
     /// 第一次启动时地址栏里预填的这台：PC 侧现在监听的就是它。
     /// 只当预填和提示用，不当写死的配置——PC 重连 WiFi 以后 IP 会变，
@@ -420,6 +420,17 @@ enum PlanHint {
     }
 }
 
+/// 没选片时点「播放」该由谁放。PC 的剪辑页「用于换脸」会把路径 POST /set_video 写进
+/// 服务端，这时画面是 PC 自己本地的片：手机要放行的正是页面原来的 /start_playback，
+/// 不能再弹自己的相册（用户看到的就是「文件名都对，点播放却让选文件」）。
+enum LivePlaySource {
+    static func usesPCVideo(hasLocalClip: Bool, pcPath: String?) -> Bool {
+        if hasLocalClip { return false }
+        let p = (pcPath ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        return !p.isEmpty && p.lowercased() != "none"
+    }
+}
+
 // MARK: - 界面挂子与注入脚本
 
 struct LiveHook: Equatable {
@@ -587,6 +598,10 @@ enum LiveShim {
           st.textContent = 'html.pc-busy button,html.pc-busy select,html.pc-busy input,'
             + 'html.pc-busy a[href],html.pc-busy [onclick],html.pc-busy .edit-mode'
             + '{pointer-events:none !important;opacity:.45 !important;}'
+            // 下载是顶层导航交给系统的 WKDownload，不是命令，没有“回话”可等：
+            // 忙的时候也让它点得动，否则用户点下载会被灰到 15 秒兜底。
+            + 'html.pc-busy a[onclick*="downloadFile"]'
+            + '{pointer-events:auto !important;opacity:1 !important;}'
             + 'html.pc-busy,html.pc-busy body{cursor:progress !important;}';
           (document.head || document.documentElement).appendChild(st);
         } catch (e) {}
@@ -604,6 +619,10 @@ enum LiveShim {
       // 光靠样式挡不干净：忙时在捕获阶段把点击整个截下来，不让它进页面自己的处理。
       document.addEventListener('click', function (ev) {
         if (!busyNow()) return;
+        var a = (ev.target && ev.target.closest) ? ev.target.closest('a') : null;
+        // 下载不是命令：页面在 iOS 上把它改成 window.location.href 顶层导航，
+        // 交给原生 WKDownload 接，不存在“等 PC 回话”这件事。
+        if (a && String(a.getAttribute('onclick') || '').indexOf('downloadFile') >= 0) return;
         ev.preventDefault();
         ev.stopPropagation();
       }, true);

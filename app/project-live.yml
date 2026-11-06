@@ -24,8 +24,8 @@ targets:
         CFBundleExecutable: LiveSwap
         CFBundleIdentifier: com.qoder.liveswap
         CFBundlePackageType: APPL
-        CFBundleShortVersionString: "0.17"
-        CFBundleVersion: "17"
+        CFBundleShortVersionString: "0.18"
+        CFBundleVersion: "18"
         CFBundleInfoDictionaryVersion: "6.0"
         NSAppTransportSecurity:
           # 局域网那台电脑是 http://192.168.x.x，这道闸不放行的话 WKWebView 和原生推流一起被杀
@@ -33,6 +33,9 @@ targets:
         # iOS 14 起连自己局域网里的地址要先过这道授权。描述写不对，弹窗只有英文键名，
         # 用户按了拒绝以后手机上只会看到「连不上」，查不到原因。
         NSLocalNetworkUsageDescription: "要把手机里那段视频的画面逐帧发到你同一张网里的电脑上算换脸，再把结果取回来显示"
+        # 下载完的录像/剪辑产物交给系统保存框时，用户选「存储视频」要有这句，
+        # 否则一点保存就闪退；只加相册写入权限，不申请读整个相册。
+        NSPhotoLibraryAddUsageDescription: "把从电脑下载下来的视频存进相册"
         LSRequiresIPhoneOS: true
         UILaunchScreen: {}
         UISupportedInterfaceOrientations:

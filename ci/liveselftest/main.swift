@@ -227,6 +227,18 @@ ck("忙闸 原生能开关", shim.contains("UI.setBusy") && shim.contains("busyN
 ck("忙闸 停止失败可重试", shim.contains("busyHold = (s === STOP_STOPPING)"),
    "失败态还灰住整页，用户就点不到「重试停止」")
 ck("忙闸 PC没回话到点放开", shim.contains("BUSY_MAX_MS") && shim.contains("clearTimeout(timer)"))
+ck("忙闸 下载链接不拦", shim.contains("downloadFile") && shim.contains("pointer-events:auto"),
+   "下载是顶层导航交给 WKDownload，没有回话可等，灰住就点不了")
+
+// 点「播放」时 PC 手上已有片（剪辑页「用于换脸」）就交回页面自己的 /start_playback；
+// 两边都没片才是手机上选片的时机。
+ck("播放 手机有片自己推", !LivePlaySource.usesPCVideo(hasLocalClip: true,
+                                                   pcPath: "uploads\\a.mp4"))
+ck("播放 PC有片放行页面", LivePlaySource.usesPCVideo(hasLocalClip: false,
+                                                  pcPath: "uploads\\edited_1.mp4"))
+ck("播放 两边都没片才弹相册", !LivePlaySource.usesPCVideo(hasLocalClip: false, pcPath: "")
+   && !LivePlaySource.usesPCVideo(hasLocalClip: false, pcPath: nil)
+   && !LivePlaySource.usesPCVideo(hasLocalClip: false, pcPath: "none"))
 ck("桥名 进度条独立", LiveConfig.seekBridgeName == "liveSeek"
    && LiveConfig.seekBridgeName != LiveConfig.bridgeName)
 ck("转义 引号反斜杠", LiveShim.jsLiteral("a\"b\\c") == "\"a\\\"b\\\\c\"",

@@ -51,6 +51,8 @@ final class PageViewController: UIViewController {
     /// 没存过地址时要在界面出现以后才能弹框：viewDidLoad 里 present 会被系统
     /// 静默拒绝（那时还没进窗口），表现就是一片黑、连填地址的输入框都看不到。
     private var pendingAddressPrompt = false
+    /// 下载落点：WKDownload 完成时只回传对象本身，路径得自己在决定落点时记下来。
+    private var downloadTargets: [ObjectIdentifier: URL] = [:]
 
     // PC 掉出推流模式（10 秒空闲看门狗、重启服务）后的重连计数
     private var restartTries = 0
@@ -364,7 +366,38 @@ final class PageViewController: UIViewController {
         case .paused:
             resumePushing(from: resumeSeconds, reason: "接着推", manual: true)
         default:
-            startPush()
+            // 有本地片才走手机推帧；没有就先问 PC，别一上来就弹相册。
+            if video.hasClip {
+                startPush()
+            } else {
+                playOnPCOrPick()
+            }
+        }
+    }
+
+    /// 手机还没选片时点「播放」：先问 PC 手上有没有片。
+    /// 剪辑页「用于换脸」会把路径交给 PC（/set_video），这时该由 PC 自己放，
+    /// 页面原有的 /start_playback 就是那条路；只有 PC 也没片才弹手机相册。
+    private func playOnPCOrPick() {
+        guard let client = client else {
+            status("还没连上 PC：屏幕长按 1.5 秒填地址", "error")
+            return
+        }
+        setPageBusy(true)
+        Task { @MainActor in
+            defer { self.setPageBusy(false) }
+            let path = await client.fetchVideoPathOnce()
+            guard self.client === client else { return }
+            guard LivePlaySource.usesPCVideo(hasLocalClip: self.video.hasClip, pcPath: path) else {
+                self.onPick()
+                return
+            }
+            // 交回页面自己的按钮处理：播放/暂停、进度条、状态行都在页面里，原生不另造一条。
+            let js = "typeof togglePlayStop === 'function' ? (togglePlayStop(), true) : false"
+            self.webView.evaluateJavaScript(js) { [weak self] result, _ in
+                guard let self = self, (result as? Bool) != true else { return }
+                self.status("PC 上已有视频，但这个页面的播放处理对不上（PC 改过页面？）", "error")
+            }
         }
     }
 
@@ -927,6 +960,57 @@ extension PageViewController: WKNavigationDelegate {
         reportFailure(error)
     }
 
+    /// 下载链接（剪辑产物、录像）走的是顶层导航 + attachment 响应：WebKit 自己不会存，
+    /// 交回 .download 让 WKDownload 接住，由原生决定落到手机哪个目录、再弹保存框。
+    /// 判断放在响应这一侧：登录过期时 /download_file 会先 302 到登录页，按 URL 提前
+    /// 判下载的话会把登录页的 HTML 存成文件；等最终响应看类型和 attachment 才不会错。
+    func webView(_ webView: WKWebView,
+                 decidePolicyFor navigationAction: WKNavigationAction,
+                 decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+        if navigationAction.shouldPerformDownload {
+            decisionHandler(.download)
+            return
+        }
+        decisionHandler(.allow)
+    }
+
+    func webView(_ webView: WKWebView,
+                 decidePolicyFor navigationResponse: WKNavigationResponse,
+                 decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void) {
+        // 三条任一命中就是下载：URL 是下载口、响应明说 attachment、或者 WebKit 自己放不了。
+        if Self.isDownloadResponse(navigationResponse.response)
+            || !navigationResponse.canShowMIMEType {
+            decisionHandler(.download)
+            return
+        }
+        decisionHandler(.allow)
+    }
+
+    func webView(_ webView: WKWebView,
+                 navigationAction: WKNavigationAction,
+                 didBecome download: WKDownload) {
+        download.delegate = self
+    }
+
+    func webView(_ webView: WKWebView,
+                 navigationResponse: WKNavigationResponse,
+                 didBecome download: WKDownload) {
+        download.delegate = self
+    }
+
+    private static func isDownloadPath(_ url: URL) -> Bool {
+        let p = url.path
+        return p == "/download_file" || p.hasPrefix("/download_file/")
+            || p == "/api/record/download"
+    }
+
+    private static func isDownloadResponse(_ response: URLResponse) -> Bool {
+        if let url = response.url, isDownloadPath(url) { return true }
+        guard let http = response as? HTTPURLResponse,
+              let cd = http.value(forHTTPHeaderField: "Content-Disposition") else { return false }
+        return cd.lowercased().contains("attachment")
+    }
+
     private func reportFailure(_ error: Error) {
         let ns = error as NSError
         guard ns.code != NSURLErrorCancelled else { return }
@@ -934,6 +1018,57 @@ extension PageViewController: WKNavigationDelegate {
         status("连不上 \(host)：\(ns.localizedDescription)｜确认手机和电脑在同一张网，"
                + "并且这台手机的「本地网络」权限是开的", "error")
         openAddress(storedHost())
+    }
+}
+
+// MARK: - 下载落盘：WKDownload 决定路径 → 完成弹保存框
+//
+// 89MB 的剪辑产物不可能读进内存再拼 blob：WKDownload 是流式落盘，
+// 完成以后把文件 URL 交给系统保存框，用户自己选「存储到文件」或相册。
+
+extension PageViewController: WKDownloadDelegate {
+    func download(_ download: WKDownload,
+                  decideDestinationUsing response: URLResponse,
+                  suggestedFilename: String,
+                  completionHandler: @escaping (URL?) -> Void) {
+        let fm = FileManager.default
+        let raw = suggestedFilename.isEmpty ? "download.mp4" : suggestedFilename
+        let name = (raw as NSString).lastPathComponent
+        let dir = fm.temporaryDirectory
+            .appendingPathComponent("LiveSwapDownloads", isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        do {
+            try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+            let dst = dir.appendingPathComponent(name)
+            downloadTargets[ObjectIdentifier(download)] = dst
+            completionHandler(dst)
+            status("正在下载 \(name)…", "success")
+        } catch {
+            completionHandler(nil)
+            status("下载落不了盘：\(error.localizedDescription)", "error")
+        }
+    }
+
+    func downloadDidFinish(_ download: WKDownload) {
+        guard let url = downloadTargets.removeValue(forKey: ObjectIdentifier(download)) else { return }
+        status("已下载 \(url.lastPathComponent)：选「存储到文件」或相册", "success")
+        let sheet = UIActivityViewController(activityItems: [url], applicationActivities: nil)
+        sheet.popoverPresentationController?.sourceView = view
+        sheet.popoverPresentationController?.sourceRect = CGRect(x: view.bounds.midX,
+                                                                 y: view.bounds.midY,
+                                                                 width: 0, height: 0)
+        sheet.completionWithItemsHandler = { _, _, _, _ in
+            // 用户存到哪儿由系统拷走；临时这份留到保存框关掉就删，不占手机空间。
+            try? FileManager.default.removeItem(at: url.deletingLastPathComponent())
+        }
+        present(sheet, animated: true)
+    }
+
+    func download(_ download: WKDownload, didFailWithError error: Error, resumeData: Data?) {
+        downloadTargets.removeValue(forKey: ObjectIdentifier(download))
+        let ns = error as NSError
+        guard ns.code != NSURLErrorCancelled else { return }
+        status("下载失败：\(ns.localizedDescription)", "error")
     }
 }
 

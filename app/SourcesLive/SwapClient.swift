@@ -292,6 +292,23 @@ final class SwapClient: ObservableObject {
         )
     }
 
+    /// 点「播放」而手机还没选片时问一句：PC 自己手上有没有片。
+    /// 剪辑页「用于换脸」用 /set_video 写的就是它；空串 / 缺字段 = PC 也没有。
+    func fetchVideoPathOnce() async -> String? {
+        var req = URLRequest(url: url("/get_video_path"))
+        authorize(&req)
+        guard let (data, resp) = try? await session.data(for: req),
+              let http = resp as? HTTPURLResponse else { return nil }
+        if LiveAuth.lost(http) {
+            importCookies()
+            return nil
+        }
+        guard http.statusCode == 200,
+              let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        let p = (j["video_path"] as? String) ?? ""
+        return p.isEmpty ? nil : p
+    }
+
     private func beginStatusPolling() {
         statusTask?.cancel()
         statusTask = Task { [weak self] in
