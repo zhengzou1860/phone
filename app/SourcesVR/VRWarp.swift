@@ -5,7 +5,7 @@ import CoreVideo
 import CoreML
 import Metal
 
-/// Swift 侧的 VRP，字段顺序和 Shaders.metal 里那个 struct 一字不差（44 字节，全 4 字节对齐）。
+/// Swift 侧的 VRP，字段顺序和 Shaders.metal 里那个 struct 一字不差（48 字节，全 4 字节对齐）。
 struct VRParams {
     var W: UInt32 = 0
     var H: UInt32 = 0
@@ -18,6 +18,8 @@ struct VRParams {
     var budget: Float = 0
     var SW: UInt32 = 0
     var rot: UInt32 = 0
+    /// 每眼画面在自家半幅里的整体水平位移（像素，正=右移）：对 VR 镜片中心用
+    var xoff: Float = 0
 }
 
 extension VRTech {
@@ -121,15 +123,12 @@ final class VRDepthFeed {
         inputCv = cv
     }
 
-    /// 一帧：kScale 画进送检框 → CoreML → 输出平面按眼格重采样
-    func infer(srcPB: CVPixelBuffer) -> (raw: [Float], ms: (prep: Double, predict: Double),
-                                         plane: VRPlane.Out, err: String?) {
+    /// 把这一帧画进送检框（518x392 那块）。整段都在锁里：它发的是 VRTech 那份共享 command buffer。
+    private func scaleInto(srcPB: CVPixelBuffer) -> (ms: Double, err: String?) {
         VRTech.gate.lock()
         defer { VRTech.gate.unlock() }
         let got = VRTech.texture(from: srcPB, width: eyeW, height: eyeH)
-        guard let srcTex = got.tex else {
-            return ([], (0, 0), VRPlane.Out(), "帧纹理建不出来: \(got.note)")
-        }
+        guard let srcTex = got.tex else { return (0, "帧纹理建不出来: \(got.note)") }
         var p = VRParams()
         p.W = UInt32(eyeW); p.H = UInt32(eyeH)
         p.MW = UInt32(mw); p.MH = UInt32(mh)
@@ -138,11 +137,22 @@ final class VRDepthFeed {
         let t0 = DispatchTime.now().uptimeNanoseconds
         guard let enc = VRTech.encode("kScale", textures: [srcTex, inputTex],
                                       params: p, buffers: [], width: mw, height: mh) else {
-            return ([], (0, 0), VRPlane.Out(), "kScale 没编出来")
+            return (0, "kScale 没编出来")
         }
         enc.endEncoding()
         VRTech.commitWait()
-        let prepMs = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000
+        return (Double(DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000, nil)
+    }
+
+    /// 一帧：kScale 画进送检框 → CoreML → 输出平面按眼格重采样
+    /// 锁只盖住第一段：kScale 那趟要动 VRTech 的静态 command buffer，跟别处的形变并发会踩成 trap。
+    /// CoreML 预测那 180 ms 一个 Metal 指令都不发，必须留在锁外——实时播放的显示线程就在旁边等这张深度，
+    /// 抱着锁预测就等于把整条播放压到 5 帧/秒。
+    func infer(srcPB: CVPixelBuffer) -> (raw: [Float], ms: (prep: Double, predict: Double),
+                                         plane: VRPlane.Out, err: String?) {
+        let pre = scaleInto(srcPB: srcPB)
+        guard pre.err == nil else { return ([], (0, 0), VRPlane.Out(), pre.err) }
+        let prepMs = pre.ms
 
         let t1 = DispatchTime.now().uptimeNanoseconds
         do {
@@ -280,7 +290,8 @@ final class VRWarp {
     }
 
     /// 一帧。dn 是已归一化到 0..1 的眼格深度；outPB 是 2W×H 的 BGRA 像素缓冲（成片的这一帧）。
-    func render(srcPB: CVPixelBuffer, dn: [Float], zp: Float, outPB: CVPixelBuffer)
+    /// xoff = 每眼画面在自家半幅里的水平位移（像素），只对实时播放的对镜片有用，出片那条一律传 0。
+    func render(srcPB: CVPixelBuffer, dn: [Float], zp: Float, xoff: Float = 0, outPB: CVPixelBuffer)
         -> (upload: Double, gpu: Double, holes: Double, err: String?) {
         VRTech.gate.lock()
         defer { VRTech.gate.unlock() }
@@ -296,6 +307,7 @@ final class VRWarp {
         p.MW = UInt32(eyeW); p.MH = UInt32(eyeH)
         p.zp = zp; p.budget = budget
         p.SW = UInt32(sbsW)
+        p.xoff = xoff
 
         let t0 = DispatchTime.now().uptimeNanoseconds
         dn.withUnsafeBytes { raw in

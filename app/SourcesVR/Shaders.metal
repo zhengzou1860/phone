@@ -20,6 +20,7 @@ struct VRP {
     float budget;   // 最大视差（像素，按每眼宽算）
     uint  SW;       // 成片宽 = 2W
     uint  rot;      // 0=摆正送检；1=顺时针转 90° 送检（只有 kScale 读它）
+    float xoff;     // 左右眼画面在各自半幅里再整体水平移这么多像素（对镜片中心用，正=右移）
 };
 
 constexpr sampler lin(coord::normalized, filter::linear, address::clamp_to_edge);
@@ -97,8 +98,8 @@ kernel void kSplatDepth(constant VRP& P [[buffer(0)]],
     if (g.x >= P.W || g.y >= P.H) return;
     float dd = ddOf(dn, g.y * P.W + g.x, P);
     uint e = encOrder(dd);
-    int dl = int(rint(float(g.x) + dd));
-    int dr = int(rint(float(g.x) - dd));
+    int dl = int(rint(float(g.x) + dd + P.xoff));
+    int dr = int(rint(float(g.x) - dd + P.xoff));
     if (dl >= 0 && uint(dl) < P.W) {
         atomic_fetch_max_explicit(bestL + g.y * P.W + uint(dl), e, memory_order_relaxed);
     }
@@ -118,8 +119,8 @@ kernel void kSplatColor(texture2d<float, access::sample> src [[texture(0)]],
     if (g.x >= P.W || g.y >= P.H) return;
     float dd = ddOf(dn, g.y * P.W + g.x, P);
     uint e = encOrder(dd);
-    int dl = int(rint(float(g.x) + dd));
-    int dr = int(rint(float(g.x) - dd));
+    int dl = int(rint(float(g.x) + dd + P.xoff));
+    int dr = int(rint(float(g.x) - dd + P.xoff));
     float4 c = src.read(g);
     if (dl >= 0 && uint(dl) < P.W && atomic_load_explicit(bestL + g.y * P.W + uint(dl), memory_order_relaxed) == e) {
         sbs.write(c, uint2(uint(dl), g.y));
@@ -141,12 +142,21 @@ kernel void kCombine(texture2d<float, access::read>  fbL [[texture(0)]],
                      uint2 g [[thread_position_in_grid]]) {
     if (g.x >= P.W || g.y >= P.H) return;
     uint idx = g.y * P.W + g.x;
+    // z 缓冲这一格是「平移后的落点」，而 fbL/fbR 是按「没平移的落点」铺的 ⇒ 取格子要减回 xoff。
+    // 平移推出的那几列（dx 越界）谁都不写，由 Swift 侧在位移一变时把显示缓冲抹一次黑，
+    // 不清的话那几列会露出轮转缓冲里上一轮（6 帧前）的残影。
+    int xf = int(rint(P.xoff));
+    int dx = int(g.x) + xf;
+    int fs = int(g.x) - xf;
+    if (fs < 0) fs = 0;
+    if (fs > int(P.W) - 1) fs = int(P.W) - 1;
+    bool fits = (dx >= 0 && uint(dx) < P.W);
     if (atomic_load_explicit(bestL + idx, memory_order_relaxed) == 0u) {
-        sbs.write(fbL.read(g), uint2(g.x, g.y));
+        if (fits) sbs.write(fbL.read(uint2(uint(fs), g.y)), uint2(uint(dx), g.y));
         atomic_fetch_add_explicit(holes, 1u, memory_order_relaxed);
     }
     if (atomic_load_explicit(bestR + idx, memory_order_relaxed) == 0u) {
-        sbs.write(fbR.read(g), uint2(P.W + g.x, g.y));
+        if (fits) sbs.write(fbR.read(uint2(uint(fs), g.y)), uint2(P.W + uint(dx), g.y));
         atomic_fetch_add_explicit(holes, 1u, memory_order_relaxed);
     }
 }

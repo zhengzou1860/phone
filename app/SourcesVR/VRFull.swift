@@ -58,6 +58,11 @@ enum VRFull {
             return "已经有一条全片在跑，这条不起（它此刻的进度：\(p.isEmpty ? "刚起手" : p)）。"
                 + "要换片请先按「停止」等它收兵。"
         }
+        // 反向也要挡：实时播放那条一直在发 Metal 指令，跟全片并发就是 10-10 那次闪退的同一个坑
+        if VRLive.isBusy() {
+            door.unlock()
+            return "实时左右眼播放还在跑，这条全片不起（两条共用那份 Metal 地基）。先退出播放页。"
+        }
         inside = true
         door.unlock()
         defer { door.lock(); inside = false; door.unlock() }
@@ -488,17 +493,33 @@ enum VRFull {
 /// 顺序解码一整条片子：一个 AVAssetReader 从头吃到尾，帧拷进调用方给的复用缓冲。
 /// Pilot 那种「每帧重建一个 reader 去 seek」不能这么用：那一次要付 54 ms 的起手开销，
 /// 它只有在「只取十帧」时才划算——全片 5400 帧要一次次重开解码器，光起手就比解码本身贵。
+/// 拖进度是唯一的例外：一次 54 ms 换一次拖动，实时播放那条就靠 restart。
 final class VRFrameStream {
-    let reader: AVAssetReader
-    let out: AVAssetReaderVideoCompositionOutput
+    private let src: VRSource
+    private var reader: AVAssetReader?
+    private var out: AVAssetReaderVideoCompositionOutput?
     let eyeW: Int
     let eyeH: Int
     private var open = false
 
     init?(src: VRSource) {
+        self.src = src
+        eyeW = src.eyeW; eyeH = src.eyeH
+        guard startReading(from: 0) else { return nil }
+    }
+
+    /// 关掉当前这条，从 seconds 那一点重开。返回假 = 没起来，调用方按「到头」处理。
+    /// 只改 timeRange 不重建 reader 是不行的：AVAssetReader 一旦 startReading 就回不到过去。
+    @discardableResult
+    func restart(from seconds: Double) -> Bool {
+        close()
+        return startReading(from: seconds)
+    }
+
+    private func startReading(from seconds: Double) -> Bool {
         guard let r = try? AVAssetReader(asset: src.asset) else {
             VRJournal.line("流 reader 建不出来")
-            return nil
+            return false
         }
         // 这个 init 不返回 Optional（CI 上机报的：conditional binding must have Optional type）。
         // 参数不被支持时它照样建得出来，真正的失败在下一步 startReading 里报。
@@ -506,19 +527,24 @@ final class VRFrameStream {
             videoTracks: [src.track],
             videoSettings: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA])
         o.videoComposition = src.vc
+        if seconds > 0.05 {
+            o.timeRange = CMTimeRange(start: CMTime(seconds: seconds, preferredTimescale: 600),
+                                      end: src.asset.duration)
+        }
         r.add(o)
         guard r.startReading() else {
             VRJournal.line("流 startReading 失败 \(r.error?.localizedDescription ?? "-")")
-            return nil
+            return false
         }
-        reader = r; out = o; eyeW = src.eyeW; eyeH = src.eyeH
+        reader = r; out = o
         open = true
+        return true
     }
 
     /// 下一帧：到头、形状不对就返回 false
     func next(into dst: CVPixelBuffer) -> Bool {
-        guard open, let s = out.copyNextSampleBuffer() else { return false }
-        guard reader.status == .reading else { return false }
+        guard open, let o = out, let s = o.copyNextSampleBuffer(), let r = reader else { return false }
+        guard r.status == .reading else { return false }
         guard let b = CMSampleBufferGetImageBuffer(s) else { return false }
         guard CVPixelBufferGetWidth(b) == eyeW, CVPixelBufferGetHeight(b) == eyeH else {
             VRJournal.line("流 直出 \(CVPixelBufferGetWidth(b))x\(CVPixelBufferGetHeight(b))，每眼 \(eyeW)x\(eyeH) 对不上")
@@ -531,6 +557,8 @@ final class VRFrameStream {
     func close() {
         guard open else { return }
         open = false
-        if reader.status == .reading { reader.cancelReading() }
+        if let r = reader, r.status == .reading { r.cancelReading() }
+        out = nil
+        reader = nil
     }
 }

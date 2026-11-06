@@ -2,6 +2,7 @@ import SwiftUI
 import Foundation
 import UIKit
 import AVFoundation
+import AVKit
 import CoreML
 import PhotosUI
 
@@ -12,6 +13,12 @@ struct VR3DApp: App {
             VRMainView()
         }
     }
+}
+
+/// fullScreenCover(item:) 要 Identifiable，URL 自己不是 ⇒ 套一层。id 用绝对路径，同一个文件不会重开两次
+struct VRPlayItem: Identifiable {
+    let url: URL
+    var id: String { url.absoluteString }
 }
 
 struct VRMainView: View {
@@ -137,6 +144,18 @@ struct VRMainView: View {
                     .font(.system(size: 10, design: .monospaced))
                     .foregroundColor(.secondary)
 
+                HStack(spacing: 10) {
+                    Button("播放相册（左右眼）") { job.pickForPlayback() }
+                    Button("实时左右眼播放") { job.pickForLive() }
+                }
+                .buttonStyle(.bordered)
+                .font(.footnote)
+                .disabled(job.busy || VRFull.isBusy() || VRLive.isBusy())
+
+                Text("播放相册那条只把文件放起来看（用系统播放器，进度条暂停都是它的）；实时那条选普通视频，边解帧边形变直接上屏，不写文件、不进相册。实时播放点屏幕出控件：暂停、拖进度、还有一条调左右眼水平位置（对镜片中心用，±12% 封顶，存一次下次照用）。实时画面按源的帧率走，深度实测 180~200 ms/帧 ⇒ 立体感约每秒 5 次一级一级跳；实时拿不到整片 p1/p99，改成已见样本的滑动分位，开头几秒幅度会偏")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundColor(.secondary)
+
                 if job.busy {
                     Text(job.status)
                         .font(.footnote)
@@ -171,6 +190,29 @@ struct VRMainView: View {
         .fullScreenCover(isPresented: $job.showVideoPicker) {
             VRPickerHost { url, msg in job.finishPick(url: url, failMessage: msg) }
         }
+        .fullScreenCover(item: $job.playItem) { item in
+            VStack(spacing: 0) {
+                HStack {
+                    Spacer()
+                    Button("关闭") { job.closePlain() }
+                        .buttonStyle(.bordered)
+                        .font(.footnote)
+                }
+                .padding(6)
+                VRPlainPlayerHost(url: item.url)
+            }
+            .background(Color.black)
+        }
+        .fullScreenCover(item: $job.liveItem) { item in
+            ZStack(alignment: .topTrailing) {
+                VRLiveHost(url: item.url, eyeLong: job.eyeLong, bpct: Float(job.bpct),
+                           units: VRJob.unit(job.unitTag), rot: job.feedRot) { r in job.liveEnd(r) }
+                Button("停止") { job.stopLive() }
+                    .buttonStyle(.borderedProminent)
+                    .padding(10)
+            }
+            .background(Color.black)
+        }
     }
 }
 
@@ -180,6 +222,14 @@ final class VRJob: ObservableObject {
     @Published var busy = false
     @Published var status = ""
     @Published var showVideoPicker = false
+    /// 播放器的两个全屏页：相册里已经是左右眼的那条走 playItem，实时那条走 liveItem
+    @Published var playItem: VRPlayItem?
+    @Published var liveItem: VRPlayItem?
+    /// 下一次选片的去向：0=拿去转，1=拿去播，2=拿去实时播
+    private var pickPurpose = 0
+    /// 播放器手里那份 tmp 副本，关掉页面时删
+    private var playCopy: URL?
+    private var liveCopy: URL?
     @Published var frames = 10
     @Published var eyeLong = 540
     @Published var bpct = 5
@@ -364,10 +414,63 @@ final class VRJob: ObservableObject {
         status = "正在收兵：把手上这一帧/这一条做完就停，已扫的深度和已出的成片照样报"
     }
 
+    func pickForPlayback() {
+        pickPurpose = 1
+        showVideoPicker = true
+    }
+
+    func pickForLive() {
+        // 实时那条也在动那份静态 Metal 地基（形变与深度各一条线程），跟转换并发就是 10-10 那次闪退的形状
+        if busy || VRFull.isBusy() || VRLive.isBusy() {
+            log.append("有一条在跑，实时播放先不起（共用那份 Metal 地基）。进度：\(status.isEmpty ? "刚起手" : status)")
+            return
+        }
+        pickPurpose = 2
+        showVideoPicker = true
+    }
+
+    func closePlain() {
+        playItem = nil
+        dropPickCopy(playCopy)
+        playCopy = nil
+    }
+
+    func stopLive() {
+        VRLive.requestStopCurrent()
+    }
+
+    /// 实时页收兵后由 VRLive 把报告送回这里：关页面、进日志、删那份 tmp 副本
+    func liveEnd(_ report: String) {
+        liveItem = nil
+        log.append(report)
+        if log.count > 8 { log.removeFirst(log.count - 8) }
+        VRJournal.line("界面 " + report.replacingOccurrences(of: "\n", with: " ／ "))
+        dropPickCopy(liveCopy)
+        liveCopy = nil
+    }
+
     func finishPick(url: URL?, failMessage: String?) {
         showVideoPicker = false
         guard let url = url else {
             log.append("取文件失败\n\(failMessage ?? "未知原因")")
+            return
+        }
+        // 播放器这两条不跑转换：去向在选择那一刻就记下了，回来只负责把全屏页撑开
+        if pickPurpose == 1 {
+            pickPurpose = 0
+            playCopy = url
+            playItem = VRPlayItem(url: url)
+            return
+        }
+        if pickPurpose == 2 {
+            pickPurpose = 0
+            if busy || VRFull.isBusy() || VRLive.isBusy() {
+                log.append("有一条在跑，实时播放不起（两条共用那份 Metal 地基）。")
+                dropPickCopy(url)
+                return
+            }
+            liveCopy = url
+            liveItem = VRPlayItem(url: url)
             return
         }
         // 选片回调是异步的：拷一条一分钟的片子要好几秒，这期间按钮的 busy 还没置上，
