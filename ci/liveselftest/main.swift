@@ -199,7 +199,7 @@ ck("脚本 全屏态上报原生", shim.contains("action: FS") && LiveShim.hookF
    "原生靠它藏/恢复状态栏")
 // 0.20：全屏里控件平时收起，点画面唤出，几秒不动自己收；退出全屏一起还原。
 ck("脚本 全屏控件默认收起", shim.contains("FS_IDLE = 'live-fs-idle'")
-   && shim.contains("if (on) {\n          fsIdle(true);"),
+   && shim.contains("if (on) fsIdle(true);"),
    "页面全屏会点亮播放行和进度条，注入层要在进入那一刻就盖掉")
 ck("脚本 收起样式压得住页面", shim.contains("html.fs.live-fs-idle .controls.play-row")
    && shim.contains("html.fs.live-fs-idle #live-seek-row.on")

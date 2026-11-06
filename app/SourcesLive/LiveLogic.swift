@@ -1007,9 +1007,8 @@ enum LiveShim {
         try { on = document.documentElement.classList.contains('fs'); } catch (e) {}
         if (on === lastFs) return;
         lastFs = on;
-        if (on) {
-          fsIdle(true);
-        } else {
+        if (on) fsIdle(true);
+        else {
           clearTimeout(fsHideTimer);
           fsIdle(false);
         }
