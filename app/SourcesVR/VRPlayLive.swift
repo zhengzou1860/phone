@@ -62,6 +62,8 @@ final class VRLive {
     private var depthTakes = 0
     private var depthSumMs = 0.0
     private var depthErr = ""
+    /// 深度那张图到底按什么读法读的（16 位=半浮点还是整数）：只报一次，好跟上机日志对账
+    private var depthFmt = ""
     private var depthFails = 0
     private var pool: [Float] = []
     private var lo: Float = 0
@@ -347,6 +349,7 @@ final class VRLive {
                 latestSeq += 1
                 depthTakes += 1
                 depthSumMs += pms
+                if depthFmt.isEmpty { depthFmt = r.plane.fmt }
                 // 在线分位的样本池：每 16 个取一个，满了就从最老那头滑掉
                 var i = 0
                 while i < fresh.count {
@@ -611,6 +614,7 @@ final class VRLive {
         let avgD = takes > 0 ? depthSumMs / Double(takes) : 0.0
         let poolN = pool.count
         let err = depthErr
+        let fmt = depthFmt
         dLock.unlock()
         let shown = Double(frames) / secs
         let gpuPer = frames > 0 ? gpuSum / Double(frames) : 0.0
@@ -623,11 +627,13 @@ final class VRLive {
             let hz = Double(takes) / secs
             let holePct = frames > 0 ? holes / Double(frames) : 0.0
             let errLine = err.isEmpty ? "" : "\n深度出错 \(err)（连续 3 次就不算了，画面退回平板）"
+                + (takes == 0 ? "\n一次深度都没算成：屏上这条是平的，没有立体" : "")
             text = "实时 出帧 \(frames)＝\(String(format: "%.1f", shown)) 帧/秒（源 \(String(format: "%.1f", fps))）"
                 + "\n深度更新 \(takes) 次＝\(String(format: "%.1f", hz)) 次/秒、单价 \(String(format: "%.0f", avgD)) ms"
                 + "｜其余 \(frames - takes) 帧复用上一张"
                 + "\n形变 \(String(format: "%.1f", gpuPer)) ms/帧｜补洞 \(String(format: "%.2f", holePct))%"
                 + "｜归一化样本池 \(poolN) 个（实时没有整片 p1/p99，边播边攒）"
+                + (fmt.isEmpty || takes == 0 ? "" : "\n深度读法 \(fmt)")
                 + errLine
         }
         if Thread.isMainThread { label?.text = text }
@@ -644,17 +650,20 @@ final class VRLive {
         dLock.lock()
         let takes = depthTakes
         let err = depthErr
+        let fmt = depthFmt
         dLock.unlock()
         var rep = "\(sbs ? "左右眼原样" : "实时") 收兵：出帧 \(frames) 帧、跑了 \(String(format: "%.1f", wall)) s"
         if sbs {
             rep += "｜平移 \(String(format: "%.1f", frames > 0 ? gpuSum / Double(frames) : 0)) ms/帧"
         } else {
             rep += "｜深度 \(takes) 次｜形变 \(String(format: "%.1f", frames > 0 ? gpuSum / Double(frames) : 0)) ms/帧"
+                + "｜补洞 \(String(format: "%.2f", frames > 0 ? holes / Double(frames) : 0))%"
         }
         rep += "｜足迹 \(VRFacts.footprintMB()) MB"
         if !note.isEmpty { rep += "｜\(note)" }
         if !extra.isEmpty { rep += "｜\(extra)" }
         if !err.isEmpty { rep += "｜深度错 \(err)" }
+        if takes > 0 && !fmt.isEmpty { rep += "｜深度读法 \(fmt)" }
         VRJournal.line(rep)
         VRLive.door.lock()
         VRLive.inside = false

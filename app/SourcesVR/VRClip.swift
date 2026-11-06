@@ -89,6 +89,7 @@ enum VRPilot {
 
         let first = samples[0].plane
         rep.append("深度输出 第0帧 \(first.w)x\(first.h) 格式 \(first.fourcc) 每像素 \(first.bpp) 字节"
+            + (first.fmt.isEmpty ? "" : "｜\(first.fmt)")
             + (first.note.isEmpty ? "" : "｜\(first.note)"))
 
         // —— 2. 整片归一化（PC 的 m6 口径）——

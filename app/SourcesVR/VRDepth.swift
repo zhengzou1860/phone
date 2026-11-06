@@ -272,6 +272,7 @@ enum VRDepth {
         let plane = VRPlane.read(pb)
         return "输出 \(key) 图像 \(plane.w)x\(plane.h) 格式 \(plane.fourcc) 每像素 \(plane.bpp) 字节"
             + "｜随机图喂进去的数值 \(String(format: "%.3f~%.3f", plane.min, plane.max))"
+            + (plane.fmt.isEmpty ? "" : "｜\(plane.fmt)")
             + (plane.note.isEmpty ? "" : "｜\(plane.note)")
     }
 }
@@ -290,6 +291,10 @@ enum VRPlane {
         var fourcc = "?"
         var min: Float = .greatestFiniteMagnitude
         var max: Float = -.greatestFiniteMagnitude
+        /// 读法说明（「16 位这张按半浮点读的」这一类）：数值照样是好的，只报不判——
+        /// 把它塞进 note 会让调用方把一次成功的深度当成失败累计
+        var fmt = ""
+        /// 真错：这一帧的深度没读出来，调用方据此收兵
         var note = ""
     }
 
@@ -353,7 +358,7 @@ enum VRPlane {
                     if v > o.max { o.max = v }
                 }
             }
-            o.note = "16 位按\(halfSane ? "半浮点" : "无符号整数")读（均值 half \(String(format: "%.3f", n > 0 ? asHalfSum / Double(n) : 0))"
+            o.fmt = "16 位按\(halfSane ? "半浮点" : "无符号整数")读（均值 half \(String(format: "%.3f", n > 0 ? asHalfSum / Double(n) : 0))"
                 + " / int \(String(format: "%.1f", n > 0 ? asIntSum / Double(n) : 0))）"
         case 4:
             let p = base.assumingMemoryBound(to: Float32.self)
@@ -367,9 +372,12 @@ enum VRPlane {
                 }
             }
         default:
+            // 一位没读：数组留空，别让"有长度但全是 0"的深度混进调用方的正常路
+            o.vals = []
             o.note = "每像素 \(o.bpp) 字节这个格式还不认（fourcc \(o.fourcc)）"
         }
-        if o.vals.isEmpty { o.note = "读出来是空的" }
+        // 具体那句（尺寸/格式不认）比"空"更有用，别被它盖掉
+        if o.vals.isEmpty && o.note.isEmpty { o.note = "读出来是空的" }
         return o
     }
 
