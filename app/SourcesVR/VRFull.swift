@@ -340,7 +340,7 @@ enum VRFull {
             let tHead0 = DispatchTime.now().uptimeNanoseconds
             do { try writer.startWriting() } catch {
                 str2.close()
-                ap?.finish(cutSeconds: 0)
+                _ = ap?.finish(cutSeconds: 0)
                 outs.append("zp\(String(format: "%.2f", zp)): startWriting 抛错 \(error)"); break
             }
             writer.startSession(atSourceTime: .zero)
@@ -432,8 +432,11 @@ enum VRFull {
             }
             cacheMap = Data()
             str2.close()
-            // 音频在视频收口前自己先挤完：视频已全写完，编解码器不会再卡在队尾
-            let audioMsg = ap?.finish(cutSeconds: Double(k) / fps) ?? audioWhy
+            // 音频在视频收口前自己先挤完：视频已全写完，编解码器不会再卡在队尾。
+            // 整条走完就别再拿最后一帧那一秒去卡它（一个 PCM 块 20 多毫秒，卡了等于把片尾剪掉），
+            // 只有按停止/内存压力中途收兵才 cut 在视频已写到的那一秒。
+            let audioCut = why.isEmpty ? Double.greatestFiniteMagnitude : Double(k) / fps
+            let audioMsg = ap?.finish(cutSeconds: audioCut) ?? audioWhy
             input.markAsFinished()
             let tTail0 = DispatchTime.now().uptimeNanoseconds
             let esem = DispatchSemaphore(value: 0)

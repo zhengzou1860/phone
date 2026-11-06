@@ -631,25 +631,31 @@ final class VRAudioPass {
     }
 
     /// 视频那一圈每写完一帧调一次：能塞就塞，队列满就把手上这份留到下一次。
-    /// cutSeconds 是此刻视频写到第几秒，音频一越过这个点就当场收尾。
-    func pump(cutSeconds: Double) {
-        guard !closed else { return }
+    /// cutSeconds 是此刻视频写到第几秒：音频不许跑到视频前面去，追上就摁住这一份等下一帧。
+    /// ⚠️ 这里绝不能收口：一个 PCM 块只有 20 多毫秒，视频写到第 1 帧时 cut 就是 0.033 s，
+    /// 第二块就越过它了——0.19 第一版在这里 shut()，结果整条片子只剩开头几十毫秒的声音（11-06 他实测「没完整声音」）。
+    func pump(cutSeconds: Double) { _ = drain(cutSeconds: cutSeconds, final: false) }
+
+    /// 挤一份算一份。final=true 才是真收尾：越过 cutSeconds 就丢、解码器干了就收。
+    /// 返回「是否已经收口」。
+    private func drain(cutSeconds: Double, final: Bool) -> Bool {
+        guard !closed else { return true }
         var spins = 0
         while spins < 4000 {
             spins += 1
             if pending == nil {
-                guard reader.status == .reading, let sb = out.copyNextSampleBuffer() else { shut(); return }
+                guard reader.status == .reading, let sb = out.copyNextSampleBuffer() else { shut(); return true }
                 pending = sb
             }
-            guard let sb = pending else { return }
-            if CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sb)) >= cutSeconds {
-                pending = nil
-                shut()
-                return
+            guard let sb = pending else { return false }
+            let sec = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sb))
+            if sec >= cutSeconds {
+                if final { pending = nil; shut(); return true }
+                return false
             }
-            guard input.isReadyForMoreMediaData else { return }
+            guard input.isReadyForMoreMediaData else { return false }
             if input.append(sb) {
-                lastSec = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sb))
+                lastSec = sec
                 pending = nil
                 appended += 1
             } else {
@@ -657,9 +663,10 @@ final class VRAudioPass {
                 pending = nil
                 VRJournal.line("音频 \(fail)")
                 shut()
-                return
+                return true
             }
         }
+        return false
     }
 
     /// 收尾：把剩下的挤进编码器（视频已经写完，音频不该再排在队尾等），然后 markAsFinished。
@@ -667,8 +674,7 @@ final class VRAudioPass {
     func finish(cutSeconds: Double) -> String {
         var tries = 0
         while !closed && tries < 4000 {
-            pump(cutSeconds: cutSeconds)
-            if closed { break }
+            if drain(cutSeconds: cutSeconds, final: true) { break }
             Thread.sleep(forTimeInterval: 0.002)
             tries += 1
         }
