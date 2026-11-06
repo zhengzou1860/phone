@@ -70,7 +70,9 @@ enum VROrientation {
                 }
                 let role = scene.session.role == .windowApplication ? "主窗" : "其它角色"
                 let ori = ws.interfaceOrientation
-                txt += "[\(n) \(role) 朝向\(ori.rawValue) 窗\(ws.windows.count) 通知\(Int(ws.effectiveGeometryPriority.rawValue))]"
+                // UIWindowScene 这一版 SDK 没有「读当前几何优先级」这一条（CI 报的 no member），
+                // 想分清通知档高低只能看 requestGeometryUpdate 被不被拒
+                txt += "[\(n) \(role) 朝向\(ori.rawValue) 窗\(ws.windows.count)]"
             }
             VRJournal.line("朝向 盘点 \(tag)：闸=\(name(current))｜场景 \(n) 个 \(txt)")
         }

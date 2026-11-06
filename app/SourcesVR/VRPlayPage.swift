@@ -1,4 +1,5 @@
 import AVFoundation
+import CoreML
 import UIKit
 
 /// 播放页自己做控制器，不再借 SwiftUI 的 fullScreenCover。
