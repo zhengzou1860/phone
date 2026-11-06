@@ -24,8 +24,8 @@ targets:
         CFBundleExecutable: LiveSwap
         CFBundleIdentifier: com.qoder.liveswap
         CFBundlePackageType: APPL
-        CFBundleShortVersionString: "0.23"
-        CFBundleVersion: "23"
+        CFBundleShortVersionString: "0.24"
+        CFBundleVersion: "24"
         CFBundleInfoDictionaryVersion: "6.0"
         NSAppTransportSecurity:
           # 局域网那台电脑是 http://192.168.x.x，这道闸不放行的话 WKWebView 和原生推流一起被杀

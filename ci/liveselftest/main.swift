@@ -193,6 +193,17 @@ ck("脚本 不整个覆盖页面LiveUI", !shim.contains("window.LiveUI = {"),
 ck("脚本 合并到现有LiveUI", shim.contains("var UI = window.LiveUI") && shim.contains("window.LiveUI = UI"))
 ck("脚本 关掉页面30秒盲刷", shim.contains("UI.autoRefresh(false)"))
 ck("脚本 长连接断了会重连", shim.contains("LiveUI.refreshStream") && shim.contains("img.id !== 'video-stream'"))
+// 页面改完特征（re_rendered）会自己调 refreshStream 再开一条 /video_feed；
+// iOS 旧的多部分流连接不马上释放，改 5 次攒满每主机 6 条后整页 fetch 卡死。
+ck("脚本 流活着时不重连", shim.contains("feedOk && !feedBroken && !feedAllow")
+   && shim.contains("跳过重连"), "0.23 实测：改 5 次特征攒满 6 条 /video_feed 后轮询归零")
+ck("脚本 回前台补重连", shim.contains("visibilitychange")
+   && shim.contains("feedAllow = true") && shim.contains("feedAllow) refreshFeed()"),
+   "后台可能把长连接挂断且不报 error，回前台要自己补一次")
+ck("脚本 首帧靠尺寸兜底", shim.contains("feedImg.naturalWidth > 0"), "load 事件在 WebKit 上不一定每帧都来")
+ck("脚本 页面卡死自愈", shim.contains("function noteStateOk()")
+   && shim.contains("stateEver") && shim.contains("location.reload()"),
+   "轮询曾经通过、又 10 秒没回话：整页重载，别让用户只能重开 App")
 ck("脚本 全屏不再克隆第二路流", !shim.contains("fullscreen-video"),
    "0.11 起页面只用 html.fs 铺满，同一路 #video-stream")
 ck("脚本 全屏态上报原生", shim.contains("action: FS") && LiveShim.hookFullscreen == "fullscreen",
@@ -310,10 +321,10 @@ ck("账目 未知源不标", LivePerf.sourceLabel(0).isEmpty)
 
 ck("契约 在途上限3", LiveConfig.inflightLimit == 3)
 ck("契约 推送15fps", LiveConfig.pushFPS == 15.0)
-// 0.23 仍是 640：这一版加「页面要改特征先停一下」，推流参数不动。
+// 0.24 仍是 640：这一版只给 /video_feed 加重连闸，推流参数不动。
 ck("契约 请求宽640", LiveConfig.fallbackMaxWidth == 640)
-ck("契约 UA带版本", LiveConfig.userAgentSuffix == "LiveSwap/0.23"
-   && LiveConfig.appVersion == "0.23" && LiveConfig.appBuild == "23")
+ck("契约 UA带版本", LiveConfig.userAgentSuffix == "LiveSwap/0.24"
+   && LiveConfig.appVersion == "0.24" && LiveConfig.appBuild == "24")
 // 页面在推流中改特征时发的动作：是命令，不是按钮挂子，所以不进 actionNames
 //（就绪对账只该对页面里那三个按钮）。
 ck("契约 改特征先停动作", LiveShim.hookStopForEdit == "stopedit"

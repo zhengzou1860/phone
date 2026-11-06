@@ -17,11 +17,11 @@ enum LiveConfig {
     /// PC 那边 /live_start 响应里的 max_width 是权威；这个既是请求值，也是读不到响应时的兜底。
     /// 0.14 试过 800，实测不是带宽先崩：PC 挂 3 张目标脸只算到 3–8fps，手机上看到的就是卡。
     /// 0.19 起退回 640（实测 51–54KB/帧），让 PC 先跟上节奏；再要高清等 PC 那边算力跟上。
-    /// 0.23 仍是 640：这一版加「页面要改特征先停一下」的桥接动作，推流参数不动。
+    /// 0.24 仍是 640：这一版只给 /video_feed 加重连闸，推流参数不动。
     static let fallbackMaxWidth = 640
 
-    static let appVersion = "0.23"
-    static let appBuild = "23"
+    static let appVersion = "0.24"
+    static let appBuild = "24"
 
     static let jpegQuality: CGFloat = 0.7
     static let pushFPS: Double = 15
@@ -591,8 +591,8 @@ enum LiveShim {
       // 不另外盖一层浮标：界面上看到的字和 PC 上同一格是一个来源。
       //
       // PC 页面自己也有 LiveUI（setPlaying / refreshStream / autoRefresh），
-      // 这里只能在它上面补 App 用的几个方法：整个赋一个新对象会把页面那三个冲掉，
-      // 暂停态改完绑定以后那次 re_rendered 自动重连就再也调用不到，画面定在原处。
+      // 这里只能在它上面补 App 用的几个方法：整个赋一个新对象会把页面那几个冲掉。
+      // refreshStream 例外：保留原函数，但包一层重连闸（见下面「/video_feed 重连闸」）。
       var UI = window.LiveUI;
       if (!UI || typeof UI !== 'object') UI = {};
       UI.status = function (msg, kind) {
@@ -858,7 +858,8 @@ enum LiveShim {
           var state = isStateCall(url);
           if (isPoll(url)) {
             var rp = rawFetch(input, init);
-            if (state) rp.then(function (r) { observeState(r); return r; }, function () {});
+            if (state) rp.then(function (r) { noteStateOk(); observeState(r); return r; },
+                               function () {});
             return rp;
           }
           busyFetches += 1;
@@ -998,6 +999,72 @@ enum LiveShim {
       // PC 给了开关就关掉它，改由下面的 error 钩子按需重连；没有这个接口（老页面）
       // 就保留原样，宁可按老节奏闪，也别让画面永远不回来。
       try { if (UI.autoRefresh) UI.autoRefresh(false); } catch (e) {}
+
+      // —— /video_feed 重连闸 ——
+      // 页面在停止态每改完一次特征（re_rendered）都会调 LiveUI.refreshStream() 想
+      // 「马上看到重画的那帧」。但 iOS WebKit 换掉 img.src 时，旧的多部分流连接
+      // 不会马上释放：改一次就多占一条（每主机上限 6 条）。0.23 实测 17:05:42–17:06:59
+      // 连续改 5 次正好攒满 6 条，之后页面所有 fetch 都排队不返回——轮询停、下拉框灰死、
+      // 按钮文案冻住，而原生 URLSession 照常推流。旧连接的生成器还在 15fps 编码发送，
+      // 白占 CPU 和 Wi-Fi，画面也就跟着卡。
+      // 帧已经在来就说明这条长连接活着，PC 补投的新帧本来就会沿它推下来，不用重连。
+      // 只在三种情况下真的换一条：img 报 error、退后台回来（系统可能挂断了长连接）、
+      // 或者连第一帧都还没到。页面自己那次 re_rendered 重连从此不再新开连接。
+      var feedImg = document.getElementById('video-stream');
+      var feedOk = false;        // 这条流至少到过一帧
+      var feedBroken = false;    // 上一条流报了 error，下一次必须重连
+      var feedAllow = false;     // 回前台放行一次
+      if (feedImg) {
+        feedImg.addEventListener('load', function () { feedOk = true; feedBroken = false; });
+        feedImg.addEventListener('error', function () { feedOk = false; feedBroken = true; });
+        if (feedImg.complete && feedImg.naturalWidth > 0) { feedOk = true; }
+      }
+      document.addEventListener('visibilitychange', function () {
+        if (document.visibilityState !== 'visible') return;
+        stateAt = Date.now();   // 回前台先给轮询一个宽限，别一回来就判卡死
+        feedAllow = true;
+        // 系统可能在后台把长连接挂断又不报 error：回前台补一次重连，
+        // 由上面的闸放行这一次。页面自己没有「恢复时主动刷新」的钩子。
+        setTimeout(function () {
+          if (document.visibilityState === 'visible' && feedAllow) refreshFeed();
+        }, 800);
+      });
+      if (typeof UI.refreshStream === 'function') {
+        var pageRefreshStream = UI.refreshStream;
+        UI.refreshStream = function () {
+          // 多部分流的 load 事件在 WebKit 上不一定每帧都发；有一帧进来了
+          // naturalWidth 就会大于 0，用它兜住「事件没来但画面确实在动」。
+          if (!feedOk && feedImg && feedImg.naturalWidth > 0) feedOk = true;
+          if (feedOk && !feedBroken && !feedAllow) {
+            send({ action: JSLOG, level: 'info',
+                   msg: '画面还在来帧，跳过重连（不再多占一条 /video_feed）' });
+            return;
+          }
+          feedAllow = false;
+          feedOk = false;
+          feedBroken = false;
+          return pageRefreshStream.apply(UI, arguments);
+        };
+      }
+
+      // —— 页面网络卡死自愈 ——
+      // 0.23 实测：六条 /video_feed 占满每主机连接池后，页面所有 fetch 排队不返回，
+      // 轮询停、下拉框永久灰住，而 JS 还活着（桥接消息照发），只有重开 App 能救。
+      // 这里盯「最近一次 /get_playback_state 有回话」：曾经通过、又超过 10 秒没有一次
+      // 成功，就整页重载（重载会关掉旧连接）；30 秒内不重复，退后台和刚回前台都不算。
+      var stateAt = Date.now();
+      var stateEver = false;
+      var lastSelfReload = 0;
+      function noteStateOk() { stateAt = Date.now(); stateEver = true; }
+      setInterval(function () {
+        if (document.visibilityState !== 'visible') return;
+        if (!stateEver) return;   // 一次都没通过：那是连不上 PC，重载也救不了
+        if (Date.now() - stateAt < 10000) return;
+        if (Date.now() - lastSelfReload < 30000) return;
+        lastSelfReload = Date.now();
+        send({ action: JSLOG, level: 'warn', msg: '状态轮询 10 秒没回话：整页重载自愈' });
+        try { location.reload(); } catch (e) {}
+      }, 3000);
 
       // /video_feed 是长连接：WebView 退后台、网络抖一下都会让它报 error 且不自恢复。
       // 0.11 起全屏不再 clone 第二个 img（页面只给 <html> 加 .fs），所以只有这一路要重连。
