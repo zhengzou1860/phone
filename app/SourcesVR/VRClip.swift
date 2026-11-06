@@ -427,11 +427,16 @@ final class VRSource {
     let upH: Int
     let eyeW: Int
     let eyeH: Int
+    /// 顺序解码/取帧直出的那一帧尺寸：普通片等于每眼，左右眼原样那条是整幅（=2·eyeW）
+    let frameW: Int
+    let frameH: Int
+    let sbs: Bool
     let deg: Int
     let duration: Double
     let fps: Double
 
-    init?(url: URL, eyeLong: Int) {
+    init?(url: URL, eyeLong: Int, sbs: Bool = false) {
+        self.sbs = sbs
         asset = AVURLAsset(url: url)
         guard let t = asset.tracks(withMediaType: .video).first else {
             VRJournal.line("源 没有视频轨 \(url.lastPathComponent)")
@@ -446,24 +451,35 @@ final class VRSource {
         deg = VRUtil.deg(tf)
         upW = max(2, Int((cs.map { $0.x }.max()! - cs.map { $0.x }.min()!).rounded()))
         upH = max(2, Int((cs.map { $0.y }.max()! - cs.map { $0.y }.min()!).rounded()))
-        let fit = VRUtil.fitEven(upW, upH, longEdge: eyeLong)
-        eyeW = fit.w
-        eyeH = fit.h
+        if sbs {
+            // 半幅的长边收进 eyeLong：整幅宽是 upW，所以先把宽折半再算信箱
+            let fit = VRUtil.fitEven(max(2, upW / 2), upH, longEdge: eyeLong)
+            eyeW = fit.w
+            eyeH = fit.h
+        } else {
+            let fit = VRUtil.fitEven(upW, upH, longEdge: eyeLong)
+            eyeW = fit.w
+            eyeH = fit.h
+        }
+        frameW = sbs ? eyeW * 2 : eyeW
+        frameH = eyeH
         duration = CMTimeGetSeconds(asset.duration)
         fps = Double(t.nominalFrameRate)
         let vc = AVMutableVideoComposition()
         let li = AVMutableVideoCompositionLayerInstruction(assetTrack: t)
         // 源的摆正变换之后再接一层缩放，直出「摆正且已经是每眼尺寸」的帧
-        let sc = CGAffineTransform(scaleX: CGFloat(eyeW) / CGFloat(upW), y: CGFloat(eyeH) / CGFloat(upH))
+        // sbs 时横向缩放正好让左半幅落在 [0, eyeW]、右半幅落在 [eyeW, 2·eyeW]，接缝不偏
+        let sc = CGAffineTransform(scaleX: CGFloat(frameW) / CGFloat(upW), y: CGFloat(frameH) / CGFloat(upH))
         li.setTransform(tf.concatenating(sc), at: .zero)
         let ti = AVMutableVideoCompositionInstruction()
         ti.timeRange = CMTimeRange(start: .zero, duration: asset.duration)
         ti.layerInstructions = [li]
         vc.instructions = [ti]
-        vc.renderSize = CGSize(width: eyeW, height: eyeH)
+        vc.renderSize = CGSize(width: frameW, height: frameH)
         vc.frameDuration = CMTime(value: 1, timescale: 600)
         self.vc = vc
-        VRJournal.line("源 \(url.lastPathComponent) \(upW)x\(upH) 转\(deg)° → 每眼 \(eyeW)x\(eyeH)"
+        VRJournal.line("源 \(url.lastPathComponent) \(upW)x\(upH) 转\(deg)°\(sbs ? "｜左右眼原样" : "")"
+            + " → 每眼 \(eyeW)x\(eyeH)｜直出 \(frameW)x\(frameH)"
             + "｜\(String(format: "%.1f", duration)) s @ \(String(format: "%.1f", fps)) fps")
         if !(duration > 0.1) {
             VRJournal.line("源 时长读不出来 \(duration)")
@@ -474,7 +490,7 @@ final class VRSource {
     /// 到点上取一帧，并把它拷进自己的缓冲（reader 给的那张会被回收，留住它等于留了个悬空引用）
     func framePB(at seconds: Double) -> (pb: CVPixelBuffer?, ms: Double, note: String) {
         let t0 = DispatchTime.now().uptimeNanoseconds
-        let made = VRTech.pixelBuffer(width: eyeW, height: eyeH)
+        let made = VRTech.pixelBuffer(width: frameW, height: frameH)
         guard let mine = made.pb else { return (nil, 0, made.note) }
         do {
             let reader = try AVAssetReader(asset: asset)
@@ -502,9 +518,9 @@ final class VRSource {
                 if let b = CMSampleBufferGetImageBuffer(s) {
                     let w = CVPixelBufferGetWidth(b)
                     let h = CVPixelBufferGetHeight(b)
-                    if w == eyeW && h == eyeH { got = b } else {
+                    if w == frameW && h == frameH { got = b } else {
                         reader.cancelReading()
-                        return (nil, 0, "每眼 \(eyeW)x\(eyeH) 但直出 \(w)x\(h)：composition 没生效")
+                        return (nil, 0, "该直出 \(frameW)x\(frameH) 但直出 \(w)x\(h)：composition 没生效")
                     }
                 }
             }

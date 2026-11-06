@@ -169,3 +169,22 @@ kernel void kCopy(texture2d<float, access::read>  src [[texture(0)]],
     if (g.x >= P.W || g.y >= P.H) return;
     dst.write(src.read(g), g);
 }
+
+// 6) 相册里已经是左右眼的成片：不跑深度不形变，只在各自半幅里整体水平平移（对镜片中心用）。
+// 整数位移、逐格照搬：这里要是用线性采样，半幅边界那半格会取到对面那只眼，
+// 而那几列正好落在镜片视场的中间，串了眼的脏边比黑边难看得多。
+// 平移腾出来的那一头留纯黑，SW=成片宽=2W，P.W 是半幅（每眼）宽。
+kernel void kSbsShift(texture2d<float, access::read>  src [[texture(0)]],
+                      texture2d<float, access::write> dst [[texture(1)]],
+                      constant VRP& P [[buffer(0)]],
+                      uint2 g [[thread_position_in_grid]]) {
+    if (g.x >= P.SW || g.y >= P.H) return;
+    uint W = P.W;
+    uint base = (g.x < W) ? 0u : W;
+    int lx = int(g.x - base) - int(rint(P.xoff));
+    if (lx < 0 || uint(lx) >= W) {
+        dst.write(float4(0.0, 0.0, 0.0, 0.0), g);
+        return;
+    }
+    dst.write(src.read(uint2(base + uint(lx), g.y)), g);
+}

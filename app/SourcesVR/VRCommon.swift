@@ -153,6 +153,35 @@ enum VRPressure {
     }
 }
 
+enum VRSound {
+    /// 播放出声的唯一开关。不配这一条，新会话默认是 soloAmbient——它听手机左侧那个静音拨片的，
+    /// 拨片一拨，两条播放全都无声（11 上机实测「都没声音」就是这么来的）。
+    /// .playback 不看拨片脸色，还会替我们暂停别人的音乐。
+    /// 只在起播时调，不退激活：setActive(false) 会把别人的音频还原，这跟播放器的礼貌不符。
+    @discardableResult
+    static func enable(_ tag: String) -> Bool {
+        let s = AVAudioSession.sharedInstance()
+        var err = ""
+        do {
+            try s.setCategory(.playback, mode: .moviePlayback, options: [.defaultToSpeaker])
+        } catch {
+            err = "setCategory 抛错 \(error)"
+        }
+        if err.isEmpty {
+            do {
+                try s.setActive(true, options: [])
+            } catch {
+                err = "setActive 抛错 \(error)"
+            }
+        }
+        let on = err.isEmpty
+        VRJournal.line("声音 \(tag) 起用 .playback \(on ? "成" : "败")"
+            + (on ? "" : "：\(err)")
+            + "｜现在这条 \(s.category.rawValue)")
+        return on
+    }
+}
+
 enum VRUploader {
     /// 8712 归剪辑项目，这个 app 走自己的端口和自己的接收文件，两边别互相覆盖。
     static let endpoint = "http://192.168.31.99:8714/report"
@@ -277,7 +306,7 @@ enum VRTech {
             return false
         }
         var bad: [String] = []
-        for name in ["kScale", "kBack", "kSplatDepth", "kSplatColor", "kCombine", "kCopy"] {
+        for name in ["kScale", "kBack", "kSplatDepth", "kSplatColor", "kCombine", "kCopy", "kSbsShift"] {
             guard let fn = library.makeFunction(name: name) else {
                 bad.append(name + "(没这个函数)")
                 continue
@@ -293,7 +322,7 @@ enum VRTech {
             initNote = "这几个 kernel 没编出来: \(bad.joined(separator: ","))"
             return false
         }
-        initNote = "Metal \(dev.name) 就绪，6 个 kernel 全在（纹理走 bgra8Unorm / rgba8Unorm）"
+        initNote = "Metal \(dev.name) 就绪，\(libs.count) 个 kernel 全在（纹理走 bgra8Unorm / rgba8Unorm）"
         VRJournal.line("Metal " + initNote)
         return true
     }

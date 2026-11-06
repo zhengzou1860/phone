@@ -343,6 +343,50 @@ final class VRWarp {
     }
 }
 
+/// 相册里已经是左右眼的那条用的极简一趟：不跑深度、不形变，只在各自半幅里整体水平平移（kSbsShift）。
+/// 跟 VRWarp 一样吃 VRTech 那份静态 command buffer 和 keep 表，所以整段照样在 gate 里。
+final class VRSbsShift {
+    let frameW: Int
+    let frameH: Int
+    /// 半幅（每眼）宽：kernel 靠它认接缝在哪一列
+    let eyeW: Int
+
+    init?(frameW: Int, frameH: Int, eyeW: Int, note: inout String) {
+        guard VRTech.libs["kSbsShift"] != nil else { note = "kSbsShift 不在管线里"; return nil }
+        self.frameW = frameW
+        self.frameH = frameH
+        self.eyeW = eyeW
+    }
+
+    /// 源和成片是同一尺寸的整幅左右眼；xoff 是每个半幅内整体平移的像素数（正=右移）。
+    /// 这里不数洞：平移腾出来的那一头本来就该发黑，不是补洞失败。
+    func render(srcPB: CVPixelBuffer, xoff: Float, outPB: CVPixelBuffer) -> (gpu: Double, err: String?) {
+        VRTech.gate.lock()
+        defer { VRTech.gate.unlock() }
+        let sg = VRTech.texture(from: srcPB, width: frameW, height: frameH)
+        let og = VRTech.texture(from: outPB, width: frameW, height: frameH)
+        guard let srcTex = sg.tex, let outTex = og.tex else {
+            return (0, "帧或成片纹理建不出来（源 \(sg.note)｜成片 \(og.note)）")
+        }
+        var p = VRParams()
+        p.W = UInt32(eyeW); p.H = UInt32(frameH)
+        p.MW = UInt32(eyeW); p.MH = UInt32(frameH)
+        p.SW = UInt32(frameW)
+        p.xoff = xoff
+        let t0 = DispatchTime.now().uptimeNanoseconds
+        guard let enc = VRTech.encode("kSbsShift", textures: [srcTex, outTex], params: p,
+                                      buffers: [], width: frameW, height: frameH) else {
+            // 开在半路的 commandBuffer 不能留给下一帧：它的 encoder 已经没了
+            VRTech.currentCommand = nil
+            VRTech.keep.removeAll()
+            return (0, "kSbsShift 没编出来")
+        }
+        enc.endEncoding()
+        VRTech.commitWait()
+        return (Double(DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000, nil)
+    }
+}
+
 extension VRPlane {
     /// 万一这个包给的是多数组而不是图像：按最后两维当 h、w，用 strides 属性逐格读。
     /// （MLMultiArray 没有 stride(for:) 这个方法，只有 strides: [NSNumber]，单位是"元素个数"不是字节。）

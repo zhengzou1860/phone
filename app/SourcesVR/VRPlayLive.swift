@@ -1,5 +1,4 @@
 import AVFoundation
-import AVKit
 import CoreMedia
 import CoreML
 import Foundation
@@ -7,6 +6,8 @@ import SwiftUI
 import UIKit
 
 /// 实时左右眼：相册里选一条普通视频，边解码边形变边直接上屏，不写文件、不进相册。
+/// sbs=true 是同一套骨架的另一副面孔：相册里那条本身已是左右眼，深度和形变都不跑，
+/// 只在各自半幅里做水平平移，暂停/拖进度/出声/横屏这些跟实时那条完全一致。
 ///
 /// 跟「先转完再播」那条两趟的区别，也是这条的天花板：
 /// 深度单价实测 180~200 ms/帧（CPU、送检 518x392 钉死），30 帧的播放要 33 ms/帧，差 6 倍。
@@ -43,6 +44,8 @@ final class VRLive {
     let smooth: Float
     let units: MLComputeUnits
     let rot: Bool
+    /// 相册里那条本身已是左右眼：不跑深度不形变，只按半幅水平平移，进度/暂停/位移这些照旧
+    let sbs: Bool
     /// 收兵后把报告交回界面（在主线程上调）
     var onEnd: ((String) -> Void)?
 
@@ -79,6 +82,8 @@ final class VRLive {
     private var src: VRSource?
     private var feed: VRDepthFeed?
     private var warp: VRWarp?
+    /// 只有 sbs 那条用：整幅左右眼的半幅平移
+    private var shift: VRSbsShift?
     private var stream: VRFrameStream?
     private var framePB: CVPixelBuffer?
     private var handPB: CVPixelBuffer?
@@ -95,7 +100,7 @@ final class VRLive {
     private var clock0 = UInt64(0)
 
     init(url: URL, eyeLong: Int, bpct: Float, zp: Float, smooth: Float,
-         units: MLComputeUnits, rot: Bool) {
+         units: MLComputeUnits, rot: Bool, sbs: Bool = false) {
         self.url = url
         self.eyeLong = eyeLong
         self.bpct = bpct
@@ -103,6 +108,7 @@ final class VRLive {
         self.smooth = smooth
         self.units = units
         self.rot = rot
+        self.sbs = sbs
     }
 
     /// 界面按「停止」调这个：只改旗子，真正的收兵在两条线程自己走到头之后
@@ -177,46 +183,68 @@ final class VRLive {
             return first
         }
         dLock.lock(); running = true; dLock.unlock()
-        DispatchQueue.global(qos: .userInteractive).async { [weak self] in self?.depthPump() }
+        if !sbs {
+            DispatchQueue.global(qos: .userInteractive).async { [weak self] in self?.depthPump() }
+        }
         DispatchQueue.global(qos: .userInteractive).async { [weak self] in self?.pump() }
         return ""
     }
 
     private func setup() -> String {
         guard VRTech.boot() else { return "Metal 起不来：\(VRTech.initNote)" }
-        guard let s = VRSource(url: url, eyeLong: eyeLong) else {
+        // 出声的开关必须在起 AVAudioPlayer 之前调好，不然那条还是按默认类别被静音拨片管着
+        VRSound.enable(sbs ? "左右眼原样" : "实时形变")
+        guard let s = VRSource(url: url, eyeLong: eyeLong, sbs: sbs) else {
             return "读不出这条片子（详情见磁盘日志）"
         }
         src = s
-        let found = VRDepth.locate()
-        guard let modelURL = found.url else { return "包里没有深度模型：\(found.note)" }
-        let got = VRDepth.load(units)
-        guard let model = got.model else {
-            return "\(VRPilot.unitsName(units)) 加载失败（\(VRUtil.ms(got.ms))）: \(got.note)"
-        }
-        let tgt = VRDepth.inputTarget(model, eyeW: s.eyeW, eyeH: s.eyeH)
+        var modelTag = ""
+        var depthTag = ""
         var fn = ""
-        guard let f = VRDepthFeed(model: model, eyeW: s.eyeW, eyeH: s.eyeH,
-                                  mw: tgt.w, mh: tgt.h, rot: rot, note: &fn) else {
-            return "送检通道建不起来：\(fn)"
+        if sbs {
+            // 这一条整趟不碰 CoreML：深度、形变、送检框一样都不建，起得比实时那条快得多
+            guard let sh = VRSbsShift(frameW: s.frameW, frameH: s.frameH, eyeW: s.eyeW,
+                                      note: &fn) else {
+                return "左右眼平移建不起来：\(fn)"
+            }
+            shift = sh
+        } else {
+            let found = VRDepth.locate()
+            guard let modelURL = found.url else { return "包里没有深度模型：\(found.note)" }
+            let got = VRDepth.load(units)
+            guard let model = got.model else {
+                return "\(VRPilot.unitsName(units)) 加载失败（\(VRUtil.ms(got.ms))）: \(got.note)"
+            }
+            let tgt = VRDepth.inputTarget(model, eyeW: s.eyeW, eyeH: s.eyeH)
+            guard let f = VRDepthFeed(model: model, eyeW: s.eyeW, eyeH: s.eyeH,
+                                      mw: tgt.w, mh: tgt.h, rot: rot, note: &fn) else {
+                return "送检通道建不起来：\(fn)"
+            }
+            feed = f
+            var wn = ""
+            guard let w = VRWarp(eyeW: s.eyeW, eyeH: s.eyeH, bpct: bpct, note: &wn) else {
+                return "形变建不起来：\(wn)"
+            }
+            warp = w
+            modelTag = "｜\(modelURL.lastPathComponent)"
+            depthTag = "｜\(VRPilot.unitsName(units)) 送检 \(tgt.w)x\(tgt.h)"
         }
-        feed = f
-        var wn = ""
-        guard let w = VRWarp(eyeW: s.eyeW, eyeH: s.eyeH, bpct: bpct, note: &wn) else {
-            return "形变建不起来：\(wn)"
-        }
-        warp = w
         guard let st = VRFrameStream(src: s) else { return "顺序解码起不来（startReading 失败）" }
         stream = st
-        guard let a = VRTech.pixelBuffer(width: s.eyeW, height: s.eyeH).pb,
-              let b = VRTech.pixelBuffer(width: s.eyeW, height: s.eyeH).pb else {
+        guard let a = VRTech.pixelBuffer(width: s.frameW, height: s.frameH).pb else {
             return "帧缓冲造不出来"
         }
         framePB = a
-        handPB = b
+        if !sbs {
+            // 交接给深度线程的那一块只有实时那条要：sbs 那条不跑深度，白占一整帧内存
+            guard let b = VRTech.pixelBuffer(width: s.frameW, height: s.frameH).pb else {
+                return "送检交接缓冲造不出来"
+            }
+            handPB = b
+        }
         // 显示缓冲按轮转用固定的 6 份：每帧新造的话，纹理缓存里会一份一份攒着不回来（全片实测 1.65 MB/帧）
         for _ in 0..<6 {
-            guard let pb = VRTech.pixelBuffer(width: s.eyeW * 2, height: s.eyeH).pb else {
+            guard let pb = VRTech.pixelBuffer(width: s.frameW, height: s.frameH).pb else {
                 return "显示缓冲造不出来（已造 \(showPBs.count) 份）"
             }
             if fmtDesc == nil {
@@ -237,20 +265,25 @@ final class VRLive {
         dLock.unlock()
         // 声音尽力而为：读不出来（没音轨或格式不认）就退回墙钟，画面照走
         if let ap = try? AVAudioPlayer(contentsOf: url) {
-            ap.prepareToPlay()
+            let ready = ap.prepareToPlay()
             audio = ap
+            VRJournal.line("声音 AVAudioPlayer 建好 时长\(String(format: "%.1f", ap.duration))s"
+                + " 声道\(Int(ap.numberOfChannels)) 备播\(ready ? "成" : "败")")
+        } else {
+            VRJournal.line("声音 AVAudioPlayer 建不出来（这条没音轨或格式不认），走墙钟")
         }
-        let rotName = rot ? "转90°" : "摆正"
         let audioName = audio == nil ? "没有（走墙钟）" : "接上（走声钟）"
         let shiftName = String(format: "%+.1f", Double(shiftPct) * 100)
         // 这块是在后台线程跑的： UILabel 只能主线程碰，起手那行也一样交回主线程写
-        let startLine = "实时起手：每眼 \(s.eyeW)x\(s.eyeH)｜\(String(format: "%.1f", s.fps)) fps"
-            + "｜\(VRPilot.unitsName(units))｜深度 \(tgt.w)x\(tgt.h) 送检｜\(modelURL.lastPathComponent)"
+        let headName = sbs ? "左右眼原样起手" : "实时起手"
+        let startLine = "\(headName)：每眼 \(s.eyeW)x\(s.eyeH)｜整幅 \(s.frameW)x\(s.frameH)"
+            + "｜\(String(format: "%.1f", s.fps)) fps\(depthTag)\(modelTag)"
             + "｜声音\(audioName)｜水平位移\(shiftName)%｜点屏幕出控件"
         DispatchQueue.main.async { [weak self] in self?.label?.text = startLine }
-        VRJournal.line("实时 开始 \(url.lastPathComponent) 每眼 \(s.eyeW)x\(s.eyeH)"
-            + " \(String(format: "%.1f", s.fps)) fps 视差\(bpct)% zp\(zp) 送检\(tgt.w)x\(tgt.h)"
-            + " 朝向\(rotName) 水平位移\(shiftName)%")
+        let modeTag = sbs ? "左右眼原样（不跑深度）" : "实时形变 视差\(bpct)% zp\(zp) 朝向\(rot ? "转90°" : "摆正")"
+        VRJournal.line("播放 开始 \(url.lastPathComponent) \(modeTag) 每眼 \(s.eyeW)x\(s.eyeH)"
+            + " 整幅 \(s.frameW)x\(s.frameH) \(String(format: "%.1f", s.fps)) fps"
+            + " 水平位移\(shiftName)%")
         return ""
     }
 
@@ -302,13 +335,22 @@ final class VRLive {
         }
     }
 
-    /// 显示线程：解码→形变→上屏，按帧号排节奏；界面发的暂停/拖进度/水平位移都在这一圈里落
+    /// 显示线程：解码→（形变｜半幅平移）→上屏，按帧号排节奏；
+    /// 界面发的暂停/拖进度/水平位移都在这一圈里落。sbs 那条深度整趟不参与。
     private func pump() {
-        guard let s = src, let f = framePB, let w = warp, let lay = layer, let st = stream else {
+        guard let s = src, let f = framePB, let lay = layer, let st = stream else {
             finish("实时 内部状态没建起来（setup 提前退了）")
             return
         }
-        let px = s.eyeW * s.eyeH
+        let w = warp
+        let sh = shift
+        if sbs {
+            guard sh != nil else { finish("左右眼原样：平移那趟没建起来"); return }
+        } else {
+            guard w != nil else { finish("实时：形变那趟没建起来"); return }
+        }
+        // sbs 那条根本不碰深度：两块眼格数组留空，别白占 0.66 MB
+        let px = sbs ? 0 : s.eyeW * s.eyeH
         let fps = s.fps > 1 ? s.fps : 30.0
         let eyeWf = Float(s.eyeW)
         var dn = [Float](repeating: 0, count: px)
@@ -320,7 +362,7 @@ final class VRLive {
         var n = 0
         var lastSeq = -1
         clock0 = DispatchTime.now().uptimeNanoseconds
-        audio?.play()
+        playAudio()
         while true {
             dLock.lock()
             let go = running
@@ -351,21 +393,32 @@ final class VRLive {
             }
             if !hold {
                 guard st.next(into: f) else { note = "解码到片尾"; break }
-                dLock.lock()
-                if !handPending && !handBusy, let h = handPB {
-                    VRUtil.copyRows(from: f, to: h)
-                    handPending = true
+                if !sbs {
+                    dLock.lock()
+                    if !handPending && !handBusy, let h = handPB {
+                        VRUtil.copyRows(from: f, to: h)
+                        handPending = true
+                    }
+                    dLock.unlock()
+                    var fresh = false
+                    dLock.lock()
+                    if latestSeq != usedSeq && !latestRaw.isEmpty { usedSeq = latestSeq; fresh = true }
+                    dLock.unlock()
+                    if fresh { recompute(px: px, dn: &dn, prev: &prev) }
                 }
-                dLock.unlock()
-                var fresh = false
-                dLock.lock()
-                if latestSeq != usedSeq && !latestRaw.isEmpty { usedSeq = latestSeq; fresh = true }
-                dLock.unlock()
-                if fresh { recompute(px: px, dn: &dn, prev: &prev) }
             }
             let outPB = showPBs[n % showPBs.count]
-            let rr = w.render(srcPB: f, dn: dn, zp: zp, xoff: xo, outPB: outPB)
-            if let e = rr.err { note = "第 \(k + 1) 帧形变失败：\(e)"; break }
+            var gpuMs = 0.0
+            if sbs {
+                let rr = sh!.render(srcPB: f, xoff: xo, outPB: outPB)
+                if let e = rr.err { note = "第 \(k + 1) 帧平移失败：\(e)"; break }
+                gpuMs = rr.gpu
+            } else {
+                let rr = w!.render(srcPB: f, dn: dn, zp: zp, xoff: xo, outPB: outPB)
+                if let e = rr.err { note = "第 \(k + 1) 帧形变失败：\(e)"; break }
+                gpuMs = rr.gpu
+                holes += rr.holes
+            }
             guard let sb = sample(outPB, k: n, fps: fps) else { note = "第 \(k + 1) 帧的显示样本造不出来"; break }
             lay.enqueue(sb)
             if lay.status == .failed {
@@ -375,8 +428,7 @@ final class VRLive {
             n += 1
             // 停住期间只有刚拖完水平位移那一下走到这里：把静止这一帧按新位移重画一遍就回去
             if hold { Thread.sleep(forTimeInterval: 1.0 / fps); continue }
-            holes += rr.holes
-            gpuSum += rr.gpu
+            gpuSum += gpuMs
             k += 1
             frames = k
             dLock.lock(); posSeen = t0sec + Double(k) / fps; dLock.unlock()
@@ -385,6 +437,17 @@ final class VRLive {
         }
         st.close()
         finish("")
+    }
+
+    /// 起音频。这一步能不能出声是这版最要紧的一件事，所以每一支都留一行账：
+    /// 类别没配上（VRSound 那行）、player 没建起来（setup 那行）、play() 返回假（这行）三样分开看。
+    private func playAudio() {
+        guard let a = audio else {
+            VRJournal.line("声音 没有 player，这一条走墙钟")
+            return
+        }
+        a.play()
+        VRJournal.line("声音 play() 返回 \(a.isPlaying ? "真，在放" : "假，没放起来")")
     }
 
     /// 拖进度落到解码器上：重开 reader、两种钟都对到新起点、把屏上的旧样本冲掉
@@ -398,11 +461,16 @@ final class VRLive {
         pausedAccum = 0
         seekTo = nil
         posSeen = t
+        // 拖完进度，交接给深度线程的那一帧是旧位置的 ⇒ 丢掉，别让拖完的头一帧拿它做立体
+        handPending = false
         let hold = paused
         dLock.unlock()
         clock0 = DispatchTime.now().uptimeNanoseconds
         lay.flush()
-        if !hold { audio?.play() }
+        if !hold {
+            audio?.currentTime = t
+            playAudio()
+        }
         let acPos = String(format: "%.1f", audio?.currentTime ?? -1)
         let tPos = String(format: "%.1f", t)
         VRJournal.line("实时 拖到 \(tPos) s（声钟 \(acPos) s）")
@@ -495,16 +563,23 @@ final class VRLive {
         let err = depthErr
         dLock.unlock()
         let shown = Double(frames) / secs
-        let hz = Double(takes) / secs
         let gpuPer = frames > 0 ? gpuSum / Double(frames) : 0.0
-        let holePct = frames > 0 ? holes / Double(frames) : 0.0
-        let errLine = err.isEmpty ? "" : "\n深度出错 \(err)（连续 3 次就不算了，画面退回平板）"
-        let text = "实时 出帧 \(frames)＝\(String(format: "%.1f", shown)) 帧/秒（源 \(String(format: "%.1f", fps))）"
-            + "\n深度更新 \(takes) 次＝\(String(format: "%.1f", hz)) 次/秒、单价 \(String(format: "%.0f", avgD)) ms"
-            + "｜其余 \(frames - takes) 帧复用上一张"
-            + "\n形变 \(String(format: "%.1f", gpuPer)) ms/帧｜补洞 \(String(format: "%.2f", holePct))%"
-            + "｜归一化样本池 \(poolN) 个（实时没有整片 p1/p99，边播边攒）"
-            + errLine
+        let text: String
+        if sbs {
+            text = "左右眼原样 出帧 \(frames)＝\(String(format: "%.1f", shown)) 帧/秒（源 \(String(format: "%.1f", fps))）"
+                + "\n平移 \(String(format: "%.1f", gpuPer)) ms/帧｜不跑深度：屏上就是相册里那两个半幅"
+                + "\n拖下面那条只在各半幅里挪，绝不跨过接缝（串眼的脏边会落在视场正中）"
+        } else {
+            let hz = Double(takes) / secs
+            let holePct = frames > 0 ? holes / Double(frames) : 0.0
+            let errLine = err.isEmpty ? "" : "\n深度出错 \(err)（连续 3 次就不算了，画面退回平板）"
+            text = "实时 出帧 \(frames)＝\(String(format: "%.1f", shown)) 帧/秒（源 \(String(format: "%.1f", fps))）"
+                + "\n深度更新 \(takes) 次＝\(String(format: "%.1f", hz)) 次/秒、单价 \(String(format: "%.0f", avgD)) ms"
+                + "｜其余 \(frames - takes) 帧复用上一张"
+                + "\n形变 \(String(format: "%.1f", gpuPer)) ms/帧｜补洞 \(String(format: "%.2f", holePct))%"
+                + "｜归一化样本池 \(poolN) 个（实时没有整片 p1/p99，边播边攒）"
+                + errLine
+        }
         if Thread.isMainThread { label?.text = text }
         else { DispatchQueue.main.async { [weak self] in self?.label?.text = text } }
     }
@@ -518,9 +593,13 @@ final class VRLive {
         let takes = depthTakes
         let err = depthErr
         dLock.unlock()
-        var rep = "实时 收兵：出帧 \(frames) 帧、跑了 \(String(format: "%.1f", wall)) s"
-            + "｜深度 \(takes) 次｜形变 \(String(format: "%.1f", frames > 0 ? gpuSum / Double(frames) : 0)) ms/帧"
-            + "｜足迹 \(VRFacts.footprintMB()) MB"
+        var rep = "\(sbs ? "左右眼原样" : "实时") 收兵：出帧 \(frames) 帧、跑了 \(String(format: "%.1f", wall)) s"
+        if sbs {
+            rep += "｜平移 \(String(format: "%.1f", frames > 0 ? gpuSum / Double(frames) : 0)) ms/帧"
+        } else {
+            rep += "｜深度 \(takes) 次｜形变 \(String(format: "%.1f", frames > 0 ? gpuSum / Double(frames) : 0)) ms/帧"
+        }
+        rep += "｜足迹 \(VRFacts.footprintMB()) MB"
         if !note.isEmpty { rep += "｜\(note)" }
         if !extra.isEmpty { rep += "｜\(extra)" }
         if !err.isEmpty { rep += "｜深度错 \(err)" }
@@ -536,19 +615,21 @@ final class VRLive {
 
 // MARK: - 播放页的界面
 
-/// 实时播放那页的宿主：根层就是 AVSampleBufferDisplayLayer，上面盖一层点播才出现的控制条
+/// 播放页的宿主：根层就是 AVSampleBufferDisplayLayer，上面盖一层点播才出现的控制条。
+/// sbs=false 走「普通视频 → 实时形变」，sbs=true 走「相册里已经是左右眼的那条 → 原样上屏、只做半幅平移」。
 struct VRLiveHost: UIViewRepresentable {
     let url: URL
     let eyeLong: Int
     let bpct: Float
     let units: MLComputeUnits
     let rot: Bool
+    let sbs: Bool
     let onEnd: (String) -> Void
 
     func makeUIView(context: Context) -> VRLiveView {
         let v = VRLiveView()
         let live = VRLive(url: url, eyeLong: eyeLong, bpct: bpct, zp: 0.15, smooth: 0.4,
-                          units: units, rot: rot)
+                          units: units, rot: rot, sbs: sbs)
         let cb = onEnd
         live.onEnd = cb
         context.coordinator.live = live
@@ -578,24 +659,6 @@ struct VRLiveHost: UIViewRepresentable {
 
     final class Coordinator {
         var live: VRLive?
-    }
-}
-
-/// 相册里那条已经是左右眼的成片：直接交给系统播放器，进度条、点播出现这些它本来就带得最全
-struct VRPlainPlayerHost: UIViewControllerRepresentable {
-    let url: URL
-
-    func makeUIViewController(context: Context) -> AVPlayerViewController {
-        let c = AVPlayerViewController()
-        c.player = AVPlayer(url: url)
-        c.player?.play()
-        return c
-    }
-
-    func updateUIViewController(_ c: AVPlayerViewController, context: Context) {}
-
-    static func dismantleUIViewController(_ c: AVPlayerViewController, coordinator: Void) {
-        c.player?.pause()
     }
 }
 
@@ -661,7 +724,7 @@ final class VRLiveView: UIView {
         bar.addSubview(shiftLbl)
         hintLbl.textColor = UIColor(white: 1, alpha: 0.6)
         hintLbl.font = UIFont.systemFont(ofSize: 10)
-        hintLbl.text = "上面那条拖进度｜下面那条调左右眼水平位置（对镜片中心，存下来下次照用）"
+        hintLbl.text = "上面那条拖进度｜下面那条调左右眼水平位置（对镜片中心，存下来下次照用）｜手机横过来即横屏全屏"
         bar.addSubview(hintLbl)
         tapCatch.addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(tapped)))
         playBtn.addTarget(self, action: #selector(tappedPlay), for: .touchUpInside)

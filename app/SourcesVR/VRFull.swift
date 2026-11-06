@@ -498,13 +498,14 @@ final class VRFrameStream {
     private let src: VRSource
     private var reader: AVAssetReader?
     private var out: AVAssetReaderVideoCompositionOutput?
-    let eyeW: Int
-    let eyeH: Int
+    /// 这条流直出的那一帧尺寸（普通片=每眼；左右眼原样那条=整幅，是每眼的两倍宽）
+    let frameW: Int
+    let frameH: Int
     private var open = false
 
     init?(src: VRSource) {
         self.src = src
-        eyeW = src.eyeW; eyeH = src.eyeH
+        frameW = src.frameW; frameH = src.frameH
         guard startReading(from: 0) else { return nil }
     }
 
@@ -547,8 +548,8 @@ final class VRFrameStream {
         guard open, let o = out, let s = o.copyNextSampleBuffer(), let r = reader else { return false }
         guard r.status == .reading else { return false }
         guard let b = CMSampleBufferGetImageBuffer(s) else { return false }
-        guard CVPixelBufferGetWidth(b) == eyeW, CVPixelBufferGetHeight(b) == eyeH else {
-            VRJournal.line("流 直出 \(CVPixelBufferGetWidth(b))x\(CVPixelBufferGetHeight(b))，每眼 \(eyeW)x\(eyeH) 对不上")
+        guard CVPixelBufferGetWidth(b) == frameW, CVPixelBufferGetHeight(b) == frameH else {
+            VRJournal.line("流 直出 \(CVPixelBufferGetWidth(b))x\(CVPixelBufferGetHeight(b))，该是 \(frameW)x\(frameH)：对不上")
             return false
         }
         VRUtil.copyRows(from: b, to: dst)

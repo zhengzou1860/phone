@@ -27,8 +27,8 @@ targets:
         CFBundleExecutable: VR3D
         CFBundleIdentifier: com.qoder.vr3d
         CFBundlePackageType: APPL
-        CFBundleShortVersionString: "0.17"
-        CFBundleVersion: "8"
+        CFBundleShortVersionString: "0.18"
+        CFBundleVersion: "9"
         CFBundleInfoDictionaryVersion: "6.0"
         NSPhotoLibraryAddUsageDescription: "要把合成的 3D(SBS) 片段存回相册"
         NSPhotoLibraryUsageDescription: "要选一条普通视频来转 3D"
@@ -36,8 +36,12 @@ targets:
           NSAllowsArbitraryLoads: true
         LSRequiresIPhoneOS: true
         UILaunchScreen: {}
+        # plist 这三档是「这台机器上允许的上限」，真按页收放的是 VRAppDelegate 那份 mask：
+        # 主界面只竖，播放页放开两个横。上限里没有横，播放页怎么请求都转不动。
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.qoder.vr3d

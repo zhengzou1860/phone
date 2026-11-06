@@ -2,15 +2,56 @@ import SwiftUI
 import Foundation
 import UIKit
 import AVFoundation
-import AVKit
 import CoreML
 import PhotosUI
 
 @main
 struct VR3DApp: App {
+    /// 方向闸在 delegate 那边（SwiftUI 没有别的口子能回答 supportedInterfaceOrientations），
+    /// 所以必须挂一个 delegate；挂上它不影响这套 App 协议的生命周期。
+    @UIApplicationDelegateAdaptor(VRAppDelegate.self) var delegate
+
     var body: some Scene {
         WindowGroup {
             VRMainView()
+        }
+    }
+}
+
+/// 系统每次要转屏都来问这里。返回的是「此刻」允许的朝向：播放页把横屏放开，出来就收回去。
+final class VRAppDelegate: NSObject, UIApplicationDelegate {
+    func application(_ application: UIApplication,
+                     supportedInterfaceOrientationsFor window: UIWindow?) -> UIInterfaceOrientationMask {
+        VROrientation.current
+    }
+}
+
+/// 播放页要不要允许横屏，由这一个开关说；Info.plist 那三档是上限，这里是在上限里再收。
+enum VROrientation {
+    private static let lock = NSLock()
+    private static var mask: UIInterfaceOrientationMask = .portrait
+
+    static var current: UIInterfaceOrientationMask {
+        lock.lock(); defer { lock.unlock() }
+        return mask
+    }
+
+    /// 改完闸还得自己催一次几何更新：手机本来就横着进播放页时，系统不会重新算一次朝向，
+    /// 页面就一直竖着（iOS 16 起 UIDevice.orientation 也不让直接设了）。
+    static func allowLandscape(_ on: Bool) {
+        lock.lock()
+        mask = on ? [.portrait, .landscapeLeft, .landscapeRight] : .portrait
+        let want = mask
+        lock.unlock()
+        VRJournal.line("朝向 \(on ? "播放页放开横屏" : "收回只留竖屏")")
+        DispatchQueue.main.async {
+            for scene in UIApplication.shared.connectedScenes {
+                guard let ws = scene as? UIWindowScene else { continue }
+                guard scene.session.role == UIWindowSceneSessionRoleApplication else { continue }
+                ws.requestGeometryUpdate(.iOS(interfaceOrientations: want)) { e in
+                    VRJournal.line("朝向 几何更新被拒 \(e.localizedDescription)")
+                }
+            }
         }
     }
 }
@@ -152,7 +193,8 @@ struct VRMainView: View {
                 .font(.footnote)
                 .disabled(job.busy || VRFull.isBusy() || VRLive.isBusy())
 
-                Text("播放相册那条只把文件放起来看（用系统播放器，进度条暂停都是它的）；实时那条选普通视频，边解帧边形变直接上屏，不写文件、不进相册。实时播放点屏幕出控件：暂停、拖进度、还有一条调左右眼水平位置（对镜片中心用，±12% 封顶，存一次下次照用）。实时画面按源的帧率走，深度实测 180~200 ms/帧 ⇒ 立体感约每秒 5 次一级一级跳；实时拿不到整片 p1/p99，改成已见样本的滑动分位，开头几秒幅度会偏")
+                Text("两条播放都走同一套：点屏幕出控件（暂停、拖进度、左右眼水平位置 ±12%，存一次下次照用），手机横过来就横屏全屏，出声靠 .playback 这个音频类别（不再听静音拨片的）。播相册那条选本身已是左右眼的片子，只按半幅平移、不跑深度；实时那条选普通视频，边解帧边形变直接上屏，不写文件、不进相册。实时画面按源的帧率走，深度实测 180~200 ms/帧 ⇒ 立体感约每秒 5 次一级一级跳；实时拿不到整片 p1/p99，改成已见样本的滑动分位，开头几秒幅度会偏\n"
+                     + "生成存相册的那条按约定不带音轨（做片的时候就把声音丢了），要看成片的效果请用实时那条播原片")
                     .font(.system(size: 10, design: .monospaced))
                     .foregroundColor(.secondary)
 
@@ -190,28 +232,19 @@ struct VRMainView: View {
         .fullScreenCover(isPresented: $job.showVideoPicker) {
             VRPickerHost { url, msg in job.finishPick(url: url, failMessage: msg) }
         }
-        .fullScreenCover(item: $job.playItem) { item in
-            VStack(spacing: 0) {
-                HStack {
-                    Spacer()
-                    Button("关闭") { job.closePlain() }
-                        .buttonStyle(.bordered)
-                        .font(.footnote)
-                }
-                .padding(6)
-                VRPlainPlayerHost(url: item.url)
-            }
-            .background(Color.black)
-        }
         .fullScreenCover(item: $job.liveItem) { item in
             ZStack(alignment: .topTrailing) {
                 VRLiveHost(url: item.url, eyeLong: job.eyeLong, bpct: Float(job.bpct),
-                           units: VRJob.unit(job.unitTag), rot: job.feedRot) { r in job.liveEnd(r) }
+                           units: VRJob.unit(job.unitTag), rot: job.feedRot, sbs: job.liveSbs) {
+                    r in job.liveEnd(r)
+                }
                 Button("停止") { job.stopLive() }
                     .buttonStyle(.borderedProminent)
                     .padding(10)
             }
             .background(Color.black)
+            .onAppear { VROrientation.allowLandscape(true) }
+            .onDisappear { VROrientation.allowLandscape(false) }
         }
     }
 }
@@ -222,13 +255,13 @@ final class VRJob: ObservableObject {
     @Published var busy = false
     @Published var status = ""
     @Published var showVideoPicker = false
-    /// 播放器的两个全屏页：相册里已经是左右眼的那条走 playItem，实时那条走 liveItem
-    @Published var playItem: VRPlayItem?
+    /// 播放那一个全屏页：两条去向（相册里已是左右眼的、要实时形变的）都开这一页，靠 liveSbs 分野
     @Published var liveItem: VRPlayItem?
-    /// 下一次选片的去向：0=拿去转，1=拿去播，2=拿去实时播
+    /// 真放进这一页的是不是「原样左右眼」：true=相册那条已经是 SBS，false=普通视频实时形变
+    @Published var liveSbs = false
+    /// 下一次选片的去向：0=拿去转，1=拿去播（已是左右眼，原样上屏），2=拿去实时播（普通视频）
     private var pickPurpose = 0
     /// 播放器手里那份 tmp 副本，关掉页面时删
-    private var playCopy: URL?
     private var liveCopy: URL?
     @Published var frames = 10
     @Published var eyeLong = 540
@@ -414,25 +447,26 @@ final class VRJob: ObservableObject {
         status = "正在收兵：把手上这一帧/这一条做完就停，已扫的深度和已出的成片照样报"
     }
 
+    /// 两条播放都要先确认没别的在跑：相册那条虽然不跑深度，可它一样要发 Metal 指令（半幅平移），
+    /// 跟全片并发就是 10-10 那次闪退的同一个坑。
+    private func playGate(_ tag: String) -> Bool {
+        guard !(busy || VRFull.isBusy() || VRLive.isBusy()) else {
+            log.append("有一条在跑，\(tag)不起（两条共用那份 Metal 地基）。进度：\(status.isEmpty ? "刚起手" : status)")
+            return false
+        }
+        return true
+    }
+
     func pickForPlayback() {
+        guard playGate("相册左右眼播放") else { return }
         pickPurpose = 1
         showVideoPicker = true
     }
 
     func pickForLive() {
-        // 实时那条也在动那份静态 Metal 地基（形变与深度各一条线程），跟转换并发就是 10-10 那次闪退的形状
-        if busy || VRFull.isBusy() || VRLive.isBusy() {
-            log.append("有一条在跑，实时播放先不起（共用那份 Metal 地基）。进度：\(status.isEmpty ? "刚起手" : status)")
-            return
-        }
+        guard playGate("实时左右眼播放") else { return }
         pickPurpose = 2
         showVideoPicker = true
-    }
-
-    func closePlain() {
-        playItem = nil
-        dropPickCopy(playCopy)
-        playCopy = nil
     }
 
     func stopLive() {
@@ -455,20 +489,15 @@ final class VRJob: ObservableObject {
             log.append("取文件失败\n\(failMessage ?? "未知原因")")
             return
         }
-        // 播放器这两条不跑转换：去向在选择那一刻就记下了，回来只负责把全屏页撑开
-        if pickPurpose == 1 {
+        // 播放器这两条不跑转换：去向在选择那一刻就记下了，回来只负责把同一个全屏页撑开（liveSbs 分野）
+        if pickPurpose == 1 || pickPurpose == 2 {
+            let asIs = pickPurpose == 1
             pickPurpose = 0
-            playCopy = url
-            playItem = VRPlayItem(url: url)
-            return
-        }
-        if pickPurpose == 2 {
-            pickPurpose = 0
-            if busy || VRFull.isBusy() || VRLive.isBusy() {
-                log.append("有一条在跑，实时播放不起（两条共用那份 Metal 地基）。")
+            guard playGate(asIs ? "相册左右眼播放" : "实时左右眼播放") else {
                 dropPickCopy(url)
                 return
             }
+            liveSbs = asIs
             liveCopy = url
             liveItem = VRPlayItem(url: url)
             return
