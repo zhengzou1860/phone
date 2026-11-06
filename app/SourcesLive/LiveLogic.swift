@@ -17,11 +17,11 @@ enum LiveConfig {
     /// PC 那边 /live_start 响应里的 max_width 是权威；这个既是请求值，也是读不到响应时的兜底。
     /// 0.14 试过 800，实测不是带宽先崩：PC 挂 3 张目标脸只算到 3–8fps，手机上看到的就是卡。
     /// 0.19 起退回 640（实测 51–54KB/帧），让 PC 先跟上节奏；再要高清等 PC 那边算力跟上。
-    /// 0.20 仍是 640：这一版改的是全屏交互，不动推流参数。
+    /// 0.21 仍是 640：这一版修的是停止/重进时的闪退，不动推流参数。
     static let fallbackMaxWidth = 640
 
-    static let appVersion = "0.20"
-    static let appBuild = "20"
+    static let appVersion = "0.21"
+    static let appBuild = "21"
 
     static let jpegQuality: CGFloat = 0.7
     static let pushFPS: Double = 15

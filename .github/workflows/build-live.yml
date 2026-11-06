@@ -42,6 +42,22 @@ jobs:
           set -o pipefail
           rec() { tee -a /tmp/selftest.log; }
           touch /tmp/selftest.log /tmp/build.log
+          # 0.21 的闪退根因：主线程 cancelReading() 和后台 copyNextSampleBuffer() 并发是
+          # 未定义行为（实测 SIGSEGV，日志停在「用户点了停止」）。编译器和自测都看不出
+          # 这种数据竞争，只能在这里挡：注释里可以提，代码里不许再出现这一行调用。
+          if awk '{ line=$0; sub(/^[ \t]+/, "", line);
+                    if (line !~ /^\/\// && line ~ /cancelReading[ \t]*\(/) { print FNR": "line; bad=1 } }
+                  END { exit bad ? 0 : 1 }' app/SourcesLive/FrameSource.swift; then
+            echo "LIVE-VERDICT FAIL FrameSource 又直接调了 cancelReading()：停止要作废代数、让读线程自己退" | rec
+            exit 1
+          fi
+          # 作废通路缺一环，停止/跳转就会退回「主线程动 AVAssetReader」那条死路。
+          for sym in beginGeneration invalidateGeneration isCurrent endGeneration sleepPacing; do
+            grep -q "$sym" app/SourcesLive/FrameSource.swift || {
+              echo "LIVE-VERDICT FAIL FrameSource 少了 $sym：停止/跳转的作废通路被删了" | rec
+              exit 1
+            }
+          done
           xcrun swiftc -O \
             app/SourcesLive/LiveLogic.swift \
             app/SourcesLive/FrameSource.swift \

@@ -105,6 +105,8 @@ final class ClipAudio {
         pendingStart?.cancel()
         pendingStart = nil
         player?.pause()
+        // 留一条下界：如果下一次还闪退，日志里能分清是卡在停读线程还是拆音频会话。
+        AppLog.shared.log("audio", "已暂停 player，准备拆音频会话 gen=\(generation)")
         deactivate()
     }
 

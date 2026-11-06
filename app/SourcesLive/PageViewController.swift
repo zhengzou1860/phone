@@ -19,7 +19,21 @@ import WebKit
 
 final class PageViewController: UIViewController {
     private var webView: WKWebView!
-    private var client: SwapClient?
+    /// 帧队列每秒读它、主线程换地址时写它：裸属性跨线程读写是未定义行为。
+    private let clientLock = NSLock()
+    private var _client: SwapClient?
+    private var client: SwapClient? {
+        get {
+            clientLock.lock()
+            defer { clientLock.unlock() }
+            return _client
+        }
+        set {
+            clientLock.lock()
+            _client = newValue
+            clientLock.unlock()
+        }
+    }
     private let video = VideoFrameSource()
 
     private enum Phase {
@@ -233,6 +247,9 @@ final class PageViewController: UIViewController {
         }
         video.onSegmentEnd = { [weak self] in
             guard let self = self else { return }
+            // 读线程判定「读完」和用户点停止可能同时发生：回调排到主线程时
+            // 用户已经停了，这时再报「这一段推完了」并补一发 /live_stop 就是假的。
+            guard self.phase == .pushing else { return }
             self.pushGen += 1
             self.audio.pause()
             self.audioWaitingForOutput = false
@@ -584,6 +601,7 @@ final class PageViewController: UIViewController {
         AppLog.shared.log("ui", "用户点了停止（从 \(phaseName)）")
         pushGen += 1
         video.stop()
+        AppLog.shared.log("frame", "停止：reader 已作废，暂停声音")
         audio.pause()
         audioWaitingForOutput = false
         resumeSeconds = clampSeconds(CMTimeGetSeconds(video.currentPTS))

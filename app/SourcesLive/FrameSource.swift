@@ -113,6 +113,11 @@ final class VideoFrameSource {
     /// running 同理，stop() 在主线程写、reader 循环在后台读。
     private let stateLock = NSLock()
     private var _currentPTS = CMTime.zero
+    /// 每一轮 reader 一个代数。stop() 只把代数往前推，不碰 AVAssetReader：
+    /// cancelReading() 和后台 copyNextSampleBuffer() 并发是未定义行为，实测会 SIGSEGV
+    /// （日志里点停止后只写出「用户点了停止」就断线）。旧循环下一圈发现代数变了就自己退出，
+    /// 退出前也不会再把旧帧发出去。
+    private var _generation: UInt64 = 0
     private var _running = false
 
     var currentPTS: CMTime {
@@ -122,22 +127,59 @@ final class VideoFrameSource {
     }
 
     private var running: Bool {
-        get {
-            stateLock.lock()
-            defer { stateLock.unlock() }
-            return _running
-        }
-        set {
-            stateLock.lock()
-            _running = newValue
-            stateLock.unlock()
-        }
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return _running
     }
 
     private func setPTS(_ pts: CMTime) {
         stateLock.lock()
         _currentPTS = pts
         stateLock.unlock()
+    }
+
+    /// 作废当前这一轮读线程，返回新代数。只在主线程调用。
+    private func invalidateGeneration() -> UInt64 {
+        stateLock.lock()
+        _generation &+= 1
+        _running = false
+        let g = _generation
+        stateLock.unlock()
+        return g
+    }
+
+    /// 启动新代数。读线程每圈都用这个数问自己还算不算数。
+    private func beginGeneration() -> UInt64 {
+        stateLock.lock()
+        _generation &+= 1
+        _running = true
+        let g = _generation
+        stateLock.unlock()
+        return g
+    }
+
+    private func isCurrent(_ gen: UInt64) -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return _running && _generation == gen
+    }
+
+    private func endGeneration(_ gen: UInt64) {
+        stateLock.lock()
+        if _generation == gen { _running = false }
+        stateLock.unlock()
+    }
+
+    /// 分段睡，每 20ms 回来看一眼代数：停止/跳转不用等满一整个抽帧间隔。
+    private func sleepPacing(_ seconds: Double, gen: UInt64) -> Bool {
+        var remain = seconds
+        while remain > 0 {
+            guard isCurrent(gen) else { return false }
+            let slice = min(remain, 0.02)
+            usleep(useconds_t(slice * 1_000_000))
+            remain -= slice
+        }
+        return isCurrent(gen)
     }
 
     // 出帧账目：读线程写、主线程每 10 秒取一次，中间必须加锁。
@@ -247,21 +289,26 @@ final class VideoFrameSource {
             return false
         }
         reader = r
-        running = true
+        let gen = beginGeneration()
         setPTS(from)
         resetStats()
+        AppLog.shared.log("frame", "出帧起：代数 \(gen) 从 "
+                          + String(format: "%.3f", max(0, CMTimeGetSeconds(from))) + "s")
 
         queue.async { [weak self] in
             guard let self = self else { return }
-            let interval = 1.0 / max(1.0, self.pushFPS)
             var originWall: TimeInterval = 0
             var originPTS: CMTime?
             var nextEmit: Double?
-            while self.running, r.status == .reading,
+            while self.isCurrent(gen), r.status == .reading,
                   let sb = out.copyNextSampleBuffer() {
+                // copyNextSampleBuffer 可能刚跨过一次 stop：先认代数，旧帧一律不发。
+                guard self.isCurrent(gen) else { break }
                 let pts = CMSampleBufferGetPresentationTimeStamp(sb)
                 guard pts.isValid else { continue }
                 let sec = CMTimeGetSeconds(pts)
+                // 间隔每圈现取：跳转后重建 reader 时配置可能刚改过，用旧值会多推/少推。
+                let interval = 1.0 / max(1.0, self.pushFPS)
                 let pace = LivePace.decide(ptsSeconds: sec, nextEmitSeconds: nextEmit,
                                            interval: interval)
                 guard pace.emit else { continue }
@@ -276,6 +323,7 @@ final class VideoFrameSource {
                     self.noteEncode(costMs: (CFAbsoluteTimeGetCurrent() - encodeStart) * 1000)
                     return out
                 }
+                guard self.isCurrent(gen) else { break }
                 guard let jpeg = jpeg else {
                     self.statLock.lock()
                     self.encodeFailures += 1
@@ -287,6 +335,7 @@ final class VideoFrameSource {
                     originPTS = pts
                 }
                 self.onJPEG?(jpeg)
+                guard self.isCurrent(gen) else { break }
                 self.setPTS(pts)
 
                 // 按 PTS 对齐墙钟：推流节奏 = 视频真实播放节奏，
@@ -296,23 +345,28 @@ final class VideoFrameSource {
                 let delay = due - CFAbsoluteTimeGetCurrent()
                 // 源时间戳偶尔会给出半个世纪这种值：直接 UInt32 会在真机上 trap。
                 if delay.isFinite, delay > 0 {
-                    usleep(useconds_t(min(delay, 0.5) * 1_000_000))
+                    guard self.sleepPacing(min(delay, 0.5), gen: gen) else { break }
                 }
             }
-            // cancelReading 以后 status 是 .cancelled，只有真读到片尾才 .completed
-            if self.running, r.status == .completed {
-                self.running = false
+            let completed = (r.status == .completed)
+            let stillCurrent = self.isCurrent(gen)
+            if stillCurrent { self.endGeneration(gen) }
+            AppLog.shared.log("frame", "读线程退出：代数 \(gen) status=\(r.status.rawValue)"
+                              + " 当前=\(stillCurrent ? "是" : "否")")
+            // 只有自然读到片尾、且这一轮没被停/跳转作废，才算「这一段推完了」
+            if stillCurrent && completed {
                 DispatchQueue.main.async { self.onSegmentEnd?() }
-            } else {
-                self.running = false
             }
         }
         return true
     }
 
     func stop() {
-        running = false
-        if let r = reader, r.status == .reading { r.cancelReading() }
+        // 不在这里 cancelReading：那是主线程对后台正在读的 AVAssetReader 动手，
+        // 正是两次 SIGSEGV 的现场。作废代数后，读线程会在 20ms 内自己退出，
+        // 退出时由它自己释放 reader（等价于取消），不会再碰旧画面。
+        let gen = invalidateGeneration()
         reader = nil
+        AppLog.shared.log("frame", "出帧停：代数 \(gen)")
     }
 }

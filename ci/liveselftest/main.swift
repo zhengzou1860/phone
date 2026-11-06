@@ -304,10 +304,10 @@ ck("账目 未知源不标", LivePerf.sourceLabel(0).isEmpty)
 
 ck("契约 在途上限3", LiveConfig.inflightLimit == 3)
 ck("契约 推送15fps", LiveConfig.pushFPS == 15.0)
-// 0.20 仍是 640：全屏交互改在脚本层，推流参数这一版不动。
+// 0.21 仍是 640：修停止/重进时的闪退，推流参数这一版不动。
 ck("契约 请求宽640", LiveConfig.fallbackMaxWidth == 640)
-ck("契约 UA带版本", LiveConfig.userAgentSuffix == "LiveSwap/0.20"
-   && LiveConfig.appVersion == "0.20" && LiveConfig.appBuild == "20")
+ck("契约 UA带版本", LiveConfig.userAgentSuffix == "LiveSwap/0.21"
+   && LiveConfig.appVersion == "0.21" && LiveConfig.appBuild == "21")
 ck("契约 质量0.7", LiveConfig.jpegQuality == 0.7)
 ck("契约 看门狗2500ms", LiveConfig.watchdogMs == 2500, "1500 太紧：收尾那一秒实测到过 1489")
 ck("契约 出帧判据500ms", LiveConfig.warmAgeMs == 500,
