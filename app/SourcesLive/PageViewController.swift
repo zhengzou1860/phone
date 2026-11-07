@@ -851,7 +851,10 @@ final class PageViewController: UIViewController {
                 : String(format: "%.0fs 前", -client.statusAt.timeIntervalSinceNow)
             AppLog.shared.log("perf", "手机 \(String(format: "%.1f", fps))fps｜\(perf)"
                               + "｜编码失败 \(encFail)"
-                              + "｜本地丢 \(client.framesDroppedLocal)｜PC拒 \(client.framesRejected)"
+                              + "｜本地丢 \(client.framesDroppedLocal)"
+                              + (client.framesDroppedByBytes > 0
+                                 ? "（内被字节闸挡 \(client.framesDroppedByBytes)）" : "")
+                              + "｜PC拒 \(client.framesRejected)"
                               + "｜PC收 \(client.pcFramesIn) 预热丢 \(client.pcFramesDropped)"
                               + "｜in_age \(inAge) out_age \(outAge)"
                               + "｜状态采样 \(sampledAt)"

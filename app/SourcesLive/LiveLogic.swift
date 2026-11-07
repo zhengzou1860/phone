@@ -43,6 +43,13 @@ enum LiveConfig {
     /// 0.28 起这只是平时值：往返高了 LiveWindow 会临时放开，往返回落自己缩回这个数。
     static let inflightLimit = 3
 
+    /// 在途字节的上限（0.28，PC 提的「按字节封顶比按帧数稳」）。
+    /// 取 400KB = PC 给的 5 格 × 实测 60–80KB/帧 再留一点：现在这个流宽下它不 binding，
+    /// 帧真变大了（改宽、改质量、素材变复杂）它才收口——那正是上行 bufferbloat 的起点。
+    /// PC 那句里的「比如 250KB」按实测帧大小只够 3 格，会把这次要修的 7fps 原样留住，
+    /// 所以那条按它自己给的 5 格换算；这道闸真挡下帧时，日志里单独报被它挡掉的条数。
+    static let inflightBytesCeiling = 400 * 1024
+
     /// 注入脚本里 messageHandlers 的名字；Swift 侧注册和脚本发送共用这一条。
     static let bridgeName = "livebridge"
     /// 进度条松手（change）单独走这条桥：页面 postMessage(浮点秒)，原生只管本地 seek。
@@ -133,20 +140,38 @@ enum LiveHost {
 // MARK: - 在途帧窗口
 
 /// 一帧等一个往返，节奏就被往返钉死：3 帧在途、往返 425ms，就只剩 7fps——
-/// 用户看到的「卡」就是这个 7fps，不是手机算不动（那两段编码还是 9–10ms）。
+/// 用户看到的「卡」就是这个 7fps，不是手机算不动（同一轮里编码还是 9–10ms）。
 /// 所以往返一高就把窗口放开，让管道里始终有帧在走；回落到几十毫秒自己缩回 PC 要的 3。
-/// 上限 6 而不是更多：手机这个 URLSession 每主机只开 9 条，要给状态轮询和一次性控制请求
-/// 留位置——0.24 那次就是池子被帧占满，页面轮询全排队、按钮冻死。
+///
+/// 上限是 PC 给的那个数（5），不是我算的：它那边实测整口吞下过 12–13fps（09:16:04–09:17:19
+/// 那 16 个窗口到达 354 / 处理 355，入口一帧没丢），5/0.425≈11.8fps 正压在这条已验证的线上；
+/// 6 格那 14fps 落在它没有样本的区域。另外 6 条连接也会挤 URLSession 每主机那 9 条，
+/// 给状态轮询和控制请求留的位置就薄了——0.24 那次池子被帧占满，页面按钮直接冻死。
+///
+/// 判放开用中位数、不用均值（PC 提的，理由是真的）：一段 2.5 秒的长尾就能把均值顶过阈值，
+/// 在错误的时间开窗。更要紧的是这条反馈环——往返本身是被在途字节撑大的，
+/// 用均值判就会「窗口放大 → RTT 更大 → 窗口再放大」自己顶到天花板，中位数把这一跳按住了。
 enum LiveWindow {
     static let base = LiveConfig.inflightLimit      // PC 平时要的 3
-    static let ceiling = 6
+    static let ceiling = 5
+
+    /// 取中位数用的样本个数。15 帧 ≈ 一秒（按 pushFPS=15），够压住单帧长尾、又不至于半天不反应。
+    static let samples = 15
 
     /// 要几条才填得满这条管道：每秒想要帧数 × 一个往返。
-    /// 夹在 base 和 ceiling 之间：往返再高也不许越过池子，往返再低也不比 PC 要求的更贪。
-    static func limit(rttAvgMs: Double, fps: Double = LiveConfig.pushFPS) -> Int {
-        guard rttAvgMs > 0 else { return base }
-        let need = Int((rttAvgMs * fps / 1000.0).rounded(.up))
+    /// 夹在 base 和 ceiling 之间：往返再高也不许越过 PC 给的数，往返再低也不比它要求的更贪。
+    static func limit(rttMedMs: Double, fps: Double = LiveConfig.pushFPS) -> Int {
+        guard rttMedMs > 0 else { return base }
+        let need = Int((rttMedMs * fps / 1000.0).rounded(.up))
         return min(ceiling, max(base, need))
+    }
+
+    /// 中位数。偶数个取中间两个的平均；空数组回 0，让调用方按「还没测到」处理。
+    static func median(_ values: [Double]) -> Double {
+        guard !values.isEmpty else { return 0 }
+        let s = values.sorted()
+        let mid = s.count / 2
+        return s.count % 2 == 1 ? s[mid] : (s[mid - 1] + s[mid]) / 2.0
     }
 }
 

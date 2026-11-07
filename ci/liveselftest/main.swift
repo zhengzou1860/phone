@@ -413,26 +413,41 @@ ck("账目 选片标源帧率", LivePerf.sourceLabel(24) == "·源 24fps", LiveP
 ck("账目 未知源不标", LivePerf.sourceLabel(0).isEmpty)
 // 0.28：往返 425ms 那一轮只有 7fps——不是手机算不动（编码 9–10ms），是同时只许 3 帧在路上。
 // fps ≈ 在途格数 ÷ 往返，所以能救这一场的只有把窗口放开；下面这组数就是放开的刻度。
-ck("窗口 没测到往返不放开", LiveWindow.limit(rttAvgMs: 0) == LiveWindow.base,
+// 上限 5 是 PC 给的（它实测整口吞下过 12–13fps，5/0.425≈11.8 正压在那条线上），不是我算的。
+ck("窗口 没测到往返不放开", LiveWindow.limit(rttMedMs: 0) == LiveWindow.base,
    "开局没有往返读数时按 PC 平时要的 3 起步，别一上来就比别人贪")
-ck("窗口 链路快用 PC 要的3", LiveWindow.limit(rttAvgMs: 20) == 3
-   && LiveWindow.limit(rttAvgMs: 100) == 3 && LiveWindow.limit(rttAvgMs: 200) == 3,
+ck("窗口 链路快用 PC 要的3", LiveWindow.limit(rttMedMs: 20) == 3
+   && LiveWindow.limit(rttMedMs: 100) == 3 && LiveWindow.limit(rttMedMs: 200) == 3,
    "200ms 以内 3 条就填得满 15fps，多开的连接只会挤 PC 的入口队列")
-ck("窗口 250ms 开4格", LiveWindow.limit(rttAvgMs: 250) == 4, "0.25×15=3.75 向上取整")
-ck("窗口 425ms 开满把节奏抬一倍", LiveWindow.limit(rttAvgMs: 425) == LiveWindow.ceiling
-   && 3 / 0.425 < 8 && Double(LiveWindow.ceiling) / 0.425 > 14,
-   "这一档就是用户报的那次卡顿：3 格只有 7.1fps，6 格 14.1fps；要真追平 15fps 得 6.4 格，被池子顶在 6")
-ck("窗口 往返再差也只到上限", LiveWindow.limit(rttAvgMs: 1000) == LiveWindow.ceiling
-   && LiveWindow.limit(rttAvgMs: 99999) == LiveWindow.ceiling,
-   "顶到 6 以上会挤爆 URLSession 每主机 9 条（帧 6 + 轮询 + 控制），0.24 那次按钮冻死就是池子满了")
-ck("窗口 往返回落自己缩回去", LiveWindow.limit(rttAvgMs: 425) == 6
-   && LiveWindow.limit(rttAvgMs: 60) == 3, "不缩回去就等于永久改掉了 PC 要的 2–3 帧在途")
+ck("窗口 250ms 开4格", LiveWindow.limit(rttMedMs: 250) == 4, "0.25×15=3.75 向上取整")
+ck("窗口 425ms 顶到 PC 给的5", LiveWindow.limit(rttMedMs: 425) == LiveWindow.ceiling
+   && LiveWindow.ceiling == 5 && 3 / 0.425 < 8 && 5 / 0.425 > 11,
+   "这一档就是用户报的那次卡顿：3 格 7.1fps，5 格 11.8fps；6 格那 14fps 落在 PC 没样本的区域")
+ck("窗口 往返再差也只到上限", LiveWindow.limit(rttMedMs: 1000) == LiveWindow.ceiling
+   && LiveWindow.limit(rttMedMs: 99999) == LiveWindow.ceiling,
+   "再往上就是替 PC 决定它入口丢多少帧；而且每主机只有 9 条连接（帧 5 + 轮询 + 控制），0.24 那次池子满了按钮直接冻死")
+ck("窗口 往返回落自己缩回去", LiveWindow.limit(rttMedMs: 425) == LiveWindow.ceiling
+   && LiveWindow.limit(rttMedMs: 60) == 3, "不缩回去就等于永久改掉了 PC 要的 2–3 帧在途")
+// 判放开用中位数不是均值（PC 提的，这条是这版最容易自己骗自己的地方）：
+// 实测有一段 2574ms 的长尾，按均值判会立刻开窗，窗一开在途字节更多、RTT 又被顶高——自己踩油门。
+let tail = [Double](repeating: 100, count: 14) + [2574]
+ck("中位数 一条长尾顶不动窗口", LiveWindow.median(tail) == 100
+   && LiveWindow.limit(rttMedMs: LiveWindow.median(tail)) == 3
+   && tail.reduce(0, +) / Double(tail.count) > 250,
+   "均值这一串是 265ms，够把窗口开到 4；那条长尾只有一帧，不该为它开门")
+ck("中位数 奇偶都取中间", LiveWindow.median([40, 10, 20, 30, 5]) == 20
+   && LiveWindow.median([1, 2, 3, 4]) == 2.5)
+ck("中位数 空读数不开窗", LiveWindow.median([]) == 0
+   && LiveWindow.limit(rttMedMs: LiveWindow.median([])) == LiveWindow.base)
+ck("契约 字节闸400KB", LiveConfig.inflightBytesCeiling == 400 * 1024,
+   "≈ PC 给的 5 格 × 实测 60–80KB 再留一点；这个流宽下不 binding，帧变大才收口")
+ck("窗口 样本取近一秒", LiveWindow.samples == 15, "15 帧按 15fps 就是一秒：太短被单帧带跑，太长半天不反应")
 // 状态行那一截：没放开时别占地方，放开了必须写得出格数
 ck("账目 没放开不写在途", !LivePerf.line(sourceFPS: 24, encodeMs: 9, gapMs: 0,
     rttAvgMs: 425, rttMaxMs: 900, inflightMax: 3).contains("在途"))
 let perfWindow = LivePerf.line(sourceFPS: 24, encodeMs: 9, gapMs: 0,
-                               rttAvgMs: 425, rttMaxMs: 900, inflightMax: 6)
-ck("账目 放开写在途格数", perfWindow.contains("在途≤6"), perfWindow)
+                               rttAvgMs: 425, rttMaxMs: 900, inflightMax: 5)
+ck("账目 放开写在途格数", perfWindow.contains("在途≤5"), perfWindow)
 
 // 0.28 起播缓发：这是用户直接要的那条（「开始播时稍微延迟开始，播放中保持连续」）。
 // 它不是保守——PC 冷启动那一秒入口队列正一次性丢一大批帧，手机那 18 帧全撞在闸上。

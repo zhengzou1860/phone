@@ -30,6 +30,7 @@ struct LiveSnapshot {
 final class SwapClient: ObservableObject {
     @Published var framesSent = 0
     @Published var framesDroppedLocal = 0      // 在途满了被手机自己丢掉的帧
+    @Published var framesDroppedByBytes = 0    // 上面那一堆里被「字节闸」挡下的：分不开就不知道在途该收哪头
     @Published var framesRejected = 0          // PC 回了非 2xx（400/413/503/405……）的帧数
     @Published var pcFramesIn = 0
     @Published var pcFramesDropped = 0
@@ -60,6 +61,9 @@ final class SwapClient: ObservableObject {
     private var rttSumMs: Double = 0
     private var rttCount = 0
     private var rttMaxMs: Double = 0
+    /// 最近 LiveWindow.samples 帧的往返，只用来判窗口放不放开（取中位数）。
+    /// 和上面那三个数分开：那三个是给状态行看的十秒账、取走就清零；这几个是滑动的近一秒。
+    private var rttRecent: [Double] = []
 
     // 每帧被拒时写日志的节流：PC 一旦持续拒帧，15fps 会把同一句刷爆。
     private let logLock = NSLock()
@@ -93,15 +97,17 @@ final class SwapClient: ObservableObject {
         rttSumMs += ms
         rttCount += 1
         if ms > rttMaxMs { rttMaxMs = ms }
-        let avg = rttCount > 0 ? rttSumMs / Double(rttCount) : 0
-        let samples = rttCount
+        rttRecent.append(ms)
+        if rttRecent.count > LiveWindow.samples { rttRecent.removeFirst(rttRecent.count - LiveWindow.samples) }
+        let med = LiveWindow.median(rttRecent)
+        let ready = rttRecent.count >= 5
         rttLock.unlock()
-        // 窗口跟着这一段均值走。要攒够 5 帧才动：每 10 秒取账目会把计数清零，
-        // 不清零的那一下偶然慢帧（实测偶发 900ms）会把窗口一口气顶到 6，
-        // 而 PC 入口只有 2 格——放开过头的代价是 PC 那边丢帧，不是白赚。
-        guard samples >= 5 else { return }
+        // 攒够 5 帧才动窗口：刚起播那几帧的样本还不足以说明链路慢。
+        // 用中位数而不是均值（PC 提的）——实测有一段 2574ms 的长尾，按均值判会在错误的时间开窗，
+        // 而窗口一开、在途字节更多、RTT 又被顶高，这是一条会自己踩油门的反馈环。
+        guard ready else { return }
         inflightLock.lock()
-        inflightMax = LiveWindow.limit(rttAvgMs: avg)
+        inflightMax = LiveWindow.limit(rttMedMs: med)
         inflightLock.unlock()
     }
 
@@ -112,9 +118,10 @@ final class SwapClient: ObservableObject {
         return inflightMax
     }
 
-    private func endInflight() {
+    private func endInflight(bytes: Int) {
         inflightLock.lock()
         if inflightNow > 0 { inflightNow -= 1 }
+        inflightBytes = max(0, inflightBytes - bytes)
         inflightLock.unlock()
     }
 
@@ -124,11 +131,13 @@ final class SwapClient: ObservableObject {
 
     private let session: URLSession
     /// 在途帧窗口。以前是一个固定 3 格的 DispatchSemaphore：往返一高，节奏就被钉死成
-    /// 3/RTT（425ms 就是 7fps），而手机这边编码还是 9ms、GPU 没抢、PC 也没排队——
-    /// 卡的是「同时只许 3 帧在路上」。现在按实测往返放开到最多 6（LiveWindow），
-    /// 往返回落自己缩回 PC 要的 3。计数和上限共用这一把锁，帧的完成回调在 URLSession 队列上。
+    /// 3/RTT（425ms 就是 7fps），而手机编码还是 9ms、PC 入口也没排队——
+    /// 卡的是「同时只许 3 帧在路上」。现在按实测往返中位数放开，上限是 PC 给的 5（LiveWindow），
+    /// 往返回落自己缩回它平时要的 3。格数之外还有一道字节闸：在途的是字节、不是编号。
+    /// 计数和上限共用这一把锁，帧的完成回调在 URLSession 队列上。
     private let inflightLock = NSLock()
     private var inflightNow = 0
+    private var inflightBytes = 0
     private var inflightMax = LiveWindow.base
     private var statusTask: Task<Void, Never>?
 
@@ -145,7 +154,7 @@ final class SwapClient: ObservableObject {
         self.baseURL = baseURL
         let cfg = URLSessionConfiguration.default
         // 0.24 那次教训：格子数小于「在途帧 + 状态轮询 + 控制请求」时，请求会静静排在池子外面，
-        // 日志上看着像链路慢。窗口最多 6 帧在途（LiveWindow.ceiling），这里得留得住。
+        // 日志上看着像链路慢。窗口最多 5 帧在途（PC 给的 LiveWindow.ceiling），这里得留得住。
         cfg.httpMaximumConnectionsPerHost = 9
         cfg.timeoutIntervalForRequest = 5
         cfg.timeoutIntervalForResource = 30
@@ -246,10 +255,12 @@ final class SwapClient: ObservableObject {
         rttSumMs = 0
         rttCount = 0
         rttMaxMs = 0
+        rttRecent = []
         rttLock.unlock()
         // 新一轮开头按 PC 平时要的 3 格起步：上一轮临收尾那几帧的高往返不该把这一轮的窗口顶高。
         inflightLock.lock()
         inflightNow = 0
+        inflightBytes = 0
         inflightMax = LiveWindow.base
         inflightLock.unlock()
         let body = try JSONSerialization.data(withJSONObject: ["max_width": LiveConfig.fallbackMaxWidth])
@@ -397,16 +408,28 @@ final class SwapClient: ObservableObject {
 
     /// 在途满了就丢新帧（丢最新），绝不排队——
     /// PC 入口队列只有 2 格且满则丢最旧，手机这边再排一层只会把延迟堆起来。
-    /// 0.28：格数不再钉死 3，跟着实测往返走（LiveWindow），往返回落自己缩回去。
+    /// 0.28：格数不再钉死 3，跟着实测往返走（LiveWindow），往返回落自己缩回去；
+    /// 但两条闸同时看——条数按 PC 给的 5，字节另封顶（在途字节才是把 RTT 撑大的那个东西，
+    /// 光数条数挡不住帧变大那一路）。两道丢帧分开计数，才知道这帧是被谁挡下的。
     /// authRetried 只给「401 后搬完 cookie 重发这一帧」用，最多一次，不会打转。
     func push(_ jpeg: Data, authRetried: Bool = false) {
+        let bytes = jpeg.count
         inflightLock.lock()
         guard inflightNow < inflightMax else {
             inflightLock.unlock()
             DispatchQueue.main.async { self.framesDroppedLocal += 1 }
             return
         }
+        guard inflightBytes + bytes <= LiveConfig.inflightBytesCeiling else {
+            inflightLock.unlock()
+            DispatchQueue.main.async {
+                self.framesDroppedLocal += 1
+                self.framesDroppedByBytes += 1
+            }
+            return
+        }
         inflightNow += 1
+        inflightBytes += bytes
         inflightLock.unlock()
         let sentAt = CFAbsoluteTimeGetCurrent()
         var req = URLRequest(url: url("/live_frame"))
@@ -418,7 +441,7 @@ final class SwapClient: ObservableObject {
             guard let self = self else { return }
             // 四条出口（网络错 / 非 2xx / 204 / 401 重发）都从这一格过：先还格子，
             // 再决定要不要重发——重发的那一帧自己去抢一格，不会把这里顶成两格。
-            self.endInflight()
+            self.endInflight(bytes: bytes)
             if let err = err {
                 let ns = err as NSError
                 // 手机侧网络抖一下不值得占一整行状态栏，计数留给自测和后台日志
