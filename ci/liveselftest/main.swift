@@ -271,8 +271,34 @@ ck("VR 二次进全屏接着用同一块画布",
    vrBlock.contains("if (vr.canvas && !vr.canvas.parentNode) document.body.appendChild(vr.canvas);")
    && !vrBlock.contains("vr.canvas = null;"),
    "上下文长在元素上：摘了元素又把手上的引用置空，第二次进全屏就在 vr.canvas.width 上炸")
-ck("VR 纹理上传限 15fps", vrBlock.contains("now - vr.lastUp >= 66"),
-   "画面在眼镜里跟着头一起动，刷新率不产生流畅度；每帧重传纹理只是白烧 GPU")
+ck("VR 重画限 15fps", vrBlock.contains("var VR_DRAW_MS = 66;")
+   && vrBlock.contains("if (!force && now - vr.lastDraw < VR_DRAW_MS) return;")
+   && vrBlock.contains("preserveDrawingBuffer: true"),
+   "画面在眼镜里跟着头一起动，刷新率不产生流畅度；0.25 那版每秒 60 次两遍全屏是白烧 GPU，"
+   + "而手机这会儿正同时抽帧编码发上行")
+// 0.26：用户报「鱼眼视频有点小」。鱼眼本身就是把整幅往中心挤，强度越高越小，
+// 所以补一颗放大——它只改读源图的步幅，弯曲张量仍按屏幕位置算（镜片是按角度压的）。
+ck("VR 有放大这一颗", vrBlock.contains("'uniform float uZoom;'")
+   && vrBlock.contains("float sx = dx * sc / uZoom + w * 0.5;")
+   && vrBlock.contains("gl.uniform1f(vr.u.uZoom, vr.zoom)")
+   && vrBlock.contains("id=\"vr-zoom\"") && vrBlock.contains("bind('vr-zoom', 'zoom'"),
+   "放大要沿两根轴一起生效，且要出现在参数行里——用户嫌小就得能自己拧")
+ck("VR 放大默认能补回鱼眼的挤", vrBlock.contains("zoom: vrGet('zoom', 1.25)"),
+   "鱼眼 0.35 时画面边缘被挤掉约 12%，默认 1.25 刚好吃满这一半的框")
+
+// 「卡顿怪谁」这条要靠日志分段：perf 行 10 秒一条，没有 VR 进出的边界就分不出
+// 开 VR 前后哪段往返高；机身热档位则是手机这一侧唯一能自证的证据。
+ck("VR 进出各记一行", vrBlock.contains("'VR 层开：'") && vrBlock.contains("'VR 层关：这次开了 '"),
+   "下一次再报卡，先能在日志里把开着 VR 的那段和没开的那段切开")
+ck("发热档位进 perf 行", LivePerf.thermalLabel(.nominal).isEmpty
+   && LivePerf.thermalLabel(.fair) == "偏热" && LivePerf.thermalLabel(.serious) == "很热"
+   && LivePerf.thermalLabel(.critical) == "过热降频",
+   "正常时不占那一行的地方；一升档就要看得见，节流是看不见的")
+ck("perf 行带得上机身档位", LivePerf.line(sourceFPS: 25, encodeMs: 8, gapMs: 90,
+                                        rttAvgMs: 60, rttMaxMs: 120) == "源 25fps｜编码 8ms｜发间隔峰 90ms｜往返 60/120ms"
+   && LivePerf.line(sourceFPS: 25, encodeMs: 8, gapMs: 90, rttAvgMs: 60, rttMaxMs: 120,
+                    thermal: "偏热").hasSuffix("｜机身偏热"),
+   "默认空串时那一截整个省掉，别留个光秃秃的分隔符")
 
 // 停止握手：点停止到 PC 确认之间，按钮和特征下拉框必须一直锁着；
 // /live_stop 没送到就停在 failed，不许假装停了——那正是用户撞 409 的那条路。
@@ -371,8 +397,8 @@ ck("契约 在途上限3", LiveConfig.inflightLimit == 3)
 ck("契约 推送15fps", LiveConfig.pushFPS == 15.0)
 // 0.25 仍是 640：全屏 VR 只在显示端弯像素，推流参数不动。
 ck("契约 请求宽640", LiveConfig.fallbackMaxWidth == 640)
-ck("契约 UA带版本", LiveConfig.userAgentSuffix == "LiveSwap/0.25"
-   && LiveConfig.appVersion == "0.25" && LiveConfig.appBuild == "25")
+ck("契约 UA带版本", LiveConfig.userAgentSuffix == "LiveSwap/0.26"
+   && LiveConfig.appVersion == "0.26" && LiveConfig.appBuild == "26")
 // 页面在推流中改特征时发的动作：是命令，不是按钮挂子，所以不进 actionNames
 //（就绪对账只该对页面里那三个按钮）。
 ck("契约 改特征先停动作", LiveShim.hookStopForEdit == "stopedit"

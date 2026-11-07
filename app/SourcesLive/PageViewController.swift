@@ -823,7 +823,8 @@ final class PageViewController: UIViewController {
             let net = client.takeNetworkStats()
             let encFail = video.takeEncodeFailures()
             let perf = LivePerf.line(sourceFPS: video.sourceFPS, encodeMs: send.costMs,
-                                     gapMs: send.gapMs, rttAvgMs: net.avgMs, rttMaxMs: net.maxMs)
+                                     gapMs: send.gapMs, rttAvgMs: net.avgMs, rttMaxMs: net.maxMs,
+                                     thermal: LivePerf.thermalLabel(ProcessInfo.processInfo.thermalState))
             status(warm + "手机 \(String(format: "%.1f", fps))fps"
                     + (perf.isEmpty ? "" : "｜" + perf)
                     + (encFail > 0 ? "｜编码失败 \(encFail)" : "")

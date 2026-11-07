@@ -19,10 +19,11 @@ enum LiveConfig {
     /// 0.19 起退回 640（实测 51–54KB/帧），让 PC 先跟上节奏；再要高清等 PC 那边算力跟上。
     /// 0.24 仍是 640：这一版只给 /video_feed 加重连闸，推流参数不动。
     /// 0.25 仍是 640：全屏 VR 只在显示端弯像素，一帧像素都不多往 PC 发。
+    /// 0.26 仍是 640：加放大、降重画频率，全在手机上，跟 PC 说的话一条没多。
     static let fallbackMaxWidth = 640
 
-    static let appVersion = "0.25"
-    static let appBuild = "25"
+    static let appVersion = "0.26"
+    static let appBuild = "26"
 
     static let jpegQuality: CGFloat = 0.7
     static let pushFPS: Double = 15
@@ -351,14 +352,27 @@ enum LiveStopGate: Equatable {
 enum LivePerf {
     /// 状态行里那一截。读数为 0 的一律省掉：还没出帧、还没测到往返时，
     /// 一屏 0 只会让人以为坏了。
+    /// 机身热档位只在离开「正常」时才写：这一版的 VR 层是不是把手机热到降频，
+    /// 是「卡顿到底怪谁」这条上唯一能在手机上取到的证据。
     static func line(sourceFPS: Double, encodeMs: Double, gapMs: Double,
-                     rttAvgMs: Double, rttMaxMs: Double) -> String {
+                     rttAvgMs: Double, rttMaxMs: Double, thermal: String = "") -> String {
         var parts: [String] = []
         if sourceFPS >= 1 { parts.append(String(format: "源 %.0ffps", sourceFPS)) }
         if encodeMs > 0 { parts.append(String(format: "编码 %.0fms", encodeMs)) }
         if gapMs > 0 { parts.append(String(format: "发间隔峰 %.0fms", gapMs)) }
         if rttAvgMs > 0 { parts.append(String(format: "往返 %.0f/%.0fms", rttAvgMs, rttMaxMs)) }
+        if !thermal.isEmpty { parts.append("机身" + thermal) }
         return parts.joined(separator: "｜")
+    }
+
+    /// iOS 的热档位。正常时返回空串（不占那一行的地方），偏热往上才写。
+    static func thermalLabel(_ state: ProcessInfo.ThermalState) -> String {
+        switch state {
+        case .nominal: return ""
+        case .fair: return "偏热"
+        case .serious: return "很热"
+        default: return "过热降频"
+        }
     }
 
     /// 选片时那一行。源帧率决定按 15fps 抽帧时实际能到多少：
@@ -820,6 +834,7 @@ enum LiveShim {
       // 只换来每秒几次跳变的立体感，而这一版用户明确要「最简单的鱼眼左右屏」。
       var VR_ROW = '#live-vr-row';
       var VR_LS = 'live.vr.';
+      var VR_DRAW_MS = 66;              // 重画上限 15fps：新内容本来就只有 PC 那 ~5fps
       var VR_ROT_NAME = ['正', '右转', '倒', '左转'];
 
       function vrGet(key, dflt) {
@@ -834,10 +849,12 @@ enum LiveShim {
 
       var vr = {
         canvas: null, gl: null, prog: null, tex: null, u: {},
-        running: false, raf: 0, lastUp: 0, dead: false,
+        running: false, raf: 0, lastDraw: 0, dead: false,
+        startedAt: 0, draws: 0,
         fish: vrGet('fish', 0.35),      // 界面强度 0~1，送进着色器翻倍成 k（和 vr3d 一样）
         gap: vrGet('gap', 0),           // 两半互相推远/拉近，±25% 每眼物理宽
         shift: vrGet('shift', 0),       // 两半一起挪，±12%，对镜片中心用
+        zoom: vrGet('zoom', 1.25),      // 整幅放大：鱼眼把画面挤小，这一颗补回来（1~2）
         extra: vrGet('extra', 0),       // 再加几个 90°：眼镜塞手机的方向是硬件定的
       };
 
@@ -857,6 +874,7 @@ enum LiveShim {
         'uniform vec4 uImg;',       // 源图在那半幅里的 contain 位置：ox, oy, iw, ih
         'uniform vec2 uOff;',       // 画面在这半幅里整体挪多少（已按视口折算到配对轴）
         'uniform float uK;',        // 鱼眼强度 k
+        'uniform float uZoom;',     // 整幅再放大几倍：鱼眼本身会把画面往中心挤，这颗补回来
         'uniform int uRot;',        // 内容再转几个 90°（0..3）
         'uniform sampler2D uTex;',
         'void main(){',
@@ -869,8 +887,9 @@ enum LiveShim {
         '  float dy = ly - h * 0.5 + 0.5 - uOff.y;',
         '  float R = 0.5 * sqrt(w * w + h * h);',
         '  float sc = 1.0 + uK * (dx * dx + dy * dy) / (R * R);',
-        '  float sx = dx * sc + w * 0.5;',
-        '  float sy = dy * sc + h * 0.5;',
+        // 弯曲张量按屏幕位置算（镜片就在那个角度压），放大只改读源图的步幅
+        '  float sx = dx * sc / uZoom + w * 0.5;',
+        '  float sy = dy * sc / uZoom + h * 0.5;',
         '  if (sx < 0.0 || sx >= w || sy < 0.0 || sy >= h) { gl_FragColor = vec4(0.0,0.0,0.0,1.0); return; }',
         '  float tx = (sx - uImg.x) / uImg.z;',
         '  float ty = (sy - uImg.y) / uImg.w;',
@@ -904,8 +923,10 @@ enum LiveShim {
           + 'background:#000;pointer-events:none;');
         var gl = null;
         try {
+          // preserveDrawingBuffer：这一层不需要每 60 次重画才亮一次，攒着上一次的画面
+          // 就能一直显出来。省下的是整屏两遍的 GPU 活儿——手机还在同时编码上行。
           gl = c.getContext('webgl', { alpha: false, antialias: false,
-                                       premultipliedAlpha: false });
+                                       preserveDrawingBuffer: true });
         } catch (e) { gl = null; }
         if (!gl) return false;
         var p;
@@ -929,7 +950,7 @@ enum LiveShim {
         var loc = gl.getAttribLocation(p, 'aPos');
         gl.enableVertexAttribArray(loc);
         gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
-        var names = ['uRect', 'uVP', 'uImg', 'uOff', 'uK', 'uRot', 'uTex'];
+        var names = ['uRect', 'uVP', 'uImg', 'uOff', 'uK', 'uZoom', 'uRot', 'uTex'];
         for (var i = 0; i < names.length; i++) vr.u[names[i]] = gl.getUniformLocation(p, names[i]);
         var tex = gl.createTexture();
         gl.bindTexture(gl.TEXTURE_2D, tex);
@@ -963,6 +984,14 @@ enum LiveShim {
       function vrDraw(force) {
         var gl = vr.gl;
         if (!gl) return;
+        var now = Date.now();
+        // 画面在眼镜里是跟着头一起动的，刷新率不产生流畅度，要紧的只有「新内容」；
+        // PC 流水线本来就 ~5fps 新帧，所以没到 15fps 那一档直接跳过这一帧不重画
+        // （preserveDrawingBuffer 留着上一次的画面）。省下的是每秒两遍全屏的 GPU，
+        // 手机这会儿还在同时抽帧、编码、发上行——那才是真瓶颈所在的另一颗核。
+        if (!force && now - vr.lastDraw < VR_DRAW_MS) return;
+        vr.lastDraw = now;
+        vr.draws++;
         var img = find('#video-stream') || document.getElementById('video-stream');
         if (!img) return;
         var dpr = Math.min(2, window.devicePixelRatio || 1);
@@ -972,12 +1001,7 @@ enum LiveShim {
           vr.canvas.width = cw; vr.canvas.height = ch;
         }
         var sw = img.naturalWidth || 16, sh = img.naturalHeight || 9;
-        var now = Date.now();
-        // 画面在眼镜里是跟着头一起动的，刷新率不产生流畅度，要紧的只有「新内容」；
-        // 而 PC 流水线本来就 ~5fps 新帧，所以纹理上传限 15fps，绘制仍跟着 rAF 走
-        // （每帧都画一次，免得 WebKit 在没重绘的帧上把 drawing buffer 亮出来）。
-        if ((force || now - vr.lastUp >= 66) && img.complete && img.naturalWidth > 0) {
-          vr.lastUp = now;
+        if (img.complete && img.naturalWidth > 0) {
           try { gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img); }
           catch (e) { return; }
         }
@@ -996,6 +1020,7 @@ enum LiveShim {
         gl.useProgram(vr.prog);
         gl.uniform2f(vr.u.uVP, cw, ch);
         gl.uniform1f(vr.u.uK, vr.fish * 2);
+        gl.uniform1f(vr.u.uZoom, vr.zoom);
         gl.uniform1i(vr.u.uTex, 0);
         gl.uniform1i(vr.u.uRot, lay.rot);
         // slot=-1 那一半是物理左眼（横屏=左半、竖屏=上半）：间距正号把它往物理左推=推远。
@@ -1032,14 +1057,27 @@ enum LiveShim {
         // 所以第二次进全屏只把同一个元素塞回文档。
         if (vr.canvas && !vr.canvas.parentNode) document.body.appendChild(vr.canvas);
         vr.running = true;
+        vr.startedAt = Date.now();
+        vr.draws = 0;
         vrDraw(true);
         vr.raf = requestAnimationFrame(vrTick);
+        // 进/出各记一行：perf 行是每 10 秒一条，没有这两个边界就分不出「开 VR 以前」
+        // 和「开 VR 以后」那两段往返谁高——这一次用户说卡，我就只能靠猜。
+        var lay = vrLayout();
+        send({ action: JSLOG, level: 'info', msg: 'VR 层开：'
+          + (lay.portrait ? '竖屏上下两半' : '横屏左右两半')
+          + '｜鱼眼' + vr.fish.toFixed(2) + '｜放大' + Math.round(vr.zoom * 100) + '%'
+          + '｜间距' + Math.round(vr.gap * 100) + '%｜移' + Math.round(vr.shift * 100) + '%'
+          + '｜朝向' + VR_ROT_NAME[vr.extra]
+          + '｜画布 ' + vr.canvas.width + '×' + vr.canvas.height });
       }
 
       function vrStop() {
         if (!vr.running) return;
         vr.running = false;
         if (vr.raf) { cancelAnimationFrame(vr.raf); vr.raf = 0; }
+        send({ action: JSLOG, level: 'info', msg: 'VR 层关：这次开了 '
+          + Math.round((Date.now() - vr.startedAt) / 100) / 10 + ' 秒、重画 ' + vr.draws + ' 帧' });
         // 退出全屏就把这层从文档里摘掉（元素留着，下次进全屏接着用）：
         // 挂着它，页面自己那张 img 会被压在下面看不见。
         if (vr.canvas && vr.canvas.parentNode) vr.canvas.parentNode.removeChild(vr.canvas);
@@ -1060,6 +1098,7 @@ enum LiveShim {
         row.innerHTML =
             '<span>VR</span>'
           + '<label>鱼眼<input type="range" id="vr-fish" min="0" max="1" step="0.01" value="' + vr.fish + '" style="width:96px"></label><span id="vr-fish-v"></span>'
+          + '<label>放大<input type="range" id="vr-zoom" min="1" max="2" step="0.05" value="' + vr.zoom + '" style="width:88px"></label><span id="vr-zoom-v"></span>'
           + '<label>间距<input type="range" id="vr-gap" min="-0.25" max="0.25" step="0.01" value="' + vr.gap + '" style="width:88px"></label><span id="vr-gap-v"></span>'
           + '<label>一起移<input type="range" id="vr-shift" min="-0.12" max="0.12" step="0.01" value="' + vr.shift + '" style="width:88px"></label><span id="vr-shift-v"></span>'
           + '<button type="button" id="vr-rot">朝向·' + VR_ROT_NAME[vr.extra] + '</button>';
@@ -1078,6 +1117,7 @@ enum LiveShim {
           });
         }
         bind('vr-fish', 'fish', function (v) { return Number(v).toFixed(2); });
+        bind('vr-zoom', 'zoom', function (v) { return (Number(v) * 100).toFixed(0) + '%'; });
         bind('vr-gap', 'gap', function (v) { return (Number(v) * 100).toFixed(0) + '%'; });
         bind('vr-shift', 'shift', function (v) { return (Number(v) * 100).toFixed(0) + '%'; });
         var rot = document.getElementById('vr-rot');
