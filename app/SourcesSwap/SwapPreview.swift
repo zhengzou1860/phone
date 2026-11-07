@@ -414,14 +414,13 @@ final class SwapPreview {
                                     + String(format: "%.0f", sd) + " px｜不是脸，先不认（要 "
                                     + String(format: "%.0f", idFloor) + " px）→ 不动")
                             } else if got.cos > -8 {
-                                // 短边够不到 identMinPx 的是糊的那一档：把第二名一起写出来，
-                                // 下一轮定 matchCosBlur／matchMargin 才有真值可用（0.44 那份是被 0.45 闸门切出来的，不算数）
+                                // 糊的那一档（短边够不到 identMinPx）把第二名一起写出来：判它的就是界面那道＋领先次近，
+                                // 印出来才有真值可核对（0.44 那份是被 0.45 闸门切出来的，环形论证不算数）
                                 say("预览 新轨迹 \(nextTrack - 1) 第 \(nDecode) 帧（\(String(format: "%.2f", sec)) s）短边 "
                                     + String(format: "%.0f", sd) + " px｜最近 \(got.best >= 0 ? cast[got.best].targetLabel : "—")"
                                     + " 余弦 \(String(format: "%.3f", got.cos))"
                                     + (sd < SwapCast.identMinPx
-                                       ? "｜次近 \(String(format: "%.3f", got.second))（糊档要 ≥"
-                                         + String(format: "%.2f", SwapCast.matchCosBlur) + " 且领先 "
+                                       ? "｜次近 \(String(format: "%.3f", got.second))（糊档还要领先 "
                                          + String(format: "%.2f", SwapCast.matchMargin) + "）" : "")
                                     + (member >= 0 ? " → 换成「\(cast[member].sourceLabel)」" : " → 目标表外、不动"))
                             }
@@ -647,11 +646,13 @@ final class SwapPreview {
             + "｜没脸 \(noFace)｜太小 \(smallFace)｜目标表外 \(unmatched)｜拟合没过 \(fitFail)"
             + "｜镜像 \(mirror)（真点位 \(mirrorReal)／框猜 \(mirrorGuess)）｜画不出 \(netFail)｜点位 \(pointSrc)")
         say("      多人镜头 见到 ≥2 张脸的格 \(nMultiDet)｜其中认到 ≥2 张 \(nMultiSwap)｜真只画上 1 张 \(nMultiHalf)")
-        say("      量身份用的门槛 \(String(format: "%.0f", max(SwapCast.identFloor(longEdge: c.longEdge), c.minFacePx))) px"
+        say("      认人用的：界面那道余弦闸门 \(String(format: "%.2f", SwapCast.matchCos))"
+            + "｜量身份的短边门槛 \(String(format: "%.0f", max(SwapCast.identFloor(longEdge: c.longEdge), c.minFacePx))) px"
             + "＝1920 档 \(String(format: "%.0f", SwapCast.identMinPx)) px 按进链 \(c.longEdge) 折算"
-            + "（\(String(format: "%.0f", SwapCast.identFloor(longEdge: c.longEdge)))）和太小线 \(String(format: "%.0f", c.minFacePx)) 取大者"
-            + "｜糊档（<\(String(format: "%.0f", SwapCast.identMinPx)) px）要 ≥\(String(format: "%.2f", SwapCast.matchCosBlur))"
-            + " 且领先次近 \(String(format: "%.2f", SwapCast.matchMargin))")
+            + "（\(String(format: "%.0f", SwapCast.identFloor(longEdge: c.longEdge)))）与太小线 "
+            + String(format: "%.0f", c.minFacePx) + " 取大者"
+            + "｜糊档（短边 <\(String(format: "%.0f", SwapCast.identMinPx)) px）另要领先次近 "
+            + String(format: "%.2f", SwapCast.matchMargin))
         say("      画面停住 超过 0.5 s 素材 \(gapN) 次｜最长 \(String(format: "%.2f", gapMax)) s"
             + "（每格都递；格距放稀到 0.4 s 是故意的，超过 0.5 s 才是真卡住）")
         say("      16 帧/秒这笔账 \(String(format: "%.2f", unit)) ms×\(String(format: "%.0f", c.fpsTarget))"

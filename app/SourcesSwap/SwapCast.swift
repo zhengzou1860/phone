@@ -24,7 +24,15 @@ enum SwapCast {
 
     /// 视频里的一张脸算不算这个目标：清晰的大脸同一人机上量到 0.72~0.86，不同人 −0.1~0.2。
     /// 但视频里的脸多半是小脸、侧脸、运动糊：同一人会掉到 0.5 上下，不同人偶尔也能冲到 0.5~0.6。
-    static let matchCos: Double = 0.55
+    /// 这一条现在由界面上那格「认人阈值」选（存下来，下次开还在）：往低调＝远一点、糊一点的脸也换得到，
+    /// 往高调＝只换有把握的那几张。没选过就用 0.55（0.45 起上机定下的那道）。
+    static let cosSteps: [Double] = [0.40, 0.45, 0.50, 0.55, 0.60]
+    static let cosKey = "swap.matchCosIdx"
+    static var matchCos: Double {
+        guard UserDefaults.standard.object(forKey: cosKey) != nil else { return 0.55 }
+        let i = UserDefaults.standard.integer(forKey: cosKey)
+        return cosSteps[min(max(i, 0), cosSteps.count - 1)]
+    }
 
     /// 清楚的线：短边够到它，112 裁片的上采样就不超过 1.75 倍。这条按进链帧上的像素算。
     static let identMinPx: Double = 64
@@ -35,15 +43,14 @@ enum SwapCast {
     /// 看着就成了「只换最大的」；而 0.44 的日志里这些短边还能认出人：目标 0.45~0.64／路人 ≤0.44。
     static func identFloor(longEdge: Int) -> Double { identMinPx * Double(longEdge) / 1920.0 }
 
-    /// 糊过一档（短边够不到 identMinPx）的余弦整段往上挤，目标掉到 0.5 上下、路人也能冲到 0.44，
-    /// 单看一个数分不清「真像」还是「糊上来的」⇒ 绝对值放到 matchCosBlur，另要领先第二名 matchMargin。
-    static let matchCosBlur: Double = 0.50
+    /// 糊过一档（短边够不到 identMinPx）的裁片是上采样糊出来的，整段余弦往上挤：目标掉到 0.5 上下、
+    /// 路人也能冲到 0.44。这一档不动界面那道数，只多要一道「领先第二名」——选了哪道就照哪道判。
     static let matchMargin: Double = 0.15
 
-    /// 这张脸的余弦算不算认出来了。清楚／糊两档分别按上面两条闸门。
+    /// 这张脸的余弦算不算认出来了：两档都用界面选的那道闸门，糊档另要领先第二名。
     static func accept(cos: Double, second: Double, shortSide: Double) -> Bool {
-        if shortSide >= identMinPx { return cos >= matchCos }
-        return cos >= matchCosBlur && cos - second >= matchMargin
+        guard cos >= matchCos else { return false }
+        return shortSide < identMinPx ? cos - second >= matchMargin : true
     }
 
     /// 注册用的那两张网挂在一条串行队列上：连着传三张目标照只装一次。
