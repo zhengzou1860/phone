@@ -25,14 +25,25 @@ enum SwapCast {
     /// 视频里的一张脸算不算这个目标：清晰的大脸同一人机上量到 0.72~0.86，不同人 −0.1~0.2。
     /// 但视频里的脸多半是小脸、侧脸、运动糊：同一人会掉到 0.5 上下，不同人偶尔也能冲到 0.5~0.6。
     /// 这一条由界面上那格「认人阈值」拖（存下来，下次开还在）：往低调＝远一点、糊一点的脸也换得到，
-    /// 往高调＝只换有把握的那几张。最低给到 0.10＝基本不看余弦，用来现场判「这张脸到底认不认得出」。
-    /// 没拖过就用 0.55（0.45 起上机定下的那道）。
-    static let cosMin: Double = 0.10
-    static let cosMax: Double = 0.60
+    /// 往高调＝只换有把握的那几张。
+    /// 上下限按 0.50 上机那几趟定：0.10、0.11 两档跑完没贴错人（余弦 0.972／0.127／0.501 都认对），
+    /// 而界面拖到 0.4 以上就开始漏——漏的还是短边 70 px 往上的清楚脸，不是小脸，
+    /// 所以 0.55 那道根本服务不了这片素材；上限压到 0.50，下限给到 0.02＝基本不看余弦，
+    /// 用来现场判「这张脸到底认不认得到」。
+    static let cosMin: Double = 0.02
+    static let cosMax: Double = 0.50
     static let cosKey = "swap.matchCos"
+    /// 没拖过就用最保守那一头（＝上限）：宁可少换，不可换错。
+    static let cosStart: Double = cosMax
     static var matchCos: Double {
-        guard let n = UserDefaults.standard.object(forKey: cosKey) as? NSNumber else { return 0.55 }
+        guard let n = UserDefaults.standard.object(forKey: cosKey) as? NSNumber else { return cosStart }
         return min(max(n.doubleValue, cosMin), cosMax)
+    }
+
+    /// 旧版本存下来的数可能落在新范围外（0.49/0.50 存过 0.55、0.60）：滑杆按那种值画会把把手顶到最右，
+    /// 而判定走夹过的数，界面和判决就对不上。开机器时夹一次，让两边读同一个数。
+    static func seatCosRange() {
+        UserDefaults.standard.set(matchCos, forKey: cosKey)
     }
 
     /// 清楚的线：短边够到它，112 裁片的上采样就不超过 1.75 倍。这条按进链帧上的像素算。

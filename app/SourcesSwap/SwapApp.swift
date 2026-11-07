@@ -9,6 +9,8 @@ struct SwapApp: App {
     @UIApplicationDelegateAdaptor(SwapAppDelegate.self) private var delegate
 
     init() {
+        // 先夹一次存着的阈值，再建界面：@AppStorage 是在这里之后才读的，晚一步滑杆就按旧数画把手。
+        SwapCast.seatCosRange()
         // AVFoundation 抛的是 Objective-C 异常，Swift 的 do/catch 抓不住，进程当场就没了，
         // 盘上只剩半截日志。这个钩子是唯一能在断气前把死因写进 swap_log.txt 的地方。
         NSSetUncaughtExceptionHandler { ex in
@@ -102,7 +104,7 @@ struct SwapContentView: View {
                                                      // ANE 只快 8 %，而它内部按 fp16 摆，赔多少精度等量速那一句「离 CPU 那一份几灰阶」说了再定。
     @State private var longIdx = 0                   // 默认 1920（长边上限）
     /// 认人阈值那一格：存进 UserDefaults（键在 SwapCast.cosKey），下次开 App 还在，整片和预览共用同一个数
-    @AppStorage(SwapCast.cosKey) private var matchCosVal = 0.55   // ＝0.45 起上机定下的那道
+    @AppStorage(SwapCast.cosKey) private var matchCosVal = SwapCast.cosStart   // ＝最保守那一头（上限 0.50）
     @State private var result = ""
     @State private var outURL: URL?
     /// 一按量四档算力：这一趟几十秒（每档重新装一次两张网），只在后台跑，最后一句留在界面上
@@ -250,9 +252,9 @@ struct SwapContentView: View {
                         }
                         .pickerStyle(.segmented)
                         .disabled(castLocked)
-                        // 这一格是「像到什么程度才算这个人」：素材里的小脸、侧脸、运动糊全挤在 0.4~0.6 那一小段，
-                        // 一个数服务不了所有片子，所以交给现场拖。拖到底＝0.10，等于基本不看余弦：先用它看清
-                        // 「这些脸到底认不认得到」，再往上找那道刚好不换错人的线。
+                        // 这一格是「像到什么程度才算这个人」：素材里的小脸、侧脸、运动糊全挤在 0.1~0.5 那一段，
+                        // 一个数服务不了所有片子，所以交给现场拖。拖到底＝0.02，等于基本不看余弦：先用它看清
+                        // 「这些脸到底认不认得到」，再往上找那道刚好不换错人的线（0.4 往上就开始漏清楚的大脸）。
                         HStack {
                             Text("认人阈值")
                             Slider(value: $matchCosVal, in: SwapCast.cosMin ... SwapCast.cosMax, step: 0.01)
