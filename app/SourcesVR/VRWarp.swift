@@ -251,7 +251,10 @@ final class VRDepthFeed {
     }
 }
 
-/// Metal 侧的一帧形变：4 个 pass（后向+清 z／前向占格／前向写色／合洞数洞）。
+/// Metal 侧的一帧形变：4 个 pass（清 z／前向占格／前向写色到 fbL、fbR／合洞数洞拼成片）。
+/// 写色落成每只眼的半幅而不是直接拼成片：填洞要读邻格的颜色，读「上一趟写完的」fbL/fbR 是干净的，
+/// 读「本趟正在拼」的成片就得靠一句「本趟写的格子永远不会被当成邻格读到」——那是跨线程的次序，
+/// 不好验也不好改，不值当。
 final class VRWarp {
     let eyeW: Int
     let eyeH: Int
@@ -346,10 +349,11 @@ final class VRWarp {
         let t1 = DispatchTime.now().uptimeNanoseconds
         let shared: [(Int, MTLBuffer)] = [(1, bestL), (2, bestR), (3, dnBuf)]
         let passes: [(String, [MTLTexture], [(Int, MTLBuffer)])] = [
-            ("kBack", [srcTex, fbL, fbR], shared),
+            ("kClear", [], shared),
             ("kSplatDepth", [], shared),
-            ("kSplatColor", [srcTex, dstTex], shared),
-            ("kCombine", [fbL, fbR, dstTex], shared + [(4, holesBuf)]),
+            ("kSplatColor", [srcTex, fbL, fbR], shared),
+            // 合洞那趟要读源帧：洞朝背景侧照抄不到时，它按视差就地回读一份当备胎（见 kCombine）
+            ("kCombine", [fbL, fbR, srcTex, dstTex], shared + [(4, holesBuf)]),
         ]
         for one in passes {
             guard let enc = VRTech.encode(one.0, textures: one.1, params: p,
