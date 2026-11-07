@@ -510,7 +510,7 @@ final class SwapPreview {
     private func audioSync(_ sec: Double) {
         guard let p = audio else { return }
         let d = p.currentTime - sec
-        if p.isPaused {
+        if !p.isPlaying {
             if d < 0.10 { p.play() }
         } else if d > 0.30 {
             p.pause()
