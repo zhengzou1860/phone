@@ -18,10 +18,11 @@ enum LiveConfig {
     /// 0.14 试过 800，实测不是带宽先崩：PC 挂 3 张目标脸只算到 3–8fps，手机上看到的就是卡。
     /// 0.19 起退回 640（实测 51–54KB/帧），让 PC 先跟上节奏；再要高清等 PC 那边算力跟上。
     /// 0.24 仍是 640：这一版只给 /video_feed 加重连闸，推流参数不动。
+    /// 0.25 仍是 640：全屏 VR 只在显示端弯像素，一帧像素都不多往 PC 发。
     static let fallbackMaxWidth = 640
 
-    static let appVersion = "0.24"
-    static let appBuild = "24"
+    static let appVersion = "0.25"
+    static let appBuild = "25"
 
     static let jpegQuality: CGFloat = 0.7
     static let pushFPS: Double = 15
@@ -742,7 +743,8 @@ enum LiveShim {
       document.addEventListener('click', function (ev) {
         if (!busyNow()) return;
         if (ev.target && ev.target.closest
-            && (ev.target.closest(LOG_SEL) || ev.target.closest(QD_SEL))) return;
+            && (ev.target.closest(LOG_SEL) || ev.target.closest(QD_SEL)
+                || ev.target.closest(VR_ROW))) return;
         var a = (ev.target && ev.target.closest) ? ev.target.closest('a') : null;
         // 下载不是命令：页面在 iOS 上把它改成 window.location.href 顶层导航，
         // 交给原生 WKDownload 接，不存在“等 PC 回话”这件事。
@@ -795,7 +797,7 @@ enum LiveShim {
         // 点在控件上不是“唤画面”：保持展开，只把自动收起往后推。
         if (t && t.closest) {
           if (t.closest('.controls.play-row') || t.closest('#live-seek-row')
-              || t.closest(LOG_SEL)) { fsShow(); return; }
+              || t.closest(LOG_SEL) || t.closest(VR_ROW)) { fsShow(); return; }
         }
         if (document.documentElement.classList.contains(FS_IDLE)) fsShow();
         else fsIdle(true);
@@ -805,8 +807,315 @@ enum LiveShim {
         if (!fsOn()) return;
         var t = ev.target;
         if (t && t.closest && (t.closest('.controls.play-row')
-            || t.closest('#live-seek-row') || t.closest(LOG_SEL))) fsShow();
+            || t.closest('#live-seek-row') || t.closest(LOG_SEL)
+            || t.closest(VR_ROW))) fsShow();
       }, true);
+
+      // —— 全屏 VR：鱼眼左右屏（只弯像素，不算深度）——
+      // 用户要的「点全屏就把手机塞进眼镜里看」：不换协议、不再多开一条下行长连接，
+      // 只把页面那一个 <img> 的当前帧当纹理，一帧画两遍到两半里，每半按 vr3d 那条
+      // kSbsFish 的原式预畸变一遍（屏幕这一格 v 读源图 u = v·(1 + k·v²)，半径按自家
+      // 半幅对角的一半归一，出界涂黑 ⇒ 整幅往中心挤、源图一个像素都不裁）。
+      // 深度那趟没进来：vr3d 实测 CPU 184ms/帧（VRApp.swift:203），推流时再占一颗核
+      // 只换来每秒几次跳变的立体感，而这一版用户明确要「最简单的鱼眼左右屏」。
+      var VR_ROW = '#live-vr-row';
+      var VR_LS = 'live.vr.';
+      var VR_ROT_NAME = ['正', '右转', '倒', '左转'];
+
+      function vrGet(key, dflt) {
+        try {
+          var v = localStorage.getItem(VR_LS + key);
+          return v === null ? dflt : Number(v);
+        } catch (e) { return dflt; }
+      }
+      function vrSet(key, val) {
+        try { localStorage.setItem(VR_LS + key, String(val)); } catch (e) {}
+      }
+
+      var vr = {
+        canvas: null, gl: null, prog: null, tex: null, u: {},
+        running: false, raf: 0, lastUp: 0, dead: false,
+        fish: vrGet('fish', 0.35),      // 界面强度 0~1，送进着色器翻倍成 k（和 vr3d 一样）
+        gap: vrGet('gap', 0),           // 两半互相推远/拉近，±25% 每眼物理宽
+        shift: vrGet('shift', 0),       // 两半一起挪，±12%，对镜片中心用
+        extra: vrGet('extra', 0),       // 再加几个 90°：眼镜塞手机的方向是硬件定的
+      };
+
+      var VR_VS = 'attribute vec2 aPos;'
+        + 'void main(){ gl_Position = vec4(aPos, 0.0, 1.0); }';
+
+      var VR_FS = [
+        // 坐标要拿到 2^14 以上才不吃得下整块屏幕（dpr 2 时竖屏就是 2000 多），
+        // 所以能上 highp 就上；老机器不给就用 mediump，误差 0.1 像素级，看不出来。
+        '#ifdef GL_FRAGMENT_PRECISION_HIGH',
+        'precision highp float;',
+        '#else',
+        'precision mediump float;',
+        '#endif',
+        'uniform vec4 uRect;',      // 这只眼在画布设备像素里的矩形：x, y(从顶量), w, h
+        'uniform vec2 uVP;',        // 画布设备像素尺寸
+        'uniform vec4 uImg;',       // 源图在那半幅里的 contain 位置：ox, oy, iw, ih
+        'uniform vec2 uOff;',       // 画面在这半幅里整体挪多少（已按视口折算到配对轴）
+        'uniform float uK;',        // 鱼眼强度 k
+        'uniform int uRot;',        // 内容再转几个 90°（0..3）
+        'uniform sampler2D uTex;',
+        'void main(){',
+        // gl_FragCoord 原点在左下，先换成「从这只眼矩形左上量」的局部坐标
+        '  float lx = gl_FragCoord.x - uRect.x;',
+        '  float ly = (uVP.y - gl_FragCoord.y) - uRect.y;',
+        '  float w = uRect.z, h = uRect.w;',
+        '  if (lx < 0.0 || lx >= w || ly < 0.0 || ly >= h) { discard; }',
+        '  float dx = lx - w * 0.5 + 0.5 - uOff.x;',
+        '  float dy = ly - h * 0.5 + 0.5 - uOff.y;',
+        '  float R = 0.5 * sqrt(w * w + h * h);',
+        '  float sc = 1.0 + uK * (dx * dx + dy * dy) / (R * R);',
+        '  float sx = dx * sc + w * 0.5;',
+        '  float sy = dy * sc + h * 0.5;',
+        '  if (sx < 0.0 || sx >= w || sy < 0.0 || sy >= h) { gl_FragColor = vec4(0.0,0.0,0.0,1.0); return; }',
+        '  float tx = (sx - uImg.x) / uImg.z;',
+        '  float ty = (sy - uImg.y) / uImg.w;',
+        '  if (tx < 0.0 || tx > 1.0 || ty < 0.0 || ty > 1.0) { gl_FragColor = vec4(0.0,0.0,0.0,1.0); return; }',
+        '  vec2 uv = vec2(tx, 1.0 - ty);',      // 纹理按 FLIP_Y 上传，翻回纹理的 v
+        '  if (uRot == 1) { uv = vec2(1.0 - uv.y, uv.x); }',
+        '  else if (uRot == 2) { uv = vec2(1.0 - uv.x, 1.0 - uv.y); }',
+        '  else if (uRot == 3) { uv = vec2(uv.y, 1.0 - uv.x); }',
+        '  gl_FragColor = texture2D(uTex, uv);',
+        '}'
+      ].join('\n');
+
+      function vrShader(gl, type, src) {
+        var s = gl.createShader(type);
+        gl.shaderSource(s, src);
+        gl.compileShader(s);
+        if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+          throw new Error(gl.getShaderInfoLog(s) || 'vr shader');
+        }
+        return s;
+      }
+
+      function vrBuild() {
+        var c = document.createElement('canvas');
+        c.id = 'live-vr-canvas';
+        // 夹在页面 #video-stream(9000) 和 .controls.play-row(9001) 之间：盖住原图、
+        // 又让底部那两行浮在画面上。pointer-events:none —— 画面上的点击要留给页面，
+        // 否则「点一下唤出控件」这套全屏规矩就被这层吞了。
+        c.setAttribute('style', 'position:fixed;top:0;left:0;right:0;bottom:0;'
+          + 'width:100%;height:100%;z-index:9000;margin:0;border:none;'
+          + 'background:#000;pointer-events:none;');
+        var gl = null;
+        try {
+          gl = c.getContext('webgl', { alpha: false, antialias: false,
+                                       premultipliedAlpha: false });
+        } catch (e) { gl = null; }
+        if (!gl) return false;
+        var p;
+        try {
+          p = gl.createProgram();
+          gl.attachShader(p, vrShader(gl, gl.VERTEX_SHADER, VR_VS));
+          gl.attachShader(p, vrShader(gl, gl.FRAGMENT_SHADER, VR_FS));
+          gl.linkProgram(p);
+          if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+            throw new Error(gl.getProgramInfoLog(p) || 'vr link');
+          }
+        } catch (e) {
+          send({ action: JSLOG, level: 'warn', msg: 'VR 着色器没编出来：' + String(e && e.message || e) });
+          return false;
+        }
+        gl.useProgram(p);
+        var buf = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+        // 一个盖满视口的三角形就够：省掉索引缓冲，越界那圈靠 discard 收
+        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+        var loc = gl.getAttribLocation(p, 'aPos');
+        gl.enableVertexAttribArray(loc);
+        gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+        var names = ['uRect', 'uVP', 'uImg', 'uOff', 'uK', 'uRot', 'uTex'];
+        for (var i = 0; i < names.length; i++) vr.u[names[i]] = gl.getUniformLocation(p, names[i]);
+        var tex = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, tex);
+        gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+        gl.clearColor(0, 0, 0, 1);
+        vr.canvas = c; vr.gl = gl; vr.prog = p; vr.tex = tex;
+        document.body.appendChild(c);
+        return true;
+      }
+
+      // 竖屏视口 ⇒ 两半上下摞（手机横过来塞进眼镜就是左右两眼），内容必须再转 90°；
+      // 横屏视口 ⇒ 直接左右两半。配对轴跟着视口换，百分比的基准都按「物理每眼宽」算。
+      function vrLayout() {
+        var vw = window.innerWidth, vh = window.innerHeight;
+        var portrait = vh > vw;
+        // 竖屏时上半就是物理左眼：内容基准转 90°（顶边朝左手那边），朝向那挡再往上叠
+        var base = portrait ? 1 : 0;
+        return {
+          portrait: portrait, vw: vw, vh: vh,
+          eyeW: portrait ? vw : vw / 2,
+          eyeH: portrait ? vh / 2 : vh,
+          axis: portrait ? 'y' : 'x',
+          rot: (base + vr.extra) % 4
+        };
+      }
+
+      function vrDraw(force) {
+        var gl = vr.gl;
+        if (!gl) return;
+        var img = find('#video-stream') || document.getElementById('video-stream');
+        if (!img) return;
+        var dpr = Math.min(2, window.devicePixelRatio || 1);
+        var lay = vrLayout();
+        var cw = Math.round(lay.vw * dpr), ch = Math.round(lay.vh * dpr);
+        if (vr.canvas.width !== cw || vr.canvas.height !== ch) {
+          vr.canvas.width = cw; vr.canvas.height = ch;
+        }
+        var sw = img.naturalWidth || 16, sh = img.naturalHeight || 9;
+        var now = Date.now();
+        // 画面在眼镜里是跟着头一起动的，刷新率不产生流畅度，要紧的只有「新内容」；
+        // 而 PC 流水线本来就 ~5fps 新帧，所以纹理上传限 15fps，绘制仍跟着 rAF 走
+        // （每帧都画一次，免得 WebKit 在没重绘的帧上把 drawing buffer 亮出来）。
+        if ((force || now - vr.lastUp >= 66) && img.complete && img.naturalWidth > 0) {
+          vr.lastUp = now;
+          try { gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img); }
+          catch (e) { return; }
+        }
+        var ewD = lay.eyeW * dpr, ehD = lay.eyeH * dpr;
+        // 源图在那半幅里等比 contain（跟页面 #video-stream 的 object-fit:contain 同规矩）；
+        // 内容转了 90° 的奇数倍时宽高比互换
+        var odd = (lay.rot % 2) === 1;
+        var ar = (odd ? sh / sw : sw / sh);
+        var iw = ewD, ih = ewD / ar;
+        if (ih > ehD) { ih = ehD; iw = ehD * ar; }
+        var ox = (ewD - iw) / 2, oy = (ehD - ih) / 2;
+        var span = lay.axis === 'y' ? ehD : ewD;
+        var shiftPx = vr.shift * span, gapPx = vr.gap * span;
+
+        gl.viewport(0, 0, cw, ch);
+        gl.useProgram(vr.prog);
+        gl.uniform2f(vr.u.uVP, cw, ch);
+        gl.uniform1f(vr.u.uK, vr.fish * 2);
+        gl.uniform1i(vr.u.uTex, 0);
+        gl.uniform1i(vr.u.uRot, lay.rot);
+        // slot=-1 那一半是物理左眼（横屏=左半、竖屏=上半）：间距正号把它往物理左推=推远。
+        // 竖屏里 rect 向下就是物理向右，所以两根轴上符号约定是同一套
+        var eyes = lay.portrait
+          ? [{ x: 0, y: 0, slot: -1 }, { x: 0, y: lay.eyeH, slot: 1 }]
+          : [{ x: 0, y: 0, slot: -1 }, { x: lay.eyeW, y: 0, slot: 1 }];
+        gl.clear(gl.COLOR_BUFFER_BIT);
+        for (var i = 0; i < 2; i++) {
+          var e = eyes[i];
+          var offPair = shiftPx + e.slot * gapPx;
+          gl.uniform4f(vr.u.uRect, e.x * dpr, e.y * dpr, ewD, ehD);
+          gl.uniform4f(vr.u.uImg, ox, oy, iw, ih);
+          gl.uniform2f(vr.u.uOff, lay.axis === 'y' ? 0 : offPair,
+                                   lay.axis === 'y' ? offPair : 0);
+          gl.drawArrays(gl.TRIANGLES, 0, 3);
+        }
+      }
+
+      function vrTick() {
+        if (!vr.running) return;
+        vrDraw(false);
+        vr.raf = requestAnimationFrame(vrTick);
+      }
+
+      function vrStart() {
+        if (vr.running || vr.dead) return;
+        if (!vr.gl && !vrBuild()) {
+          vr.dead = true;   // 这台 WebView 没给 WebGL：整层放弃，画面就退回页面原来那张 img
+          send({ action: JSLOG, level: 'warn', msg: 'VR 层起不来（拿不到 WebGL）：全屏退回普通画面' });
+          return;
+        }
+        // 上下文是挂在 canvas 这个元素上的，摘掉元素再新建就得重编一遍着色器；
+        // 所以第二次进全屏只把同一个元素塞回文档。
+        if (vr.canvas && !vr.canvas.parentNode) document.body.appendChild(vr.canvas);
+        vr.running = true;
+        vrDraw(true);
+        vr.raf = requestAnimationFrame(vrTick);
+      }
+
+      function vrStop() {
+        if (!vr.running) return;
+        vr.running = false;
+        if (vr.raf) { cancelAnimationFrame(vr.raf); vr.raf = 0; }
+        // 退出全屏就把这层从文档里摘掉（元素留着，下次进全屏接着用）：
+        // 挂着它，页面自己那张 img 会被压在下面看不见。
+        if (vr.canvas && vr.canvas.parentNode) vr.canvas.parentNode.removeChild(vr.canvas);
+      }
+
+      // —— VR 参数那一行 ——
+      // 只在全屏里出现，跟播放行同一套「点画面才出来、4 秒自己收起」；戴进眼镜前对好参数，
+      // 戴上以后它自己收走。忙闸会把这些 input 一起打灰，所以整行豁免（和页面 #thr-bar 同一条口子）。
+      function vrAddRow() {
+        if (find(VR_ROW) || !document.body) return;
+        var row = document.createElement('div');
+        row.id = 'live-vr-row';
+        row.className = 'controls';
+        row.setAttribute('style', 'position:fixed;top:0;left:0;right:0;z-index:9002;'
+          + 'margin:0;padding:6px calc(12px + env(safe-area-inset-right)) 6px calc(12px + env(safe-area-inset-left));'
+          + 'gap:8px;align-items:center;flex-wrap:wrap;background:rgba(0,0,0,.55);'
+          + 'color:#eee;font-size:12px;visibility:hidden;');
+        row.innerHTML =
+            '<span>VR</span>'
+          + '<label>鱼眼<input type="range" id="vr-fish" min="0" max="1" step="0.01" value="' + vr.fish + '" style="width:96px"></label><span id="vr-fish-v"></span>'
+          + '<label>间距<input type="range" id="vr-gap" min="-0.25" max="0.25" step="0.01" value="' + vr.gap + '" style="width:88px"></label><span id="vr-gap-v"></span>'
+          + '<label>一起移<input type="range" id="vr-shift" min="-0.12" max="0.12" step="0.01" value="' + vr.shift + '" style="width:88px"></label><span id="vr-shift-v"></span>'
+          + '<button type="button" id="vr-rot">朝向·' + VR_ROT_NAME[vr.extra] + '</button>';
+        document.body.appendChild(row);
+        function bind(id, key, fmt) {
+          var el = document.getElementById(id);
+          var lab = document.getElementById(id + '-v');
+          var paint = function () { if (lab) lab.textContent = fmt(el.value); };
+          paint();
+          el.addEventListener('input', paint);
+          el.addEventListener('change', function () {
+            vr[key] = Number(el.value);
+            vrSet(key, vr[key]);
+            paint();
+            if (vr.running) vrDraw(true);
+          });
+        }
+        bind('vr-fish', 'fish', function (v) { return Number(v).toFixed(2); });
+        bind('vr-gap', 'gap', function (v) { return (Number(v) * 100).toFixed(0) + '%'; });
+        bind('vr-shift', 'shift', function (v) { return (Number(v) * 100).toFixed(0) + '%'; });
+        var rot = document.getElementById('vr-rot');
+        if (rot) rot.addEventListener('click', function (ev) {
+          ev.preventDefault();
+          ev.stopPropagation();
+          vr.extra = (vr.extra + 1) % 4;
+          vrSet('extra', vr.extra);
+          rot.textContent = '朝向·' + VR_ROT_NAME[vr.extra];
+          if (vr.running) vrDraw(true);
+        }, true);
+      }
+
+      // 参数那一行跟着收起态走：进全屏先收着，点画面才和播放行一起出来。
+      // 平时（非全屏）整行 display:none —— 它是 fixed 在顶上的，不挡住普通页面才怪。
+      function vrSetOn(on) {
+        if (on) { vrStart(); vrAddRow(); } else { vrStop(); }
+      }
+
+      // 页面全屏把 body 下所有东西都 visibility:hidden，只点名放行 img 和底部两行；
+      // 注入层不在它的名单里，必须自己顶回来（用 !important，压的直接是它那条声明）。
+      // 忙闸那条 html.pc-busy input 会把参数行打灰，这里连着豁免——它不跟 PC 说话。
+      (function addVrStyle() {
+        try {
+          var st = document.createElement('style');
+          st.id = 'live-vr-style';
+          st.textContent =
+            '#live-vr-row{display:none;}'
+            + 'html.fs #live-vr-canvas{visibility:visible !important;}'
+            + 'html.fs #live-vr-row{visibility:visible !important;display:flex !important;}'
+            + 'html.fs #live-vr-row *{visibility:visible !important;}'
+            + 'html.fs.live-fs-idle #live-vr-row,'
+            + 'html.fs.live-fs-idle #live-vr-row *{visibility:hidden !important;}'
+            + 'html.pc-busy #live-vr-row,html.pc-busy #live-vr-row *'
+            + '{pointer-events:auto !important;opacity:1 !important;}';
+          (document.head || document.documentElement).appendChild(st);
+        } catch (e) {}
+      })();
 
       // —— 页面侧日志 ——
       // 1) 命令回话：非轮询 fetch 的路径/状态码/耗时/响应体前一段。
@@ -1087,6 +1396,7 @@ enum LiveShim {
       // 全屏只靠 <html class="fs"> 表达；页面不会额外调原生，这里盯 class 变化再上报。
       // 原生只拿它来藏/恢复状态栏，不参与画面布局。
       // 进全屏先把控件收起来（点画面才出来）；退出去时把收起态和定时器一起还原。
+      // VR 层跟着这一个开关走：用户要的就是「点全屏 = 塞进眼镜看」，不另设入口。
       var lastFs = null;
       function noteFullscreen() {
         var on = false;
@@ -1097,6 +1407,9 @@ enum LiveShim {
         else {
           clearTimeout(fsHideTimer);
           fsIdle(false);
+        }
+        try { vrSetOn(on); } catch (e) {
+          send({ action: JSLOG, level: 'warn', msg: 'VR 层没起来：' + String(e && e.message || e) });
         }
         send({ action: FS, on: on });
       }

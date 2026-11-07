@@ -226,6 +226,54 @@ ck("脚本 拖进度条不收起", shim.contains("addEventListener('input'")
 ck("脚本 退出全屏还原控件", shim.contains("clearTimeout(fsHideTimer)")
    && shim.contains("fsIdle(false)") && shim.contains("html.fs.live-fs-idle #live-log-btn"))
 
+// 0.25：全屏 = VR 鱼眼左右屏。只弯显示，不动协议、不动推流，所以这一组检查全在
+// 「有没有偷偷多开一条流 / 有没有把页面的点击吃掉」这类越界动作上。
+let vrFrom = shim.range(of: "// —— 全屏 VR")
+let vrTo = shim.range(of: "// —— 页面侧日志")
+let vrBlock = (vrFrom != nil && vrTo != nil && vrFrom!.upperBound < vrTo!.lowerBound)
+    ? String(shim[vrFrom!.lowerBound..<vrTo!.lowerBound]) : ""
+ck("VR 段找得到", vrBlock.count > 2000, vrBlock.isEmpty ? "整段没截到" : "只截到 \(vrBlock.count) 字")
+ck("VR 不发任何请求", !vrBlock.contains("fetch(") && !vrBlock.contains("XMLHttpRequest")
+   && !vrBlock.contains("video_feed"),
+   "多开一条 /video_feed 就是把 0.24 刚修好的连接额度泄漏再犯一遍")
+ck("VR 跟着全屏开关", shim.contains("try { vrSetOn(on); }")
+   && vrBlock.contains("function vrStart()") && vrBlock.contains("function vrStop()"),
+   "用户要的就是「点全屏 = 塞进眼镜」，不另设入口")
+ck("VR 光学照 vr3d 原式", vrBlock.contains("float R = 0.5 * sqrt(w * w + h * h);")
+   && vrBlock.contains("float sc = 1.0 + uK * (dx * dx + dy * dy) / (R * R);")
+   && vrBlock.contains("gl.uniform1f(vr.u.uK, vr.fish * 2)"),
+   "半径按自家半幅对角的一半归一、强度翻倍成 k，都和 Shaders.metal 的 kSbsFish 一致")
+ck("VR 出界涂黑不裁图", vrBlock.contains("if (sx < 0.0 || sx >= w || sy < 0.0 || sy >= h)")
+   && vrBlock.contains("if (tx < 0.0 || tx > 1.0 || ty < 0.0 || ty > 1.0)"),
+   "黑只落在画框外那一圈：源图一个像素都不丢，这是 vr3d 那边「遮画框方向反了」的教训")
+ck("VR 一帧画两遍两半", vrBlock.contains("for (var i = 0; i < 2; i++)")
+   && vrBlock.contains("slot: -1") && vrBlock.contains("slot: 1"),
+   "两半各装整幅；间距按 slot 反号才是互相推远")
+ck("VR 竖屏换上下两半并转 90", vrBlock.contains("var base = portrait ? 1 : 0;")
+   && vrBlock.contains("rot: (base + vr.extra) % 4"),
+   "竖屏视口里 rect 向下就是物理向右，两半得上下摞、内容再转 90°")
+ck("VR 不吞画面上的点击", vrBlock.contains("background:#000;pointer-events:none;"),
+   "canvas 盖住整屏，点了还要能唤出控件")
+ck("VR 层压得住页面全屏", vrBlock.contains("html.fs #live-vr-canvas")
+   && vrBlock.contains("visibility:visible !important")
+   && vrBlock.contains("'#live-vr-row{display:none;}'"),
+   "页面全屏把 body 下所有东西 visibility:hidden，注入元素不在它名单里；非全屏时那一行不许挡普通页面")
+ck("VR 参数行不被忙闸打灰", vrBlock.contains("html.pc-busy #live-vr-row")
+   && vrBlock.contains("pointer-events:auto !important"),
+   "忙闸那条 html.pc-busy input 会把滑杆灰掉，和页面 #thr-bar 是同一条口子")
+ck("VR 参数存本地", vrBlock.contains("var VR_LS = 'live.vr.';")
+   && vrBlock.contains("localStorage.getItem(VR_LS + key)"),
+   "镜片间距是硬件，一次对好就一直用")
+ck("VR 没 WebGL 就退回原画面", vrBlock.contains("vr.dead = true;")
+   && vrBlock.contains("if (vr.running || vr.dead) return;"),
+   "起不来时页面那张 img 本来就在，不能把画面整个弄没")
+ck("VR 二次进全屏接着用同一块画布",
+   vrBlock.contains("if (vr.canvas && !vr.canvas.parentNode) document.body.appendChild(vr.canvas);")
+   && !vrBlock.contains("vr.canvas = null;"),
+   "上下文长在元素上：摘了元素又把手上的引用置空，第二次进全屏就在 vr.canvas.width 上炸")
+ck("VR 纹理上传限 15fps", vrBlock.contains("now - vr.lastUp >= 66"),
+   "画面在眼镜里跟着头一起动，刷新率不产生流畅度；每帧重传纹理只是白烧 GPU")
+
 // 停止握手：点停止到 PC 确认之间，按钮和特征下拉框必须一直锁着；
 // /live_stop 没送到就停在 failed，不许假装停了——那正是用户撞 409 的那条路。
 ck("停止 按下即锁", LiveStopGate.stopping.blocksPlay && LiveStopGate.stopping.holdsEditingLock)
@@ -321,10 +369,10 @@ ck("账目 未知源不标", LivePerf.sourceLabel(0).isEmpty)
 
 ck("契约 在途上限3", LiveConfig.inflightLimit == 3)
 ck("契约 推送15fps", LiveConfig.pushFPS == 15.0)
-// 0.24 仍是 640：这一版只给 /video_feed 加重连闸，推流参数不动。
+// 0.25 仍是 640：全屏 VR 只在显示端弯像素，推流参数不动。
 ck("契约 请求宽640", LiveConfig.fallbackMaxWidth == 640)
-ck("契约 UA带版本", LiveConfig.userAgentSuffix == "LiveSwap/0.24"
-   && LiveConfig.appVersion == "0.24" && LiveConfig.appBuild == "24")
+ck("契约 UA带版本", LiveConfig.userAgentSuffix == "LiveSwap/0.25"
+   && LiveConfig.appVersion == "0.25" && LiveConfig.appBuild == "25")
 // 页面在推流中改特征时发的动作：是命令，不是按钮挂子，所以不进 actionNames
 //（就绪对账只该对页面里那三个按钮）。
 ck("契约 改特征先停动作", LiveShim.hookStopForEdit == "stopedit"
