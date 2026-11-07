@@ -22,7 +22,7 @@ enum LiveConfig {
     /// 0.26 仍是 640：加放大、降重画频率，全在手机上，跟 PC 说的话一条没多。
     /// 0.27 仍是 640：这一版只擦两笔旧账（红字不跟着新一轮挂、节流按 key 各记各的），
     /// 上行一个字节没动。
-    /// 0.28 仍是 640：动的是「同时几条在途」，一帧的字节数一个字节没变。
+    /// 0.28 仍是 640：改的是「同时几条在途」和「开头那 1.2 秒发几条」，一帧的字节数一个字节没动。
     static let fallbackMaxWidth = 640
 
     static let appVersion = "0.28"
@@ -30,6 +30,13 @@ enum LiveConfig {
 
     static let jpegQuality: CGFloat = 0.7
     static let pushFPS: Double = 15
+
+    /// 起播缓发：头 rampFrames 帧的间隔拉长 rampDivisor 倍，之后回到全速。
+    /// 用户要的就是这一条（「开始播时稍微延迟开始，播放中保持连续」），它也不是凭空来的——
+    /// PC 冷启动那一秒入口队列会一次性丢一大批帧，手机照样 15fps 往上砸：那批帧白占了上行，
+    /// 开头那几秒就一顿一顿。抽掉的帧由 PTS 对齐兜着，不会欠成越滚越长的延迟。
+    static let rampFrames = 6
+    static let rampDivisor = 3
 
     /// 在途帧窗口的起点。PC 明确要求保持 2–3 帧在途：一帧等一个往返会被单次 RTT 限死节奏
     /// （它第一版测试就是这么只跑到 10fps）。满了丢最旧，绝不排队。
@@ -352,6 +359,12 @@ enum LivePace {
         guard ptsSeconds.isFinite, interval > 0 else { return (false, nextEmitSeconds) }
         if let ne = nextEmitSeconds, ptsSeconds < ne { return (false, ne) }
         return (true, ptsSeconds + interval)
+    }
+
+    /// 起播那一段把间隔拉长，之后回到全速（LiveConfig.rampFrames/rampDivisor）。
+    /// 数的是已经发出去的帧数、不是墙钟：跳转和重建 reader 都从头计，所以那两处也一起缓。
+    static func interval(full: Double, emitted: Int) -> Double {
+        emitted < LiveConfig.rampFrames ? full * Double(LiveConfig.rampDivisor) : full
     }
 }
 

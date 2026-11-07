@@ -300,6 +300,7 @@ final class VideoFrameSource {
             var originWall: TimeInterval = 0
             var originPTS: CMTime?
             var nextEmit: Double?
+            var emitted = 0
             while self.isCurrent(gen), r.status == .reading,
                   let sb = out.copyNextSampleBuffer() {
                 // copyNextSampleBuffer 可能刚跨过一次 stop：先认代数，旧帧一律不发。
@@ -308,7 +309,9 @@ final class VideoFrameSource {
                 guard pts.isValid else { continue }
                 let sec = CMTimeGetSeconds(pts)
                 // 间隔每圈现取：跳转后重建 reader 时配置可能刚改过，用旧值会多推/少推。
-                let interval = 1.0 / max(1.0, self.pushFPS)
+                // 头 6 帧按 1/3 速走（0.28 起播缓发）：PC 冷启动那一秒正被入口队列丢帧顶着。
+                let interval = LivePace.interval(full: 1.0 / max(1.0, self.pushFPS),
+                                                 emitted: emitted)
                 let pace = LivePace.decide(ptsSeconds: sec, nextEmitSeconds: nextEmit,
                                            interval: interval)
                 guard pace.emit else { continue }
@@ -335,6 +338,12 @@ final class VideoFrameSource {
                     originPTS = pts
                 }
                 self.onJPEG?(jpeg)
+                if emitted == LiveConfig.rampFrames {
+                    AppLog.shared.log("frame", "起播缓发结束：前 \(LiveConfig.rampFrames) 帧按 "
+                                      + String(format: "%.0f", self.pushFPS / Double(LiveConfig.rampDivisor))
+                                      + "fps，之后回 " + String(format: "%.0f", self.pushFPS) + "fps")
+                }
+                emitted += 1
                 guard self.isCurrent(gen) else { break }
                 self.setPTS(pts)
 

@@ -434,6 +434,19 @@ let perfWindow = LivePerf.line(sourceFPS: 24, encodeMs: 9, gapMs: 0,
                                rttAvgMs: 425, rttMaxMs: 900, inflightMax: 6)
 ck("账目 放开写在途格数", perfWindow.contains("在途≤6"), perfWindow)
 
+// 0.28 起播缓发：这是用户直接要的那条（「开始播时稍微延迟开始，播放中保持连续」）。
+// 它不是保守——PC 冷启动那一秒入口队列正一次性丢一大批帧，手机那 18 帧全撞在闸上。
+ck("缓发 头几帧按三分之一速", LivePace.interval(full: 1.0 / 15.0, emitted: 0) == 3.0 / 15.0
+   && LivePace.interval(full: 1.0 / 15.0, emitted: LiveConfig.rampFrames - 1) == 3.0 / 15.0,
+   "6 帧 × 0.2 秒 = 1.2 秒，正好盖住 PC 那一段预热")
+ck("缓发 到点自己回全速", LivePace.interval(full: 1.0 / 15.0, emitted: LiveConfig.rampFrames) == 1.0 / 15.0
+   && LivePace.interval(full: 1.0 / 15.0, emitted: 999) == 1.0 / 15.0,
+   "只顶开头那几帧；一直缓下去就是每小时少发两万帧，用户要的「播放中保持连续」反倒没了")
+ck("缓发 不改抽帧判据", LivePace.decide(ptsSeconds: 0.2, nextEmitSeconds: 0.2,
+                                         interval: 3.0 / 15.0).emit
+   && !LivePace.decide(ptsSeconds: 0.167, nextEmitSeconds: 0.2, interval: 3.0 / 15.0).emit,
+   "缓发只把间隔拉长，抽帧还是同一套 PTS 比较——两处一起改就没人说得清开头那几帧是谁丢的")
+
 // MARK: - 和 PC 契约绑死的几个数
 
 ck("契约 在途上限3", LiveConfig.inflightLimit == 3)
