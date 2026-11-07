@@ -217,7 +217,9 @@ enum SwapClip {
             }
             say("目标表 \(i + 1)/\(members.count)：\(m.targetLabel) → 替换「\(m.sourceLabel)」"
                 + "｜认得脸用的余弦闸门 \(String(format: "%.2f", SwapCast.matchCos))"
-                + "，短边 < \(String(format: "%.0f", SwapCast.identMinPx)) px 的脸不量身份"
+                + "，短边 < \(String(format: "%.0f", max(SwapCast.identFloor(longEdge: args.longEdge), args.minFacePx))) px 的不量身份"
+                + "（进链 \(args.longEdge) 折算；糊过 112 那一档的还要领先次近 "
+                + String(format: "%.2f", SwapCast.matchMargin) + "）"
                 + "｜足迹 \(SwapFacts.footprintMB()) MB")
         }
 
@@ -283,6 +285,8 @@ enum SwapClip {
         var nextTrack = 0
         var trackLog: [String] = []
         var preDecodeMs: [Double] = [], preDetectMs: [Double] = []
+        // 量身份的门槛：跟着进链折算（出片 1920 ⇒ 64 px），再和太小线取大者；长边调小它跟着缩
+        let floorPx = max(SwapCast.identFloor(longEdge: args.longEdge), args.minFacePx)
         let pre0 = DispatchTime.now().uptimeNanoseconds
         // 从这一帧的像素缓冲裁 112、过向量网，和目标表比一次余弦。两条路用它：预检的新轨迹、预检失败时的现检。
         func identify(_ pb: CVPixelBuffer, w: Int, h: Int, pts: [CGPoint], src: String, side: Double)
@@ -300,7 +304,8 @@ enum SwapClip {
             let e = engine.embedding(crop112_01: crop)
             guard !e.emb.isEmpty else { return (-1, -1, -9, "向量网没回话：\(e.note)") }
             let m = SwapCast.nearest(e.emb, members: members)
-            return (m.cos >= SwapCast.matchCos ? m.index : -1, m.index, m.cos, e.note)
+            return (SwapCast.accept(cos: m.cos, second: m.second, shortSide: side) ? m.index : -1,
+                    m.index, m.cos, e.note)
         }
         func iou(_ a: CGRect, _ b: CGRect) -> Double {
             let x0 = max(a.minX, b.minX), y0 = max(a.minY, b.minY)
@@ -375,8 +380,8 @@ enum SwapClip {
                             t.lastBox = box
                             t.lastFrame = frame
                             // 轨迹开头那一帧可能是运动糊的：在机上再采一次身份，余弦更高的那次说了算。
-                            // 脸太小时不采（上采样出来的余弦不算数），等它长到 identMinPx 再采。
-                            if t.samples < 2, frame >= t.sampleAt, side >= SwapCast.identMinPx {
+                            // 脸太小时不采（上采样出来的余弦不算数），等它长到 floorPx 再采。
+                            if t.samples < 2, frame >= t.sampleAt, side >= floorPx {
                                 let got = identify(pb, w: pw, h: ph, pts: pp, src: pn, side: side)
                                 if got.member >= 0, got.cos > t.cos {
                                     let prev = t.cos
@@ -397,11 +402,11 @@ enum SwapClip {
                         } else {
                             let id = nextTrack
                             nextTrack += 1
-                            // 小脸上的身份证全是上采样噪声：这一帧不认，轨迹先留着，等脸够大再采
-                            let canId = side >= SwapCast.identMinPx
+                            // 够不上 floorPx 的不算脸：这一帧不认，轨迹先留着，等它长到门槛再采
+                            let canId = side >= floorPx
                             let got = canId
                                 ? identify(pb, w: pw, h: ph, pts: pp, src: pn, side: side)
-                                : (member: -1, best: -1, cos: -9.0, note: "脸太小")
+                                : (member: -1, best: -1, cos: -9.0, note: "不是脸")
                             let member = got.member
                             let t = LiveTrack(id: id, member: member, cos: got.cos, lastBox: box,
                                               lastFrame: frame, samples: canId ? 1 : 0,
@@ -411,8 +416,8 @@ enum SwapClip {
                             if trackLog.count < 40 {
                                 let near: String
                                 if !canId {
-                                    near = "脸太小，先不认（要 "
-                                        + String(format: "%.0f", SwapCast.identMinPx) + " px）"
+                                    near = "不是脸，先不认（要 "
+                                        + String(format: "%.0f", floorPx) + " px）"
                                 } else if got.cos > -8 {
                                     near = got.best >= 0
                                         ? "最近 \(members[got.best].targetLabel) 余弦 \(String(format: "%.3f", got.cos))"
@@ -708,10 +713,10 @@ enum SwapClip {
                         if side1 < 12 { continue }
                         let (p, n) = SwapVision.sendPoints(face: obs1, w: w, h: h)
                         guard p.count == 5 else { continue }
-                        // 现检这条路也一样：小脸不量身份（上采样余弦会把路人认成目标）
-                        let got = side1 >= SwapCast.identMinPx
+                        // 现检这条路也一样：够不上 floorPx 的不量身份
+                        let got = side1 >= floorPx
                             ? identify(dst, w: w, h: h, pts: p, src: n, side: side1)
-                            : (member: -1, best: -1, cos: -9.0, note: "脸太小")
+                            : (member: -1, best: -1, cos: -9.0, note: "不是脸")
                         faces.append(PreFace(pts: p, side: side1, src: n, box: box,
                                              track: -1, member: got.member))
                     }
@@ -721,12 +726,13 @@ enum SwapClip {
                 var did = false
                 var frameFaces = 0
                 for (fi, ff) in faces.enumerated() {
-                    if ff.member < 0 {
-                        unmatched += 1
-                        continue
-                    }
+                    // 两笔账分开：太小＝补丁贴出来也没用；表外＝量过、跟目标表都不像
                     if ff.side < args.minFacePx {
                         smallFace += 1
+                        continue
+                    }
+                    if ff.member < 0 {
+                        unmatched += 1
                         continue
                     }
                     guard ff.pts.count == 5, let pl = FsxGeo.place(pts: ff.pts, src: ff.src, shortSide: ff.side)

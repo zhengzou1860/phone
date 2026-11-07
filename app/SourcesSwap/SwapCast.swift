@@ -24,13 +24,27 @@ enum SwapCast {
 
     /// 视频里的一张脸算不算这个目标：清晰的大脸同一人机上量到 0.72~0.86，不同人 −0.1~0.2。
     /// 但视频里的脸多半是小脸、侧脸、运动糊：同一人会掉到 0.5 上下，不同人偶尔也能冲到 0.5~0.6。
-    /// 上机 11-05 那一趟就是 0.45 的闸门把 36~57 px 的路人认成了目标（日志里 0.452~0.573 一片）。
-    /// 所以抬到 0.55，并且短边不到 identMinPx 的脸根本不量身份——宁可不换，也不换错人。
     static let matchCos: Double = 0.55
 
-    /// 量身份用的最小短边（进链 640 小窗上的像素）。比这更小的脸，112 裁片全是上采样，
-    /// 余弦跟谁都能到 0.5 上下，量了只会骗自己；小脸靠已经定下人的那条轨迹沿用。
+    /// 清楚的线：短边够到它，112 裁片的上采样就不超过 1.75 倍。这条按进链帧上的像素算。
     static let identMinPx: Double = 64
+
+    /// 够得着这条线的脸才量身份，而且这条要跟着进链窗口折算——出片 1920 ⇒ 64 px（＝上面那条本身），
+    /// 预览小窗只有 640，同一个人到这一格里像素少 3 倍，门槛不跟着缩就永远够不着。
+    /// 0.45 起那道写死的 64 px 就是这么把多人镜头里除最近那张全挡在门外（短边 36~63 px 根本不量身份），
+    /// 看着就成了「只换最大的」；而 0.44 的日志里这些短边还能认出人：目标 0.45~0.64／路人 ≤0.44。
+    static func identFloor(longEdge: Int) -> Double { identMinPx * Double(longEdge) / 1920.0 }
+
+    /// 糊过一档（短边够不到 identMinPx）的余弦整段往上挤，目标掉到 0.5 上下、路人也能冲到 0.44，
+    /// 单看一个数分不清「真像」还是「糊上来的」⇒ 绝对值放到 matchCosBlur，另要领先第二名 matchMargin。
+    static let matchCosBlur: Double = 0.50
+    static let matchMargin: Double = 0.15
+
+    /// 这张脸的余弦算不算认出来了。清楚／糊两档分别按上面两条闸门。
+    static func accept(cos: Double, second: Double, shortSide: Double) -> Bool {
+        if shortSide >= identMinPx { return cos >= matchCos }
+        return cos >= matchCosBlur && cos - second >= matchMargin
+    }
 
     /// 注册用的那两张网挂在一条串行队列上：连着传三张目标照只装一次。
     /// 出片/预览开始前必须 release()：两条链路各装一份引擎＝两份几百 MB 的足迹。
@@ -105,15 +119,17 @@ enum SwapCast {
     }
 
     /// 这一张脸最像目标表里的谁；一个都不像也把最高的那个余弦带回来，日志里才判得了闸门。
-    static func nearest(_ emb: [Float], members: [SwapCastMember]) -> (index: Int, cos: Double) {
-        guard !emb.isEmpty, !members.isEmpty else { return (-1, -9) }
+    static func nearest(_ emb: [Float], members: [SwapCastMember])
+        -> (index: Int, cos: Double, second: Double) {
+        guard !emb.isEmpty, !members.isEmpty else { return (-1, -9, -9) }
         var bi = -1
         var bc = -2.0
+        var sc = -2.0
         for (i, m) in members.enumerated() {
             let c = FsxMath.cosine(emb, m.targetEmb)
-            if c > bc { bc = c; bi = i }
+            if c > bc { sc = bc; bc = c; bi = i } else if c > sc { sc = c }
         }
-        return (bi, bc)
+        return (bi, bc, sc)
     }
 
     /// 新选的源脸照 → 存档。存不下也把向量带回去：这一趟还能跑，只是下次要重选。

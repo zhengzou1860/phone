@@ -70,6 +70,8 @@ final class SwapPreview {
     private var frameMs: [Double] = [], pasteMs: [Double] = [], swapMs: [Double] = []
     private var nSwap = 0, nPub = 0, nFaces = 0, nDecode = 0, noFace = 0, unmatched = 0
     private var smallFace = 0, mirror = 0, fitFail = 0, netFail = 0, nTracks = 0
+    /// 多人镜头的三笔账：一格见到 ≥2 张脸／其中认到 ≥2 张目标脸／真只画上 1 张
+    private var nMultiDet = 0, nMultiSwap = 0, nMultiHalf = 0
     /// 被手性闸门挡下的帧分两拨：点是从 Vision 五官来的、还是只按脸框猜的
     private var mirrorReal = 0, mirrorGuess = 0
     /// 画面停住（这一格没换新东西）的最长一段素材秒数、和超过 0.25 s 的次数：卡顿先量出来再说话
@@ -237,6 +239,7 @@ final class SwapPreview {
         pasteMs = []; swapMs = []
         nSwap = 0; nPub = 0; nFaces = 0; nDecode = 0; noFace = 0; unmatched = 0
         smallFace = 0; mirror = 0; fitFail = 0; netFail = 0; nTracks = 0
+        nMultiDet = 0; nMultiSwap = 0; nMultiHalf = 0
         mirrorReal = 0; mirrorGuess = 0; gapN = 0; gapMax = 0
 
         guard let reader = try? AVAssetReader(asset: src.asset) else { say("预览 reader 建不起来"); return .stop }
@@ -324,10 +327,14 @@ final class SwapPreview {
 
                     var used = Set<Int>()
                     var faces: [PFace] = []
+                    var seen = 0
+                    // 量身份的门槛：跟着进链窗口折算（道理见 SwapCast.identFloor），再和「太小贴了也没用」那条取大者
+                    let idFloor = max(SwapCast.identFloor(longEdge: c.longEdge), c.minFacePx)
                     for o in obs {
                         let box = SwapVision.pixelBox(o.boundingBox, frameW, frameH)
                         let sd = Double(min(box.width, box.height))
                         if sd < 12 { continue }
+                        seen += 1
                         let (p, pn) = SwapVision.sendPoints(face: o, w: frameW, h: frameH)
                         guard p.count == 5, let pl = FsxGeo.place(pts: p, src: pn, shortSide: sd) else {
                             fitFail += 1
@@ -375,9 +382,9 @@ final class SwapPreview {
                             t.lastBox = box
                             t.lastSec = sec
                             // 轨迹开头那一格可能是运动糊的：隔 0.6 s 素材再认一次，余弦更高的那次说了算。
-                            // 脸太小时不采（上采样出来的余弦不算数），等它长到 identMinPx 再采。
-                            if t.samples < 2, sec >= t.sampleAt, sd >= SwapCast.identMinPx {
-                                let got = identify(pb, pl: pl, engine: engine, cast: cast)
+                            // 够不到 idFloor 的框多半不是脸：隔 0.6 s 素材再采一次身份，余弦更高的那次说了算
+                            if t.samples < 2, sec >= t.sampleAt, sd >= idFloor {
+                                let got = identify(pb, pl: pl, engine: engine, cast: cast, sd: sd)
                                 if got.member >= 0, got.cos > t.cos {
                                     t.member = got.member
                                     t.cos = got.cos
@@ -392,10 +399,10 @@ final class SwapPreview {
                             member = t.member
                             tracks[best] = t
                         } else {
-                            // 小脸上的身份证全是上采样噪声：这一格不认，轨迹先留着，等脸够大再采
-                            let canId = sd >= SwapCast.identMinPx
-                            let got = canId ? identify(pb, pl: pl, engine: engine, cast: cast)
-                                            : (member: -1, best: -1, cos: -9.0)
+                            // 够不到 idFloor 的框不认：这一格不量身份，轨迹先留着，等它长到门槛再采
+                            let canId = sd >= idFloor
+                            let got = canId ? identify(pb, pl: pl, engine: engine, cast: cast, sd: sd)
+                                            : (member: -1, best: -1, cos: -9.0, second: -9.0)
                             member = got.member
                             tracks.append(PTrack(id: nextTrack, member: member, cos: got.cos,
                                                  lastBox: box, lastSec: sec,
@@ -404,30 +411,43 @@ final class SwapPreview {
                             nextTrack += 1
                             if !canId {
                                 say("预览 新轨迹 \(nextTrack - 1) 第 \(nDecode) 帧（\(String(format: "%.2f", sec)) s）短边 "
-                                    + String(format: "%.0f", sd) + " px｜脸太小，先不认（要 "
-                                    + String(format: "%.0f", SwapCast.identMinPx) + " px）→ 不动")
+                                    + String(format: "%.0f", sd) + " px｜不是脸，先不认（要 "
+                                    + String(format: "%.0f", idFloor) + " px）→ 不动")
                             } else if got.cos > -8 {
+                                // 短边够不到 identMinPx 的是糊的那一档：把第二名一起写出来，
+                                // 下一轮定 matchCosBlur／matchMargin 才有真值可用（0.44 那份是被 0.45 闸门切出来的，不算数）
                                 say("预览 新轨迹 \(nextTrack - 1) 第 \(nDecode) 帧（\(String(format: "%.2f", sec)) s）短边 "
                                     + String(format: "%.0f", sd) + " px｜最近 \(got.best >= 0 ? cast[got.best].targetLabel : "—")"
                                     + " 余弦 \(String(format: "%.3f", got.cos))"
+                                    + (sd < SwapCast.identMinPx
+                                       ? "｜次近 \(String(format: "%.3f", got.second))（糊档要 ≥"
+                                         + String(format: "%.2f", SwapCast.matchCosBlur) + " 且领先 "
+                                         + String(format: "%.2f", SwapCast.matchMargin) + "）" : "")
                                     + (member >= 0 ? " → 换成「\(cast[member].sourceLabel)」" : " → 目标表外、不动"))
                             }
+                        }
+                        // 两笔账分开：太小＝补丁贴出来也没用；表外＝量过、跟目标表都不像。
+                        // 先前这两条顺序反了，「没量」全记进「表外」，报告看不出挡下来的到底是哪一道门。
+                        if sd < c.minFacePx {
+                            smallFace += 1
+                            continue
                         }
                         if member < 0 {
                             unmatched += 1
                             continue
                         }
-                        if sd < c.minFacePx {
-                            smallFace += 1
-                            continue
-                        }
                         faces.append(PFace(pl: pl, member: member))
                     }
                     var painted = 0
+                    // 多人镜头这笔账要单独留：下一趟报告得说清「一张格里有几张脸」和「真换了几张」，
+                    // 不然又只能靠猜——这一版之前的毛病正是把没量的和认不出的记在同一笔里。
+                    if seen >= 2 { nMultiDet += 1 }
+                    if faces.count >= 2 { nMultiSwap += 1 }
                     if !faces.isEmpty {
                         if SwapTech.copyRows(from: pb, to: hd) {
                             painted = compose(engine, faces: faces, cast: cast)
                             if painted > 0 { nSwap += 1 } else { netFail += 1 }
+                            if seen >= 2 && painted == 1 { nMultiHalf += 1 }
                         } else {
                             netFail += 1
                         }
@@ -520,17 +540,20 @@ final class SwapPreview {
     }
 
     /// 新轨迹认人：这一帧的 5 点裁 112 过向量网，跟目标表比一次余弦。
+    /// `sd` 是这张脸在进链小窗里的短边：够清楚的按绝对余弦定，糊过一档的还要领先第二名（SwapCast.accept）。
     private func identify(_ pb: CVPixelBuffer, pl: FsxGeo.Placed, engine: FsxEngine,
-                          cast: [SwapCastMember]) -> (member: Int, best: Int, cos: Double) {
+                          cast: [SwapCastMember], sd: Double)
+        -> (member: Int, best: Int, cos: Double, second: Double) {
         let ok = SwapTech.withPixels(pb) { base, bpr -> Bool in
             FsxGeo.warpCrop(UnsafeRawPointer(base), bytesPerRow: bpr, w: frameW, h: frameH,
                             fwd: pl.fwd112, size: FsxGeo.side112, out: &c112)
         }
-        guard ok == true else { return (-1, -1, -9) }
+        guard ok == true else { return (-1, -1, -9, -9) }
         let e = engine.embedding(crop112_01: c112)
-        guard !e.emb.isEmpty else { return (-1, -1, -9) }
+        guard !e.emb.isEmpty else { return (-1, -1, -9, -9) }
         let m = SwapCast.nearest(e.emb, members: cast)
-        return (m.cos >= SwapCast.matchCos ? m.index : -1, m.index, m.cos)
+        return (SwapCast.accept(cos: m.cos, second: m.second, shortSide: sd) ? m.index : -1,
+                m.index, m.cos, m.second)
     }
 
     /// 一格画面里的所有目标脸：画布先从原帧重铺一次，然后一张一张 裁 256 → 前向 → 贴回。
@@ -621,8 +644,14 @@ final class SwapPreview {
         say("      解码 \(SwapUtil.stat(decodeMs))×\(String(format: "%.1f", fps)) 帧/秒"
             + "｜整帧含节奏 \(SwapUtil.stat(swapMs))")
         say("      这一趟 换出 \(nSwap) 格／共换 \(nFaces) 张脸／递出 \(nPub) 格／读掉 \(nDecode) 格｜轨迹最多 \(nTracks) 条"
-            + "｜没脸 \(noFace)｜目标表外 \(unmatched)｜太小 \(smallFace)｜拟合没过 \(fitFail)"
+            + "｜没脸 \(noFace)｜太小 \(smallFace)｜目标表外 \(unmatched)｜拟合没过 \(fitFail)"
             + "｜镜像 \(mirror)（真点位 \(mirrorReal)／框猜 \(mirrorGuess)）｜画不出 \(netFail)｜点位 \(pointSrc)")
+        say("      多人镜头 见到 ≥2 张脸的格 \(nMultiDet)｜其中认到 ≥2 张 \(nMultiSwap)｜真只画上 1 张 \(nMultiHalf)")
+        say("      量身份用的门槛 \(String(format: "%.0f", max(SwapCast.identFloor(longEdge: c.longEdge), c.minFacePx))) px"
+            + "＝1920 档 \(String(format: "%.0f", SwapCast.identMinPx)) px 按进链 \(c.longEdge) 折算"
+            + "（\(String(format: "%.0f", SwapCast.identFloor(longEdge: c.longEdge)))）和太小线 \(String(format: "%.0f", c.minFacePx)) 取大者"
+            + "｜糊档（<\(String(format: "%.0f", SwapCast.identMinPx)) px）要 ≥\(String(format: "%.2f", SwapCast.matchCosBlur))"
+            + " 且领先次近 \(String(format: "%.2f", SwapCast.matchMargin))")
         say("      画面停住 超过 0.5 s 素材 \(gapN) 次｜最长 \(String(format: "%.2f", gapMax)) s"
             + "（每格都递；格距放稀到 0.4 s 是故意的，超过 0.5 s 才是真卡住）")
         say("      16 帧/秒这笔账 \(String(format: "%.2f", unit)) ms×\(String(format: "%.0f", c.fpsTarget))"
