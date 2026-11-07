@@ -26,8 +26,8 @@ targets:
         CFBundleExecutable: SwapBench
         CFBundleIdentifier: com.qoder.swapbench
         CFBundlePackageType: APPL
-        CFBundleShortVersionString: "0.46"
-        CFBundleVersion: "46"
+        CFBundleShortVersionString: "0.47"
+        CFBundleVersion: "47"
         CFBundleInfoDictionaryVersion: "6.0"
         NSPhotoLibraryAddUsageDescription: "要把换好脸的片段存回相册"
         NSPhotoLibraryUsageDescription: "要选一张源脸照片和一条要换脸的视频"
@@ -39,7 +39,10 @@ targets:
         LSRequiresIPhoneOS: true
         UILaunchScreen: {}
         UISupportedInterfaceOrientations:
+          # 横屏这一条只为全屏预览开：plist 里不列横屏，requestGeometryUpdate 转不过去（系统只按这张表放行）。
+          # 平时钉不钉在竖屏由 SwapAppDelegate.supportedInterfaceOrientationsFor 那一句回答，不在这里回答。
           - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeRight
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.qoder.swapbench

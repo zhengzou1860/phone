@@ -6,6 +6,8 @@ import UIKit
 
 @main
 struct SwapApp: App {
+    @UIApplicationDelegateAdaptor(SwapAppDelegate.self) private var delegate
+
     init() {
         // AVFoundation 抛的是 Objective-C 异常，Swift 的 do/catch 抓不住，进程当场就没了，
         // 盘上只剩半截日志。这个钩子是唯一能在断气前把死因写进 swap_log.txt 的地方。
@@ -19,6 +21,36 @@ struct SwapApp: App {
         WindowGroup {
             SwapContentView()
         }
+    }
+}
+
+/// 横屏只借给全屏预览那一阵，其余时候整台机器仍钉在竖屏。
+/// plist 那一张表管「系统允许哪些方向」（不列横屏就 requestGeometryUpdate 转不过去），
+/// 这一句管「此刻要哪个」——两边都得点头，屏幕才真的转。
+final class SwapAppDelegate: NSObject, UIApplicationDelegate {
+    func application(_ application: UIApplication,
+                     supportedInterfaceOrientationsFor window: UIWindow?) -> UIInterfaceOrientationMask {
+        SwapRotate.landscape ? .landscapeRight : .portrait
+    }
+}
+
+enum SwapRotate {
+    static var landscape = false
+
+    /// 进全屏叫一次（true）、出全屏叫一次（false）。不缓存「已经转过了」：cover 刚挂上那一下请求常被系统按旧口径拒掉，
+    /// 于是 onAppear 再叫一次，第二次落在新界面上——被拒那一次会留在流水里，看得到到底是哪一步没转。
+    static func apply(_ want: Bool) {
+        landscape = want
+        guard let s = UIApplication.shared.connectedScenes
+            .compactMap({ $0 as? UIWindowScene })
+            .first(where: { $0.activationState == .foregroundActive }) else {
+            SwapJournal.line("全屏 没找到在前台的窗口场景：方向没改")
+            return
+        }
+        s.requestGeometryUpdate(.iOS(interfaceOrientations: want ? .landscapeRight : .portrait)) { err in
+            SwapJournal.line("全屏 方向请求被拒：\(err.localizedDescription)")
+        }
+        s.keyWindow?.rootViewController?.setNeedsUpdateOfSupportedInterfaceOrientations()
     }
 }
 
@@ -95,6 +127,8 @@ struct SwapContentView: View {
 
     /// 预览那一格界面上看到的东西
     @StateObject private var pv = SwapPreviewMirror()
+    /// 全屏横屏那一档开着没有（开着一趟只借横屏这一阵，退出就还回竖屏）
+    @State private var pvFull = false
     /// 整台手机同时只跑一路预览，挂在类型上：挂在 struct 上每刷一次界面就换一个实例（新的那条队列白建）
     private static let engine = SwapPreview()
 
@@ -286,6 +320,8 @@ struct SwapContentView: View {
                         Button(pv.on ? "停预览" : "开始预览") { togglePreview() }
                             .buttonStyle(.borderedProminent)
                             .disabled(!pv.on && !previewBlock.isEmpty)
+                        Button("全屏横屏（带声音）") { pvFull = true }
+                            .buttonStyle(.bordered)
                         if !previewBlock.isEmpty { Text(previewBlock).font(.caption2) }
                         // 只递这一下点出来的那句答案（被挡／开了／停了）；跑动中的逐秒实况不再上界面
                         if !pv.status.isEmpty { Text(pv.status).font(.caption).textSelection(.enabled) }
@@ -296,6 +332,14 @@ struct SwapContentView: View {
                 .padding()
             }
             .navigationTitle("换脸出片")
+            // 全屏预览这一档：开的时候借横屏，关的时候还回竖屏（方向由 SwapRotate 那一句口径说了算）
+            .fullScreenCover(isPresented: $pvFull) {
+                SwapPreviewFull(pv: pv, block: previewBlock,
+                                onToggle: { togglePreview() },
+                                onSeek: { seekPreview($0) },
+                                onClose: { pvFull = false })
+            }
+            .onChange(of: pvFull) { _, on in SwapRotate.apply(on) }
             .onAppear {
                 facts = SwapFacts.lines()
                 idents = SwapIdents.list()
@@ -839,6 +883,56 @@ struct SwapContentView: View {
                 sending = false
             }
         }
+    }
+}
+
+/// 全屏横屏那一档：看的还是引擎往 SwapPreviewMirror 上递的那一格画面（两处同一份，不另开一趟预览），
+/// 底下只留停／开、位置、退出三样。声音不在这里——在引擎那一趟里，跟着它自己那把「素材 1 s ≈ 墙钟 1 s」的钟走。
+struct SwapPreviewFull: View {
+    @ObservedObject var pv: SwapPreviewMirror
+    /// 开跑前那一句被挡的理由（从外面递进来：这一版预览的闸门还是 SwapContentView 那一套）
+    var block: String
+    var onToggle: () -> Void
+    var onSeek: (Double) -> Void
+    var onClose: () -> Void
+
+    var body: some View {
+        VStack(spacing: 8) {
+            ZStack {
+                Color.black
+                if let im = pv.img {
+                    Image(uiImage: im).resizable().scaledToFit()
+                } else {
+                    Text(block.isEmpty ? (pv.on ? "开跑了，第一格要等两张网装好" : "（还没开）") : block)
+                        .font(.footnote).foregroundColor(.gray)
+                        .multilineTextAlignment(.center).padding()
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+            HStack(spacing: 10) {
+                Button(pv.on ? "停" : "开始预览") { onToggle() }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(!pv.on && !block.isEmpty)
+                Slider(value: $pv.pos, in: 0 ... max(0.1, pv.dur), onEditingChanged: { began in
+                    pv.dragging = began
+                    if !began { onSeek(pv.pos) }
+                })
+                .disabled(!pv.on)
+                Text(String(format: "%.0f／%.0f s", pv.pos, pv.dur))
+                    .font(.caption2).monospacedDigit()
+                Button("退出全屏") { onClose() }.buttonStyle(.bordered)
+            }
+            .padding(.horizontal)
+            if !pv.person.isEmpty {
+                Text("这一趟目标表：\(pv.person)").font(.caption2).foregroundColor(.gray)
+            }
+        }
+        .background(Color.black)
+        .preferredColorScheme(.dark)
+        .statusBarHidden(true)
+        // cover 挂上之后再叫一次：外面那一次是在它还没上屏时发的，系统那会儿还按竖屏的口径给拒了
+        .onAppear { SwapRotate.apply(true) }
     }
 }
 

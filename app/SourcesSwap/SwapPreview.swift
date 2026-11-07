@@ -76,6 +76,8 @@ final class SwapPreview {
     private var gapN = 0, gapMax = 0.0
     private var pointSrc = "—"
     private var duration = 0.0
+    /// 预览的那一条声音：素材副本里的音轨原样交给 AVAudioPlayer 放，画面这条钟慢下来就由它等一等
+    private var audio: AVAudioPlayer?
 
     private struct PTrack {
         var id: Int
@@ -253,6 +255,7 @@ final class SwapPreview {
             return .stop
         }
         let req = VNDetectFaceLandmarksRequest()
+        audioStart(video, at: fromSec)
         // 格距从 1/16 s 起，算不过来按实测单价放稀（见每格末尾）：一张换脸网 128 ms，
         // 16 格/秒要 2.4 s 算 1 s 素材，A13 的 CPU 给不出这个数。硬按 16 格跑就是 11-05 那一趟：
         // 素材每 1 s 只走 0.56 s，看着又慢又顿。
@@ -441,6 +444,7 @@ final class SwapPreview {
                     let hold = sec - lastPub
                     if hold > 0.5 { gapN += 1; gapMax = max(gapMax, hold) }
                     lastPub = sec
+                    audioSync(sec)
                     nTracks = max(nTracks, tracks.count)
                     let cellWall = msFrom(ts)
                     swapMs.append(cellWall)
@@ -466,8 +470,53 @@ final class SwapPreview {
             if sleepTo > now { Thread.sleep(forTimeInterval: min(0.2, sleepTo - now)) }
         }
         reader.cancelReading()
+        audioStop()
         reportPrice(c: c, wall: seconds() - wall0, play: lastSec - fromSec, fps: fps)
         return outcome
+    }
+
+    /// 开声音：读的就是 ②那一条副本的音轨（选片时是整份文件原样拷进临时目录，音轨跟着一起进来），不另找文件。
+    /// 类别钉 .playback：静音拨片压不住它——全屏横屏里要的就是这个，拨片在下面也能只靠音量键调大小。
+    private func audioStart(_ url: URL, at sec: Double) {
+        audioStop()
+        var note = ""
+        do {
+            try AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
+            try AVAudioSession.sharedInstance().setActive(true)
+        } catch {
+            note = "｜会话没开成：\(error.localizedDescription)"
+        }
+        guard let p = try? AVAudioPlayer(contentsOf: url) else {
+            say("预览 没声音：这条副本读不出音轨\(note)｜\(url.lastPathComponent)")
+            return
+        }
+        p.prepareToPlay()
+        p.currentTime = max(0, min(sec, p.duration))
+        guard p.play() else {
+            say("预览 没声音：播放器起不来\(note)")
+            return
+        }
+        audio = p
+    }
+
+    private func audioStop() {
+        audio?.stop()
+        audio = nil
+        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+    }
+
+    /// 每一格对一次表：声音超前＝画面算不过来，把它按住等画面（声音跑到画面前面比静音难看得多）；
+    /// 画面反过来超前 0.6 s 以上（拖完滑杆重开 reader 那一阵）才把声音拽回画面那一秒。
+    private func audioSync(_ sec: Double) {
+        guard let p = audio else { return }
+        let d = p.currentTime - sec
+        if p.isPaused {
+            if d < 0.10 { p.play() }
+        } else if d > 0.30 {
+            p.pause()
+        } else if d < -0.60 {
+            p.currentTime = max(0, min(sec, p.duration))
+        }
     }
 
     /// 新轨迹认人：这一帧的 5 点裁 112 过向量网，跟目标表比一次余弦。
