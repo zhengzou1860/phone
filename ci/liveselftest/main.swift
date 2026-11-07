@@ -300,6 +300,27 @@ ck("perf 行带得上机身档位", LivePerf.line(sourceFPS: 25, encodeMs: 8, ga
                     thermal: "偏热").hasSuffix("｜机身偏热"),
    "默认空串时那一截整个省掉，别留个光秃秃的分隔符")
 
+// 0.27：0.25 那轮日志里 09:16:11–09:17:18 有 68 行「登录失效了」，而 PC 那边只回过
+// 两秒的 401，之后每一帧都是 204。红字是上一轮留下的、谁都只写不擦；节流又只有一个格子，
+// 两条告警换着 key 写就把 10 秒的节流顶没了。这两条不修，日志就会一直把人往
+// 一个根本不存在的故障上带——我这次就先被它带偏了一回。
+ck("红字 只有真收到帧才擦", LiveAuth.clearsLastError(.accepted)
+   && !LiveAuth.clearsLastError(.sessionLost) && !LiveAuth.clearsLastError(.notLive)
+   && !LiveAuth.clearsLastError(.rejected(413)),
+   "擦早了就是把 401 也一起藏了；擦晚了就是 0.25 那一轮那样挂满一分钟")
+var gate0 = LiveWarnGate()
+ck("节流 换着 key 轮流说也拦得住",
+   gate0.allow("err", now: 0, every: 10) && gate0.allow("fps", now: 1, every: 10)
+   && !gate0.allow("err", now: 2, every: 10) && !gate0.allow("fps", now: 3, every: 10)
+   && gate0.allow("err", now: 10.5, every: 10),
+   "旧写法只记「上一句是谁」：两句轮流写同一格，谁都不算自己的重复，节流形同没有")
+ck("节流 一秒一条的活数不误伤", gate0.allow("fps", now: 11.5, every: 0.9)
+   && gate0.allow("fps", now: 12.5, every: 0.9),
+   "perf 那行是给用户看的活数，看门狗一秒一次，节流按 0.9 秒才不会把它压成十分钟一条")
+gate0.reset()
+ck("节流 新一轮开头说得出口", gate0.allow("err", now: 13, every: 60),
+   "起播以后先把上一轮的静默期清空，不然新一轮开头那句该报的话被压住")
+
 // 停止握手：点停止到 PC 确认之间，按钮和特征下拉框必须一直锁着；
 // /live_stop 没送到就停在 failed，不许假装停了——那正是用户撞 409 的那条路。
 ck("停止 按下即锁", LiveStopGate.stopping.blocksPlay && LiveStopGate.stopping.holdsEditingLock)
@@ -397,8 +418,8 @@ ck("契约 在途上限3", LiveConfig.inflightLimit == 3)
 ck("契约 推送15fps", LiveConfig.pushFPS == 15.0)
 // 0.25 仍是 640：全屏 VR 只在显示端弯像素，推流参数不动。
 ck("契约 请求宽640", LiveConfig.fallbackMaxWidth == 640)
-ck("契约 UA带版本", LiveConfig.userAgentSuffix == "LiveSwap/0.26"
-   && LiveConfig.appVersion == "0.26" && LiveConfig.appBuild == "26")
+ck("契约 UA带版本", LiveConfig.userAgentSuffix == "LiveSwap/0.27"
+   && LiveConfig.appVersion == "0.27" && LiveConfig.appBuild == "27")
 // 页面在推流中改特征时发的动作：是命令，不是按钮挂子，所以不进 actionNames
 //（就绪对账只该对页面里那三个按钮）。
 ck("契约 改特征先停动作", LiveShim.hookStopForEdit == "stopedit"

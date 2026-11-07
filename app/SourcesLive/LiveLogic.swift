@@ -20,10 +20,12 @@ enum LiveConfig {
     /// 0.24 仍是 640：这一版只给 /video_feed 加重连闸，推流参数不动。
     /// 0.25 仍是 640：全屏 VR 只在显示端弯像素，一帧像素都不多往 PC 发。
     /// 0.26 仍是 640：加放大、降重画频率，全在手机上，跟 PC 说的话一条没多。
+    /// 0.27 仍是 640：这一版只擦两笔旧账（红字不跟着新一轮挂、节流按 key 各记各的），
+    /// 上行一个字节没动。
     static let fallbackMaxWidth = 640
 
-    static let appVersion = "0.26"
-    static let appBuild = "26"
+    static let appVersion = "0.27"
+    static let appBuild = "27"
 
     static let jpegQuality: CGFloat = 0.7
     static let pushFPS: Double = 15
@@ -174,8 +176,36 @@ enum LiveAuth {
         return judge(statusCode: resp.statusCode, path: path, contentType: type)
     }
 
+    /// 屏幕上那行红字什么时候擦。以前谁都只写不擦：用户重登、重新起播以后
+    /// 帧明明一路走到 55KB/帧，界面却还每秒贴一句「登录失效了」，
+    /// 看日志的人就照着这句话去找一个根本不存在的故障。
+    /// 只有 PC 真收下了一帧才擦；401、409、被拒那三条得留着，那是真该看见的。
+    static func clearsLastError(_ verdict: FrameVerdict) -> Bool {
+        if case .accepted = verdict { return true }
+        return false
+    }
+
     /// 给用户看的那一句：重新搬一次 cookie 还是 401，页面那边就得重登了。
     static let lostMessage = "登录失效了（PC 回 401 未登录）：在这一页重新登录，再点「播放」接着推"
+}
+
+// MARK: - 告警不刷屏
+
+/// 同一句话最多多少秒说一遍。以前整个界面共用一个格子记「上次说的是哪句」：
+/// 看门狗里「会话失效」和 perf 行一秒换一次 key，谁都不算自己的连续重复，
+/// 10 秒的节流形同没有——0.25 那轮日志里「登录失效」和 perf 行就是这么每秒贴在一起贴了一分多钟。
+/// 每个 key 自己记自己的上次时间，轮流说话也拦得住。
+struct LiveWarnGate {
+    private var last: [String: TimeInterval] = [:]
+
+    mutating func allow(_ key: String, now: TimeInterval, every: TimeInterval) -> Bool {
+        if let t = last[key], now - t < every { return false }
+        last[key] = now
+        return true
+    }
+
+    /// 新一轮起播：上一轮的静默期不该压住这一轮开头该说的话。
+    mutating func reset() { last = [:] }
 }
 
 // MARK: - 页面会话 cookie

@@ -246,6 +246,7 @@ final class SwapClient: ObservableObject {
         await MainActor.run {
             self.pcLiveMode = true
             self.sessionLost = false        // 能进得推流模式就说明 cookie 是好用的
+            self.lastError = nil            // 上一轮「登录失效」的那句不能跟着新一轮一起挂回去
         }
         beginStatusPolling()
         return liveWidth
@@ -391,7 +392,10 @@ final class SwapClient: ObservableObject {
             guard let http = resp as? HTTPURLResponse else { return }
             // 拿到回应才记：往返慢说明链路/PC 在拖，和手机编码是两笔账。
             self.noteRTT((CFAbsoluteTimeGetCurrent() - sentAt) * 1000)
-            switch LiveAuth.judge(http) {
+            let verdict = LiveAuth.judge(http)
+            // 「这一帧落定以后那行红字该不该擦」单独算：四条出口里只有 PC 真收下那一帧才擦。
+            let clearsError = LiveAuth.clearsLastError(verdict)
+            switch verdict {
             case .sessionLost:
                 if authRetried {
                     // 搬过一次还是 401：页面那边确实没登录了，停下来让人重登。
@@ -430,6 +434,10 @@ final class SwapClient: ObservableObject {
                     self.framesSent += 1
                     self.sessionBytes += jpeg.count
                     self.sessionFrames += 1
+                    // 那句「登录失效」以前是上一轮留下的、谁都只写不擦：0.25 那一轮
+                    // /live_start 已经成功、帧每秒都在走，界面上却还每秒贴一次它。
+                    // 下一轮看日志的人只会照着这句去找一个根本不存在的故障。
+                    if clearsError { self.lastError = nil }
                 }
             }
         }.resume()

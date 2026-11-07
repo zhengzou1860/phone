@@ -72,8 +72,9 @@ final class PageViewController: UIViewController {
     private var meterTimer: Timer?
     private var lastSentSample = 0
     private var lastSentTick: TimeInterval = 0
-    private var lastWarnKey = ""
-    private var lastWarnTick: TimeInterval = 0
+    /// 每一句自己记自己的上次播报时间。放在 LiveLogic 那个 gate 里，是为了让自测也能过一遍
+    /// 「两条告警换着 key 轮流说」这一种——界面这个文件要 UIKit，自测根本不编它。
+    private var warnGate = LiveWarnGate()
     /// 屏幕不动时补一次 /video_feed 重连的节流。页面 30 秒盲刷已经在注入脚本里关掉，
     /// 这条是它之外唯一的兜底：长连接断掉时 WebView 不一定报 error。
     private var lastFeedRefresh: TimeInterval = 0
@@ -553,7 +554,7 @@ final class PageViewController: UIViewController {
             // 而原生还停在 loaded，用户点下去会被当成「开始」再开一轮。
             self.disarmStopGate()
             self.lastSeen409 = client.saw409
-            self.lastWarnKey = ""
+            self.warnGate.reset()           // 新一轮开头该说的话说得出口，不带上轮的静默期
             self.startMeter()
             self.pushSeek(cur: seconds, total: CMTimeGetSeconds(self.video.duration))
             self.startAudio(at: seconds, client: client)
@@ -808,7 +809,10 @@ final class PageViewController: UIViewController {
             }
         }
         // 冷启动预热期 PC 入口队列会一次性丢一大批帧，那不是故障，所以只进这一行账目、不报警
-        if warnOnce("fps", every: 10.0) {
+        // 0.9 不是笔误：这一行是给用户看的活数（fps、往返、上行均值），看门狗本来就走一秒一次，
+        // 十几秒才更新一次的那个数没人看得下去。以前写的是 10.0，但它从没生效过——
+        // 旧的节流只有一个格子，和「会话失效」换着 key 轮流动，两边都按 1 秒在打。
+        if warnOnce("fps", every: 0.9) {
             // 模型还没加载完时 PC 一帧输出都没有（frames_in 在涨、output 是 null）：
             // 空着不说明，手机上看到的就是「点了没画面」，最容易当成连坏了。
             // 判据是 output_age_ms：has_output 热态下一直为 true（上一轮的 latest_frame 还挂着），
@@ -866,11 +870,7 @@ final class PageViewController: UIViewController {
 
     /// 同一句话别刷屏：同 key 两次播报最少隔 every 秒
     private func warnOnce(_ key: String, every: Double = 6.0) -> Bool {
-        let now = CFAbsoluteTimeGetCurrent()
-        if key == lastWarnKey && now - lastWarnTick < every { return false }
-        lastWarnKey = key
-        lastWarnTick = now
-        return true
+        warnGate.allow(key, now: CFAbsoluteTimeGetCurrent(), every: every)
     }
 
     /// 让页面重连 /video_feed。0.11 起全屏不再克隆第二个 img，只有页面那一路。
