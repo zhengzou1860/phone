@@ -411,6 +411,28 @@ ck("账目 零值全省", LivePerf.line(sourceFPS: 0, encodeMs: 0, gapMs: 0,
                                   rttAvgMs: 0, rttMaxMs: 0).isEmpty)
 ck("账目 选片标源帧率", LivePerf.sourceLabel(24) == "·源 24fps", LivePerf.sourceLabel(24))
 ck("账目 未知源不标", LivePerf.sourceLabel(0).isEmpty)
+// 0.28：往返 425ms 那一轮只有 7fps——不是手机算不动（编码 9–10ms），是同时只许 3 帧在路上。
+// fps ≈ 在途格数 ÷ 往返，所以能救这一场的只有把窗口放开；下面这组数就是放开的刻度。
+ck("窗口 没测到往返不放开", LiveWindow.limit(rttAvgMs: 0) == LiveWindow.base,
+   "开局没有往返读数时按 PC 平时要的 3 起步，别一上来就比别人贪")
+ck("窗口 链路快用 PC 要的3", LiveWindow.limit(rttAvgMs: 20) == 3
+   && LiveWindow.limit(rttAvgMs: 100) == 3 && LiveWindow.limit(rttAvgMs: 200) == 3,
+   "200ms 以内 3 条就填得满 15fps，多开的连接只会挤 PC 的入口队列")
+ck("窗口 250ms 开4格", LiveWindow.limit(rttAvgMs: 250) == 4, "0.25×15=3.75 向上取整")
+ck("窗口 425ms 开满把节奏抬一倍", LiveWindow.limit(rttAvgMs: 425) == LiveWindow.ceiling
+   && 3 / 0.425 < 8 && Double(LiveWindow.ceiling) / 0.425 > 14,
+   "这一档就是用户报的那次卡顿：3 格只有 7.1fps，6 格 14.1fps；要真追平 15fps 得 6.4 格，被池子顶在 6")
+ck("窗口 往返再差也只到上限", LiveWindow.limit(rttAvgMs: 1000) == LiveWindow.ceiling
+   && LiveWindow.limit(rttAvgMs: 99999) == LiveWindow.ceiling,
+   "顶到 6 以上会挤爆 URLSession 每主机 9 条（帧 6 + 轮询 + 控制），0.24 那次按钮冻死就是池子满了")
+ck("窗口 往返回落自己缩回去", LiveWindow.limit(rttAvgMs: 425) == 6
+   && LiveWindow.limit(rttAvgMs: 60) == 3, "不缩回去就等于永久改掉了 PC 要的 2–3 帧在途")
+// 状态行那一截：没放开时别占地方，放开了必须写得出格数
+ck("账目 没放开不写在途", !LivePerf.line(sourceFPS: 24, encodeMs: 9, gapMs: 0,
+    rttAvgMs: 425, rttMaxMs: 900, inflightMax: 3).contains("在途"))
+let perfWindow = LivePerf.line(sourceFPS: 24, encodeMs: 9, gapMs: 0,
+                               rttAvgMs: 425, rttMaxMs: 900, inflightMax: 6)
+ck("账目 放开写在途格数", perfWindow.contains("在途≤6"), perfWindow)
 
 // MARK: - 和 PC 契约绑死的几个数
 
@@ -418,8 +440,8 @@ ck("契约 在途上限3", LiveConfig.inflightLimit == 3)
 ck("契约 推送15fps", LiveConfig.pushFPS == 15.0)
 // 0.25 仍是 640：全屏 VR 只在显示端弯像素，推流参数不动。
 ck("契约 请求宽640", LiveConfig.fallbackMaxWidth == 640)
-ck("契约 UA带版本", LiveConfig.userAgentSuffix == "LiveSwap/0.27"
-   && LiveConfig.appVersion == "0.27" && LiveConfig.appBuild == "27")
+ck("契约 UA带版本", LiveConfig.userAgentSuffix == "LiveSwap/0.28"
+   && LiveConfig.appVersion == "0.28" && LiveConfig.appBuild == "28")
 // 页面在推流中改特征时发的动作：是命令，不是按钮挂子，所以不进 actionNames
 //（就绪对账只该对页面里那三个按钮）。
 ck("契约 改特征先停动作", LiveShim.hookStopForEdit == "stopedit"

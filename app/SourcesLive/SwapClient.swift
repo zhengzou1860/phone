@@ -93,7 +93,29 @@ final class SwapClient: ObservableObject {
         rttSumMs += ms
         rttCount += 1
         if ms > rttMaxMs { rttMaxMs = ms }
+        let avg = rttCount > 0 ? rttSumMs / Double(rttCount) : 0
+        let samples = rttCount
         rttLock.unlock()
+        // 窗口跟着这一段均值走。要攒够 5 帧才动：每 10 秒取账目会把计数清零，
+        // 不清零的那一下偶然慢帧（实测偶发 900ms）会把窗口一口气顶到 6，
+        // 而 PC 入口只有 2 格——放开过头的代价是 PC 那边丢帧，不是白赚。
+        guard samples >= 5 else { return }
+        inflightLock.lock()
+        inflightMax = LiveWindow.limit(rttAvgMs: avg)
+        inflightLock.unlock()
+    }
+
+    /// 当前在途上限，给状态行读数用（0.28：不写这个数就分不出「7fps 是往返压的」还是「手机发不出去」）。
+    var inflightWindow: Int {
+        inflightLock.lock()
+        defer { inflightLock.unlock() }
+        return inflightMax
+    }
+
+    private func endInflight() {
+        inflightLock.lock()
+        if inflightNow > 0 { inflightNow -= 1 }
+        inflightLock.unlock()
     }
 
     let baseURL: URL
@@ -101,7 +123,13 @@ final class SwapClient: ObservableObject {
     private(set) var liveWidth = LiveConfig.fallbackMaxWidth
 
     private let session: URLSession
-    private let inflight = DispatchSemaphore(value: LiveConfig.inflightLimit)
+    /// 在途帧窗口。以前是一个固定 3 格的 DispatchSemaphore：往返一高，节奏就被钉死成
+    /// 3/RTT（425ms 就是 7fps），而手机这边编码还是 9ms、GPU 没抢、PC 也没排队——
+    /// 卡的是「同时只许 3 帧在路上」。现在按实测往返放开到最多 6（LiveWindow），
+    /// 往返回落自己缩回 PC 要的 3。计数和上限共用这一把锁，帧的完成回调在 URLSession 队列上。
+    private let inflightLock = NSLock()
+    private var inflightNow = 0
+    private var inflightMax = LiveWindow.base
     private var statusTask: Task<Void, Never>?
 
     // WK 页面那边的会话快照。pageCookies 走锁是因为帧的完成回调在 URLSession 的队列上；
@@ -116,7 +144,9 @@ final class SwapClient: ObservableObject {
     init(baseURL: URL) {
         self.baseURL = baseURL
         let cfg = URLSessionConfiguration.default
-        cfg.httpMaximumConnectionsPerHost = 6   // 在途帧 + 状态轮询 + 一次性的控制请求
+        // 0.24 那次教训：格子数小于「在途帧 + 状态轮询 + 控制请求」时，请求会静静排在池子外面，
+        // 日志上看着像链路慢。窗口最多 6 帧在途（LiveWindow.ceiling），这里得留得住。
+        cfg.httpMaximumConnectionsPerHost = 9
         cfg.timeoutIntervalForRequest = 5
         cfg.timeoutIntervalForResource = 30
         cfg.requestCachePolicy = .reloadIgnoringLocalCacheData
@@ -217,6 +247,11 @@ final class SwapClient: ObservableObject {
         rttCount = 0
         rttMaxMs = 0
         rttLock.unlock()
+        // 新一轮开头按 PC 平时要的 3 格起步：上一轮临收尾那几帧的高往返不该把这一轮的窗口顶高。
+        inflightLock.lock()
+        inflightNow = 0
+        inflightMax = LiveWindow.base
+        inflightLock.unlock()
         let body = try JSONSerialization.data(withJSONObject: ["max_width": LiveConfig.fallbackMaxWidth])
         AppLog.shared.log("pc", "/live_start 请求宽 \(LiveConfig.fallbackMaxWidth)")
         // 登录很可能就发生在刚才那一页：发之前先搬一次，401 再搬一次重试（见 callWithAuthRetry）。
@@ -360,14 +395,19 @@ final class SwapClient: ObservableObject {
 
     // MARK: - 数据面（每帧一次，回调式，不为每帧起一个 Task）
 
-    /// 满 3 帧在途就丢新帧（丢最新），绝不排队——
+    /// 在途满了就丢新帧（丢最新），绝不排队——
     /// PC 入口队列只有 2 格且满则丢最旧，手机这边再排一层只会把延迟堆起来。
+    /// 0.28：格数不再钉死 3，跟着实测往返走（LiveWindow），往返回落自己缩回去。
     /// authRetried 只给「401 后搬完 cookie 重发这一帧」用，最多一次，不会打转。
     func push(_ jpeg: Data, authRetried: Bool = false) {
-        guard inflight.wait(timeout: .now()) == .success else {
+        inflightLock.lock()
+        guard inflightNow < inflightMax else {
+            inflightLock.unlock()
             DispatchQueue.main.async { self.framesDroppedLocal += 1 }
             return
         }
+        inflightNow += 1
+        inflightLock.unlock()
         let sentAt = CFAbsoluteTimeGetCurrent()
         var req = URLRequest(url: url("/live_frame"))
         req.httpMethod = "POST"
@@ -376,7 +416,9 @@ final class SwapClient: ObservableObject {
         authorize(&req)
         session.dataTask(with: req) { [weak self] data, resp, err in
             guard let self = self else { return }
-            self.inflight.signal()
+            // 四条出口（网络错 / 非 2xx / 204 / 401 重发）都从这一格过：先还格子，
+            // 再决定要不要重发——重发的那一帧自己去抢一格，不会把这里顶成两格。
+            self.endInflight()
             if let err = err {
                 let ns = err as NSError
                 // 手机侧网络抖一下不值得占一整行状态栏，计数留给自测和后台日志

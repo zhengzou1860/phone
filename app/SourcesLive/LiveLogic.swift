@@ -22,16 +22,18 @@ enum LiveConfig {
     /// 0.26 仍是 640：加放大、降重画频率，全在手机上，跟 PC 说的话一条没多。
     /// 0.27 仍是 640：这一版只擦两笔旧账（红字不跟着新一轮挂、节流按 key 各记各的），
     /// 上行一个字节没动。
+    /// 0.28 仍是 640：动的是「同时几条在途」，一帧的字节数一个字节没变。
     static let fallbackMaxWidth = 640
 
-    static let appVersion = "0.27"
-    static let appBuild = "27"
+    static let appVersion = "0.28"
+    static let appBuild = "28"
 
     static let jpegQuality: CGFloat = 0.7
     static let pushFPS: Double = 15
 
-    /// 在途帧上限。PC 明确要求保持 2–3 帧在途：一帧等一个往返会被单次 RTT 限死节奏
+    /// 在途帧窗口的起点。PC 明确要求保持 2–3 帧在途：一帧等一个往返会被单次 RTT 限死节奏
     /// （它第一版测试就是这么只跑到 10fps）。满了丢最旧，绝不排队。
+    /// 0.28 起这只是平时值：往返高了 LiveWindow 会临时放开，往返回落自己缩回这个数。
     static let inflightLimit = 3
 
     /// 注入脚本里 messageHandlers 的名字；Swift 侧注册和脚本发送共用这一条。
@@ -118,6 +120,26 @@ enum LiveHost {
     private static func isDigits(_ s: String) -> Bool {
         guard !s.isEmpty else { return false }
         return s.allSatisfy { $0 >= "0" && $0 <= "9" }
+    }
+}
+
+// MARK: - 在途帧窗口
+
+/// 一帧等一个往返，节奏就被往返钉死：3 帧在途、往返 425ms，就只剩 7fps——
+/// 用户看到的「卡」就是这个 7fps，不是手机算不动（那两段编码还是 9–10ms）。
+/// 所以往返一高就把窗口放开，让管道里始终有帧在走；回落到几十毫秒自己缩回 PC 要的 3。
+/// 上限 6 而不是更多：手机这个 URLSession 每主机只开 9 条，要给状态轮询和一次性控制请求
+/// 留位置——0.24 那次就是池子被帧占满，页面轮询全排队、按钮冻死。
+enum LiveWindow {
+    static let base = LiveConfig.inflightLimit      // PC 平时要的 3
+    static let ceiling = 6
+
+    /// 要几条才填得满这条管道：每秒想要帧数 × 一个往返。
+    /// 夹在 base 和 ceiling 之间：往返再高也不许越过池子，往返再低也不比 PC 要求的更贪。
+    static func limit(rttAvgMs: Double, fps: Double = LiveConfig.pushFPS) -> Int {
+        guard rttAvgMs > 0 else { return base }
+        let need = Int((rttAvgMs * fps / 1000.0).rounded(.up))
+        return min(ceiling, max(base, need))
     }
 }
 
@@ -384,13 +406,17 @@ enum LivePerf {
     /// 一屏 0 只会让人以为坏了。
     /// 机身热档位只在离开「正常」时才写：这一版的 VR 层是不是把手机热到降频，
     /// 是「卡顿到底怪谁」这条上唯一能在手机上取到的证据。
+    /// 在途窗口只在放开过 PC 要的那 3 条时才写：不写就分不出「这 7fps 是往返压出来的」
+    /// 还是「这 7fps 是手机自己发不出去」。
     static func line(sourceFPS: Double, encodeMs: Double, gapMs: Double,
-                     rttAvgMs: Double, rttMaxMs: Double, thermal: String = "") -> String {
+                     rttAvgMs: Double, rttMaxMs: Double, thermal: String = "",
+                     inflightMax: Int = 0) -> String {
         var parts: [String] = []
         if sourceFPS >= 1 { parts.append(String(format: "源 %.0ffps", sourceFPS)) }
         if encodeMs > 0 { parts.append(String(format: "编码 %.0fms", encodeMs)) }
         if gapMs > 0 { parts.append(String(format: "发间隔峰 %.0fms", gapMs)) }
         if rttAvgMs > 0 { parts.append(String(format: "往返 %.0f/%.0fms", rttAvgMs, rttMaxMs)) }
+        if inflightMax > LiveWindow.base { parts.append("在途≤\(inflightMax)") }
         if !thermal.isEmpty { parts.append("机身" + thermal) }
         return parts.joined(separator: "｜")
     }

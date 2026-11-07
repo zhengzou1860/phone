@@ -823,12 +823,15 @@ final class PageViewController: UIViewController {
             let up = avg > 0 ? "｜上行均值 \(max(1, avg / 1024)) KB/帧" : ""
             // 眼睛看到的卡顿只有三种来源：抽帧规则、编码太慢、链路太慢。
             // 这三个数摆在一行里，一看就知道该动哪处，不再靠猜。
+            // 「在途」那一截是 0.28 加的决定性一条：fps ≈ 在途格数 ÷ 往返，
+            // 少了它就分不出「7fps 是窗口钉死的」还是「手机根本发不出去」。
             let send = video.takeSendStats()
             let net = client.takeNetworkStats()
             let encFail = video.takeEncodeFailures()
             let perf = LivePerf.line(sourceFPS: video.sourceFPS, encodeMs: send.costMs,
                                      gapMs: send.gapMs, rttAvgMs: net.avgMs, rttMaxMs: net.maxMs,
-                                     thermal: LivePerf.thermalLabel(ProcessInfo.processInfo.thermalState))
+                                     thermal: LivePerf.thermalLabel(ProcessInfo.processInfo.thermalState),
+                                     inflightMax: client.inflightWindow)
             status(warm + "手机 \(String(format: "%.1f", fps))fps"
                     + (perf.isEmpty ? "" : "｜" + perf)
                     + (encFail > 0 ? "｜编码失败 \(encFail)" : "")
