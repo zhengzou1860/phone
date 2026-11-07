@@ -1,9 +1,6 @@
-// 等幅左右眼的 DIBR：清 z／前向占格／前向写色／合洞数洞。
+// 等幅左右眼的 DIBR：后向 remap（补洞用的底）+ 前向 splat（z 缓冲取最近）+ 合洞。
 // 照的是 PC 那套 post_vr.py 的 m6 臂：dd=(dn-zp)*budget，左眼 dest=x+dd，右眼 dest=x-dd，
-// 同格相撞取 dd 最大（最近）的那个。
-// 剩下没被写到的格子（洞）填的方向和 m6 不一样，这里以本文件为准：先朝背景那一侧找最近一格
-// 真写过的颜色照抄，找不到才按视差回读源帧。回读那份在小数视差上会把人和背景各掺一半，
-// 贴在人影上就是一条看着半透明的边——所以它只当备胎，见 kCombine。
+// 同格相撞取 dd 最大（最近）的那个，剩下没被写到的格子用后向 remap 那份填。
 //
 // 通道序在这里一律不解释：帧从 kCVPixelFormatType_32BGRA 的像素缓冲进来，最后写回同样是
 // BGRA 的像素缓冲，中间只做整 texel 的搬运和线性插值，读写两次换算是同一次对调 ⇒ 字节原样回还。
@@ -26,6 +23,7 @@ struct VRP {
     float xoff;     // 左右眼画面在各自半幅里再整体水平移这么多像素（正=两只眼一起右移）
     float gap;      // 两图之间的距离（像素）：左眼往左、右眼往右各挪这么多，图本身大小不动
     float fish;     // 鱼眼强度 k（0=不弯）：屏幕半径 v 读源图 u=v·(1+k·v²)，见 kSbsFish
+    uint  mono;     // 1=源纹理是一整幅单眼图（实时平铺那条：两只眼都铺同一幅）；0=源本身已是左右眼整幅
 };
 
 constexpr sampler lin(coord::normalized, filter::linear, address::clamp_to_edge);
@@ -74,15 +72,30 @@ kernel void kScale(texture2d<float, access::sample> src [[texture(0)]],
     dst.write(src.sample(lin, uv), g);
 }
 
-// 1) 把两只眼的 z 缓冲清成「没人写过」。前向 splat 用 atomic_fetch_max 只往上顶，
-// 上一帧留下的非零值会把这一帧的洞认成写过的格子 ⇒ 必须在占格之前先清一遍。
-kernel void kClear(constant VRP& P [[buffer(0)]],
-                   device atomic_uint* bestL [[buffer(1)]],
-                   device atomic_uint* bestR [[buffer(2)]],
-                   device const float* dn [[buffer(3)]],
-                   uint2 g [[thread_position_in_grid]]) {
+// 1) 后向 remap 两只眼 + 把 z 缓冲清成「没人写过」
+// 这一份只会被合洞那一趟用到：前向写到的格子它照抄，没写到的那些格子才来回读它 ⇒ 它的活是「把人让出来的那条洞填上」，不是铺整幅。
+// 填法是：按这格自己的视差回源图取一列，取整格，取整的方向偏背景那侧（左眼向下、右眼向上）。
+// 为什么不用线性插值：深度图在人影边缘是几个像素的渐变，于是回读的列在这一小段里会一路跨过颜色的边缘，
+//   插值就把「人那一列」和「背景那一列」混成半半 ⇒ 人身边那道看着半透明的轮廓边（0.27 及之前）。
+//   0.28 试的是照抄隔壁写过的格子：混色没了，但那 20 多列全变成同一列拉长 ⇒ 一条被拖长的纹理，更难看。
+// 现在这条边是一格一刀切：单眼可见区在真拍的立体素材里本来也是一条硬边，不是缺陷。
+kernel void kBack(texture2d<float, access::sample> src [[texture(0)]],
+                  texture2d<float, access::write>  fbL [[texture(1)]],
+                  texture2d<float, access::write>  fbR [[texture(2)]],
+                  constant VRP& P [[buffer(0)]],
+                  device atomic_uint* bestL [[buffer(1)]],
+                  device atomic_uint* bestR [[buffer(2)]],
+                  device const float* dn [[buffer(3)]],
+                  uint2 g [[thread_position_in_grid]]) {
     if (g.x >= P.W || g.y >= P.H) return;
     uint idx = g.y * P.W + g.x;
+    float dd = ddOf(dn, idx, P);
+    // 左眼里近处的东西往右挪 ⇒ 它让出来的洞在左边、要拿更左边的背景填 ⇒ 列号向下取整；右眼整套反号 ⇒ 向上。
+    int W = int(P.W);
+    int cl = clamp(int(floor(float(g.x) - dd)), 0, W - 1);
+    int cr = clamp(int(ceil(float(g.x) + dd)), 0, W - 1);
+    fbL.write(src.read(uint2(uint(cl), g.y)), g);
+    fbR.write(src.read(uint2(uint(cr), g.y)), g);
     atomic_store_explicit(bestL + idx, 0u, memory_order_relaxed);
     atomic_store_explicit(bestR + idx, 0u, memory_order_relaxed);
 }
@@ -106,13 +119,9 @@ kernel void kSplatDepth(constant VRP& P [[buffer(0)]],
     }
 }
 
-// 3) 前向 splat 的第二趟：只有「自己就是赢家」的源像素才把颜色写进自家那半幅
-// （落成 fbL/fbR 而不是直接拼成片：合洞那一趟要读邻格的颜色来填洞，而它就是写成片的那一趟——
-//  读自己正在写的图，次序得靠「本趟写的格子绝不会当邻格读」这种跨线程论证才成立，不值得赌。
-//  fbL/fbR 是上一趟写完的，读它干净，而且和 z 缓冲一格对一格。）
+// 3) 前向 splat 的第二趟：只有「自己就是赢家」的源像素才把颜色写进成片
 kernel void kSplatColor(texture2d<float, access::sample> src [[texture(0)]],
-                        texture2d<float, access::write>  fbL [[texture(1)]],
-                        texture2d<float, access::write>  fbR [[texture(2)]],
+                        texture2d<float, access::write>  sbs [[texture(1)]],
                         constant VRP& P [[buffer(0)]],
                         device atomic_uint* bestL [[buffer(1)]],
                         device atomic_uint* bestR [[buffer(2)]],
@@ -125,31 +134,17 @@ kernel void kSplatColor(texture2d<float, access::sample> src [[texture(0)]],
     int dr = int(rint(float(g.x) - dd + P.xoff));
     float4 c = src.read(g);
     if (dl >= 0 && uint(dl) < P.W && atomic_load_explicit(bestL + g.y * P.W + uint(dl), memory_order_relaxed) == e) {
-        fbL.write(c, uint2(uint(dl), g.y));
+        sbs.write(c, uint2(uint(dl), g.y));
     }
     if (dr >= 0 && uint(dr) < P.W && atomic_load_explicit(bestR + g.y * P.W + uint(dr), memory_order_relaxed) == e) {
-        fbR.write(c, uint2(uint(dr), g.y));
+        sbs.write(c, uint2(P.W + uint(dr), g.y));
     }
 }
 
-// 4) 合洞 + 拼成片：写过的格子照抄，没写过的格子填。
-// 填的规矩（这一趟的全部要点）：
-//   近处东西在左眼里往右挪、右眼里往左挪 ⇒ 它让出来的那条洞，背景那侧永远在
-//   左眼的左边、右眼的右边（和 dd 的正负无关，只和「近的挪得多」有关）。所以洞就朝那一侧
-//   一格一格找最近一个真被写过的格子，照抄它的颜色：填进来的必是实打实存在过的像素，不掺人影。
-//   这一侧到头都没找到才退回老办法：按这格的视差回读源帧。
-//   回读在小数视差上会把人和背景线性混色——那就是人身上那道看着半透明的边的来源，
-//   所以它只是备胎，能照抄到就不该走到它。
-//   而 fs 出界（被「一起移」推出半幅的那条边界带）连照抄都不许：那两列本来就没有内容，
-//   拿最边上一格拉长填过去只有一只眼会这么长，两条黑带变成一条黑带一条拉伸带，比黑带更晃眼。
-// g 就是成片里的目标列，z 缓冲和 fbL/fbR 也是按目标列编的号 ⇒ 三个同一坐标系，取格子不做二次换算。
-// （0.23 之前这里写成 dx = g + xoff，等于把平移加了第二遍：位移一小看不出来，
-//  一拖滑杆到 ±10% 就是六十多列的双影，正好落在中缝上——用户报的「重叠」有一半是它。）
-// 只有备胎那份回读要还原「没平移」的源列 fs = g - xoff；fs 出界说明这段被推出了半幅，写黑。
-kernel void kCombine(texture2d<float, access::read>   fbL [[texture(0)]],
-                     texture2d<float, access::read>   fbR [[texture(1)]],
-                     texture2d<float, access::sample> src [[texture(2)]],
-                     texture2d<float, access::write>  sbs [[texture(3)]],
+// 4) 合洞：z 缓冲还是 0 的格子拿后向那份填，同时数洞
+kernel void kCombine(texture2d<float, access::read>  fbL [[texture(0)]],
+                     texture2d<float, access::read>  fbR [[texture(1)]],
+                     texture2d<float, access::write> sbs [[texture(2)]],
                      constant VRP& P [[buffer(0)]],
                      device atomic_uint* bestL [[buffer(1)]],
                      device atomic_uint* bestR [[buffer(2)]],
@@ -157,59 +152,22 @@ kernel void kCombine(texture2d<float, access::read>   fbL [[texture(0)]],
                      device atomic_uint* holes [[buffer(4)]],
                      uint2 g [[thread_position_in_grid]]) {
     if (g.x >= P.W || g.y >= P.H) return;
-    uint W = P.W, H = P.H;
-    uint idx = g.y * W + g.x;
+    uint idx = g.y * P.W + g.x;
+    // g 就是成片里的目标列，z 缓冲那两格也是按目标列编的号 ⇒ 两边同一个坐标系，取格子不做二次换算。
+    // （0.23 之前这里写成 dx = g + xoff，等于把平移加了第二遍：位移一小看不出来，
+    //  一拖滑杆到 ±10% 就是六十多列的双影，正好落在中缝上——用户报的「重叠」有一半是它。）
+    // fbL/fbR 是「没平移」那份铺的 ⇒ 减回 xoff 才是它对应的格子；减出界的说明这段被推出了半幅，写黑。
     int xf = int(rint(P.xoff));
     int fs = int(g.x) - xf;
-    bool fits = (fs >= 0 && uint(fs) < W);
-    // 洞最宽约等于两侧深度差 × budget，最坏 2·budget；再往外的空洞不该拿颜色硬填，交给备胎/黑边。
-    int reach = int(2.0 * P.budget) + 8;
-    float vy = (float(g.y) + 0.5) / float(H);
-
-    if (atomic_load_explicit(bestL + idx, memory_order_relaxed) != 0u) {
-        sbs.write(fbL.read(g, 0), uint2(g.x, g.y));
-    } else if (!fits) {
+    bool fits = (fs >= 0 && fs < int(P.W));
+    if (atomic_load_explicit(bestL + idx, memory_order_relaxed) == 0u) {
+        sbs.write(fits ? fbL.read(uint2(uint(fs), g.y), 0) : float4(0.0, 0.0, 0.0, 0.0), uint2(g.x, g.y));
         atomic_fetch_add_explicit(holes, 1u, memory_order_relaxed);
-        sbs.write(float4(0.0, 0.0, 0.0, 0.0), uint2(g.x, g.y));
-    } else {
-        atomic_fetch_add_explicit(holes, 1u, memory_order_relaxed);
-        float4 c = float4(0.0, 0.0, 0.0, 1.0);
-        bool got = false;
-        for (int k = 1; k <= reach; k++) {
-            int x = int(g.x) - k;
-            if (x < 0) { break; }
-            if (atomic_load_explicit(bestL + g.y * W + uint(x), memory_order_relaxed) != 0u) {
-                c = fbL.read(uint2(uint(x), g.y), 0); got = true; break;
-            }
-        }
-        if (!got) {
-            float dd = ddOf(dn, g.y * W + uint(fs), P);
-            c = src.sample(lin, float2((float(fs) + 0.5 - dd) / float(W), vy));
-        }
-        sbs.write(c, uint2(g.x, g.y));
     }
-
-    if (atomic_load_explicit(bestR + idx, memory_order_relaxed) != 0u) {
-        sbs.write(fbR.read(g, 0), uint2(W + g.x, g.y));
-    } else if (!fits) {
+    if (atomic_load_explicit(bestR + idx, memory_order_relaxed) == 0u) {
+        sbs.write(fits ? fbR.read(uint2(uint(fs), g.y), 0) : float4(0.0, 0.0, 0.0, 0.0),
+                  uint2(P.W + uint(g.x), g.y));
         atomic_fetch_add_explicit(holes, 1u, memory_order_relaxed);
-        sbs.write(float4(0.0, 0.0, 0.0, 0.0), uint2(W + g.x, g.y));
-    } else {
-        atomic_fetch_add_explicit(holes, 1u, memory_order_relaxed);
-        float4 c = float4(0.0, 0.0, 0.0, 1.0);
-        bool got = false;
-        for (int k = 1; k <= reach; k++) {
-            int x = int(g.x) + k;
-            if (uint(x) >= W) { break; }
-            if (atomic_load_explicit(bestR + g.y * W + uint(x), memory_order_relaxed) != 0u) {
-                c = fbR.read(uint2(uint(x), g.y), 0); got = true; break;
-            }
-        }
-        if (!got) {
-            float dd = ddOf(dn, g.y * W + uint(fs), P);
-            c = src.sample(lin, float2((float(fs) + 0.5 + dd) / float(W), vy));
-        }
-        sbs.write(c, uint2(W + g.x, g.y));
     }
 }
 
@@ -236,13 +194,15 @@ kernel void kSbsShift(texture2d<float, access::read>  src [[texture(0)]],
     uint W = P.W;
     bool left = g.x < W;
     uint base = left ? 0u : W;
+    // mono＝源是一整幅单眼图：两只眼都从第 0 列起读同一幅，读侧不再偏移半幅宽
+    uint sbase = P.mono == 0u ? base : 0u;
     int sh = int(rint(left ? P.xoff - P.gap : P.xoff + P.gap));
     int lx = int(g.x - base) - sh;
     if (lx < 0 || uint(lx) >= W) {
         dst.write(float4(0.0, 0.0, 0.0, 0.0), g);
         return;
     }
-    dst.write(src.read(uint2(base + uint(lx), g.y)), g);
+    dst.write(src.read(uint2(sbase + uint(lx), g.y)), g);
 }
 
 // 7) 播放上屏的鱼眼那一趟：把每只眼那半幅按桶形（鱼眼）重采样一遍，顺手把摆位（xoff/gap）也一起做了。
@@ -262,6 +222,9 @@ kernel void kSbsFish(texture2d<float, access::sample> src [[texture(0)]],
     uint W = P.W, H = P.H;
     bool left = g.x < W;
     uint base = left ? 0u : W;
+    // mono＝源是一整幅单眼图：读侧的起点恒 0、归一化按源宽 W（不是成片宽 SW）
+    uint sbase = P.mono == 0u ? base : 0u;
+    float sw = P.mono == 0u ? float(P.SW) : float(W);
     // 先把摆位还原成「自家半幅中心为原点」的偏移，符号与 kSbsShift 一致
     int sh = int(rint(left ? P.xoff - P.gap : P.xoff + P.gap));
     float dx = float(int(g.x - base) - sh) + 0.5 - float(W) / 2.0;
@@ -274,7 +237,7 @@ kernel void kSbsFish(texture2d<float, access::sample> src [[texture(0)]],
         dst.write(float4(0.0, 0.0, 0.0, 0.0), g);
         return;
     }
-    // uv 按整张纹理归一，所以 x 要先把「自家半幅」的局部列换回成片里的绝对列（base 就是左/右眼的起点）。
-    // 少加这个 base、或除数写成 W：每只眼都会把两只眼拼起来的整幅塞进自己那半个枕形 ⇒ 左右眼都是双图。
-    dst.write(src.sample(lin, float2((float(base) + sx) / float(P.SW), sy / float(H))), g);
+    // uv 按整张源纹理归一，所以 x 要先把「自家半幅」的局部列换回源图里的绝对列（sbase 就是那只眼的起点）。
+    // 非 mono 时少加这个 sbase、或除数写成 W：每只眼都会把两只眼拼起来的整幅塞进自己那半个枕形 ⇒ 左右眼都是双图。
+    dst.write(src.sample(lin, float2((float(sbase) + sx) / sw, sy / float(H))), g);
 }

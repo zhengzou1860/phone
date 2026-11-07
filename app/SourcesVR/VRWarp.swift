@@ -5,7 +5,7 @@ import CoreVideo
 import CoreML
 import Metal
 
-/// Swift 侧的 VRP，字段顺序和 Shaders.metal 里那个 struct 一字不差（56 字节，全 4 字节对齐）。
+/// Swift 侧的 VRP，字段顺序和 Shaders.metal 里那个 struct 一字不差（60 字节，全 4 字节对齐）。
 struct VRParams {
     var W: UInt32 = 0
     var H: UInt32 = 0
@@ -24,6 +24,8 @@ struct VRParams {
     var gap: Float = 0
     /// 鱼眼强度 k（0=不弯）：只在播放上屏那一趟用，出片那条一律 0（弯法是镜片的属性，不是片子的）
     var fish: Float = 0
+    /// 1=源纹理是一整幅单眼图（实时平铺那条，两只眼铺同一幅）；0=源本身已是左右眼整幅
+    var mono: UInt32 = 0
 }
 
 extension VRTech {
@@ -150,8 +152,8 @@ final class VRDepthFeed {
 
     /// 一帧：kScale 画进送检框 → CoreML → 输出平面按眼格重采样
     /// 锁只盖住第一段：kScale 那趟要动 VRTech 的静态 command buffer，跟别处的形变并发会踩成 trap。
-    /// CoreML 预测那 180 ms 一个 Metal 指令都不发，必须留在锁外——实时播放的显示线程就在旁边等这张深度，
-    /// 抱着锁预测就等于把整条播放压到 5 帧/秒。
+    /// CoreML 预测那 180 ms 一个 Metal 指令都不发，必须留在锁外：抱着锁预测，等于让所有要发指令的活
+    /// （同一趟里下一帧的形变、播放页那一趟摆位）排在这 180 ms 后面。
     func infer(srcPB: CVPixelBuffer) -> (raw: [Float], ms: (prep: Double, predict: Double),
                                          plane: VRPlane.Out, err: String?) {
         let pre = scaleInto(srcPB: srcPB)
@@ -251,10 +253,7 @@ final class VRDepthFeed {
     }
 }
 
-/// Metal 侧的一帧形变：4 个 pass（清 z／前向占格／前向写色到 fbL、fbR／合洞数洞拼成片）。
-/// 写色落成每只眼的半幅而不是直接拼成片：填洞要读邻格的颜色，读「上一趟写完的」fbL/fbR 是干净的，
-/// 读「本趟正在拼」的成片就得靠一句「本趟写的格子永远不会被当成邻格读到」——那是跨线程的次序，
-/// 不好验也不好改，不值当。
+/// Metal 侧的一帧形变：4 个 pass（后向+清 z／前向占格／前向写色／合洞数洞）。
 final class VRWarp {
     let eyeW: Int
     let eyeH: Int
@@ -266,10 +265,6 @@ final class VRWarp {
     let bestR: MTLBuffer
     let dnBuf: MTLBuffer
     let holesBuf: MTLBuffer
-    /// 播放上屏那两档（间距、鱼眼）要挪/要弯的是「已经拼好的整幅」，形变那四趟只认自家半幅，
-    /// 所以先拼到 comp 再走最后一趟。只在真要有这一趟时才造——出片那条和两档都没动的播放
-    /// 不该多占这一份内存和多跑一趟 GPU。
-    var comp: MTLTexture?
 
     init?(eyeW: Int, eyeH: Int, bpct: Float, note: inout String) {
         guard let dev = VRTech.device else { note = "没有 Metal 设备"; return nil }
@@ -301,11 +296,8 @@ final class VRWarp {
     }
 
     /// 一帧。dn 是已归一化到 0..1 的眼格深度；outPB 是 2W×H 的 BGRA 像素缓冲（成片的这一帧）。
-    /// xoff = 每眼画面在自家半幅里的水平位移（像素），只对实时播放的对镜片有用，出片那条一律传 0。
-    /// gap = 两图之间的距离（像素），fish = 鱼眼强度 k（0=不弯），两个都只有播放上屏用；
-    /// 都传 0 就少跑最后一趟。出片那条一律 0：间距和弯法都是戴镜看的时候的事，不烧进文件。
-    func render(srcPB: CVPixelBuffer, dn: [Float], zp: Float, xoff: Float = 0,
-                gap: Float = 0, fish: Float = 0, outPB: CVPixelBuffer)
+    /// 这里没有任何「摆位」：间距、鱼眼、对镜片的位移全是戴镜看的那一趟的事，不烧进文件（见 VRSbsShift）。
+    func render(srcPB: CVPixelBuffer, dn: [Float], zp: Float, outPB: CVPixelBuffer)
         -> (upload: Double, gpu: Double, holes: Double, err: String?) {
         VRTech.gate.lock()
         defer { VRTech.gate.unlock() }
@@ -316,29 +308,11 @@ final class VRWarp {
         }
         let px = eyeW * eyeH
         guard dn.count == px else { return (0, 0, 0, "深度数组 \(dn.count) 与眼格 \(px) 不符") }
-        // 间距和鱼眼都要动「已经拼好的整幅」，形变那四趟只认自家半幅，所以先拼到 comp 再走最后一趟。
-        // 两档都是 0（出片、没碰滑杆的播放）不建这张、不多跑一趟。
-        var dstTex = outTex
-        if gap != 0 || fish != 0 {
-            if comp == nil {
-                guard let dev = VRTech.device else { return (0, 0, 0, "没有 Metal 设备，上屏那一趟起不来") }
-                let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm,
-                                                                 width: sbsW, height: eyeH, mipmapped: false)
-                d.usage = [.shaderRead, .shaderWrite]
-                guard let t = dev.makeTexture(descriptor: d) else {
-                    return (0, 0, 0, "上屏中转纹理建不出来")
-                }
-                comp = t
-            }
-            guard let c = comp else { return (0, 0, 0, "上屏中转纹理是空的") }
-            dstTex = c
-        }
         var p = VRParams()
         p.W = UInt32(eyeW); p.H = UInt32(eyeH)
         p.MW = UInt32(eyeW); p.MH = UInt32(eyeH)
         p.zp = zp; p.budget = budget
         p.SW = UInt32(sbsW)
-        p.xoff = xoff
 
         let t0 = DispatchTime.now().uptimeNanoseconds
         dn.withUnsafeBytes { raw in
@@ -349,11 +323,10 @@ final class VRWarp {
         let t1 = DispatchTime.now().uptimeNanoseconds
         let shared: [(Int, MTLBuffer)] = [(1, bestL), (2, bestR), (3, dnBuf)]
         let passes: [(String, [MTLTexture], [(Int, MTLBuffer)])] = [
-            ("kClear", [], shared),
+            ("kBack", [srcTex, fbL, fbR], shared),
             ("kSplatDepth", [], shared),
-            ("kSplatColor", [srcTex, fbL, fbR], shared),
-            // 合洞那趟要读源帧：洞朝背景侧照抄不到时，它按视差就地回读一份当备胎（见 kCombine）
-            ("kCombine", [fbL, fbR, srcTex, dstTex], shared + [(4, holesBuf)]),
+            ("kSplatColor", [srcTex, outTex], shared),
+            ("kCombine", [fbL, fbR, outTex], shared + [(4, holesBuf)]),
         ]
         for one in passes {
             guard let enc = VRTech.encode(one.0, textures: one.1, params: p,
@@ -362,22 +335,6 @@ final class VRWarp {
                 VRTech.currentCommand = nil
                 VRTech.keep.removeAll()
                 return (uploadMs, 0, 0, "\(one.0) 没编出来")
-            }
-            enc.endEncoding()
-        }
-        if fish != 0 || gap != 0 {
-            // 最后一趟只做摆位（鱼眼还要加弯）：xoff 已经烧进 comp 了，这里传的 xoff=0、gap=gap。
-            // 弯这一趟顺手把 gap 也做了，所以有鱼眼时不再单跑 kSbsShift；没鱼眼时仍走那条整数照搬的老路。
-            var q = p
-            q.xoff = 0
-            q.gap = gap
-            q.fish = fish
-            let kn = fish != 0 ? "kSbsFish" : "kSbsShift"
-            guard let enc = VRTech.encode(kn, textures: [dstTex, outTex], params: q,
-                                          buffers: [], width: sbsW, height: eyeH) else {
-                VRTech.currentCommand = nil
-                VRTech.keep.removeAll()
-                return (uploadMs, 0, 0, "\(kn) 没编出来")
             }
             enc.endEncoding()
         }
@@ -391,33 +348,38 @@ final class VRWarp {
     }
 }
 
-/// 相册里已经是左右眼的那条用的极简上屏：不跑深度、不形变，只把两张图各自摆到屏幕上哪一格（kSbsShift），
-/// 要鱼眼就换成同时做弯的那一趟（kSbsFish）。
-/// 实时形变那条跑完四趟后如果间距或鱼眼不是 0，也走同一对 kernel。
+/// 实时播放页那唯一的一趟上屏：不跑深度、不形变，只把两张图各自摆到屏幕上哪一格（kSbsShift），
+/// 要鱼眼就换成同时做弯的那一趟（kSbsFish）。源既是相册那条的整幅左右眼（mono=false），
+/// 也是普通视频那一整幅单眼图（mono=true，两只眼铺同一幅）。
+/// 出片那条形变完直接写成片，不走这里：间距、鱼眼、对镜片的位移都不该烧进文件。
 /// 跟 VRWarp 一样吃 VRTech 那份静态 command buffer 和 keep 表，所以整段照样在 gate 里。
 final class VRSbsShift {
     let frameW: Int
     let frameH: Int
     /// 半幅（每眼）宽：kernel 靠它认接缝在哪一列
     let eyeW: Int
+    /// 真是每只眼的宽：源是一整幅单眼图时（实时平铺那条），两只眼都从第 0 列读同一幅
+    let mono: Bool
 
-    init?(frameW: Int, frameH: Int, eyeW: Int, note: inout String) {
+    init?(frameW: Int, frameH: Int, eyeW: Int, mono: Bool, note: inout String) {
         guard VRTech.libs["kSbsShift"] != nil, VRTech.libs["kSbsFish"] != nil else {
             note = "kSbsShift/kSbsFish 不在管线里"; return nil
         }
         self.frameW = frameW
         self.frameH = frameH
         self.eyeW = eyeW
+        self.mono = mono
     }
 
-    /// 源和成片是同一尺寸的整幅左右眼；xoff 是两个半幅一起水平平移的像素数（正=右移），
+    /// 成片永远是 2W 宽的左右眼整幅；源看 mono：false＝源本身已是左右眼整幅（2W），
+    /// true＝源是一整幅单眼图（W），两只眼铺同一幅。xoff 是两个半幅一起水平平移的像素数（正=右移），
     /// gap 是把两张图互相拉开的像素数（各挪一半，图自己大小不动），fish 是鱼眼强度 k（0=不弯）。
     /// 这里不数洞：平移和鱼眼腾出来的那一头本来就该发黑，不是补洞失败。
     func render(srcPB: CVPixelBuffer, xoff: Float, gap: Float = 0, fish: Float = 0, outPB: CVPixelBuffer)
         -> (gpu: Double, err: String?) {
         VRTech.gate.lock()
         defer { VRTech.gate.unlock() }
-        let sg = VRTech.texture(from: srcPB, width: frameW, height: frameH)
+        let sg = VRTech.texture(from: srcPB, width: mono ? eyeW : frameW, height: frameH)
         let og = VRTech.texture(from: outPB, width: frameW, height: frameH)
         guard let srcTex = sg.tex, let outTex = og.tex else {
             return (0, "帧或成片纹理建不出来（源 \(sg.note)｜成片 \(og.note)）")
@@ -429,6 +391,7 @@ final class VRSbsShift {
         p.xoff = xoff
         p.gap = gap
         p.fish = fish
+        p.mono = mono ? 1 : 0
         let kn = fish != 0 ? "kSbsFish" : "kSbsShift"
         let t0 = DispatchTime.now().uptimeNanoseconds
         guard let enc = VRTech.encode(kn, textures: [srcTex, outTex], params: p,

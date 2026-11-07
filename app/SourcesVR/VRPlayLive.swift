@@ -1,20 +1,17 @@
 import AVFoundation
 import CoreMedia
-import CoreML
 import Foundation
 import SwiftUI
 import UIKit
 
-/// 实时左右眼：相册里选一条普通视频，边解码边形变边直接上屏，不写文件、不进相册。
-/// sbs=true 是同一套骨架的另一副面孔：相册里那条本身已是左右眼，深度和形变都不跑，
-/// 只在各自半幅里做水平平移，暂停/拖进度/出声/横屏这些跟实时那条完全一致。
+/// 实时播放：相册里选一条片子，边解码边摆位边直接上屏，不写文件、不进相册。
+/// sbs=false 是普通视频（一整幅单眼图），两只眼铺同一幅；sbs=true 是相册里那条本身已是左右眼，
+/// 各读各的半幅。两副面孔都只剩「摆位」这一趟：一起移、间距、鱼眼，暂停/拖进度/出声/横屏全共用。
 ///
-/// 跟「先转完再播」那条两趟的区别，也是这条的天花板：
-/// 深度单价实测 180~200 ms/帧（CPU、送检 518x392 钉死），30 帧的播放要 33 ms/帧，差 6 倍。
-/// 所以深度线程只在空着的时候领最新那一帧去算，算完发布；显示线程照 30 帧的节奏走，
-/// 没有新深度就复用上一张 ⇒ 画面动是流畅的，只有立体感的更新是 5 次/秒一级一级跳。
-/// 整片 p1/p99 在这里拿不到（未来帧还没解出来），改成已见样本的滑动分位：开头几秒的幅度会偏，
-/// 越播越准。这两条都在统计那三行里如实报出来。
+/// 0.29 起这条不跑深度了（实机反馈：形变在人边上留下一条被拖长的带，实时看着比干脆没立体更难受）。
+/// 深度＋形变只留在「生成 VR 文件」那两条里——那里离线逐帧，洞的填法还能慢慢改。
+/// 于是这一页屏上永远是原片本来的像素，一条带都不可能有；代价是普通视频这条不再有立体感。
+/// 它现在管两件事：把相册里已是左右眼的片子塞进眼镜看，还有把眼镜的摆位/鱼眼在这一页对出来（存档）。
 final class VRLive {
     /// 与全片共用「一次只许一条」这条规矩：Metal 那份静态地基（keep/currentCommand）不给并发踩
     static let door = NSLock()
@@ -27,7 +24,7 @@ final class VRLive {
         return inside
     }
 
-    /// 界面上那枚停止键走这里：转给当前在跑的那条。只改旗子，收兵还是两条线程自己走
+    /// 界面上那枚停止键走这里：转给当前在跑的那条。只改旗子，收兵还是显示线程自己走到头
     static func requestStopCurrent() {
         door.lock(); let c = current; door.unlock()
         c?.requestStop()
@@ -50,32 +47,14 @@ final class VRLive {
 
     let url: URL
     let eyeLong: Int
-    let bpct: Float
-    let zp: Float
-    let smooth: Float
-    let units: MLComputeUnits
-    let rot: Bool
-    /// 相册里那条本身已是左右眼：不跑深度不形变，只按半幅水平平移，进度/暂停/位移这些照旧
+    /// 相册里那条本身已是左右眼：源读各自半幅；否则源是一整幅单眼图，两只眼铺同一幅
     let sbs: Bool
     /// 收兵后把报告交回界面（在主线程上调）
     var onEnd: ((String) -> Void)?
 
-    // —— 两条线程之间的全部状态都由 dLock 保护 ——
+    // —— 界面发过来的控制跟显示线程自己的状态都由 dLock 保护 ——
     private let dLock = NSLock()
     private var running = false
-    private var handPending = false
-    private var handBusy = false
-    private var latestRaw: [Float] = []
-    private var latestSeq = -1
-    private var depthTakes = 0
-    private var depthSumMs = 0.0
-    private var depthErr = ""
-    /// 深度那张图到底按什么读法读的（16 位=半浮点还是整数）：只报一次，好跟上机日志对账
-    private var depthFmt = ""
-    private var depthFails = 0
-    private var pool: [Float] = []
-    private var lo: Float = 0
-    private var span: Float = 1
     // —— 界面上的控件发过来的播放控制，跟上面这些同一条锁 ——
     private var paused = false
     private var seekTo: Double?
@@ -86,7 +65,7 @@ final class VRLive {
     /// 两图之间的距离（占每眼宽的比例）：正=两只眼互相离远（中缝多出黑带来），负=互相靠近；
     /// 每张图自己多大始终不动，也永不越过中缝 ⇒ 这个旋钮只改距离，不改大小、不串眼
     private var gapPct: Float = 0
-    /// 鱼眼强度（0~1，0=不弯）：只作用在上屏那一趟，深度和成片都不碰它
+    /// 鱼眼强度（0~1，0=不弯）：只作用在上屏这一趟，出片那条完全不碰它
     private var fishPct: Float = 0
     /// 位移/间距/鱼眼每变一次 +1：显示线程看到它变了先把 6 块显示缓冲抹一次黑、再把静止这帧重画
     private var shiftSeq = 0
@@ -98,13 +77,10 @@ final class VRLive {
     private(set) var duration = 0.0
 
     private var src: VRSource?
-    private var feed: VRDepthFeed?
-    private var warp: VRWarp?
-    /// 只有 sbs 那条用：整幅左右眼的半幅平移
+    /// 这一页唯一的一趟上屏：把源铺成两只眼各自那一格（外加一起移/间距/鱼眼三档摆位）
     private var shift: VRSbsShift?
     private var stream: VRFrameStream?
     private var framePB: CVPixelBuffer?
-    private var handPB: CVPixelBuffer?
     private var showPBs: [CVPixelBuffer] = []
     private var fmtDesc: CMFormatDescription?
     private var layer: AVSampleBufferDisplayLayer?
@@ -115,23 +91,16 @@ final class VRLive {
 
     private var note = ""
     private var frames = 0
-    private var holes = 0.0
     private var gpuSum = 0.0
     private var clock0 = UInt64(0)
 
-    init(url: URL, eyeLong: Int, bpct: Float, zp: Float, smooth: Float,
-         units: MLComputeUnits, rot: Bool, sbs: Bool = false) {
+    init(url: URL, eyeLong: Int, sbs: Bool = false) {
         self.url = url
         self.eyeLong = eyeLong
-        self.bpct = bpct
-        self.zp = zp
-        self.smooth = smooth
-        self.units = units
-        self.rot = rot
         self.sbs = sbs
     }
 
-    /// 界面按「停止」调这个：只改旗子，真正的收兵在两条线程自己走到头之后
+    /// 界面按「停止」调这个：只改旗子，真正的收兵在显示线程自己走到头之后
     func requestStop() {
         dLock.lock(); running = false; dLock.unlock()
     }
@@ -211,7 +180,7 @@ final class VRLive {
         VRJournal.line("实时 鱼眼 \(String(format: "%.0f", Double(v) * 100))%")
     }
 
-    /// 起头。成功返回空串并把两条线程放出去；失败返回那句原因，界面直接显示，不用等线程。
+    /// 起头。成功返回空串并把显示线程放出去；失败返回那句原因，界面直接显示，不用等线程。
     func start(layer: AVSampleBufferDisplayLayer, label: UILabel) -> String {
         VRLive.door.lock()
         if VRLive.inside {
@@ -229,9 +198,6 @@ final class VRLive {
             return first
         }
         dLock.lock(); running = true; dLock.unlock()
-        if !sbs {
-            DispatchQueue.global(qos: .userInteractive).async { [weak self] in self?.depthPump() }
-        }
         DispatchQueue.global(qos: .userInteractive).async { [weak self] in self?.pump() }
         return ""
     }
@@ -239,61 +205,30 @@ final class VRLive {
     private func setup() -> String {
         guard VRTech.boot() else { return "Metal 起不来：\(VRTech.initNote)" }
         // 出声的开关必须在起 AVAudioPlayer 之前调好，不然那条还是按默认类别被静音拨片管着
-        VRSound.enable(sbs ? "左右眼原样" : "实时形变")
+        VRSound.enable("实时平铺")
         guard let s = VRSource(url: url, eyeLong: eyeLong, sbs: sbs) else {
             return "读不出这条片子（详情见磁盘日志）"
         }
         src = s
-        var modelTag = ""
-        var depthTag = ""
+        // 整趟不碰 CoreML：深度模型、送检框、形变缓冲一样都不建
+        // ⚠️ 上屏这一份的宽不跟 s.frameW 走：普通视频那条是一整幅单眼图，要在这里铺成两只眼 ⇒ 宽 = 每眼 ×2；
+        // 只有 sbs 那条整幅本来就带着两只眼。0.18 我把这里统一写成 s.frameW（=每眼宽），
+        // 纹理却按 2×每眼 去建，手上是半宽的缓冲 ⇒ 第 1 帧就 -6684，整页退回主页像闪退（11-06 15:34 实测）。
+        let outW = sbs ? s.frameW : s.eyeW * 2
+        let outH = s.frameH
         var fn = ""
-        if sbs {
-            // 这一条整趟不碰 CoreML：深度、形变、送检框一样都不建，起得比实时那条快得多
-            guard let sh = VRSbsShift(frameW: s.frameW, frameH: s.frameH, eyeW: s.eyeW,
-                                      note: &fn) else {
-                return "左右眼平移建不起来：\(fn)"
-            }
-            shift = sh
-        } else {
-            let found = VRDepth.locate()
-            guard let modelURL = found.url else { return "包里没有深度模型：\(found.note)" }
-            let got = VRDepth.load(units)
-            guard let model = got.model else {
-                return "\(VRPilot.unitsName(units)) 加载失败（\(VRUtil.ms(got.ms))）: \(got.note)"
-            }
-            let tgt = VRDepth.inputTarget(model, eyeW: s.eyeW, eyeH: s.eyeH)
-            guard let f = VRDepthFeed(model: model, eyeW: s.eyeW, eyeH: s.eyeH,
-                                      mw: tgt.w, mh: tgt.h, rot: rot, note: &fn) else {
-                return "送检通道建不起来：\(fn)"
-            }
-            feed = f
-            var wn = ""
-            guard let w = VRWarp(eyeW: s.eyeW, eyeH: s.eyeH, bpct: bpct, note: &wn) else {
-                return "形变建不起来：\(wn)"
-            }
-            warp = w
-            modelTag = "｜\(modelURL.lastPathComponent)"
-            depthTag = "｜\(VRPilot.unitsName(units)) 送检 \(tgt.w)x\(tgt.h)"
+        guard let sh = VRSbsShift(frameW: outW, frameH: outH, eyeW: s.eyeW,
+                                  mono: !sbs, note: &fn) else {
+            return "平铺上屏建不起来：\(fn)"
         }
+        shift = sh
         guard let st = VRFrameStream(src: s) else { return "顺序解码起不来（startReading 失败）" }
         stream = st
         guard let a = VRTech.pixelBuffer(width: s.frameW, height: s.frameH).pb else {
             return "帧缓冲造不出来"
         }
         framePB = a
-        if !sbs {
-            // 交接给深度线程的那一块只有实时那条要：sbs 那条不跑深度，白占一整帧内存
-            guard let b = VRTech.pixelBuffer(width: s.frameW, height: s.frameH).pb else {
-                return "送检交接缓冲造不出来"
-            }
-            handPB = b
-        }
         // 显示缓冲按轮转用固定的 6 份：每帧新造的话，纹理缓存里会一份一份攒着不回来（全片实测 1.65 MB/帧）
-        // ⚠️ 上屏这一份的宽不跟 s.frameW 走：实时那条是形变把两只眼并排写出来，宽 = 每眼 ×2；
-        // 只有 sbs 那条整幅本来就带着两只眼。0.18 我把这里统一写成 s.frameW（=每眼宽），
-        // VRWarp 照样按 2×每眼 去建纹理，手上却是半宽的缓冲 ⇒ 第 1 帧就 -6684，整页退回主页像闪退（11-06 15:34 实测）。
-        let outW = sbs ? s.frameW : s.eyeW * 2
-        let outH = sbs ? s.frameH : s.eyeH
         for _ in 0..<6 {
             guard let pb = VRTech.pixelBuffer(width: outW, height: outH).pb else {
                 return "显示缓冲造不出来（已造 \(showPBs.count) 份）"
@@ -325,89 +260,29 @@ final class VRLive {
         let gapName = String(format: "%+.1f", Double(gapPct) * 100)
         let fishTag = "鱼眼\(String(format: "%.0f", VRLive.storedFish * 100))%"
         // 这块是在后台线程跑的： UILabel 只能主线程碰，起手那行也一样交回主线程写
-        // 「上屏」那对数才是真正进眼睛的尺寸：实时形变拼出来的是 每眼×2，sbs 那条就是原片整幅
-        let headName = sbs ? "左右眼原样起手" : "实时起手"
+        // 「上屏」那对数才是真正进眼睛的尺寸：两条都是 每眼×2（普通视频那条由这一页现场铺两份）
+        let headName = sbs ? "左右眼原样起手" : "实时平铺起手"
         let startLine = "\(headName)：每眼 \(s.eyeW)x\(s.eyeH)｜上屏 \(outW)x\(outH)"
-            + "｜\(String(format: "%.1f", s.fps)) fps\(depthTag)\(modelTag)"
+            + "｜\(String(format: "%.1f", s.fps)) fps"
             + "｜声音\(audioName)｜一起移\(shiftName)% 间距\(gapName)%\(fishTag)｜点屏幕出控件"
         DispatchQueue.main.async { [weak self] in self?.label?.text = startLine }
-        let modeTag = sbs ? "左右眼原样（不跑深度）" : "实时形变 视差\(bpct)% zp\(zp) 朝向\(rot ? "转90°" : "摆正")"
-        VRJournal.line("播放 开始 \(url.lastPathComponent) \(modeTag) 每眼 \(s.eyeW)x\(s.eyeH)"
+        let modeTag = sbs ? "左右眼原样" : "实时平铺"
+        VRJournal.line("播放 开始 \(url.lastPathComponent) \(modeTag)（不跑深度）每眼 \(s.eyeW)x\(s.eyeH)"
             + " 上屏 \(outW)x\(outH) \(String(format: "%.1f", s.fps)) fps"
             + " 一起移\(shiftName)% 间距\(gapName)% \(fishTag)")
         return ""
     }
 
-    /// 深度线程：空着才领活，一次只算一帧；算完把眼格数组发布出去
-    private func depthPump() {
-        guard let f = feed, let h = handPB else {
-            dLock.lock()
-            depthErr = "深度线程拿不到送检通道或交接缓冲"
-            dLock.unlock()
-            return
-        }
-        while true {
-            dLock.lock()
-            if !running { dLock.unlock(); break }
-            if !handPending || handBusy || depthFails >= 3 { dLock.unlock(); Thread.sleep(forTimeInterval: 0.004); continue }
-            handPending = false
-            handBusy = true
-            dLock.unlock()
-
-            let r = f.infer(srcPB: h)
-            var fresh: [Float] = []
-            var pms = 0.0
-            if r.err == nil, !r.raw.isEmpty {
-                fresh = r.raw
-                pms = r.ms.predict
-            } else {
-                dLock.lock()
-                depthFails += 1
-                if depthErr.isEmpty { depthErr = r.err ?? "深度数组是空的" }
-                dLock.unlock()
-            }
-
-            dLock.lock()
-            handBusy = false
-            if !fresh.isEmpty {
-                latestRaw = fresh
-                latestSeq += 1
-                depthTakes += 1
-                depthSumMs += pms
-                if depthFmt.isEmpty { depthFmt = r.plane.fmt }
-                // 在线分位的样本池：每 16 个取一个，满了就从最老那头滑掉
-                var i = 0
-                while i < fresh.count {
-                    pool.append(fresh[i])
-                    i += 16
-                }
-                if pool.count > 60000 { pool.removeFirst(pool.count - 60000) }
-            }
-            dLock.unlock()
-        }
-    }
-
-    /// 显示线程：解码→（形变｜半幅平移）→上屏，按帧号排节奏；
-    /// 界面发的暂停/拖进度/一起移/间距都在这一圈里落。sbs 那条深度整趟不参与。
+    /// 显示线程：解码→铺成两只眼→上屏，按帧号排节奏；
+    /// 界面发的暂停/拖进度/一起移/间距/鱼眼都在这一圈里落。
     private func pump() {
         guard let s = src, let f = framePB, let lay = layer, let st = stream else {
             finish("实时 内部状态没建起来（setup 提前退了）")
             return
         }
-        let w = warp
-        let sh = shift
-        if sbs {
-            guard sh != nil else { finish("左右眼原样：平移那趟没建起来"); return }
-        } else {
-            guard w != nil else { finish("实时：形变那趟没建起来"); return }
-        }
-        // sbs 那条根本不碰深度：两块眼格数组留空，别白占 0.66 MB
-        let px = sbs ? 0 : s.eyeW * s.eyeH
+        guard let sh = shift else { finish("实时：平铺上屏那趟没建起来"); return }
         let fps = s.fps > 1 ? s.fps : 30.0
         let eyeWf = Float(s.eyeW)
-        var dn = [Float](repeating: 0, count: px)
-        var prev = [Float](repeating: 0, count: px)
-        var usedSeq = -1
         // k = 这一段里已解出的源帧（排节奏、算单价用它）；n = 已上屏的样本数（只喂 PTS，
         // PTS 必须一直往前，否则显示层会把倒回去的样本丢掉 ⇒ 暂停期间的补帧也算在 n 里，不进 k）
         var k = 0
@@ -432,7 +307,6 @@ final class VRLive {
                     break
                 }
                 k = 0
-                usedSeq = -1
                 continue
             }
             let moved = wantSeq != lastSeq
@@ -447,32 +321,10 @@ final class VRLive {
             }
             if !hold {
                 guard st.next(into: f) else { note = "解码到片尾"; break }
-                if !sbs {
-                    dLock.lock()
-                    if !handPending && !handBusy, let h = handPB {
-                        VRUtil.copyRows(from: f, to: h)
-                        handPending = true
-                    }
-                    dLock.unlock()
-                    var fresh = false
-                    dLock.lock()
-                    if latestSeq != usedSeq && !latestRaw.isEmpty { usedSeq = latestSeq; fresh = true }
-                    dLock.unlock()
-                    if fresh { recompute(px: px, dn: &dn, prev: &prev) }
-                }
             }
             let outPB = showPBs[n % showPBs.count]
-            var gpuMs = 0.0
-            if sbs {
-                let rr = sh!.render(srcPB: f, xoff: xo, gap: gp, fish: fh, outPB: outPB)
-                if let e = rr.err { note = "第 \(k + 1) 帧平移失败：\(e)"; break }
-                gpuMs = rr.gpu
-            } else {
-                let rr = w!.render(srcPB: f, dn: dn, zp: zp, xoff: xo, gap: gp, fish: fh, outPB: outPB)
-                if let e = rr.err { note = "第 \(k + 1) 帧形变失败：\(e)"; break }
-                gpuMs = rr.gpu
-                holes += rr.holes
-            }
+            let rr = sh.render(srcPB: f, xoff: xo, gap: gp, fish: fh, outPB: outPB)
+            if let e = rr.err { note = "第 \(k + 1) 帧平铺失败：\(e)"; break }
             guard let sb = sample(outPB, k: n, fps: fps) else { note = "第 \(k + 1) 帧的显示样本造不出来"; break }
             lay.enqueue(sb)
             if lay.status == .failed {
@@ -482,7 +334,7 @@ final class VRLive {
             n += 1
             // 停住期间只有刚拖完位移、间距或鱼眼那一下走到这里：把静止这一帧按新数值重画一遍就回去
             if hold { Thread.sleep(forTimeInterval: 1.0 / fps); continue }
-            gpuSum += gpuMs
+            gpuSum += rr.gpu
             k += 1
             frames = k
             dLock.lock(); posSeen = t0sec + Double(k) / fps; dLock.unlock()
@@ -534,8 +386,6 @@ final class VRLive {
         pausedAccum = 0
         seekTo = nil
         posSeen = t
-        // 拖完进度，交接给深度线程的那一帧是旧位置的 ⇒ 丢掉，别让拖完的头一帧拿它做立体
-        handPending = false
         let hold = paused
         dLock.unlock()
         clock0 = DispatchTime.now().uptimeNanoseconds
@@ -561,35 +411,6 @@ final class VRLive {
                 memset(b, 0, n)
             }
             CVPixelBufferUnlockBaseAddress(pb, [])
-        }
-    }
-
-    /// 拿已见样本的 p1/p99 归一化，再跟上一张深度做时域平滑 0.4（只在真来了新深度时做）
-    private func recompute(px: Int, dn: inout [Float], prev: inout [Float]) {
-        dLock.lock()
-        defer { dLock.unlock() }
-        guard latestRaw.count >= px else { return }
-        if pool.count >= 1024 {
-            let sorted = pool.sorted()
-            lo = sorted[sorted.count / 100]
-            let hi = sorted[(sorted.count * 99) / 100]
-            span = max(1e-6, hi - lo)
-        }
-        var i = 0
-        while i < px {
-            dn[i] = min(1.0, max(0.0, (latestRaw[i] - lo) / span))
-            i += 1
-        }
-        if smooth > 0 {
-            i = 0
-            while i < px {
-                dn[i] = (1 - smooth) * dn[i] + smooth * prev[i]
-                prev[i] = dn[i]
-                i += 1
-            }
-        } else {
-            i = 0
-            while i < px { prev[i] = dn[i]; i += 1 }
         }
     }
 
@@ -635,33 +456,11 @@ final class VRLive {
 
     private func stat(fps: Double) {
         let secs = max(Double(DispatchTime.now().uptimeNanoseconds - clock0) / 1_000_000_000.0, 0.001)
-        dLock.lock()
-        let takes = depthTakes
-        let avgD = takes > 0 ? depthSumMs / Double(takes) : 0.0
-        let poolN = pool.count
-        let err = depthErr
-        let fmt = depthFmt
-        dLock.unlock()
         let shown = Double(frames) / secs
         let gpuPer = frames > 0 ? gpuSum / Double(frames) : 0.0
-        let text: String
-        if sbs {
-            text = "左右眼原样 出帧 \(frames)＝\(String(format: "%.1f", shown)) 帧/秒（源 \(String(format: "%.1f", fps))）"
-                + "\n平移 \(String(format: "%.1f", gpuPer)) ms/帧｜不跑深度：屏上就是相册里那两个半幅"
-                + "\n拖下面那条只在各半幅里挪，绝不跨过接缝（串眼的脏边会落在视场正中）"
-        } else {
-            let hz = Double(takes) / secs
-            let holePct = frames > 0 ? holes / Double(frames) : 0.0
-            let errLine = err.isEmpty ? "" : "\n深度出错 \(err)（连续 3 次就不算了，画面退回平板）"
-                + (takes == 0 ? "\n一次深度都没算成：屏上这条是平的，没有立体" : "")
-            text = "实时 出帧 \(frames)＝\(String(format: "%.1f", shown)) 帧/秒（源 \(String(format: "%.1f", fps))）"
-                + "\n深度更新 \(takes) 次＝\(String(format: "%.1f", hz)) 次/秒、单价 \(String(format: "%.0f", avgD)) ms"
-                + "｜其余 \(frames - takes) 帧复用上一张"
-                + "\n形变 \(String(format: "%.1f", gpuPer)) ms/帧｜补洞 \(String(format: "%.2f", holePct))%"
-                + "｜归一化样本池 \(poolN) 个（实时没有整片 p1/p99，边播边攒）"
-                + (fmt.isEmpty || takes == 0 ? "" : "\n深度读法 \(fmt)")
-                + errLine
-        }
+        let text = "\(sbs ? "左右眼原样" : "实时平铺") 出帧 \(frames)＝\(String(format: "%.1f", shown)) 帧/秒（源 \(String(format: "%.1f", fps))）"
+            + "\n摆位 \(String(format: "%.1f", gpuPer)) ms/帧｜这一页不跑深度：屏上就是原片的像素，不会有被拖长的那条带"
+            + "\n下面几条只管把画面在眼镜里摆舒服（挪、推远、弯），要立体感得用「选视频出全片」生成文件"
         if Thread.isMainThread { label?.text = text }
         else { DispatchQueue.main.async { [weak self] in self?.label?.text = text } }
     }
@@ -674,23 +473,13 @@ final class VRLive {
         if let lay = layer { lay.flush() }
         let wall = Double(DispatchTime.now().uptimeNanoseconds - clock0) / 1_000_000_000.0
         dLock.lock()
-        let takes = depthTakes
-        let err = depthErr
-        let fmt = depthFmt
         let fish = fishPct
         dLock.unlock()
-        var rep = "\(sbs ? "左右眼原样" : "实时") 收兵：出帧 \(frames) 帧、跑了 \(String(format: "%.1f", wall)) s"
-        if sbs {
-            rep += "｜平移 \(String(format: "%.1f", frames > 0 ? gpuSum / Double(frames) : 0)) ms/帧"
-        } else {
-            rep += "｜深度 \(takes) 次｜形变 \(String(format: "%.1f", frames > 0 ? gpuSum / Double(frames) : 0)) ms/帧"
-                + "｜补洞 \(String(format: "%.2f", frames > 0 ? holes / Double(frames) : 0))%"
-        }
+        var rep = "\(sbs ? "左右眼原样" : "实时平铺") 收兵：出帧 \(frames) 帧、跑了 \(String(format: "%.1f", wall)) s"
+        rep += "｜摆位 \(String(format: "%.1f", frames > 0 ? gpuSum / Double(frames) : 0)) ms/帧｜不跑深度"
         rep += "｜足迹 \(VRFacts.footprintMB()) MB"
         if !note.isEmpty { rep += "｜\(note)" }
         if !extra.isEmpty { rep += "｜\(extra)" }
-        if !err.isEmpty { rep += "｜深度错 \(err)" }
-        if takes > 0 && !fmt.isEmpty { rep += "｜深度读法 \(fmt)" }
         rep += "｜鱼眼 \(String(format: "%.0f", Double(fish) * 100))%"
         VRJournal.line(rep)
         VRLive.door.lock()
@@ -813,7 +602,7 @@ final class VRLiveView: UIView {
         let w = bounds.width, h = bounds.height
         tapCatch.frame = bounds
         // 右边留出 100 pt：那格是 SwiftUI 那枚「停止」的落点，别把实测那几行铺到它底下去
-        // 高 120：起手那行要绕两三行，实测连「深度读法」「深度出错」一起最多六行，写死 56 会把尾巴裁掉
+        // 高 120：起手那行和统计那几行在最窄的屏上都要绕好几行，写死 56 会把尾巴裁掉
         stats.frame = CGRect(x: 6, y: 6, width: max(40, w - 112), height: 120)
         let bh: CGFloat = 206
         bar.frame = CGRect(x: 6, y: h - bh - 6, width: max(40, w - 12), height: bh)

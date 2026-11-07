@@ -191,6 +191,10 @@ struct VRMainView: View {
                 .pickerStyle(.segmented)
                 .font(.footnote)
 
+                Text("这一档只管出文件（试片/全片）里前后景错开多少：实时播放那一页 0.29 起不跑深度，改它没反应")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundColor(.secondary)
+
                 Picker("试片计算单元", selection: $job.unitTag) {
                     Text("CPU").tag(3)
                     Text("all").tag(0)
@@ -244,8 +248,9 @@ struct VRMainView: View {
                 .font(.footnote)
                 .disabled(job.busy || VRFull.isBusy() || VRLive.isBusy())
 
-                Text("两条播放都走同一套：点屏幕出控件（暂停、拖进度、左右眼水平位置 ±12%，存一次下次照用），手机横过来就横屏全屏，出声靠 .playback 这个音频类别（不再听静音拨片的）。播相册那条选本身已是左右眼的片子，只按半幅平移、不跑深度；实时那条选普通视频，边解帧边形变直接上屏，不写文件、不进相册。实时画面按源的帧率走，深度实测 180~200 ms/帧 ⇒ 立体感约每秒 5 次一级一级跳；实时拿不到整片 p1/p99，改成已见样本的滑动分位，开头几秒幅度会偏\n"
-                     + "生成存相册的那条按约定不带音轨（做片的时候就把声音丢了），要看成片的效果请用实时那条播原片")
+                Text("两条播放都走同一套，也都只剩摆位（0.29 起实时那条把深度摘了：形变在人边上留下一条被拖长的带，实时看着比干脆没立体更难受）：点屏幕出控件（暂停、拖进度、一起移/间距/鱼眼，存一次下次照用），手机横过来就横屏全屏，出声靠 .playback 这个音频类别（不再听静音拨片的）。播相册那条选本身已是左右眼的片子，各读各的半幅；实时那条选普通视频，同一幅铺进两只眼。屏上永远是原片本来的像素，所以这一页没有立体感，只负责把画面在眼镜里摆舒服\n"
+                     + "要立体感只有「选视频出试片/全片」那两条：深度和形变离线逐帧做，结果写进文件\n"
+                     + "生成存相册的那条按约定不带音轨（做片的时候就把声音丢了），它的立体效果要在眼镜里放这个文件看")
                     .font(.system(size: 10, design: .monospaced))
                     .foregroundColor(.secondary)
 
@@ -294,7 +299,7 @@ final class VRJob: ObservableObject {
     @Published var busy = false
     @Published var status = ""
     @Published var showVideoPicker = false
-    /// 真放进这一页的是不是「原样左右眼」：true=相册那条已经是 SBS，false=普通视频实时形变
+    /// 真放进这一页的是不是「原样左右眼」：true=相册那条已经是 SBS，false=普通视频铺成左右眼
     @Published var liveSbs = false
     /// 下一次选片的去向：0=拿去转，1=拿去播（已是左右眼，原样上屏），2=拿去实时播（普通视频）
     private var pickPurpose = 0
@@ -530,10 +535,9 @@ final class VRJob: ObservableObject {
         showVideoPicker = true
     }
 
-    /// 把播放页呈现出去。两条去向（相册里已是左右眼的、要实时形变的）都进同一个页，靠 sbs 分野。
+    /// 把播放页呈现出去。两条去向（相册里已是左右眼的、普通视频铺成左右眼）都进同一个页，靠 sbs 分野。
     private func openLive(_ url: URL) {
-        let ok = VRPage.present(url: url, eyeLong: eyeLong, bpct: Float(bpct),
-                                units: VRJob.unit(unitTag), rot: feedRot, sbs: liveSbs) { r in
+        let ok = VRPage.present(url: url, eyeLong: eyeLong, sbs: liveSbs) { r in
             self.liveEnd(r)
         }
         if ok {

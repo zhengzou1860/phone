@@ -1,5 +1,4 @@
 import AVFoundation
-import CoreML
 import UIKit
 
 /// 播放页自己做控制器，不再借 SwiftUI 的 fullScreenCover：全屏不带卡片缩边，能不能横屏由这一页自己报给系统。
@@ -16,10 +15,8 @@ final class VRPlayVC: UIViewController {
     private var oriSeen = 0
     private var oriLast = ""
 
-    init(url: URL, eyeLong: Int, bpct: Float, units: MLComputeUnits, rot: Bool, sbs: Bool,
-         onEnd: @escaping (String) -> Void) {
-        self.live = VRLive(url: url, eyeLong: eyeLong, bpct: bpct, zp: 0.15, smooth: 0.4,
-                           units: units, rot: rot, sbs: sbs)
+    init(url: URL, eyeLong: Int, sbs: Bool, onEnd: @escaping (String) -> Void) {
+        self.live = VRLive(url: url, eyeLong: eyeLong, sbs: sbs)
         self.onEnd = onEnd
         super.init(nibName: nil, bundle: nil)
         modalPresentationStyle = .fullScreen
@@ -102,7 +99,7 @@ final class VRPlayVC: UIViewController {
         VROrientation.allowLandscape(false)
     }
 
-    /// 页面被收走 = 两条线程必须停：inside 一直占着的话，全片和下一条实时都起不来
+    /// 页面被收走 = 跑着那条线程必须停：inside 一直占着的话，全片和下一条播放都起不来
     override func viewDidDisappear(_ animated: Bool) {
         super.viewDidDisappear(animated)
         surface.teardown()
@@ -159,19 +156,18 @@ enum VRPage {
     /// 根控制器手上还挂着它，系统会直接拒掉第二次呈现（「already presenting」）。
     /// 所以这里等它退干净，最多再试 3 次、每次隔 0.25 s。
     @discardableResult
-    static func present(url: URL, eyeLong: Int, bpct: Float, units: MLComputeUnits,
-                        rot: Bool, sbs: Bool, onEnd: @escaping (String) -> Void) -> Bool {
+    static func present(url: URL, eyeLong: Int, sbs: Bool,
+                        onEnd: @escaping (String) -> Void) -> Bool {
         guard rootController() != nil else {
             VRJournal.line("页面 没有找到窗口根控制器，播放页没开")
             return false
         }
-        launch(url: url, eyeLong: eyeLong, bpct: bpct, units: units, rot: rot, sbs: sbs,
-               tries: 0, onEnd: onEnd)
+        launch(url: url, eyeLong: eyeLong, sbs: sbs, tries: 0, onEnd: onEnd)
         return true
     }
 
-    private static func launch(url: URL, eyeLong: Int, bpct: Float, units: MLComputeUnits,
-                               rot: Bool, sbs: Bool, tries: Int, onEnd: @escaping (String) -> Void) {
+    private static func launch(url: URL, eyeLong: Int, sbs: Bool, tries: Int,
+                               onEnd: @escaping (String) -> Void) {
         guard let root = rootController() else {
             VRJournal.line("页面 第 \(tries + 1) 次没找到窗口根控制器，不起了")
             return
@@ -180,13 +176,11 @@ enum VRPage {
             VRJournal.line("页面 根控制器手上还挂着 \(String(describing: type(of: busy)))"
                 + "（相册大概还在退），0.25 s 后再试第 \(tries + 1) 次")
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
-                launch(url: url, eyeLong: eyeLong, bpct: bpct, units: units, rot: rot,
-                       sbs: sbs, tries: tries + 1, onEnd: onEnd)
+                launch(url: url, eyeLong: eyeLong, sbs: sbs, tries: tries + 1, onEnd: onEnd)
             }
             return
         }
-        let vc = VRPlayVC(url: url, eyeLong: eyeLong, bpct: bpct, units: units, rot: rot,
-                          sbs: sbs, onEnd: onEnd)
+        let vc = VRPlayVC(url: url, eyeLong: eyeLong, sbs: sbs, onEnd: onEnd)
         let had = root.presentedViewController.map { String(describing: type(of: $0)) } ?? "无"
         root.present(vc, animated: true) {
             VRJournal.line("页面 呈现完成 \(String(describing: type(of: vc)))"
