@@ -101,8 +101,8 @@ struct SwapContentView: View {
                                                      // 而且两份网的足迹要到 854 MB；CPU 那一档全程 44 MB。
                                                      // ANE 只快 8 %，而它内部按 fp16 摆，赔多少精度等量速那一句「离 CPU 那一份几灰阶」说了再定。
     @State private var longIdx = 0                   // 默认 1920（长边上限）
-    /// 认人阈值那格：存进 UserDefaults（键在 SwapCast.cosKey），下次开 App 还在，整片和预览共用同一个数
-    @AppStorage(SwapCast.cosKey) private var cosIdx = 3   // 3 ＝ 0.55，就是 0.45 起上机定下的那道
+    /// 认人阈值那一格：存进 UserDefaults（键在 SwapCast.cosKey），下次开 App 还在，整片和预览共用同一个数
+    @AppStorage(SwapCast.cosKey) private var matchCosVal = 0.55   // ＝0.45 起上机定下的那道
     @State private var result = ""
     @State private var outURL: URL?
     /// 一按量四档算力：这一趟几十秒（每档重新装一次两张网），只在后台跑，最后一句留在界面上
@@ -250,18 +250,18 @@ struct SwapContentView: View {
                         }
                         .pickerStyle(.segmented)
                         .disabled(castLocked)
-                        Picker("认人阈值", selection: $cosIdx) {
-                            ForEach(0 ..< SwapCast.cosSteps.count, id: \.self) { i in
-                                Text(String(format: "%.2f", SwapCast.cosSteps[i])).tag(i)
-                            }
-                        }
-                        .pickerStyle(.segmented)
-                        .disabled(castLocked)
                         // 这一格是「像到什么程度才算这个人」：素材里的小脸、侧脸、运动糊全挤在 0.4~0.6 那一小段，
-                        // 一个数服务不了所有片子，所以交给现场调。两档都用选的这道数，只是短边不到 64 px 的
-                        // 那一档另要领先第二名 0.15——糊出来的余弦谁都能沾一点，光看一个数不算数。
-                        Text("认人的余弦闸门 \(String(format: "%.2f", SwapCast.matchCos))"
-                             + "：调低＝远／糊一点的脸也换得到，调高＝只换有把握的（整片与预览共用）")
+                        // 一个数服务不了所有片子，所以交给现场拖。拖到底＝0.10，等于基本不看余弦：先用它看清
+                        // 「这些脸到底认不认得到」，再往上找那道刚好不换错人的线。
+                        HStack {
+                            Text("认人阈值")
+                            Slider(value: $matchCosVal, in: SwapCast.cosMin ... SwapCast.cosMax, step: 0.01)
+                            Text(String(format: "%.2f", SwapCast.matchCos))
+                                .monospacedDigit().frame(minWidth: 42, alignment: .trailing)
+                        }
+                        .disabled(castLocked)
+                        Text("整片与预览共用｜短边不到 \(String(format: "%.0f", SwapCast.identMinPx)) px 的那一档"
+                             + "还要领先次近 \(String(format: "%.2f", SwapCast.matchMargin))（拖到多低都带这条）")
                             .font(.caption).textSelection(.enabled)
 
                         // 量速不动开始换脸那一步：只把上面那格「算力单元」该点哪一个量出来。

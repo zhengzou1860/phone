@@ -24,14 +24,15 @@ enum SwapCast {
 
     /// 视频里的一张脸算不算这个目标：清晰的大脸同一人机上量到 0.72~0.86，不同人 −0.1~0.2。
     /// 但视频里的脸多半是小脸、侧脸、运动糊：同一人会掉到 0.5 上下，不同人偶尔也能冲到 0.5~0.6。
-    /// 这一条现在由界面上那格「认人阈值」选（存下来，下次开还在）：往低调＝远一点、糊一点的脸也换得到，
-    /// 往高调＝只换有把握的那几张。没选过就用 0.55（0.45 起上机定下的那道）。
-    static let cosSteps: [Double] = [0.40, 0.45, 0.50, 0.55, 0.60]
-    static let cosKey = "swap.matchCosIdx"
+    /// 这一条由界面上那格「认人阈值」拖（存下来，下次开还在）：往低调＝远一点、糊一点的脸也换得到，
+    /// 往高调＝只换有把握的那几张。最低给到 0.10＝基本不看余弦，用来现场判「这张脸到底认不认得出」。
+    /// 没拖过就用 0.55（0.45 起上机定下的那道）。
+    static let cosMin: Double = 0.10
+    static let cosMax: Double = 0.60
+    static let cosKey = "swap.matchCos"
     static var matchCos: Double {
-        guard UserDefaults.standard.object(forKey: cosKey) != nil else { return 0.55 }
-        let i = UserDefaults.standard.integer(forKey: cosKey)
-        return cosSteps[min(max(i, 0), cosSteps.count - 1)]
+        guard let n = UserDefaults.standard.object(forKey: cosKey) as? NSNumber else { return 0.55 }
+        return min(max(n.doubleValue, cosMin), cosMax)
     }
 
     /// 清楚的线：短边够到它，112 裁片的上采样就不超过 1.75 倍。这条按进链帧上的像素算。
