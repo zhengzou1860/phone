@@ -462,6 +462,22 @@ ck("缓发 不改抽帧判据", LivePace.decide(ptsSeconds: 0.2, nextEmitSeconds
    && !LivePace.decide(ptsSeconds: 0.167, nextEmitSeconds: 0.2, interval: 3.0 / 15.0).emit,
    "缓发只把间隔拉长，抽帧还是同一套 PTS 比较——两处一起改就没人说得清开头那几帧是谁丢的")
 
+// 0.28 落后不追（PC 提的边界，它说这条比上限 5 还是 6 更影响体验）：
+// 手机被卡住一会儿以后再醒，欠的账不能靠「这几帧不 sleep 连着发」补——
+// 那一下会有 4–5 帧同一瞬间砸进 PC 那个 2 格、留新丢旧的入口，
+// 而它的丢帧判定排在 imdecode 之后，中间那几帧的解码钱照样付。
+ck("落后 欠一帧以内自己追得上", !LivePace.shouldReanchor(delay: -0.02, interval: 1.0 / 15.0)
+   && !LivePace.shouldReanchor(delay: -1.0 / 15.0, interval: 1.0 / 15.0),
+   "正常抖动不该搬锚点；边界那一格算「恰好一帧」，还不算欠多")
+ck("落后 欠超过一帧就搬锚点", LivePace.shouldReanchor(delay: -0.2, interval: 1.0 / 15.0)
+   && LivePace.shouldReanchor(delay: -18.0, interval: 1.0 / 15.0),
+   "日志里那种十几秒的整段静默一次就够触发：搬锚点=丢在手机上，PC 一分不花")
+ck("落后 提前与坏读数不搬", !LivePace.shouldReanchor(delay: 0.12, interval: 1.0 / 15.0)
+   && !LivePace.shouldReanchor(delay: .nan, interval: 1.0 / 15.0)
+   && !LivePace.shouldReanchor(delay: -1, interval: 0)
+   && !LivePace.shouldReanchor(delay: .infinity, interval: 1.0 / 15.0),
+   "delay 的负无穷那类脏值一进来，锚点会被搬到不该去的地方")
+
 // MARK: - 和 PC 契约绑死的几个数
 
 ck("契约 在途上限3", LiveConfig.inflightLimit == 3)

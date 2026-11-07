@@ -391,6 +391,15 @@ enum LivePace {
     static func interval(full: Double, emitted: Int) -> Double {
         emitted < LiveConfig.rampFrames ? full * Double(LiveConfig.rampDivisor) : full
     }
+
+    /// 落后超过一个 interval 就把墙钟重新对齐、欠的那几帧不补发（0.28，PC 提的边界）。
+    /// 不追才是对的：追的写法就是「接下来几帧都不 sleep、连着发」，那一下会有 4–5 帧
+    /// 砸进 PC 那个 2 格、留新丢旧的入口——它只拿到最新一帧加一坨 frames_dropped，
+    /// 而中间那几帧的 JPEG 解码钱照付（它的丢帧判定排在 imdecode 之后）。
+    /// 手机这边丢（重新对齐）PC 一分不花，给的还是更新的一帧。
+    static func shouldReanchor(delay: Double, interval: Double) -> Bool {
+        delay.isFinite && interval > 0 && delay < -interval
+    }
 }
 
 // MARK: - 流水线停了的判定

@@ -301,6 +301,7 @@ final class VideoFrameSource {
             var originPTS: CMTime?
             var nextEmit: Double?
             var emitted = 0
+            var reanchors = 0
             while self.isCurrent(gen), r.status == .reading,
                   let sb = out.copyNextSampleBuffer() {
                 // copyNextSampleBuffer 可能刚跨过一次 stop：先认代数，旧帧一律不发。
@@ -347,13 +348,24 @@ final class VideoFrameSource {
                 guard self.isCurrent(gen) else { break }
                 self.setPTS(pts)
 
-                // 按 PTS 对齐墙钟：推流节奏 = 视频真实播放节奏，
-                // 落后了就跟着当前 PTS 重新对齐，不欠账堆积。
+                // 按 PTS 对齐墙钟：推流节奏 = 视频真实播放节奏。
+                // 早了就 sleep 等到位；落后超过一帧就搬锚点、欠的不补发（0.28 前是「不 sleep 连着追」，
+                // 那一追就是 4–5 帧同一瞬间砸到 PC 的 2 格入口）。
                 let start = originPTS ?? pts
                 let due = originWall + (sec - CMTimeGetSeconds(start))
                 let delay = due - CFAbsoluteTimeGetCurrent()
-                // 源时间戳偶尔会给出半个世纪这种值：直接 UInt32 会在真机上 trap。
-                if delay.isFinite, delay > 0 {
+                if LivePace.shouldReanchor(delay: delay, interval: interval) {
+                    // 欠得超过一帧：把锚点搬到当下，欠的那几帧就当没它们——不补发。
+                    originWall = CFAbsoluteTimeGetCurrent()
+                    originPTS = pts
+                    reanchors += 1
+                    if reanchors == 1 {
+                        AppLog.shared.log("frame", "墙钟重对齐：欠 "
+                                          + String(format: "%.2f", -delay)
+                                          + "s 的帧不补发（补发就是往 PC 那 2 格里一次砸好几帧）")
+                    }
+                } else if delay.isFinite, delay > 0 {
+                    // 源时间戳偶尔会给出半个世纪这种值：直接 UInt32 会在真机上 trap。
                     guard self.sleepPacing(min(delay, 0.5), gen: gen) else { break }
                 }
             }
@@ -361,7 +373,8 @@ final class VideoFrameSource {
             let stillCurrent = self.isCurrent(gen)
             if stillCurrent { self.endGeneration(gen) }
             AppLog.shared.log("frame", "读线程退出：代数 \(gen) status=\(r.status.rawValue)"
-                              + " 当前=\(stillCurrent ? "是" : "否")")
+                              + " 当前=\(stillCurrent ? "是" : "否")"
+                              + " 发出 \(emitted) 帧·墙钟重对齐 \(reanchors) 次")
             // 只有自然读到片尾、且这一轮没被停/跳转作废，才算「这一段推完了」
             if stillCurrent && completed {
                 DispatchQueue.main.async { self.onSegmentEnd?() }
