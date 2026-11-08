@@ -168,7 +168,9 @@ enum SnoreUploader {
 
     static var endpoint: String {
         let saved = savedEndpoint.trimmingCharacters(in: .whitespacesAndNewlines)
-        return saved.isEmpty ? defaultEndpoint : saved
+        let raw = saved.isEmpty ? defaultEndpoint : saved
+        // 手填常常只写 192.168.31.100:8717/report，少个 http:// 就整条发不出去
+        return raw.contains("://") ? raw : "http://" + raw
     }
 
     static func saveEndpoint(_ text: String) {
