@@ -136,7 +136,7 @@ struct ContentView: View {
             coverPage(slot)
         }
         // ⑥ 那一页看不见这边的 @State，所以主页面这四条一开跑就把互斥位写过去
-        .onChange(of: localChainBusy) { chainGate.main = $0 }
+        .onChange(of: localChainBusy) { chainGate.main = localChainBusy }
     }
 
     /// 链子这一头（① 转换／② 生成样本／④ 读小说／⑤ 视频）在不在跑。录音不算：那条不载图。
@@ -1211,7 +1211,7 @@ struct ContentView: View {
             Text("问话走局域网到电脑上那个「AI Local Model Manager」代理（它再转给本机 llama-server）：手机这边不装任何语言模型，也不往云上发一个字节。页面和电脑上那个聊天页一样 —— 模型清单、Stream、思考、🔍 联网、📎 附件（图片/文本，也能从相册挑、粘贴截图）、复制、＋ 新开会话；多出来的只有「音色」和「语音回复」两项。回答念出来走的就是 ④ 那条链（系统朗读 → ②③④），所以一样要等载图；两边共用一套图，⑥ 在念时上面那四条一律不给按，反过来也一样。")
                 .font(.caption)
                 .foregroundColor(.secondary)
-            Text("先决条件：手机和电脑在同一个局域网，电脑上那个代理起着（start.bat，端口 8000、监听 0.0.0.0），聊天页第一行把地址填成 http://<电脑IP>:8000 再点「测试」。地址、模型、音色、语音回复开关都记在这台手机上，下次不用重填。念出来的成品叫 chat_<时间>.wav，留在 app 目录、在「历史文件」页能删；会话副本是 Documents/chat_feed.json，由聊天页里「＋ 新开会话」清（连那些 wav 一起收）。")
+            Text("先决条件：手机和电脑在同一个局域网，电脑上那个代理起着（start.bat，端口 8000、监听 0.0.0.0），聊天页第一行把地址填成 http://<电脑IP>:8000 再点「测试」。第一次连会弹一句「允许访问本地网络吗」——那是 iOS 14 起对直连局域网主机也要问的，点允许；点了不允许就连不上，去 设置 → 隐私与安全性 → 本地网络 里把 LiveContainer 打开。地址、模型、音色、语音回复开关都记在这台手机上，下次不用重填。念出来的成品叫 chat_<时间>.wav，留在 app 目录、在「历史文件」页能删；会话副本是 Documents/chat_feed.json，由聊天页里「＋ 新开会话」清（连那些 wav 一起收）。")
                 .font(.caption)
                 .foregroundColor(.secondary)
         }

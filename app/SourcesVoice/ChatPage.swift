@@ -135,9 +135,12 @@ struct ChatPage: View {
     let onClose: () -> Void
 
     /// 显式给一份入口：调用方只该看见这六样，下面那堆私有状态和配色不进参数表。
+    /// 里面那层回调必须写 `@escaping`：写在声明参数位的函数类型，它自己的函数参数默认算 non-escaping，
+    /// 而 ContentView 那头 `chatSpeak` 的 onStage 是 @escaping（要交给 readNovel）。函数子类型对参数是逆变的
+    /// ⇒ 不标这一句，传方法引用当场报「converting non-escaping value … may allow it to escape」。
     init(player: PlayController, chain: ChainGate, samples: [SampleStore.Sample],
          pickedID: Binding<String?>,
-         synthesize: @escaping @MainActor (String, SampleStore.Sample?, (String) -> Void) async throws -> URL,
+         synthesize: @escaping @MainActor (String, SampleStore.Sample?, @escaping (String) -> Void) async throws -> URL,
          onClose: @escaping () -> Void) {
         self.player = player
         self.chain = chain

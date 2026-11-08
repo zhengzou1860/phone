@@ -45,6 +45,10 @@ targets:
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true
         NSMicrophoneUsageDescription: "要录你的声音来做声音转换"
+        # ⑥ 打字问电脑那条是直连局域网主机的 unicast HTTP。Apple 的 NSLocalNetworkUsageDescription
+        # 文档把这一种明确算进去了（不只是 Bonjour／组播）⇒ 缺这条，iOS 14+ 那句授权弹窗就没有理由可写。
+        # 装机只进 LiveContainer，弹窗归宿主那份 plist 管，这里写上是为了单独签时也能通。
+        NSLocalNetworkUsageDescription: "要连同一个局域网里你那台电脑上的本地 AI，问话和回答都不出这个网"
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
         LSRequiresIPhoneOS: true
