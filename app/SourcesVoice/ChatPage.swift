@@ -193,6 +193,11 @@ struct ChatPage: View {
     @State private var loaded = false
     @Environment(\.openURL) private var openURL
 
+    /// 两个输入框各是谁在响。不接这一根的话，点「发送」之后键盘没有任何人收 ——
+    /// 这一页是 fullScreenCover，外面没有导航栏的返回键可点，键盘就一直在（0.1/40 真机报的）。
+    private enum InputField: Hashable { case server, draft }
+    @FocusState private var focus: InputField?
+
     var body: some View {
         GeometryReader { geo in
             VStack(spacing: 0) {
@@ -218,6 +223,8 @@ struct ChatPage: View {
                     }
                     .onAppear { sc.scrollTo(feed.last?.id, anchor: .bottom) }
                     .onChange(of: scrollTick) { sc.scrollTo(feed.last?.id, anchor: .bottom) }
+                    // 打到一半想看看上面：往下拖这段对话就把键盘带走（不用先发出去）
+                    .scrollDismissesKeyboard(.interactively)
                 }
                 inputBar
             }
@@ -533,6 +540,9 @@ struct ChatPage: View {
                     .foregroundColor(fg)
                     .autocapitalization(.none)
                     .disableAutocorrection(true)
+                    .focused($focus, equals: .server)
+                    .submitLabel(.done)
+                    .onSubmit { focus = nil }
                     .padding(.horizontal, 10)
                     .padding(.vertical, 6)
                     .background(bg)
@@ -606,6 +616,25 @@ struct ChatPage: View {
                     .foregroundColor(edge))
             }
 
+            // 网页没有这一行。和主页面 ①④ 那档是同一个 PlayController.rate（TimePitch：只改时长、
+            // 音高钉死 0 音分），存同一个 UserDefaults 键 ⇒ 在这儿调完退出去还是这个数，
+            // 正在响的那条也当场跟着变，不用停了重播。气泡上的「播放」同样吃这一档。
+            HStack(spacing: 8) {
+                Text(String(format: "语速 %.2f×", player.rate))
+                    .font(.system(size: 12))
+                    .foregroundColor(muted)
+                    .frame(width: 78, alignment: .leading)
+                Slider(value: $player.rate, in: 0.5...2.0, step: 0.05)
+                    .tint(accent)
+                Button("原速") { player.rate = 1.0 }
+                    .font(.system(size: 12))
+                    .foregroundColor(muted)
+                    .buttonStyle(.plain)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .overlay(RoundedRectangle(cornerRadius: 5).stroke(edge, lineWidth: 1))
+            }
+
             // 待发附件条（网页 attachRow）：图 64 pt 缩略图带 ✕，文件一格名字＋大小＋字数
             if !pend.isEmpty {
                 WrapRow(spacing: 8) {
@@ -640,6 +669,7 @@ struct ChatPage: View {
                     .font(.system(size: 14))
                     .lineSpacing(5)
                     .foregroundColor(fg)
+                    .focused($focus, equals: .draft)
                     .padding(10)
                     .frame(minHeight: 44, maxHeight: 160)
                     .background(bg)
@@ -672,7 +702,9 @@ struct ChatPage: View {
                     Text("读图：只有加载了投影器（--mmproj）的模型能读图，发给不支持的会被后端拒绝；上面挂着图时会按代理报的 vision 先提醒一句。一张全屏截图约值 1.5–2.5K prompt token。")
                     Text("复制：回答下面「复制」拿的是原始文字（不含排队提示和来源链接），开了思考的多一个「复制思考」。")
                     Text("会话：消息连同附件正文存在这台手机的 Documents/chat_feed.json 里，重开 app 接着问；副本太大时图片只留名字和大小（那种图重开后发不出去，气泡上会写明）。「＋ 新开会话」把消息、待发附件、已经念出来的语音文件和这份副本一起清掉，不可恢复。")
-                    Text("语音（网页没有这一项）：走的就是 ④ 那条链 —— 系统朗读 → ②③④ 换成你挑的音色。所以一条回答念出来要等它载图（几十秒），长答复按片落盘、边转边写；系统嗓音和音高两个旋钮和 ④ 共用。链子两边共用一套，⑥ 在念时主页面那四条不给按，反过来也一样。")
+                    Text("语音（网页没有这一项）：走的就是 ④ 那条链 —— 系统朗读 → ②③④ 换成你挑的音色。所以一条回答念出来要等它载图（几十秒），长答复按片落盘、边转边写；系统嗓音和音高两个旋钮在主页面、和 ④ 共用。链子两边共用一套，⑥ 在念时主页面那四条不给按，反过来也一样。")
+                    Text("语速（网页没有这一项）：上面那一行 0.5–2.0×，和主页面 ①④ 那档是同一个值，调一次三处都跟着，重开 app 也记得。走 TimePitch：只有时长变、音高钉死不动（不是磁带快进那种越放越尖）。正在响的那条当场跟着变，气泡上的「播放」也吃这一档；「原速」回 1.00×。")
+                    Text("键盘：点「发送」或按键盘上的「发送」之后自动收起；打到一半想看看上面的对话，往下拖那段消息也能把它带走。电脑地址那一栏按「完成」收。")
                 }
                 .font(.system(size: 11))
                 .foregroundColor(muted)
@@ -939,6 +971,8 @@ struct ChatPage: View {
     private func send() {
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty || !pend.isEmpty, !busy else { return }
+        // 发出去就收键盘：这一页没有别的地方能点掉它，留着会一直挡住半屏对话
+        focus = nil
         guard !model.isEmpty else {
             netNote = "还没拿到模型清单：先把电脑地址填对，点「测试」"
             return
