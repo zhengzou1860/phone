@@ -23,11 +23,12 @@ enum FileHistory {
         var id: String { rawValue }
 
         /// 这一类认领哪些文件名前缀。`pick_` 是「选文件」当场拷进来的固化副本，`record_` 是麦克风录的。
+        /// `chat_raw_` 必须排在 `chat_` 前面认：allCases 里 raw 在 output 之前，所以中间那份不会落进「最终音频」。
         var prefixes: [String] {
             switch self {
             case .source: return ["pick_", "record_"]
-            case .raw: return ["tts_raw_"]
-            case .output: return ["output_", "novel_"]
+            case .raw: return ["tts_raw_", "chat_raw_"]
+            case .output: return ["output_", "novel_", "chat_"]
             case .video: return ["video_"]
             }
         }

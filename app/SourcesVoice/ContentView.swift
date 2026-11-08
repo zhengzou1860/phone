@@ -16,6 +16,8 @@ enum PickSlot: String, Identifiable {
     case voice
     /// 同上：历史文件清理页。
     case history
+    /// 同上：⑥「和 AI 聊天」整页（局域网连电脑上那个本地模型代理）。
+    case chat
     var id: String { rawValue }
 }
 
@@ -24,6 +26,8 @@ struct ContentView: View {
     @StateObject private var srcRec = AudioEngine()
     @StateObject private var refRec = AudioEngine()
     @StateObject private var player = PlayController()
+    /// 与 ⑥ 共用的链子互斥位：主页面这四条在跑时写 `main`，⑥ 念语音时写 `chat`。
+    @StateObject private var chainGate = ChainGate()
     @State private var engine: VoiceEngine?
     @State private var isConverting = false
     @State private var convertStatus = ""
@@ -107,6 +111,7 @@ struct ContentView: View {
                         convertSection
                         novelSection
                         videoSection
+                        chatSection
                     }
                     // 放在 if 外面：模型没下（或像 0.1/24 那样被误删）时，留下的录音照样要能删。
                     historySection
@@ -130,14 +135,24 @@ struct ContentView: View {
         .fullScreenCover(item: $pickSlot) { slot in
             coverPage(slot)
         }
+        // ⑥ 那一页看不见这边的 @State，所以主页面这四条一开跑就把互斥位写过去
+        .onChange(of: localChainBusy) { chainGate.main = $0 }
     }
 
-    /// 一个呈现六种内容：`.voice` 是自己铺的嗓音清单、`.history` 是自己铺的历史文件清单、
+    /// 链子这一头（① 转换／② 生成样本／④ 读小说／⑤ 视频）在不在跑。录音不算：那条不载图。
+    private var localChainBusy: Bool {
+        isConverting || isMakingSample || isReading || isVideoing
+    }
+
+    /// 一个呈现七种内容：`.chat` 是 ⑥ 那一整页、`.voice` 是自己铺的嗓音清单、`.history` 是自己铺的历史文件清单、
     /// `.video` 是相册选片，剩下那三个槽（①②／文本）还是系统文件选择器。
     /// 分支写在带 `@ViewBuilder` 的函数里，不赌 `fullScreenCover` 那个闭包是不是 ViewBuilder。
     @ViewBuilder
     private func coverPage(_ slot: PickSlot) -> some View {
-        if slot == .voice {
+        if slot == .chat {
+            ChatPage(player: player, chain: chainGate, samples: samples, pickedID: $pickedID,
+                     synthesize: chatSpeak, onClose: { pickSlot = nil })
+        } else if slot == .voice {
             voiceListPage
         } else if slot == .history {
             historyPage
@@ -193,7 +208,8 @@ struct ContentView: View {
                     .textFieldStyle(.roundedBorder)
                 Button(isMakingSample ? "生成中…" : "生成样本") { makeSampleFromRef() }
                     .buttonStyle(.bordered)
-                    .disabled(refURL == nil || isMakingSample || isConverting || srcRec.isRecording || refRec.isRecording)
+                    .disabled(refURL == nil || isMakingSample || isConverting || chainGate.chat
+                              || srcRec.isRecording || refRec.isRecording)
             }
             Text("样本 = 音色向量 1 KB + 150 帧 prompt mel 47 KB，做一次反复用。参考音频硬下限 1.5 s（DiT 的 prompts 钉死 150 帧），但 PC 实测像不像随样本长度单调涨：1.5 s→0.636、3 s→0.705、6 s→0.748、10.9 s→0.759（尺：同人 0.928／两人 0.089）⇒ 录 6~10 s 连续干净说话，别只录一两个字。")
                 .font(.caption)
@@ -658,7 +674,7 @@ struct ContentView: View {
                 startConversion()
             }
             .buttonStyle(.borderedProminent)
-            .disabled(!canConvert || isConverting)
+            .disabled(!canConvert || isConverting || chainGate.chat)
 
             if sourceURL == nil {
                 Text("先在 ① 录一段或选一个音频文件")
@@ -727,7 +743,7 @@ struct ContentView: View {
 
                 Button(isReading ? "读着…" : "读给我听") { startReading() }
                     .buttonStyle(.borderedProminent)
-                    .disabled(isReading || novelChars == 0
+                    .disabled(isReading || novelChars == 0 || chainGate.chat
                               || isConverting || srcRec.isRecording || refRec.isRecording)
                 Spacer()
                 Text(estimateLine)
@@ -1016,8 +1032,9 @@ struct ContentView: View {
     // MARK: - ⑤ 视频换声（画面不动，只换音轨）
 
     /// 六条动作共用的互斥位：任何一条在跑就不许再起点别的（手机上链子一次只吃得起一个）。
+    /// ⑥ 在念回答也算一条 —— 它用的是同一套图。
     private var busyAnywhere: Bool {
-        isConverting || isReading || isVideoing || isMakingSample
+        isConverting || isReading || isVideoing || isMakingSample || chainGate.chat
             || srcRec.isRecording || refRec.isRecording
     }
 
@@ -1167,6 +1184,79 @@ struct ContentView: View {
                 }
             }
         }
+    }
+
+    // MARK: - ⑥ 和 AI 聊天（局域网连电脑上那个本地模型代理）
+
+    @ViewBuilder
+    private var chatSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("和 AI 聊天（打字问它，回答用选中样本的音色念出来）").font(.headline)
+
+            HStack(spacing: 12) {
+                Button("打开聊天页") {
+                    VoiceJournal.line("点「打开聊天页」槽=chat")
+                    pickSlot = .chat
+                }
+                .buttonStyle(.borderedProminent)
+                // 念到一半把页面关掉、又开一份新的：两份 ChatPage 会各写各的 chat_feed.json，
+                // 后写的那份把前一份整段盖掉 ⇒ 正在念的时候不给再开。
+                .disabled(chainGate.chat)
+                Spacer()
+                Text(chainGate.chat ? "正在念上一条回答…" : chatServerLine)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+
+            Text("问话走局域网到电脑上那个「AI Local Model Manager」代理（它再转给本机 llama-server）：手机这边不装任何语言模型，也不往云上发一个字节。页面和电脑上那个聊天页一样 —— 模型清单、Stream、思考、🔍 联网、📎 附件（图片/文本，也能从相册挑、粘贴截图）、复制、＋ 新开会话；多出来的只有「音色」和「语音回复」两项。回答念出来走的就是 ④ 那条链（系统朗读 → ②③④），所以一样要等载图；两边共用一套图，⑥ 在念时上面那四条一律不给按，反过来也一样。")
+                .font(.caption)
+                .foregroundColor(.secondary)
+            Text("先决条件：手机和电脑在同一个局域网，电脑上那个代理起着（start.bat，端口 8000、监听 0.0.0.0），聊天页第一行把地址填成 http://<电脑IP>:8000 再点「测试」。地址、模型、音色、语音回复开关都记在这台手机上，下次不用重填。念出来的成品叫 chat_<时间>.wav，留在 app 目录、在「历史文件」页能删；会话副本是 Documents/chat_feed.json，由聊天页里「＋ 新开会话」清（连那些 wav 一起收）。")
+                .font(.caption)
+                .foregroundColor(.secondary)
+        }
+    }
+
+    private var chatServerLine: String {
+        let s = UserDefaults.standard.string(forKey: "aiServerURL") ?? ""
+        return s.isEmpty ? "电脑地址还没填" : ChatNet.normalized(s)
+    }
+
+    /// ⑥ 的「念出来」：和 ④ 同一条链，只是成品叫 chat_，中间那份系统原声跑成即删
+    /// （④ 留着它是为了对着听噪音，⑥ 没有第二个入口会用到）。
+    @MainActor
+    private func chatSpeak(_ text: String, _ sample: SampleStore.Sample?,
+                           _ onStage: @escaping (String) -> Void) async throws -> URL {
+        guard let modelDir = models.modelDir else {
+            throw ChatNet.Failure(text: "模型还没下好（回主页面看第一格的状态）")
+        }
+        guard let sample = sample else {
+            throw ChatNet.Failure(text: "没挑音色：文本这条路没有自转换")
+        }
+        if engine == nil { engine = VoiceEngine(modelDir: modelDir) }
+        let eng = engine!
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+        let stamp = Int(Date().timeIntervalSince1970)
+        let output = docs.appendingPathComponent("chat_\(stamp).wav")
+        let raw = docs.appendingPathComponent("chat_raw_\(stamp).wav")
+        let voice = voiceID.isEmpty ? nil : voiceID
+        let t0 = Date()
+        VoiceJournal.line("聊天念出来开跑：\(text.count) 字／音色=样本「\(sample.info.name)」"
+                          + "／音高 \(String(format: "%+.0f", semitones)) 半音／嗓音 \(voice ?? "默认")")
+        let r = try await eng.readNovel(text: text,
+                                       sample: sample,
+                                       refWav: nil,
+                                       outputWav: output,
+                                       rawTTSWav: raw,
+                                       pitchCents: semitones * 100.0,
+                                       voiceID: voice,
+                                       onStage: onStage)
+        try? FileManager.default.removeItem(at: raw)
+        history = FileHistory.scan()
+        VoiceJournal.line(String(format: "聊天念出来完成：%d 句合成 %.0f s → %d 片转换出 %.0f s，墙钟 %.0f s → %@",
+                                 r.tts.sentences, r.tts.seconds, r.passes, r.convertedSeconds,
+                                 Date().timeIntervalSince(t0), output.lastPathComponent))
+        return output
     }
 
     /// 一条成品wav的四件套：语速 / 播放 / 停止 / 导出。①「转换」和 ④「读小说」各挂一份在自己的格子里，

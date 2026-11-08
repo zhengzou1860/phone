@@ -20,12 +20,15 @@ struct DocumentPickerHost: UIViewControllerRepresentable {
     let onPick: (URL) -> Void
     let onCancel: (String) -> Void
     let onDismiss: () -> Void
+    /// ⑥ 的附件一次能选几个（网页那个 input 是 multiple）。默认 false：①②④ 那三个槽照旧一次一个。
+    /// 多选时 onPick 每个 URL 各叫一次，onDismiss 只在最后叫一次。
+    var multiple = false
 
     func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
         let vc = UIDocumentPickerViewController(forOpeningContentTypes: [.item], asCopy: true)
-        vc.allowsMultipleSelection = false
+        vc.allowsMultipleSelection = multiple
         vc.delegate = context.coordinator
-        VoiceJournal.line("文件选择器已呈现（forOpeningContentTypes=[.item] asCopy=true）")
+        VoiceJournal.line("文件选择器已呈现（forOpeningContentTypes=[.item] asCopy=true 多选=\(multiple)）")
         return vc
     }
 
@@ -39,12 +42,12 @@ struct DocumentPickerHost: UIViewControllerRepresentable {
 
         func documentPicker(_ controller: UIDocumentPickerViewController,
                             didPickDocumentsAt urls: [URL]) {
-            guard let url = urls.first else {
+            guard !urls.isEmpty else {
                 parent.onCancel("回调给了空列表（0 个 URL）")
                 parent.onDismiss()
                 return
             }
-            parent.onPick(url)
+            for url in urls { parent.onPick(url) }
             parent.onDismiss()
         }
 
