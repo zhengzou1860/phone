@@ -115,6 +115,16 @@ private extension Color {
     }
 }
 
+/// ⑥「念出来」那个入口的形状，存一份在这儿：属性位和 init 参数位必须一字不差，写两遍早晚要漂。
+///
+/// 内嵌那层回调的 `@escaping` 不能省：函数类型里再套一层函数参数时，Swift 默认按 non-escaping 算
+/// （属性位也一样，0.1/40 头两轮 CI 就是分别红在这两处），而 ContentView 那头 `chatSpeak` 的 onStage
+/// 要转交 readNovel（@escaping）。函数子类型对参数是逆变的 ⇒ 少标一处就报
+/// 「converting non-escaping value … may allow it to escape」／「cannot assign value of type …」。
+///
+/// 标 @MainActor：那一头要读 ContentView 的 @State（模型目录、音高、嗓音），不许跑到别的线程上读。
+typealias ChatSynth = @MainActor (String, SampleStore.Sample?, @escaping (String) -> Void) async throws -> URL
+
 /// ⑥「和 AI 聊天」那一整页。
 ///
 /// 版式逐条对着电脑上那个 `AI local model manager` 的聊天页搬（`index.html:252-294` + `:75-92`）：
@@ -130,17 +140,13 @@ struct ChatPage: View {
     var samples: [SampleStore.Sample]
     @Binding var pickedID: String?
     /// 文本 + 音色 → 一个能播的 wav。模型目录、链子、系统嗓音都在 ContentView 那边。
-    /// 标 @MainActor：那一头要读 ContentView 的 @State（模型目录、音高、嗓音），不许跑到别的线程上读。
-    let synthesize: @MainActor (String, SampleStore.Sample?, (String) -> Void) async throws -> URL
+    let synthesize: ChatSynth
     let onClose: () -> Void
 
     /// 显式给一份入口：调用方只该看见这六样，下面那堆私有状态和配色不进参数表。
-    /// 里面那层回调必须写 `@escaping`：写在声明参数位的函数类型，它自己的函数参数默认算 non-escaping，
-    /// 而 ContentView 那头 `chatSpeak` 的 onStage 是 @escaping（要交给 readNovel）。函数子类型对参数是逆变的
-    /// ⇒ 不标这一句，传方法引用当场报「converting non-escaping value … may allow it to escape」。
     init(player: PlayController, chain: ChainGate, samples: [SampleStore.Sample],
          pickedID: Binding<String?>,
-         synthesize: @escaping @MainActor (String, SampleStore.Sample?, @escaping (String) -> Void) async throws -> URL,
+         synthesize: @escaping ChatSynth,
          onClose: @escaping () -> Void) {
         self.player = player
         self.chain = chain
