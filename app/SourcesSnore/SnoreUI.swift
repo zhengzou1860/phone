@@ -702,16 +702,29 @@ struct SettingsView: View {
                         }
                     }
                     .disabled(mon.uploading)
-                    HStack {
-                        Text("目标").font(.system(size: 12))
-                        Spacer()
-                        Text(SnoreUploader.endpoint)
-                            .font(.system(size: 10, design: .monospaced)).foregroundColor(.secondary)
+                    HStack(spacing: 8) {
+                        Text("电脑地址").font(.system(size: 12))
+                        TextField(SnoreUploader.defaultEndpoint, text: Binding(
+                            get: { SnoreUploader.savedEndpoint },
+                            set: { SnoreUploader.saveEndpoint($0) }))
+                            .font(.system(size: 10, design: .monospaced))
+                            .keyboardType(.URL)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                            .multilineTextAlignment(.trailing)
+                            .submitLabel(.done)
                     }
+                    Button {
+                        mon.pingPC()
+                    } label: {
+                        Text("先探一下通不通（几个字节，不发记录）").font(.system(size: 12))
+                    }
+                    .disabled(mon.uploading)
                     Text(mon.uploadReply.isEmpty ? "还没发过" : mon.uploadReply)
                         .font(.system(size: 10, design: .monospaced)).foregroundColor(.secondary)
                     Text((mon.uploading ? "正发着……" : sendTargetText(mon))
-                         + "。手机和电脑得在同一个 Wi-Fi，电脑上先起 tools/report_server_snore.py（8717）。")
+                         + "。地址照电脑上 ipconfig 里 WLAN 的 IPv4 填，末尾 /report 别丢，改完先探一下。"
+                         + "手机和电脑得在同一个 Wi-Fi，电脑上先起 tools/report_server_snore.py（8717）。")
                         .font(.system(size: 10)).foregroundColor(.secondary)
                 }
 

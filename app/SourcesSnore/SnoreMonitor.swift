@@ -368,6 +368,21 @@ final class SnoreMonitor: NSObject, ObservableObject {
         }
     }
 
+    /// 只探地址通不通：GET /ping 几个字节。地址写错时别拿 1 MB 的整晚记录去试。
+    func pingPC() {
+        guard !uploading else { return }
+        uploading = true
+        uploadReply = "正在探 \(SnoreUploader.endpoint) ……"
+        work.async {
+            let reply = SnoreUploader.ping()
+            SnoreJournal.line("探地址 \(reply)")
+            DispatchQueue.main.async {
+                self.uploadReply = reply
+                self.uploading = false
+            }
+        }
+    }
+
     /// 执行日志：现场读数、档位、磁盘流水全量、此刻的实时水位。查错就发这条，几 KB。
     func sendLogToPC() {
         let cfg = "灵敏度 \(config.sensitivity)／判定分 \(String(format: "%.2f", config.enterScore))"
