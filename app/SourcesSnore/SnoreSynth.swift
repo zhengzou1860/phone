@@ -468,6 +468,37 @@ enum SnoreCases {
                                                         bouts.count, snoreCells, SnoreAnalyze.blindBar,
                                                         quiet.hit, quiet.cells, bedOnly.hit, bedOnly.cells)))
         }
+
+        // ⑬ 连续背景声不该把【轻鼾盲区】撑虚高：机器/稳态噪声频谱像鼾、又一直压在门以下，
+        //    11-09 那晚据此数出 7 h 30 min 的「轻鼾」，其实是一片不断的连续声（人不可能一口气打这么久）。
+        //    0.10 在报告侧加一道剔除：连着 >20 s 都是盲区候选、且前后 ±10 s 响度起伏（p90−p10）<10 dB
+        //    ⇒ 又长又平 = 机器声，不当轻鼾。判定路径、absGateDb、六项打分权重一个字没改。
+        //    这一条两头钉：持续单音（又长又平）要几乎全被剔除；门以下轻鼾（连着但起伏 22 dB）要保住，
+        //    否则就是把真轻鼾一起屏蔽了（段长单用就会犯这个错，所以必须两条合起来）。
+        do {
+            // A：本底 + 持续 120 Hz 轻单音（最像连续机器声，整段压在门以下）
+            var ma = SnoreSynth.bed(count: Int(sr * 60), level: 0.0006, seed: 51)
+            SnoreSynth.add(&ma, SnoreSynth.tone(count: ma.count, sampleRate: sr, freq: 120, level: 0.002))
+            let ra = SnoreTracker(frameSec: 4096.0 / sr, config: config)
+            let ga = run(samples: ma, sampleRate: sr, config: config, into: ra)
+            let sa = SnoreAnalyze.summarize(buckets: ga.seconds, events: ga.events, config: config)
+            let rawA = sa.blindCells + sa.blindSuppressed
+            // B：本底 + 门以下轻鼾（3 s 一鼾，连着但响度有呼吸起伏）—— 与用例⑫同形状
+            var mb = SnoreSynth.bed(count: Int(sr * 60), level: 0.0006, seed: 101)
+            SnoreSynth.add(&mb, SnoreSynth.snore(count: mb.count, sampleRate: sr, periodSec: 3.0,
+                                                 f0: 140, level: 0.004, startAt: 8.0, seed: 7))
+            let rb = SnoreTracker(frameSec: 4096.0 / sr, config: config)
+            let gb = run(samples: mb, sampleRate: sr, config: config, into: rb)
+            let sb = SnoreAnalyze.summarize(buckets: gb.seconds, events: gb.events, config: config)
+            let rawB = sb.blindCells + sb.blindSuppressed
+            let ok = rawA >= 20 && sa.blindSuppressed >= 20 && Double(sa.blindCells) <= 0.15 * Double(rawA)
+                && rawB >= 30 && sb.blindCells >= 30 && Double(sb.blindSuppressed) <= 0.10 * Double(rawB)
+            out.append(SnoreCaseResult(name: "连续背景声剔除：机器声压掉、门以下轻鼾保住", ok: ok,
+                                       detail: String(format: "持续单音：候选 %d，剔除 %d，剩 %d（要剩 ≤15%%）"
+                                                        + "｜门以下轻鼾：候选 %d，剔除 %d，剩 %d（要剩 ≥30 且剔除 ≤10%%）",
+                                                        rawA, sa.blindSuppressed, sa.blindCells,
+                                                        rawB, sb.blindSuppressed, sb.blindCells)))
+        }
         return out
     }
 

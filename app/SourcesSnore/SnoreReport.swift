@@ -24,7 +24,8 @@ struct SnoreSummary {
     var peakDb: Double = -120
     var snoreMeanDb: Double = -120
     var floorMedianDb: Double = -120
-    var blindCells: Int = 0             // 「频谱过了盲区线、可整秒一帧都没过响度门」的秒格数
+    var blindCells: Int = 0             // 「频谱过了盲区线、可整秒一帧都没过响度门」的秒格数（已剔除连续背景声）
+    var blindSuppressed: Int = 0        // 被当成连续背景声（机器/稳态噪声）剔除的盲区候选秒数
     var blindBaseline: Double = 0       // 门以下那些秒自己的频谱分中位（= 这一晚的本底打多少分）
     var blindPeakDb: Double = -120      // 盲区秒格里最响的那一格的峰值（dBFS）
     var blindHasColumn = false          // 这一晚的记录里有没有 maxScoreNoGate 那一列（0.8 以前的晚上没有）
@@ -54,6 +55,51 @@ enum SnoreAnalyze {
     /// 不是拍脑袋——CI 用例⑫两头都钉着（轻鼾抓到 ≥60%、纯本底误报 ≤10%）。
     static let blindBar = 0.75
 
+    /// 连续背景声（机器运转、房间稳态噪声）会把【轻鼾盲区】撑得虚高：它频谱像鼾、又一直压在门以下，
+    /// 于是一整晚几千秒全被数成「可能有轻鼾被挡住」。11-09 那晚 26 885 s（7 h 30 min）连成一片不断，
+    /// 人不可能一口气打这么久 ⇒ 是连续声源，不是轻鼾。真人打鼾是一口气一口气的，响度有起伏；机器声是平的。
+    /// 两条合起来才屏蔽（单用任一条都验过不行：段长单用会误伤合成轻鼾，起伏单用剩太多）：
+    ///   连着 >blindRunLen 秒都是盲区候选，且这段前后 ±blindWinSec 秒的响度起伏（p90−p10）<blindFlatDb。
+    /// 又长又平才是机器。合成轻鼾虽也连着 38 s，但起伏 22 dB ⇒ 保住；持续单音起伏 0.03 dB ⇒ 屏蔽。
+    /// 只动报告这一侧的计数，判定路径、absGateDb、六项打分权重一个字没改；meanDb 早已落在 curve 里，老晚上也能重算。
+    static let blindRunLen = 20         // 连续候选秒超过这个长度才考虑屏蔽
+    static let blindFlatDb = 10.0       // 局部响度起伏（p90−p10）低于这个值才算「平」
+    static let blindWinSec = 10         // 起伏窗口：前后各 10 s
+
+    /// 门以下「频谱像鼾」的候选秒，剔除连续背景声后剩下的峰值（dBFS）。返回的格数就是 blindCells。
+    static func blindPeaks(_ buckets: [SnoreSecond]) -> [Double] {
+        let live = buckets.filter { !$0.stale }
+        let n = live.count
+        guard n > 0 else { return [] }
+        let cand = live.map {
+            $0.maxScore == 0 && $0.snoreSec == 0 && $0.vocalSec == 0 && $0.maxScoreNoGate >= SnoreAnalyze.blindBar
+        }
+        // 段长：t0 相邻的连续候选游程（stale 已剔掉，数据断口处 t0 跳号 ⇒ 自然断开）
+        var runLen = [Int](repeating: 0, count: n)
+        var i = 0
+        while i < n {
+            if !cand[i] { i += 1; continue }
+            var j = i
+            while j + 1 < n && cand[j + 1] && live[j + 1].t0 == live[j].t0 + 1 { j += 1 }
+            let len = j - i + 1
+            for k in i...j { runLen[k] = len }
+            i = j + 1
+        }
+        var out: [Double] = []
+        for k in 0..<n {
+            if !cand[k] { continue }
+            if runLen[k] > blindRunLen {
+                let a = max(0, k - blindWinSec)
+                let b = min(n, k + blindWinSec + 1)
+                let win = live[a..<b].map { $0.meanDb }
+                let spread = (snorePercentile(win, 0.9) ?? 0) - (snorePercentile(win, 0.1) ?? 0)
+                if spread < blindFlatDb { continue }   // 又长又平 ⇒ 机器/稳态噪声，不当轻鼾
+            }
+            out.append(live[k].maxDb)
+        }
+        return out
+    }
+
     static func summarize(buckets: [SnoreSecond], events: [SnoreEvent], config: SnoreConfig) -> SnoreSummary {
         let bouts = events.filter { $0.kind == .bout }
         let gaps = events.filter { $0.kind == .gap }
@@ -65,7 +111,7 @@ enum SnoreAnalyze {
         var floors: [Double] = []
         var peak = -120.0
         var stale = 0
-        var blind: [Double] = []         // 门以下那些「频谱过盲区线」的秒的峰值
+        var blindRaw = 0               // 门以下「频谱过盲区线」的候选秒数（屏蔽前）
         var belowGate: [Double] = []     // 门以下所有秒的频谱分（不看响度那一份）：这一晚本底自己的分数
         var noGateSeen = 0
         for b in buckets {
@@ -80,11 +126,13 @@ enum SnoreAnalyze {
             if b.maxScore == 0 {
                 belowGate.append(b.maxScoreNoGate)
                 if b.snoreSec == 0 && b.vocalSec == 0 && b.maxScoreNoGate >= SnoreAnalyze.blindBar {
-                    blind.append(b.maxDb)
+                    blindRaw += 1
                 }
             }
         }
+        let blind = blindPeaks(buckets)   // 剔除连续背景声（机器/稳态噪声）后剩下的轻鼾候选
         s.blindCells = blind.count
+        s.blindSuppressed = blindRaw - blind.count
         s.blindPeakDb = blind.max() ?? -120
         s.blindBaseline = snoreMedian(belowGate) ?? 0
         s.blindHasColumn = noGateSeen > 0
@@ -286,18 +334,29 @@ enum SnoreAnalyze {
         }
         let gate = String(format: "%.0f", s.gateDb)
         let bar = String(format: "%.2f", SnoreAnalyze.blindBar)
+        let rl = SnoreAnalyze.blindRunLen
+        let fd = String(format: "%.0f", SnoreAnalyze.blindFlatDb)
         if s.blindCells == 0 {
+            if s.blindSuppressed > 0 {
+                return ["【轻鼾盲区】比响度门（\(gate) dBFS）还轻、频谱分却过了 \(bar) 的秒，剔除连续背景声后剩 0 s"
+                        + "｜门以下像鼾的那 \(s.blindSuppressed) s 全是连着又平的背景声（机器/房间稳态噪声），不是轻鼾"
+                        + " ⇒ 这一晚的门没挡住鼾。"]
+            }
             return ["【轻鼾盲区】比响度门（\(gate) dBFS）还轻、频谱分却过了 \(bar) 的秒：0 s"
                     + "｜门以下那一片的频谱分中位只有 \(String(format: "%.2f", s.blindBaseline))（就是本底）"
                     + " ⇒ 这一晚的门没挡住鼾，轻的那头没什么可捞的。"]
         }
         let pct = 100.0 * Double(s.blindCells) / max(1.0, s.totalSec - Double(s.staleSec))
+        let filtered = s.blindSuppressed > 0
+            ? "｜已剔除连续背景声 \(s.blindSuppressed) s（连着 >\(rl) s 又平，机器/稳态噪声，不当轻鼾）"
+            : ""
         return ["【轻鼾盲区】比响度门（\(gate) dBFS）还轻、频谱分却过了 \(bar) 的秒：\(s.blindCells) s"
                 + "（占夜 \(String(format: "%.1f", pct))%）｜这些秒里最响 \(SnoreCalib.text(s.blindPeakDb, config))"
-                + "｜门以下整片的频谱分中位 \(String(format: "%.2f", s.blindBaseline))",
+                + "｜门以下整片的频谱分中位 \(String(format: "%.2f", s.blindBaseline))" + filtered,
                 "　　　　　这条线画在判定线（\(String(format: "%.2f", config.enterScore))）之上是有原因的：频谱那几项都是比例，"
                     + "本底噪声自己就能拿 0.65~0.72。上面那个中位数就是这一晚的本底分，只有明显高过它的秒才算证据。"
-                    + "连着几晚这一堆都不小，才谈把门往下挪一档（−63／−68）再对照着记。"]
+                    + "连续又平的背景声（机器/稳态噪声）已按「连着 >\(rl) s 且前后响度起伏 <\(fd) dB」剔除；"
+                    + "剩下的连着几晚都不小，才谈把门往下挪一档（−63／−68）再对照着记。"]
     }
 
     /// 一句「接下来做什么」。界面上顶在第一行，报告里跟着【看一眼】。
