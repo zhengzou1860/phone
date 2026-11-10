@@ -24,8 +24,6 @@ struct SnoreConfig: Codable, Equatable {
     /// 0.35：一整段鼾串出来的发作本来就长，这一条只挡「一声都不成段」的那种；
     /// 段长本身有形状分把关（0.10 s 起分、0.30 s 满分、4.0 s 归零）。
     var minBoutSec: Double = 0.35
-    /// 事件要不要留 6 秒音频片段（能回放给医生听）。
-    var keepSnippets: Bool = true
     /// 本地保留多少个晚上，超出的从旧到新删。
     var keepNights: Int = 14
     /// dBFS → 近似 dB(SPL) 的偏移。没拿声级计对过一次就留 0，报告会写明「相对刻度」。
@@ -124,6 +122,28 @@ func snoreDurText(_ seconds: Double) -> String {
 func snoreClockText(_ date: Date) -> String {
     let f = DateFormatter()
     f.dateFormat = "HH:mm"
+    return f.string(from: date)
+}
+
+/// 秒 → 「4 秒」「1 小时 23 分」「4 分 02 秒」。白话报告用这个，不摆 s/min/h。
+func snoreDurCN(_ seconds: Double) -> String {
+    let s = max(0, seconds)
+    if s < 60 {
+        let r = s.rounded()
+        return r < 1 ? String(format: "%.1f 秒", s) : "\(Int(r)) 秒"
+    }
+    let total = Int(s.rounded())
+    let h = total / 3600
+    let m = (total % 3600) / 60
+    let sec = total % 60
+    if h > 0 { return m > 0 ? "\(h) 小时 \(m) 分" : "\(h) 小时" }
+    return sec > 0 ? String(format: "%d 分 %02d 秒", m, sec) : "\(m) 分"
+}
+
+/// 「11月9日 23:45」：跨零点的记录起止，光给 HH:mm 看不出是哪一天。
+func snoreDayText(_ date: Date) -> String {
+    let f = DateFormatter()
+    f.dateFormat = "M月d日 HH:mm"
     return f.string(from: date)
 }
 

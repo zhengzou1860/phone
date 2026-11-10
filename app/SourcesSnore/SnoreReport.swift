@@ -26,10 +26,6 @@ struct SnoreSummary {
     var floorMedianDb: Double = -120
     var blindCells: Int = 0             // 「频谱过了盲区线、可整秒一帧都没过响度门」的秒格数（已剔除连续背景声）
     var blindSuppressed: Int = 0        // 被当成连续背景声（机器/稳态噪声）剔除的盲区候选秒数
-    var blindBaseline: Double = 0       // 门以下那些秒自己的频谱分中位（= 这一晚的本底打多少分）
-    var blindPeakDb: Double = -120      // 盲区秒格里最响的那一格的峰值（dBFS）
-    var blindHasColumn = false          // 这一晚的记录里有没有 maxScoreNoGate 那一列（0.8 以前的晚上没有）
-    var gateDb: Double = -58            // 报告里把门限本身也写出来，读的人才知道「盲区」是从哪条线往下的
     var staleSec: Int = 0               // 没数据的秒（引擎断过、被系统暂停过）
     var grade: String = "—"
     var tooShort = false                // 不足 1 分钟的场次：占比和分级不给（试录半分钟不该被判成「中度鼾」，
@@ -44,6 +40,10 @@ struct SnoreSummary {
     var coverageText: String { tooShort ? "太短，不分级" : String(format: "%.1f%%", coverage * 100) }
     var boutsText: String { "\(boutCount) 次（\(String(format: "%.1f", boutsPerHour)) 每时）" }
     var gapsText: String { "\(gapCount) 次（\(String(format: "%.1f", gapsPerHour)) 每时）" }
+
+    /// 停住密度到了「值得当回事」那一档。报告开头那句定性和【建议】共用这一条：
+    /// 两处各写一遍阈值，11-07 那晚就写分裂过——开头说「建议去医院」，建议栏说「先确认手机放得够近」。
+    var gapHot: Bool { gapsPerHour >= 5.0 || (gapsPerHour >= 3.0 && arousalCount >= 2) }
 }
 
 enum SnoreAnalyze {
@@ -66,11 +66,11 @@ enum SnoreAnalyze {
     static let blindFlatDb = 10.0       // 局部响度起伏（p90−p10）低于这个值才算「平」
     static let blindWinSec = 10         // 起伏窗口：前后各 10 s
 
-    /// 门以下「频谱像鼾」的候选秒，剔除连续背景声后剩下的峰值（dBFS）。返回的格数就是 blindCells。
-    static func blindPeaks(_ buckets: [SnoreSecond]) -> [Double] {
+    /// 门以下「频谱像鼾」的候选秒，剔除连续背景声（机器/稳态噪声）后还剩几秒。这个数就是 blindCells。
+    static func blindSeconds(_ buckets: [SnoreSecond]) -> Int {
         let live = buckets.filter { !$0.stale }
         let n = live.count
-        guard n > 0 else { return [] }
+        guard n > 0 else { return 0 }
         let cand = live.map {
             $0.maxScore == 0 && $0.snoreSec == 0 && $0.vocalSec == 0 && $0.maxScoreNoGate >= SnoreAnalyze.blindBar
         }
@@ -85,7 +85,7 @@ enum SnoreAnalyze {
             for k in i...j { runLen[k] = len }
             i = j + 1
         }
-        var out: [Double] = []
+        var kept = 0
         for k in 0..<n {
             if !cand[k] { continue }
             if runLen[k] > blindRunLen {
@@ -95,9 +95,9 @@ enum SnoreAnalyze {
                 let spread = (snorePercentile(win, 0.9) ?? 0) - (snorePercentile(win, 0.1) ?? 0)
                 if spread < blindFlatDb { continue }   // 又长又平 ⇒ 机器/稳态噪声，不当轻鼾
             }
-            out.append(live[k].maxDb)
+            kept += 1
         }
-        return out
+        return kept
     }
 
     static func summarize(buckets: [SnoreSecond], events: [SnoreEvent], config: SnoreConfig) -> SnoreSummary {
@@ -107,42 +107,30 @@ enum SnoreAnalyze {
         var s = SnoreSummary()
         s.totalSec = Double(buckets.count)
         var snoreSec = 0.0
-        var levels: [Double] = []
         var floors: [Double] = []
         var peak = -120.0
         var stale = 0
         var blindRaw = 0               // 门以下「频谱过盲区线」的候选秒数（屏蔽前）
-        var belowGate: [Double] = []     // 门以下所有秒的频谱分（不看响度那一份）：这一晚本底自己的分数
-        var noGateSeen = 0
         for b in buckets {
             if b.stale { stale += 1; continue }
             snoreSec += b.snoreSec
-            levels.append(b.maxDb)
             if b.floorDb > -119 { floors.append(b.floorDb) }
             if b.maxDb > peak { peak = b.maxDb }
-            if b.maxScoreNoGate > 0 { noGateSeen += 1 }
             // 「整秒没一帧过门」看 maxScore 是不是 0：0.8 起 score 只在过门的帧上算，所以 0 就是
             // 「这一秒连一次都没够着门」；配上 maxScoreNoGate 才知道这一秒的频谱到底像不像鼾。
-            if b.maxScore == 0 {
-                belowGate.append(b.maxScoreNoGate)
-                if b.snoreSec == 0 && b.vocalSec == 0 && b.maxScoreNoGate >= SnoreAnalyze.blindBar {
-                    blindRaw += 1
-                }
+            if b.maxScore == 0 && b.snoreSec == 0 && b.vocalSec == 0 && b.maxScoreNoGate >= SnoreAnalyze.blindBar {
+                blindRaw += 1
             }
         }
-        let blind = blindPeaks(buckets)   // 剔除连续背景声（机器/稳态噪声）后剩下的轻鼾候选
-        s.blindCells = blind.count
-        s.blindSuppressed = blindRaw - blind.count
-        s.blindPeakDb = blind.max() ?? -120
-        s.blindBaseline = snoreMedian(belowGate) ?? 0
-        s.blindHasColumn = noGateSeen > 0
+        let blind = blindSeconds(buckets)   // 剔除连续背景声（机器/稳态噪声）后剩下的轻鼾候选
+        s.blindCells = blind
+        s.blindSuppressed = blindRaw - blind
         s.staleSec = stale
         s.snoreSec = snoreSec
         s.tooShort = s.totalSec <= 60
         s.coverage = s.tooShort ? 0 : snoreSec / max(1.0, Double(buckets.count - stale))
         s.peakDb = peak
         s.floorMedianDb = snorePercentile(floors, 0.5) ?? -120
-        s.gateDb = max(s.floorMedianDb + 4.0, config.absGateDb)
         s.grade = s.tooShort ? "" : gradeText(s.coverage)
 
         // 鼾声期间的响度：只取那些确有鼾的秒，本底和翻身不该拉低这个数
@@ -218,178 +206,180 @@ enum SnoreAnalyze {
         return out
     }
 
-    /// 报告的正文。一行一句，界面上直接摆、发给电脑也是这一份。
+    /// 报告正文：写给刚睡醒的人看的，几行大白话。界面上直接摆、发给电脑也是这一份。
+    ///
+    /// 术语一律不进这里（dBFS、频谱分、盲区线、判定口径那六条）：0.10 以前这份报告摆了一屏，
+    /// 用户原话是「太复杂，看不懂」。要重算的数字在 curve.csv 和 events.jsonl 里，程序跑成什么样在执行日志里，
+    /// 电脑上自取，不必让睡醒的人先读一遍算法说明。
     static func reportText(summary s: SnoreSummary, start: Date, end: Date, events: [SnoreEvent],
-                           buckets: [SnoreSecond], config: SnoreConfig, facts: [String],
-                           title: String) -> String {
+                           buckets: [SnoreSecond], config: SnoreConfig, title: String) -> String {
+        let hours = topHours(buckets, start: start)
         var lines: [String] = []
-        let df = DateFormatter()
-        df.dateFormat = "yyyy-MM-dd HH:mm"
         lines.append("====== \(title) ======")
-        lines.append("时段     \(df.string(from: start)) → \(df.string(from: end))（\(snoreDurText(s.totalSec))）")
+        lines.append("\(snoreDayText(start)) → \(snoreDayText(end))，一共记了 \(snoreDurCN(s.totalSec))")
+        lines.append("")
+        lines.append("【一句话】" + headline(s, hours: hours))
         lines.append("")
         if s.tooShort {
-            lines.append("【鼾声占比】这一场只采了 \(snoreDurText(s.totalSec))，不到 1 分钟 ⇒ 不给占比和分级。"
-                         + "判定本身照做：判成鼾 \(snoreDurText(s.snoreSec))、发作 \(s.boutCount) 段、"
-                         + "疑似中断 \(s.gapCount) 次——别把这一场读成「没检测到鼾声」。")
+            lines.append("只记了 \(snoreDurCN(s.totalSec))（不到 1 分钟）：听到鼾 \(snoreDurCN(s.snoreSec))、分成 \(s.boutCount) 段。"
+                         + "别把这一场读成「没打鼾」，占比和分级要录满 1 分钟才给。")
         } else {
-            lines.append("【鼾声占比】\(String(format: "%.1f", s.coverage * 100))%（\(snoreDurText(s.snoreSec))）→ \(s.grade)")
+            lines.append("打鼾多久：\(snoreDurCN(s.snoreSec))，\(coverageCN(s))（\(s.grade)）")
+            lines.append("分几段：\(s.boutCount) 段，最长一段 \(snoreDurCN(s.longestBout))，平均 \(snoreDurCN(s.meanBout))")
+            lines.append("什么时候打的：" + whenDetail(hours))
+            if let loud = loudnessText(s) { lines.append("响不响：" + loud) }
+            if let r = s.ratePerMin, r > 0 {
+                lines.append("打鼾节奏：大约每 \(String(format: "%.0f", 60.0 / r)) 秒一声")
+            }
         }
-        lines.append("【发作次数】\(s.boutCount) 次，每小时 \(String(format: "%.1f", s.boutsPerHour)) 次；"
-                     + "最长一次 \(snoreDurText(s.longestBout))，平均 \(snoreDurText(s.meanBout))")
-        if let r = s.ratePerMin {
-            lines.append("【鼾声节律】发作内 \(String(format: "%.1f", r)) 次/分（约每 \(String(format: "%.1f", 60.0 / r)) 秒一鼾）")
-        } else {
-            lines.append("【鼾声节律】没数出稳定的鼾间隔（发作太短或鼾太密，间隔不足 1 s）")
+        lines.append("鼾声停住（打鼾中间安静满 \(Int(config.interruptGapSec)) 秒记一次）：\(s.gapCount) 次"
+                     + (s.gapCount > 0 ? "，平均每小时 \(String(format: "%.1f", s.gapsPerHour)) 次，最长一次 \(snoreDurCN(s.longestGap))" : ""))
+        if s.gapCount > 0 {
+            let worst = events.filter { $0.kind == .gap && !$0.unresolved }
+                .sorted { $0.dur > $1.dur }.prefix(3)
+            if !worst.isEmpty {
+                let f = DateFormatter()
+                f.dateFormat = "HH:mm"
+                lines.append("安静最久的几次：" + worst.map {
+                    "\(f.string(from: start.addingTimeInterval($0.t0))) 安静 \(snoreDurCN($0.dur))"
+                }.joined(separator: "、"))
+            }
+            if s.arousalCount > 0 {
+                lines.append("其中 \(s.arousalCount) 次是停完之后猛地又打起来，比停之前还响")
+            }
         }
-        lines.append("【响度】峰值 \(SnoreCalib.text(s.peakDb, config))｜鼾声期均值 \(SnoreCalib.text(s.snoreMeanDb, config))"
-                     + "｜本底中位 \(SnoreCalib.text(s.floorMedianDb, config))")
-        if !s.tooShort { lines.append(contentsOf: blindLines(s, config)) }
-        lines.append("")
-        lines.append("【疑似中断】≥\(Int(config.interruptGapSec)) s 的鼾声停住：\(s.gapCount) 次，"
-                     + "每小时 \(String(format: "%.1f", s.gapsPerHour)) 次")
-        lines.append("　　　　　最长 \(snoreDurText(s.longestGap))，平均 \(snoreDurText(s.meanGap))；"
-                     + "其中 \(s.arousalCount) 次以明显更响的复鼾结束")
         if s.unresolvedCount > 0 {
-            // 这几条只列在【中断明细】里，不进上面那些数。措辞别写成「起床」：用户是整晚睡到醒的，
-            // 0.6 那晚那句「多半是鼾段结束或起床」直接把人的记录带偏了——这里唯一站得住的说法是
-            // 「鼾自己停了，一直到停止记录都没再出现」，为什么停交给手表/人来对，不在这里猜。
-            lines.append("　　　　　另有 \(s.unresolvedCount) 条是鼾自己停了：一直到停止记录都没再出现鼾，"
-                         + "不算进中断统计（见【中断明细】里标「未复鼾」的那几条）")
+            // 措辞别写成「起床」：用户是整晚睡到醒的，0.6 那晚那句「多半是鼾段结束或起床」直接把人的记录带偏了。
+            // 这里唯一站得住的说法是「鼾自己停了，一直到记录结束都没再出现」，为什么停交给手表/人来对，不在这里猜。
+            lines.append("另外有 \(s.unresolvedCount) 次是鼾声自己停了，一直到记录结束都没再出现（不算进上面的停住次数）")
         }
-        lines.append("【其他发声】说话/咳嗽样 \(s.vocalCount) 次")
-        lines.append("【看一眼】\(advice(s, config))")
+        lines.append("别的动静：\(s.vocalCount) 次（不是鼾的声音，像翻身、说话、咳嗽，分不清具体是哪种）")
+        if !s.tooShort && s.blindCells >= 60 {
+            lines.append("很轻的声音：另有约 \(snoreDurCN(Double(s.blindCells)))的动静听着有点像鼾，但太轻，没算进上面的数"
+                         + "（可能是极轻的鼾，也可能是风扇、电脑这类一直响的声音）")
+        }
         if s.staleSec > 0 {
-            lines.append("【数据缺口】有 \(snoreDurText(Double(s.staleSec))) 没采到（引擎断过或手机被暂停），统计按采到的部分算")
+            lines.append("没录到的部分：有 \(snoreDurCN(Double(s.staleSec))) 没采到（程序断过或手机被暂停），上面的数只按录到的部分算")
         }
-
-        let hour = hourly(buckets: buckets, start: start)
-        if hour.count > 1 {
-            var row = "【逐小时】"
-            for (date, cov, sec) in hour {
-                let h = DateFormatter()
-                h.dateFormat = "HH"
-                // 光给整数百分比会把轻的那几小时全四舍五入成 0%（一小时 50 s 鼾才 1.4%），
-                // 所以留一位小数，再带上这一小时里究竟有多少秒判成了鼾
-                row += " \(h.string(from: date))时\(String(format: "%.1f", cov * 100))%/\(Int(sec.rounded()))s"
-            }
-            lines.append(row)
-        }
-
-        // 最要紧的几条中断单独列出来：医生问「最长那次几点」的时候要能马上答。
-        // 未复鼾的那几条排到最后——它们往往最长（鼾段结束后没人再打），摆在头一行会把人吓一跳。
-        let shown = events.filter { $0.kind == .gap }
-            .sorted { a, b in
-                if a.unresolved != b.unresolved { return !a.unresolved }
-                return a.dur > b.dur
-            }
-            .prefix(8)
-        if !shown.isEmpty {
-            lines.append("")
-            lines.append("【中断明细】（按停住的时长从长到短，最多 8 条；标「未复鼾」的排在最后、不算进上面的次数）")
-            for e in shown {
-                let d = start.addingTimeInterval(e.t0)
-                let f2 = DateFormatter()
-                f2.dateFormat = "HH:mm:ss"
-                var tail = e.unresolved ? "未复鼾" : "复鼾 \(SnoreCalib.text(e.resumeDb ?? -120, config))"
-                if e.arousal { tail += "（比停住前响）" }
-                if e.otherDuring { tail += "｜期间有别的发声" }
-                lines.append("  \(f2.string(from: d))  停 \(snoreDurText(e.dur))  \(tail)")
-            }
-        }
-
         lines.append("")
-        lines.append("【口径与限度】")
-        lines.append("  · 只有麦克风：测不到气流、胸腹运动和血氧，所以「疑似中断」是鼾声停住的间接推断，"
-                     + "不等于呼吸暂停，更不能当诊断。")
-        lines.append("  · 响度是手机麦克风的相对刻度 dBFS；不接声级计换算就不是 dB(A) SPL，"
-                     + "跨设备比较要留意。")
-        lines.append("  · 判鼾按「一声」来判：声音一收口（安静满 0.3 s）就结一次账，这一声要同时过三关——"
-                     + "时长像一次呼吸里的鼾（零点几秒到两秒）、频谱形状过判定线、声内频率稳得住（说话会滑来滑去，过不了）。"
-                     + "过了还得跟最近的上一声配成对（间隔 1–10 s，一鼾一口气）；实在响得离谱才允许单独算鼾。")
-        lines.append("  · 这套口径认「一鼾一口气」的稀鼾，也认得密鼾；代价是持续的嗡鸣、空调声、单独一两声咳嗽都不算鼾。")
-        lines.append("  · 响度门（本底+4 与 \(String(format: "%.0f", config.absGateDb)) dBFS 取大）以下的声音还是不判成鼾——"
-                     + "隔着被子、离得远的那种极轻鼾会漏。0.8 起门以下的频谱照样要评，漏多少看【轻鼾盲区】那一行。")
-        lines.append("  · 距离、枕头、体位、同床者翻身都会改变读数；本 App 统计的是「采到的声音」，不是「你打得多厉害」的绝对量。")
-        lines.append("  · 真要看有没有睡眠呼吸暂停，去做多导睡眠监测（PSG）或医生开的便携睡眠呼吸监测。")
-        if !facts.isEmpty {
-            lines.append("")
-            lines.append("【运行环境】")
-            for f in facts { lines.append("  " + f) }
-        }
+        lines.append("【建议】" + advice(s))
+        lines.append("【怎么算的】一声一声听：像鼾、长短像一口气里的鼾、又能跟上一声配成「一鼾一口气」才算。"
+                     + "空调、风扇这类一直响的声音不算鼾；隔着被子、离得远的极轻鼾会漏。")
+        lines.append("【说明】「鼾声停住」量的是鼾声安静了多久，不是呼吸停了多久——几分钟那种多半是这一整段都没打鼾。"
+                     + "手机只能听声音，测不到呼吸和血氧，所以这只是听出来的推断，不等于呼吸暂停，不能当诊断。"
+                     + "响度是跟房间底噪比的相对值，不是医院用的分贝数；手机离得远近、枕头、体位都会改变读数。"
+                     + "真要查有没有睡眠呼吸暂停，去医院做睡眠监测。")
         return lines.joined(separator: "\n")
     }
 
-    /// 「响度门以下那一片究竟有没有鼾」这两行。
-    ///
-    /// 判定单位换到「一声」以后，剩下的最大不确定性不是算法，是门：门 = max(本底+4, absGateDb)，
-    /// 本底整晚 −85 上下 ⇒ 门死在 −58 dBFS，比它轻的声音以前连频谱都不评（0.5/0.6 那两晚想查
-    /// 「是不是太轻才漏判」，数据里根本问不出来——那些秒的分数就是 0，而 0 分不清「安静」和「没评」）。
-    /// 0.8 起打分跟门脱钩：门以下照样算一份不看响度的频谱分，这里就能把三种情况分开：
-    /// ①这一晚的记录里没这一列（0.8 以前）②门以下确实只有本底 ③门以下有一堆像鼾的轻声音。
-    static func blindLines(_ s: SnoreSummary, _ config: SnoreConfig) -> [String] {
-        guard s.blindHasColumn else {
-            return ["【轻鼾盲区】这一晚的记录里没有「不看响度门的频谱分」那一列（0.8 以前的晚上不评），"
-                    + "比门还轻的声音在这一晚的数据里看不了。"]
-        }
-        let gate = String(format: "%.0f", s.gateDb)
-        let bar = String(format: "%.2f", SnoreAnalyze.blindBar)
-        let rl = SnoreAnalyze.blindRunLen
-        let fd = String(format: "%.0f", SnoreAnalyze.blindFlatDb)
-        if s.blindCells == 0 {
-            if s.blindSuppressed > 0 {
-                return ["【轻鼾盲区】比响度门（\(gate) dBFS）还轻、频谱分却过了 \(bar) 的秒，剔除连续背景声后剩 0 s"
-                        + "｜门以下像鼾的那 \(s.blindSuppressed) s 全是连着又平的背景声（机器/房间稳态噪声），不是轻鼾"
-                        + " ⇒ 这一晚的门没挡住鼾。"]
-            }
-            return ["【轻鼾盲区】比响度门（\(gate) dBFS）还轻、频谱分却过了 \(bar) 的秒：0 s"
-                    + "｜门以下那一片的频谱分中位只有 \(String(format: "%.2f", s.blindBaseline))（就是本底）"
-                    + " ⇒ 这一晚的门没挡住鼾，轻的那头没什么可捞的。"]
-        }
-        let pct = 100.0 * Double(s.blindCells) / max(1.0, s.totalSec - Double(s.staleSec))
-        let filtered = s.blindSuppressed > 0
-            ? "｜已剔除连续背景声 \(s.blindSuppressed) s（连着 >\(rl) s 又平，机器/稳态噪声，不当轻鼾）"
-            : ""
-        return ["【轻鼾盲区】比响度门（\(gate) dBFS）还轻、频谱分却过了 \(bar) 的秒：\(s.blindCells) s"
-                + "（占夜 \(String(format: "%.1f", pct))%）｜这些秒里最响 \(SnoreCalib.text(s.blindPeakDb, config))"
-                + "｜门以下整片的频谱分中位 \(String(format: "%.2f", s.blindBaseline))" + filtered,
-                "　　　　　这条线画在判定线（\(String(format: "%.2f", config.enterScore))）之上是有原因的：频谱那几项都是比例，"
-                    + "本底噪声自己就能拿 0.65~0.72。上面那个中位数就是这一晚的本底分，只有明显高过它的秒才算证据。"
-                    + "连续又平的背景声（机器/稳态噪声）已按「连着 >\(rl) s 且前后响度起伏 <\(fd) dB」剔除；"
-                    + "剩下的连着几晚都不小，才谈把门往下挪一档（−63／−68）再对照着记。"]
+    /// 哪几个小时打得最多：按鼾声秒数从多到少，最多摆 3 个。「一句话」和「什么时候打的」共用这一份。
+    private static func topHours(_ buckets: [SnoreSecond], start: Date) -> [(date: Date, sec: Double)] {
+        hourly(buckets: buckets, start: start)
+            .filter { $0.snoreSeconds >= 0.5 }
+            .sorted { $0.snoreSeconds > $1.snoreSeconds }
+            .prefix(3)
+            .map { (date: $0.hourDate, sec: $0.snoreSeconds) }
     }
 
-    /// 一句「接下来做什么」。界面上顶在第一行，报告里跟着【看一眼】。
-    /// 阈值挑的是筛查里常用的那几条口径的影子（次数/小时、占比、复鼾是否更响），
+    /// 「凌晨 2 点」「早上 6 点」：跨零点的记录光写「2 点」看不出是凌晨还是下午。
+    private static func hourCN(_ date: Date) -> String {
+        let h = Calendar.current.component(.hour, from: date)
+        switch h {
+        case 0: return "半夜 12 点"
+        case 1...5: return "凌晨 \(h) 点"
+        case 6...11: return "早上 \(h) 点"
+        case 12: return "中午 12 点"
+        case 13...18: return "下午 \(h - 12) 点"
+        default: return "晚上 \(h - 12) 点"
+        }
+    }
+
+    private static func whenDetail(_ hours: [(date: Date, sec: Double)]) -> String {
+        guard !hours.isEmpty else { return "整晚都没听到鼾" }
+        let most = hours.map { "\(hourCN($0.date))（\(snoreDurCN($0.sec))）" }.joined(separator: "、")
+        return hours.count == 1 ? "\(most)；别的时候没听到" : "最多的是 \(most)"
+    }
+
+    /// 开头那一句：打了多少、集中在几点、有没有停住，最后一句给个定性。
+    /// 这里只给次数和每小时几次，不摆「最长一次」——最长那一次往往是十几分钟没打鼾，
+    /// 摆在开头会被读成「憋了十几分钟」。时长留在下面那行，配着【说明】一起看。
+    private static func headline(_ s: SnoreSummary, hours: [(date: Date, sec: Double)]) -> String {
+        if s.tooShort { return "这一场太短，说明不了整晚的情况。" }
+        let amount = s.snoreSec < 1
+            ? "昨晚几乎没打鼾"
+            : "昨晚打鼾 \(snoreDurCN(s.snoreSec))（\(coverageCN(s))）"
+        let when = s.snoreSec < 1 ? "" : "，\(whenPhrase(hours))"
+        let gap = s.gapCount == 0
+            ? "，没有鼾声停住"
+            : "，有 \(s.gapCount) 次鼾声停住（平均每小时 \(String(format: "%.1f", s.gapsPerHour)) 次）"
+        return amount + when + gap + "。" + verdict(s)
+    }
+
+    private static func whenPhrase(_ hours: [(date: Date, sec: Double)]) -> String {
+        guard let first = hours.first else { return "整晚都没听到" }
+        if hours.count == 1 { return "都在\(hourCN(first.date))前后" }
+        return "主要在" + hours.map { hourCN($0.date) }.joined(separator: "、")
+    }
+
+    /// 定性那一句。阈值跟 advice 用的是同一条（gapHot），别出现「一句话」说去医院、「建议」说先挪手机的分裂。
+    private static func verdict(_ s: SnoreSummary) -> String {
+        if s.gapHot && s.coverage >= 0.10 { return "停住的次数偏多，建议去医院做一次睡眠监测。" }
+        if s.gapHot { return "停住的次数偏多，但鼾声本身不多，先确认手机放得够近。" }
+        if s.coverage >= 0.30 { return "打得比较多，值得留意。" }
+        if s.coverage >= 0.10 { return "打得有些多。" }
+        if s.gapCount > 0 { return "鼾声不多，但有停住，连记几晚看看。" }
+        if s.coverage < 0.005 { return "睡得挺安静。" }
+        return "鼾声不算多。"
+    }
+
+    /// 占比那一格：不到 0.05% 就写「不到 0.1%」。「打了 4 秒（占整晚 0.0%）」读着像自相矛盾，
+    /// 而那一晚（11-10）确实判到了 4 秒鼾，不是零。
+    private static func coverageCN(_ s: SnoreSummary) -> String {
+        let pct = s.coverage * 100
+        return pct < 0.05 ? "占整晚不到 0.1%" : String(format: "占整晚 %.1f%%", pct)
+    }
+
+    /// 「响不响」：拿鼾声期均值跟这一晚的房间底噪比，只给差值、不下「响/轻」的断语。
+    /// dBFS 本身跨手机不可比；而门 = max(本底+4, −58)，房间一安静，任何判成鼾的声音都高出本底 25 dB 以上，
+    /// 按差值分档会把每一晚都写成「比较响」。差值本身能连着几晚比趋势，够了。
+    private static func loudnessText(_ s: SnoreSummary) -> String? {
+        guard s.snoreMeanDb > -119, s.floorMedianDb > -119 else { return nil }
+        let d = s.snoreMeanDb - s.floorMedianDb
+        guard d > 0 else { return nil }
+        return "打鼾时平均比房间底噪高 \(Int(d.rounded())) 分贝"
+    }
+
+    /// 一句「接下来做什么」。历史那一晚的详情页和报告里的【建议】都用它。
+    /// 阈值挑的是筛查里常用口径的影子（停住次数/小时、鼾声占比、复鼾是否更响），
     /// 但只凭音频绝不写「你有睡眠呼吸暂停」这种话。
-    static func advice(_ s: SnoreSummary, _ config: SnoreConfig) -> String {
+    static func advice(_ s: SnoreSummary) -> String {
         if s.tooShort {
-            // 试录半分钟就收尾：占比那一格本来就是空的，直接走到底下的「几乎没采到鼾声」，
-            // 于是「判出来 8 声鼾、2 段发作」的一场测试也会写成「没检测到鼾」——正是用户盯的那句话。
+            // 试录半分钟就收尾：占比那一格本来就是空的，走到底下会写成「几乎没采到鼾声」——
+            // 于是「判出来 8 声鼾、2 段发作」的一场测试也被写成「没检测到鼾」。时长上面已经给过，这里只说下一步。
             if s.boutCount == 0 && s.snoreSec < 0.5 {
-                return "这一场只采了 \(snoreDurText(s.totalSec))，一件鼾都没判出来。这场太短，说明不了有没有鼾："
-                    + "手机离嘴 30–60 cm、连着录满 1 分钟再看（判定账目在「发到电脑 → 执行日志」最上面一行）。"
+                return "手机离嘴 30–60 厘米、连着记满 1 分钟再看，这一场说明不了有没有鼾。"
             }
-            return "这一场只采了 \(snoreDurText(s.totalSec))：判成鼾 \(snoreDurText(s.snoreSec))、发作 \(s.boutCount) 段、"
-                + "停住 \(s.gapCount) 次——判定在起作用。占比和分级要录满 1 分钟才给，整夜记录才看得出趋势。"
+            return "判定在起作用。手机离嘴 30–60 厘米、连着记一整晚，才看得出趋势。"
         }
-        let gapHot = s.gapsPerHour >= 5.0 || (s.gapsPerHour >= 3.0 && s.arousalCount >= 2)
-        if gapHot && s.coverage >= 0.10 {
-            return "鼾声停住 \(String(format: "%.1f", s.gapsPerHour)) 次/小时、最长 \(snoreDurText(s.longestGap))，"
-                + "这个密度值得去睡眠门诊或呼吸科做一次正规睡眠监测；把这份报告和音频片段一起带上。"
+        if s.gapHot && s.coverage >= 0.10 {
+            return "鼾声停住平均每小时 \(String(format: "%.1f", s.gapsPerHour)) 次、最长 \(snoreDurCN(s.longestGap))，"
+                + "这个次数值得去睡眠门诊或呼吸科做一次正规睡眠监测，把这份报告带上。"
         }
-        if gapHot {
-            return "鼾声停住 \(String(format: "%.1f", s.gapsPerHour)) 次/小时，但鼾声本身不多——"
-                + "先确认手机放得离嘴够近（30–60 cm）、没被枕头压住，再连记几晚。"
+        if s.gapHot {
+            return "鼾声停住平均每小时 \(String(format: "%.1f", s.gapsPerHour)) 次，但鼾声本身不多——"
+                + "先确认手机离嘴够近（30–60 厘米）、没被枕头压住，再连记几晚。"
         }
         if s.coverage >= 0.30 {
-            return "鼾声占了 \(String(format: "%.0f", s.coverage * 100))% 的时间（\(s.grade)），"
-                + "停住不算频繁；这类以鼾声为主，管体重、侧睡、睡前别喝酒先看两周趋势。"
+            return "鼾声占了整晚 \(String(format: "%.0f", s.coverage * 100))% 的时间（\(s.grade)），停住不算频繁："
+                + "这类以鼾声为主，先管体重、侧着睡、睡前别喝酒，看两周趋势。"
         }
         if s.coverage < 0.005 && s.gapCount == 0 {
-            return "这一晚几乎没采到鼾声。要么确实没打，要么手机离得太远/被压住/麦克风权限没给。"
+            // 别在这里质疑麦克风权限：这一晚判到了鼾、也记了别的动静，权限显然是给了的。
+            // 开头说「睡得挺安静」，这里再说「可能没给权限」就自相矛盾了。
+            return "这一晚几乎没听到鼾声，先按「睡得安静」读。要是你或伴侣觉得其实打了，"
+                + "把手机挪到离嘴 30–60 厘米、别被枕头压住，再连记几晚对一对。"
         }
-        return "鼾声和停住都不算突出。建议连着记 3–5 晚看趋势，单晚的数字别当结论。"
+        return "鼾声和停住都不算突出。连着记 3–5 晚看趋势，单晚的数字别当结论。"
     }
 }
 

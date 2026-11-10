@@ -23,15 +23,15 @@ targets:
         CFBundleExecutable: SnoreBench
         CFBundleIdentifier: com.qoder.snorebench
         CFBundlePackageType: APPL
-        CFBundleShortVersionString: "0.10"
-        CFBundleVersion: "10"
+        CFBundleShortVersionString: "0.11"
+        CFBundleVersion: "11"
         CFBundleInfoDictionaryVersion: "6.0"
-        NSMicrophoneUsageDescription: "整晚只在手机自己这儿判定鼾声和鼾声停住，声音不上传；只有你按「发到电脑」或事件片段才落在这台手机上。"
+        NSMicrophoneUsageDescription: "整晚只在手机自己这儿判定鼾声和鼾声停住：不存录音、声音不上传，落到手机上的只有文字和数字（曲线、事件、报告），你按「发到电脑」才发出去。"
         # 「发到电脑」是往同一张网里的电脑 POST 日志，iOS 14 起连本地地址要先过这道授权，
         # 描述没写对的话弹窗只显示英文键名、用户一头雾水点拒绝，那条调试路就断了。
         NSLocalNetworkUsageDescription: "要把整晚的日志和报告发到你自己的电脑上，方便调这台手机上的判定"
         # 开这两个键以后 Documents 整个出现在「文件」app 里：curve.csv、events.jsonl、
-        # 片段 wav、snore_log.txt 都能就地拷出来，不必每条都点一次分享面板。
+        # report.txt、snore_log.txt 都能就地拷出来，不必每条都点一次分享面板。
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true
         NSAppTransportSecurity:

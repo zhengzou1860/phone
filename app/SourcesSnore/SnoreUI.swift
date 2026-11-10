@@ -161,24 +161,14 @@ struct TonightView: View {
 
     private var eventsSection: some View {
         VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Text("今晚的事件（最上面是刚发生的）").font(.headline)
-                Spacer()
-                if mon.running && !mon.currentNightId.isEmpty {
-                    Button("停止播放") { mon.stopPlayback() }
-                        .font(.caption)
-                }
-            }
+            Text("今晚的事件（最上面是刚发生的）").font(.headline)
             if mon.events.isEmpty {
                 Text(mon.running ? "还没判出事件。睡着以后鼾声起来，这里一条条就出来了。"
                                  : "点了开始才会有。")
                     .font(.footnote).foregroundColor(.secondary)
             }
             ForEach(mon.events.suffix(30).reversed()) { e in
-                EventRow(event: e, start: mon.nightStart, config: mon.config,
-                         hasSnippet: mon.running && !mon.currentNightId.isEmpty) {
-                    mon.playSnippet(nightId: mon.currentNightId, eventId: e.id)
-                }
+                EventRow(event: e, start: mon.nightStart, config: mon.config)
             }
         }
         .padding(12)
@@ -217,8 +207,6 @@ struct EventRow: View {
     let event: SnoreEvent
     let start: Date
     let config: SnoreConfig
-    let hasSnippet: Bool
-    let play: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
@@ -230,12 +218,6 @@ struct EventRow: View {
                     .font(.system(size: 11, design: .monospaced))
                 Text("— \(snoreDurText(event.dur))").font(.system(size: 11)).foregroundColor(.secondary)
                 Spacer()
-                if hasSnippet {
-                    Button("听") { play() }
-                        .font(.system(size: 12, weight: .semibold))
-                        .buttonStyle(.bordered)
-                        .tint(.orange)
-                }
             }
             HStack(spacing: 8) {
                 Text("响 \(SnoreCalib.text(event.peakDb, config)) 均 \(SnoreCalib.text(event.meanDb, config))")
@@ -315,7 +297,7 @@ struct HistoryView: View {
                                 Button("删", role: .destructive) { mon.deleteNight(r.id) }
                             }
                         }
-                        Text("左滑一行＝删掉那一晚（曲线、事件、音频片段一起没）；点开一行里也有「删掉这一晚」和「发这一晚的记录」。"
+                        Text("左滑一行＝删掉那一晚（曲线、事件、报告一起没）；点开一行里也有「删掉这一晚」和「发这一晚的记录」。"
                              + "留 \(mon.config.keepNights) 晚，多了从最旧的开始自动清。")
                             .font(.system(size: 10)).foregroundColor(.secondary)
                     }
@@ -366,7 +348,7 @@ struct NightDetailView: View {
                         SnoreStat(title: "说话/咳嗽", value: "\(detail.summary.vocalCount) 次")
                         SnoreStat(title: "没采到", value: snoreDurText(Double(detail.summary.staleSec)))
                     }
-                    Text(SnoreAnalyze.advice(detail.summary, detail.meta.config))
+                    Text(SnoreAnalyze.advice(detail.summary))
                         .font(.footnote)
                         .foregroundColor(.secondary)
 
@@ -390,12 +372,6 @@ struct NightDetailView: View {
                                 Text(snoreDurText(e.dur)).foregroundColor(.red)
                                 Text(e.unresolved ? "之后没复鼾" : (e.arousal ? "复鼾更响" : "复鼾"))
                                     .font(.system(size: 11)).foregroundColor(.secondary)
-                                Spacer()
-                                if detail.snippetIds.contains(e.id) {
-                                    Button("听") { mon.playSnippet(nightId: detail.id, eventId: e.id) }
-                                        .font(.system(size: 12, weight: .semibold))
-                                        .buttonStyle(.bordered).tint(.orange)
-                                }
                             }
                         }
                     }
@@ -403,10 +379,7 @@ struct NightDetailView: View {
                     VStack(alignment: .leading, spacing: 8) {
                         Text("今晚全部事件（\(detail.events.count) 条）").font(.headline)
                         ForEach(detail.events.suffix(60).reversed()) { e in
-                            EventRow(event: e, start: detail.meta.startDate, config: detail.meta.config,
-                                     hasSnippet: detail.snippetIds.contains(e.id)) {
-                                mon.playSnippet(nightId: detail.id, eventId: e.id)
-                            }
+                            EventRow(event: e, start: detail.meta.startDate, config: detail.meta.config)
                         }
                     }
 
@@ -453,7 +426,7 @@ struct NightDetailView: View {
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) { Button("关闭") { dismiss() } }
             }
-            .confirmationDialog("删掉 \(detail.id)？曲线、事件、音频片段一起没。\n要留的先按「发这一晚的记录」发到电脑，或者用「分享」。",
+            .confirmationDialog("删掉 \(detail.id)？曲线、事件、报告一起没。\n要留的先按「发这一晚的记录」发到电脑，或者用「分享」。",
                                 isPresented: $confirmDelete, titleVisibility: .visible) {
                 Button("删掉这一晚", role: .destructive) {
                     mon.deleteNight(detail.id)
@@ -608,14 +581,13 @@ struct SettingsView: View {
                 }
 
                 Section("留什么") {
-                    Toggle("事件留 6 秒音频片段（能放给医生听）", isOn: $mon.config.keepSnippets)
-                    Text("一晚约 10～30 MB（存 16 k 单声道）。关掉最省盘，但第二天没法回放。")
-                        .font(.system(size: 10)).foregroundColor(.secondary)
                     Picker("本地保留几晚", selection: $mon.config.keepNights) {
                         Text("7 晚").tag(7)
                         Text("14 晚").tag(14)
                         Text("30 晚").tag(30)
                     }
+                    Text("只存文字和数字（逐秒曲线、事件、报告），不存录音，一晚约 1 MB。麦克风整晚开着是用来判定的，声音不落盘、不上传。")
+                        .font(.system(size: 10)).foregroundColor(.secondary)
                 }
 
                 Section("刻度") {
@@ -731,7 +703,7 @@ struct SettingsView: View {
                 Section {
                     Button("清空本地所有记录", role: .destructive) { confirmWipe = true }
                 } footer: {
-                    Text("把 \(mon.rows.count) 晚的曲线、事件、片段全删掉。删之前先用「发到电脑」或「分享」把要留的报告带走。")
+                    Text("把 \(mon.rows.count) 晚的曲线、事件、报告全删掉。删之前先用「发到电脑」或「分享」把要留的报告带走。")
                 }
             }
             .navigationTitle("设置")

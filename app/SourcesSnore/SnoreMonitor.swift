@@ -1,4 +1,3 @@
-import AVFoundation
 import Combine
 import Foundation
 import UIKit
@@ -41,7 +40,6 @@ struct SnoreNightDetail: Identifiable {
     var chart: [SnoreChartPoint]
     var events: [SnoreEvent]
     var report: String
-    var snippetIds: Set<Int>
     var dirText: String
 }
 
@@ -54,7 +52,7 @@ final class SnoreMonitor: NSObject, ObservableObject {
     @Published var notes: [String] = []
     @Published var running = false
     @Published var statusLine = ""
-    /// 正在录的这一晚落在哪个目录——「今晚」页上点「听片段」要拿它拼路径。
+    /// 正在录的这一晚落在哪个目录——「发到电脑」挑哪一晚、执行日志里写哪一晚都靠它。
     @Published var currentNightId = ""
     @Published var nightStart = Date()
 
@@ -74,7 +72,6 @@ final class SnoreMonitor: NSObject, ObservableObject {
 
     let core = SnoreCore()
     private let work = DispatchQueue(label: "com.qoder.snorebench.ui", qos: .userInitiated)
-    private var player: AVAudioPlayer?
     private var envTimer: Timer?
 
     override init() {
@@ -152,7 +149,7 @@ final class SnoreMonitor: NSObject, ObservableObject {
             DispatchQueue.main.async { self.currentNightId = id }
         }
         SnoreJournal.line("开始一晚：灵敏度 \(config.sensitivity)｜中断阈值 \(Int(config.interruptGapSec)) s"
-                          + "｜发作间隔 \(config.boutGapSec) s｜门限 \(config.absGateDb) dBFS｜片段 \(config.keepSnippets)")
+                          + "｜发作间隔 \(config.boutGapSec) s｜门限 \(config.absGateDb) dBFS")
     }
 
     func stop() {
@@ -236,11 +233,13 @@ final class SnoreMonitor: NSObject, ObservableObject {
             let chart = SnoreCore.decimate(n.buckets, span: Double(max(1, n.buckets.count)),
                                            gapMarks: gapMarks, vocalMarks: vocalMarks,
                                            bins: SnoreCore.chartBins)
-            var ids = Set<Int>()
-            for e in n.events where n.hasSnippet(e.id) { ids.insert(e.id) }
-            let text = (try? String(contentsOf: n.reportURL, encoding: .utf8)) ?? ""
+            // 报告就地重算，不读盘上那份 report.txt：0.11 以前的晚上存的是满屏术语的旧文案，
+            // 曲线和事件都在，重算一遍就能让老晚上也读得懂。
+            let text = SnoreAnalyze.reportText(summary: s, start: n.meta.startDate, end: n.meta.endDate,
+                                               events: n.events, buckets: n.buckets, config: cfg,
+                                               title: "鼾声监测报告 \(n.meta.id)")
             let d = SnoreNightDetail(id: id, meta: n.meta, summary: s, chart: chart,
-                                     events: n.events, report: text, snippetIds: ids,
+                                     events: n.events, report: text,
                                      dirText: n.dir.lastPathComponent)
             DispatchQueue.main.async {
                 self.detail = d
@@ -276,34 +275,6 @@ final class SnoreMonitor: NSObject, ObservableObject {
         }
     }
 
-    // MARK: 片段回放
-
-    /// 播某一晚的 s_<id>.wav。录音挂着的时候也能播：会话本来就是 playAndRecord。
-    func playSnippet(nightId: String, eventId: Int) {
-        stopPlayback()
-        work.async {
-            guard let root = SnoreArchive.root else { return }
-            let url = root.appendingPathComponent(nightId).appendingPathComponent("snippets")
-                .appendingPathComponent("s_\(eventId).wav")
-            do {
-                let p = try AVAudioPlayer(contentsOf: url)
-                p.prepareToPlay()
-                DispatchQueue.main.async {
-                    self.player = p
-                    if p.play() { self.statusLine = "播放 s_\(eventId).wav（\(String(format: "%.1f", p.duration)) s）" }
-                    else { self.statusLine = "点了没响：播放器起了但播不出来（可能被别的音频占着）" }
-                }
-            } catch {
-                DispatchQueue.main.async { self.statusLine = "片段打不开：\(error)" }
-            }
-        }
-    }
-
-    func stopPlayback() {
-        player?.stop()
-        player = nil
-    }
-
     // MARK: 报告
 
     /// 正在录的那一场：28 800 格的汇总不能在滑动的时候于主线程算，走 core 的队列。
@@ -321,7 +292,7 @@ final class SnoreMonitor: NSObject, ObservableObject {
                 let s = SnoreAnalyze.summarize(buckets: n.buckets, events: n.events, config: n.meta.config)
                 let text = SnoreAnalyze.reportText(summary: s, start: n.meta.startDate, end: n.meta.endDate,
                                                    events: n.events, buckets: n.buckets, config: n.meta.config,
-                                                   facts: SnoreFacts.lines(), title: "鼾声监测报告 \(n.meta.id)")
+                                                   title: "鼾声监测报告 \(n.meta.id)")
                 DispatchQueue.main.async { self.report = text }
             }
             return
@@ -337,7 +308,7 @@ final class SnoreMonitor: NSObject, ObservableObject {
             let s = SnoreAnalyze.summarize(buckets: n.buckets, events: n.events, config: n.meta.config)
             let text = SnoreAnalyze.reportText(summary: s, start: n.meta.startDate, end: n.meta.endDate,
                                                events: n.events, buckets: n.buckets, config: n.meta.config,
-                                               facts: SnoreFacts.lines(), title: "鼾声监测报告 \(n.meta.id)")
+                                               title: "鼾声监测报告 \(n.meta.id)")
             DispatchQueue.main.async { self.report = text }
         }
     }
@@ -387,7 +358,7 @@ final class SnoreMonitor: NSObject, ObservableObject {
     func sendLogToPC() {
         let cfg = "灵敏度 \(config.sensitivity)／判定分 \(String(format: "%.2f", config.enterScore))"
             + "／中断阈值 \(Int(config.interruptGapSec)) s／发作间隔 \(config.boutGapSec) s"
-            + "／发作最短 \(config.minBoutSec) s／绝对门限 \(config.absGateDb) dBFS／留片段 \(config.keepSnippets)／保留 \(config.keepNights) 晚"
+            + "／发作最短 \(config.minBoutSec) s／绝对门限 \(config.absGateDb) dBFS／保留 \(config.keepNights) 晚"
         let rt = running
             ? "在录 \(snoreDurText(live.elapsed))｜鼾 \(live.bouts)｜停 \(live.gaps)｜说话 \(live.vocals)"
                 + "｜电平 \(String(format: "%.1f", live.level)) dBFS｜本底 \(String(format: "%.1f", live.floor)) dBFS"

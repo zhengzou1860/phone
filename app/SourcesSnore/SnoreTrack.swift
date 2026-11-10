@@ -101,7 +101,7 @@ final class SnoreTracker {
     /// 鼾色随后补上）；SnoreStore 按 t0 原位改一格，盘上还是 30 s 一重写。
     var onSecondAmend: ((SnoreSecond) -> Void)?
 
-    /// 下一件事件的编号：界面上「听片段」按 id 找 snippets/s_12.wav，两头都用它。
+    /// 下一件事件的编号：events.jsonl 里一行一个 id，界面那一条条也按它认。
     private(set) var nextId = 1
 
     // 给界面实时读的

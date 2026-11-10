@@ -5,7 +5,7 @@ import UIKit
 // MARK: - 今晚这一场的总管
 //
 // 线程口径：音频块从 SnoreAudio 的分析队列递过来，一律再 hop 进 core 这一条串行队列——
-// FFT、判定、落盘、片段都在这条队列上按顺序发生，没有第二处写者。界面上读的那份是快照，
+// FFT、判定、落盘都在这条队列上按顺序发生，没有第二处写者。界面上读的那份是快照，
 // 由 core 每 1 s 整份递回主线程（不是逐帧推：一晚 28 800 格每帧都刷会把界面拖死）。
 
 /// 图上的一格（整晚最多 720 格，屏宽就那么点）
@@ -51,7 +51,6 @@ final class SnoreCore {
 
     private let queue = DispatchQueue(label: "com.qoder.snorebench.core", qos: .utility)
     private let audio = SnoreAudio()
-    private let ring = SnoreSnippetRing(keepSec: 8.0)
 
     private var analyzer: SnoreAnalyzer?
     private var tracker: SnoreTracker?
@@ -75,10 +74,10 @@ final class SnoreCore {
     /// 返回空串＝可以开始；非空是把按钮按下去的那句拒绝。
     func begin(config: SnoreConfig) -> String {
         let free = SnoreArchive.diskFreeMB()
-        let need = config.keepSnippets ? 500.0 : 60.0
+        // 只落逐秒曲线＋事件＋报告，一晚 1 MB 量级；60 MB 够十几晚周转，不必再为音频留半 G。
+        let need = 60.0
         if free >= 0 && free < need {
-            return "磁盘只剩 \(String(format: "%.0f", free)) MB，这条线要 \(Int(need)) MB 才敢开整晚"
-                + "（片段\(config.keepSnippets ? "要" : "不要")存）。先清掉旧晚，或把「存片段」关了再来。"
+            return "磁盘只剩 \(String(format: "%.0f", free)) MB，这条线要 \(Int(need)) MB 才敢开整晚。先清掉旧晚再来。"
         }
         queue.sync {
             guard !running else { return }
@@ -94,7 +93,6 @@ final class SnoreCore {
             lastHeartbeat = 0
             analyzer = nil
             tracker = nil
-            ring.clear()
             store = SnoreArchive.openNight(start: Date(), config: config,
                                            sampleRate: audio.sampleRate,
                                            device: SnoreFacts.machine())
@@ -189,7 +187,6 @@ final class SnoreCore {
         }
         guard let analyzer = analyzer, let tracker = tracker else { return }
 
-        ring.append(samples, endTime: endTime, sampleRate: sr)
         frames += 1
         analyzer.feed(samples, endTime: endTime) { f in
             tracker.accept(f)
@@ -226,16 +223,6 @@ final class SnoreCore {
             store.add(e)
             if e.kind == .gap { self.gapMarks.append(e.t0) }
             if e.kind == .vocal { self.vocalMarks.append(e.t0) }
-            if self.config.keepSnippets {
-                // 中断的那一条：声音在「停住之前」，所以往前多取 2 s 才听得到停住前的最后一鼾
-                let lo = e.kind == .gap ? e.t0 - 2.0 : e.t0
-                if let name = store.writeSnippet(id: e.id, from: lo, to: e.t1, ring: self.ring,
-                                                 config: self.config) {
-                    self.post("片段存下 s_\(e.id).wav（\(e.kind == .gap ? "中断" : e.kind == .bout ? "鼾" : "发声")）")
-                } else {
-                    self.post("事件 #\(e.id) 的片段没留成：环形缓冲里那一段已被裁掉")
-                }
-            }
             let copy = e
             DispatchQueue.main.async { self.onEvent?(copy) }
         }
@@ -318,7 +305,7 @@ final class SnoreCore {
         let summary = SnoreAnalyze.summarize(buckets: store.buckets, events: store.events, config: cfg)
         return SnoreAnalyze.reportText(summary: summary, start: store.meta.startDate, end: Date(),
                                        events: store.events, buckets: store.buckets, config: cfg,
-                                       facts: SnoreFacts.lines(), title: "鼾声监测报告 \(store.meta.id)")
+                                       title: "鼾声监测报告 \(store.meta.id)")
     }
 
     /// 界面按「刷新报告」时走的这条路：不在主线程算 28 800 格。

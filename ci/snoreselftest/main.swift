@@ -61,11 +61,16 @@ do {
     let text = SnoreAnalyze.reportText(summary: summary, start: start,
                                        end: start.addingTimeInterval(900),
                                        events: got.events, buckets: got.seconds, config: config,
-                                       facts: [], title: "鼾声监测报告（CI 合成样例）")
+                                       title: "鼾声监测报告（CI 合成样例）")
     print("------ 合成样例报告 ------")
     print(text)
     print("------ 样例账目：事件 \(got.events.count) 条（发作 \(summary.boutCount)／停 \(summary.gapCount)／发声 \(summary.vocalCount)）"
         + "／逐秒 \(got.seconds.count) 格／帧 \(got.frames) ------")
+    // 0.11 起报告是写给刚睡醒的人看的：术语不该再爬回来，开头那句白话摘要必须在。
+    if text.contains("dBFS") || text.contains("频谱分") || !text.contains("【一句话】") {
+        bad += 1
+        print("CASE FAIL 报告不再是白话（出现 dBFS/频谱分，或少了【一句话】）")
+    }
     // 这一晚是「该看见东西的一晚」：一件都没判出来就说明通路断了（比如喂块尺寸变了、门限写反了）
     if summary.boutCount == 0 || summary.gapCount == 0 {
         bad += 1

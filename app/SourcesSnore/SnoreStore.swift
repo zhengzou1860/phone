@@ -6,8 +6,8 @@ import Foundation
 //   meta.json     起止／配置／设备／是否正常收尾／引擎重连了几次
 //   curve.csv     逐秒曲线（Excel 直接能开，也是导出给医生的那份数）
 //   events.jsonl  一行一个事件（发作／疑似中断／其他发声）
-//   snippets/     s_<事件号>.wav，16 k 单声道
-//   report.txt    收尾时生成的报告；历史列表直接读它，不用每晚重算
+//   report.txt    收尾时生成的报告；发给电脑带这一份。界面上打开老晚上是就地重算的，
+//                 不读它——0.11 以前盘上存的是满屏术语的旧文案，重算才能让老晚上也读得懂。
 
 struct SnoreNightMeta: Codable {
     var id: String
@@ -32,21 +32,15 @@ final class SnoreNightStore {
     private(set) var buckets: [SnoreSecond] = []
     private(set) var events: [SnoreEvent] = []
 
-    private let fm = FileManager.default
-
     init(dir: URL, meta: SnoreNightMeta) {
         self.dir = dir
         self.meta = meta
-        try? fm.createDirectory(at: snippetsDir, withIntermediateDirectories: true)
     }
 
-    var snippetsDir: URL { dir.appendingPathComponent("snippets") }
     private var curveURL: URL { dir.appendingPathComponent("curve.csv") }
     private var eventsURL: URL { dir.appendingPathComponent("events.jsonl") }
     private var metaURL: URL { dir.appendingPathComponent("meta.json") }
     var reportURL: URL { dir.appendingPathComponent("report.txt") }
-
-    func snippetURL(_ id: Int) -> URL { snippetsDir.appendingPathComponent("s_\(id).wav") }
 
     // MARK: 追加
 
@@ -151,21 +145,6 @@ final class SnoreNightStore {
             }
         }
     }
-
-    // MARK: 片段
-
-    /// 环形缓冲里截 [from-1.5, to+1.5]，降到 16 k 写 wav。拿不到就返回 nil（界面上那条会显示「片段没留成」）。
-    func writeSnippet(id: Int, from: Double, to: Double, ring: SnoreSnippetRing, config: SnoreConfig) -> String? {
-        guard config.keepSnippets else { return nil }
-        guard let got = ring.capture(from: from - 1.5, to: to + 1.5) else { return nil }
-        let resampled = SnoreWav.resample(got.samples, from: got.rate, to: 16000)
-        let url = snippetURL(id)
-        return SnoreWav.write(resampled, sampleRate: 16000, to: url) ? url.lastPathComponent : nil
-    }
-
-    func hasSnippet(_ id: Int) -> Bool {
-        return fm.fileExists(atPath: snippetURL(id).path)
-    }
 }
 
 // MARK: - 跨晚的管理：列目录、开新晚、清旧、回收没收尾的那晚
@@ -195,7 +174,7 @@ enum SnoreArchive {
         guard let root = ensureRoot() else { return nil }
         let id = makeId(start)
         let dir = root.appendingPathComponent(id)
-        try? fm.createDirectory(at: dir.appendingPathComponent("snippets"), withIntermediateDirectories: true)
+        try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
         let meta = SnoreNightMeta(id: id, startMs: start.timeIntervalSince1970 * 1000.0,
                                   endMs: start.timeIntervalSince1970 * 1000.0, ended: false,
                                   sampleRate: sampleRate, restarts: 0, blocks: 0, seconds: 0,
