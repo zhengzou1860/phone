@@ -428,15 +428,69 @@ enum PressureWatch {
 }
 
 enum Uploader {
-    static let endpoint = "http://192.168.31.100:8712/report"
+    /// 8712 剪辑 / 8714 VR3D / 8715 Voice / 8716 换脸 / 8717 鼾声，这条线走 8712 和 phone-reports.txt。
+    ///
+    /// 地址在剪辑页「电脑地址」那一格可改。写死就吃过亏：电脑的 .99 变成了残留地址、真正在用的是
+    /// .100，日志发不出来，而为改一个 IP 重新出包、重装一轮太贵（鼾声线 0.9 同一个坑，照它那套搬）。
+    static let defaultEndpoint = "http://192.168.31.100:8712/report"
+    private static let endpointKey = "hellolc.pcEndpoint"
+
+    /// 存下来的原文（可能是空串）。输入框绑这一份，清空了才不会被默认值立刻顶回去。
+    static var savedEndpoint: String {
+        UserDefaults.standard.string(forKey: endpointKey) ?? ""
+    }
+
+    static var endpoint: String {
+        let saved = savedEndpoint.trimmingCharacters(in: .whitespacesAndNewlines)
+        let raw = saved.isEmpty ? defaultEndpoint : saved
+        // 手填常常只写 192.168.31.100:8712/report，少个 http:// 就整条发不出去
+        return raw.contains("://") ? raw : "http://" + raw
+    }
+
+    static func saveEndpoint(_ text: String) {
+        UserDefaults.standard.set(text.trimmingCharacters(in: .whitespacesAndNewlines), forKey: endpointKey)
+    }
+
     static func send(_ text: String) -> String {
-        guard let url = URL(string: endpoint) else { return "发送失败: 地址非法" }
+        let target = endpoint
+        guard let url = URL(string: target) else { return badAddress }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("text/plain; charset=utf-8", forHTTPHeaderField: "Content-Type")
         request.timeoutInterval = 15
         request.httpBody = text.data(using: .utf8)
+        let r = roundTrip(request, wait: 20)
+        if r.timedOut { return unreachable(target, seconds: 20) }
+        if r.code < 0 { return "发到电脑：失败 \(r.failure)" }
+        return "发到电脑：HTTP \(r.code) 回执 \(r.reply)（送出 \(text.count) 字符）"
+    }
 
+    /// 先探通不通：GET /ping 只有几个字节，别拿整份扫描报告去试一个可能写错的地址。
+    static func ping() -> String {
+        let target = endpoint
+        guard var parts = URLComponents(string: target) else { return badAddress }
+        parts.path = "/ping"
+        parts.query = nil
+        guard let url = parts.url else { return badAddress }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 6
+        let r = roundTrip(request, wait: 8)
+        if r.timedOut { return "探不通：" + unreachable(target, seconds: 8) }
+        if r.code < 0 { return "探不通：\(r.failure)" }
+        return "通了：HTTP \(r.code) 回执「\(r.reply)」← \(url.absoluteString)"
+    }
+
+    private static var badAddress: String {
+        "发到电脑：地址非法（「电脑地址」那一格要形如 \(defaultEndpoint)）"
+    }
+
+    private static func unreachable(_ target: String, seconds: Int) -> String {
+        "发到电脑：超时 \(seconds) s 没回音（\(target) 不通？核对三件事：手机和电脑同一个 Wi-Fi；"
+            + "电脑上 tools/report_server.py 起着（8712）；地址跟电脑 ipconfig 里的 IPv4 一致，末尾 /report 别丢）"
+    }
+
+    private static func roundTrip(_ request: URLRequest, wait: Double)
+        -> (code: Int, reply: String, failure: String, timedOut: Bool) {
         let done = DispatchSemaphore(value: 0)
         var code = -1
         var reply = ""
@@ -447,12 +501,8 @@ enum Uploader {
             if let data = data { reply = String(data: data, encoding: .utf8) ?? "?" }
             done.signal()
         }.resume()
-
-        if done.wait(timeout: .now() + 20) == .timedOut {
-            return "发到电脑：超时 20 s 无回音（手机到 192.168.31.100:8712 不通？电脑上的接收端没开？）"
-        }
-        if code < 0 { return "发到电脑：失败 \(failure)" }
-        return "发到电脑：HTTP \(code) 回执 \(reply)（送出 \(text.count) 字符）"
+        let timedOut = done.wait(timeout: .now() + wait) == .timedOut
+        return (code, reply, failure, timedOut)
     }
 }
 

@@ -1245,6 +1245,8 @@ final class Cutter: ObservableObject {
     @Published var report = ""
     @Published var segments: [Segment] = []
     @Published var exportNote = ""
+    /// 「电脑地址」那一格的探/发回执。不并进 status：status 是扫描与导出的现场读数，报告里要带它。
+    @Published var pcReply = ""
     @Published var showPicker = false
     @Published var step = 1
     @Published var sideTh = 96.0
@@ -1630,6 +1632,21 @@ final class Cutter: ObservableObject {
         }
     }
 
+    /// 只探地址通不通：GET /ping 几个字节。地址写错时别拿整份扫描报告去试。
+    func pingPC() {
+        guard !busy else { return }
+        busy = true
+        pcReply = "正在探 \(Uploader.endpoint) ……"
+        Task.detached { [weak self] in
+            let r = Uploader.ping()
+            Journal.line("探地址 \(r)")
+            Task { @MainActor in
+                self?.busy = false
+                self?.pcReply = r
+            }
+        }
+    }
+
     func sendReport() {
         var text = "—— 剪辑 ——\n\(videoURL?.lastPathComponent ?? "没选视频")\n\(status)\n"
         text += "要保留的人 \(anchors.count) 个：\n" + (anchors.isEmpty ? "（一个都没选）\n" : anchorList + "\n")
@@ -1669,6 +1686,32 @@ struct CutView: View {
                     Button("发到电脑") { cut.sendReport() }
                 }
                 .font(.footnote)
+
+                HStack(spacing: 8) {
+                    Text("电脑地址").font(.system(size: 12))
+                    TextField(Uploader.defaultEndpoint, text: Binding(
+                        get: { Uploader.savedEndpoint },
+                        set: { Uploader.saveEndpoint($0) }))
+                        .font(.system(size: 10, design: .monospaced))
+                        .keyboardType(.URL)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .multilineTextAlignment(.trailing)
+                        .submitLabel(.done)
+                    Button("先探一下") { cut.pingPC() }
+                        .font(.footnote)
+                        .disabled(cut.busy)
+                }
+                if !cut.pcReply.isEmpty {
+                    Text(cut.pcReply)
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundColor(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                Text("地址照电脑上 ipconfig 里的 IPv4 填，末尾 /report 别丢，少写 http:// 也能发；改完先探一下。"
+                     + "手机和电脑得在同一个 Wi-Fi，电脑上先起 tools/report_server.py（8712）。这一格存着，下次开还在。")
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary)
 
                 Text(cut.status.isEmpty ? "先「选视频」" : cut.status)
                     .font(.system(size: 11, design: .monospaced))
