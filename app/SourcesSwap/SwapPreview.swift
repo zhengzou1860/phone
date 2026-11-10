@@ -505,17 +505,27 @@ final class SwapPreview {
         } catch {
             note = "｜会话没开成：\(error.localizedDescription)"
         }
-        guard let p = try? AVAudioPlayer(contentsOf: url) else {
-            say("预览 没声音：这条副本读不出音轨\(note)｜\(url.lastPathComponent)")
-            return
+        // 先把音轨自己的数写进报告：AVAudioPlayer 打不开时只给一句「读不出」，判不了案。
+        // 别的 app 导出的片子有三种实情长得一样——没音轨／音频起点不在 0 s（掐头去尾留下的偏移）／
+        // 子类型这套播放器不收，只有音轨本身能把它们分开。整份文件是字节级拷进来的，不是我们丢了音轨。
+        let asset = AVURLAsset(url: url)
+        say("预览 声音查档 \(url.lastPathComponent) \(asset.audioTrackNote())\(note)")
+        do {
+            let p = try AVAudioPlayer(contentsOf: url)
+            p.prepareToPlay()
+            p.currentTime = max(0, min(sec, p.duration))
+            if p.play() {
+                audio = p
+                say("预览 声音开成 播放器时长 \(String(format: "%.2f", p.duration)) s"
+                    + "｜声道 \(p.numberOfChannels)｜采样 \(String(format: "%.0f", p.sampleRate)) Hz"
+                    + "｜这格从 \(String(format: "%.2f", sec)) s 起播")
+            } else {
+                say("预览 没声音：播放器建出来了但 play 不应（会话没开成或被别人占着）\(note)")
+            }
+        } catch {
+            let e = error as NSError
+            say("预览 没声音：AVAudioPlayer 抛错 \(e.domain) #\(e.code)｜\(e.localizedDescription)")
         }
-        p.prepareToPlay()
-        p.currentTime = max(0, min(sec, p.duration))
-        guard p.play() else {
-            say("预览 没声音：播放器起不来\(note)")
-            return
-        }
-        audio = p
     }
 
     private func audioStop() {
@@ -702,4 +712,33 @@ final class SwapPreview {
     private func msFrom(_ t0: UInt64) -> Double { Double(ns() &- t0) / 1_000_000 }
     private func seconds() -> Double { Double(DispatchTime.now().uptimeNanoseconds) / 1_000_000_000 }
     private func avg(_ v: [Double]) -> Double { v.isEmpty ? 0 : v.reduce(0, +) / Double(v.count) }
+}
+
+extension AVURLAsset {
+    /// 音轨的身份证：条数、子类型、采样率声道、起点和时长。预览没声音时靠这一行分清
+    /// 「这条片子根本没音轨」和「有音轨但这一档播放器不收／起点不在 0 s」。
+    func audioTrackNote() -> String {
+        let ts = tracks(withMediaType: .audio)
+        guard !ts.isEmpty else { return "音轨 0 条（这条片子压根没声音）" }
+        return "音轨 \(ts.count) 条：" + ts.map { t -> String in
+            var sub = "-", sr = "-", ch = "-"
+            if !t.formatDescriptions.isEmpty {
+                // 空数组才没提示；交出来那份本来就是 CMFormatDescription，在这套工具链里写条件转换是编译错误。
+                // 音轨的这份必然是 CMAudioFormatDescription（不是它这条轨压根不会被列为音频），所以强转取 ASBD。
+                let fd = t.formatDescriptions[0] as! CMAudioFormatDescription
+                let four = CMFormatDescriptionGetMediaSubType(fd)
+                let bs = [UInt8((four >> 24) & 0xFF), UInt8((four >> 16) & 0xFF), UInt8((four >> 8) & 0xFF), UInt8(four & 0xFF)]
+                    .filter { $0 >= 32 && $0 < 127 }
+                let s = String(decoding: bs, as: UTF8.self)
+                sub = s.isEmpty ? "-" : s
+                if let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(fd) {
+                    sr = String(format: "%.0f", asbd.pointee.mSampleRate)
+                    ch = String(asbd.pointee.mChannelsPerFrame)
+                }
+            }
+            let r = t.timeRange
+            return "子类型 \(sub)｜\(sr) Hz \(ch) 声道｜起点 \(String(format: "%.3f", CMTimeGetSeconds(r.start))) s"
+                + "｜长 \(String(format: "%.2f", CMTimeGetSeconds(r.duration))) s"
+        }.joined(separator: "　")
+    }
 }
