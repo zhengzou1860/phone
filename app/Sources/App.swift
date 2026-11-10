@@ -428,7 +428,7 @@ enum PressureWatch {
 }
 
 enum Uploader {
-    static let endpoint = "http://192.168.31.99:8712/report"
+    static let endpoint = "http://192.168.31.100:8712/report"
     static func send(_ text: String) -> String {
         guard let url = URL(string: endpoint) else { return "发送失败: 地址非法" }
         var request = URLRequest(url: url)
@@ -449,7 +449,7 @@ enum Uploader {
         }.resume()
 
         if done.wait(timeout: .now() + 20) == .timedOut {
-            return "发到电脑：超时 20 s 无回音（手机到 192.168.31.99:8712 不通？电脑上的接收端没开？）"
+            return "发到电脑：超时 20 s 无回音（手机到 192.168.31.100:8712 不通？电脑上的接收端没开？）"
         }
         if code < 0 { return "发到电脑：失败 \(failure)" }
         return "发到电脑：HTTP \(code) 回执 \(reply)（送出 \(text.count) 字符）"
