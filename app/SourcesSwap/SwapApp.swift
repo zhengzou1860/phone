@@ -134,7 +134,7 @@ struct SwapContentView: View {
     /// 全屏横屏那一档开着没有（开着一趟只借横屏这一阵，退出就还回竖屏）
     @State private var pvFull = false
     /// 整台手机同时只跑一路预览，挂在类型上：挂在 struct 上每刷一次界面就换一个实例（新的那条队列白建）
-    private static let engine = SwapPreview()
+    fileprivate static let engine = SwapPreview()
 
     static let units: [(String, MLComputeUnits)] = [
         ("CPU(cpuOnly)", .cpuOnly),
