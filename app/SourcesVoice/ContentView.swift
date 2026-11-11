@@ -76,12 +76,17 @@ struct ContentView: View {
 
     /// 「改台词重配」那一格：提取出来的台词（可编辑）、听写状态、重配状态和成片。
     @State private var videoScript = ""
+    /// 每行在原片上的起点，和 `videoScript` 的**非空行**一一对应（提台词那一窗第一个字的时刻）。
+    /// 他定的口径是「每行钉原起点＋超长截断」⇒ 文本他能改，位置得单独带着走，不能从字里再猜。
+    @State private var scriptAnchors: [Double] = []
     @State private var asrBusy = false
     @State private var asrStatus = ""
     @State private var asrNote = ""
     @State private var dubBusy = false
     @State private var dubStatus = ""
     @State private var dubNote = ""
+    /// 上一趟逐行摆位的账（起点／念了多少／截了多少／顺延），跑完摊在按钮下面。
+    @State private var dubLines = ""
     @State private var dubOutURL: URL?
     @State private var showDubShare = false
     /// 「提取台词」要的整条长度上限。听写按 1.5× 实时喂，所以这条同时也是要等多久：
@@ -539,8 +544,9 @@ struct ContentView: View {
                         VoiceJournal.line("提台词覆盖了编辑器里原来那份（\(oldScript.count) 字）：\(oldScript)")
                     }
                     videoScript = r.text
-                    asrNote = String(format: "认出 %d 字／源 %.0f s／墙钟 %.0f s（%@）｜下面直接改，改完点「按新词配音并回写」",
-                                     r.chars, r.sourceSecs, r.wallSeconds,
+                    scriptAnchors = r.lines.map { $0.startSecs }
+                    asrNote = String(format: "认出 %d 字／%d 行／源 %.0f s／墙钟 %.0f s（%@）｜下面直接改，改完点「按新词配音并回写」",
+                                     r.chars, r.lines.count, r.sourceSecs, r.wallSeconds,
                                      r.onDevice ? "本机识别" : "这一趟走了需要联网那头")
                     saveScript(scriptKey(input, isVideo))
                 }
@@ -563,6 +569,15 @@ struct ContentView: View {
 
     private func saveScript(_ key: String) {
         UserDefaults.standard.set(videoScript, forKey: key)
+        // 锚点跟着稿子一起存：只存文本的话，退出再进来位置就全丢了 ⇒ 又变成从 0 连着念。
+        UserDefaults.standard.set(scriptAnchors.map { String(format: "%.3f", $0) }.joined(separator: ","),
+                                  forKey: key + ":t")
+    }
+
+    private func loadScript(_ key: String) {
+        videoScript = UserDefaults.standard.string(forKey: key) ?? ""
+        let raw = UserDefaults.standard.string(forKey: key + ":t") ?? ""
+        scriptAnchors = raw.split(separator: ",").compactMap { Double($0) }
     }
 
     /// 「按新词配音并回写」：改过的字 → ④ 那条（系统朗读 → ②③④）→ 装回原来那条画面。
@@ -586,12 +601,33 @@ struct ContentView: View {
             return
         }
         let using = picked != nil ? "样本「\(picked!.info.name)」" : "现场参考 \(refURL!.lastPathComponent)"
+        // 一行一行取锚。**空行不占号**（提台词那边空窗也不占行）：占号的话删一个空行就把后面全错开。
+        var dub: [VoiceEngine.DubLine] = []
+        var k = 0
+        var noAnchor = 0
+        var prevEnd = 0.0
+        for raw in videoScript.components(separatedBy: .newlines) {
+            let s = raw.trimmingCharacters(in: .whitespaces)
+            if s.isEmpty { continue }
+            let a: Double
+            if k < scriptAnchors.count {
+                a = scriptAnchors[k]
+            } else {
+                // 他自己新加的行没有原起点 ⇒ 接在上一行大概念完之后（4.1 字/秒是 PC 实测那个数）
+                a = prevEnd
+                noAnchor += 1
+            }
+            dub.append(VoiceEngine.DubLine(startSecs: a, text: s))
+            prevEnd = a + Double(s.count) / 4.1 + 0.3
+            k += 1
+        }
         dubBusy = true
         dubNote = ""
+        dubLines = ""
         dubStatus = "念稿…"
         dubOutURL = nil
-        VoiceJournal.line(String(format: "点「按新词配音并回写」片源=%@ 音色=%@ 稿子 %d 字／音高 %+.0f 半音",
-                                 input.lastPathComponent, using, text.count, semitones))
+        VoiceJournal.line(String(format: "点「按新词配音并回写」片源=%@ 音色=%@ 稿子 %d 字／%d 行（%d 行没原起点，接在上一行后面）／音高 %+.0f 半音",
+                                 input.lastPathComponent, using, text.count, dub.count, noAnchor, semitones))
         if engine == nil { engine = VoiceEngine(modelDir: modelDir) }
         let eng = engine!
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
@@ -602,7 +638,7 @@ struct ContentView: View {
         Task {
             do {
                 let r = try await eng.dubVideo(inputVideo: input,
-                                               text: text,
+                                               lines: dub,
                                                sample: picked,
                                                refWav: picked != nil ? nil : refURL,
                                                outputVideo: output,
@@ -616,11 +652,15 @@ struct ContentView: View {
                     dubOutURL = r.outURL
                     dubBusy = false
                     history = FileHistory.scan()
-                    dubNote = String(format: "%d 字 → 朗读 %.0f s → 链子 %.0f s／画面到 %.0f s｜补静音 %.0f s／超出丢掉 %.0f s"
-                                      + "｜成片 %@（口径 \(r.mux.cfgName)／%.1f MB／墙钟 %.0f s）",
-                                      r.textChars, r.tts.seconds, r.dubSecs, r.picEnd,
+                    let nPush = r.lines.filter { $0.pushed }.count
+                    let nCut = r.lines.filter { $0.cutSecs > 0.05 || $0.stopped }.count
+                    dubNote = String(format: "%d 字／%d 行 → 链子 %.0f s／画面到 %.0f s｜钉住 %d 行／顺延 %d 行／截断 %d 行"
+                                      + "｜补静音 %.0f s／超出丢掉 %.0f s｜成片 %@（口径 \(r.mux.cfgName)／%.1f MB／墙钟 %.0f s）",
+                                      r.textChars, r.lines.count, r.dubSecs, r.picEnd,
+                                      r.lines.count - nPush, nPush, nCut,
                                       r.padSecs, r.overSecs, r.outURL.lastPathComponent,
                                       Double(r.mux.bytes) / 1_048_576, wall)
+                    dubLines = r.lines.map { $0.line }.joined(separator: "\n")
                     dubStatus = "重配完成"
                     VoiceJournal.line("重配界面收尾：\(dubNote)")
                 }
@@ -636,25 +676,32 @@ struct ContentView: View {
         }
     }
 
-    /// 开跑前把账摊在按钮旁边：画面多长、这份稿子大概念多长、差多少。
+    /// 开跑前把账摊在按钮旁边：画面多长、稿子几行几字、其中几行有原起点可钉。
     private var dubEstimateLine: String {
         guard let i = videoProbe else { return "还没选视频" }
         let pic = i.videoStart + i.videoSecs
-        let n = videoScript.trimmingCharacters(in: .whitespacesAndNewlines).count
-        let secs = Double(n) / 4.1
-        return String(format: "画面 %.0f s｜稿子 %d 字 ≈ 念 %.0f s（差 %+.0f s）", pic, n, secs, secs - pic)
+        let rows = videoScript.components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        let n = rows.reduce(0) { $0 + $1.count }
+        let pinned = min(rows.count, scriptAnchors.count)
+        return String(format: "画面 %.0f s｜稿子 %d 行 %d 字 ≈ 念 %.0f s｜%d 行钉原起点",
+                      pic, rows.count, n, Double(n) / 4.1, pinned)
     }
 
     @ViewBuilder
     private var dubSection: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text("改台词重配（把视频里那个人说的话改成别的，口型不管）").font(.headline)
+            Text("改台词重配（把视频里那个人说的话改成别的，每句话还在原来的位置，口型不管）").font(.headline)
 
             HStack(spacing: 12) {
                 Button(asrBusy ? "听写中…" : "提取台词") { runASR() }
                     .buttonStyle(.bordered)
                     .disabled(asrBusy || busyAnywhere || (videoURL == nil && sourceURL == nil))
-                Button("清空稿子") { videoScript = "" }
+                Button("清空稿子") {
+                    videoScript = ""
+                    scriptAnchors = []
+                    dubLines = ""
+                }
                     .buttonStyle(.bordered)
                     .font(.caption)
                 Spacer()
@@ -666,7 +713,13 @@ struct ContentView: View {
             Text("「提取台词」走系统自带的本机听写（不下载任何模型，包一个字节都不长）：把音轨一段一段喂给它认字，按 1.5× 实时 ⇒ 5 分钟素材要等 3~4 分钟。认出来的字不一定全对（听写本来就有别字、专有名词容易错），所以下面直接改成你要说的。听写包没装／不给权限会一行话说明去哪儿开；实在不行自己打字也一样能配音。")
                 .font(.caption)
                 .foregroundColor(.secondary)
-            Text("改完点「按新词配音并回写」：这几句字走 ④ 那条（系统朗读 → ②③④ 换成选中样本的音色），再装回原来那条画面（画面一个像素不动、透传）。字数和原来不一样 ⇒ 声音长度必然和画面对不齐，这一条就是不管口型；新声比画面短就补静音到画面末尾，比画面长的那一截被回写丢掉（上面那行「差」就是这一头的账）。音色、音高、去男声用的还是上面那几格。")
+            Text("一行 = 原来那一段话（约 50 秒一窗），行号就是它在原片上的位置：配音时每行钉回自己原来的起点，行内的句子连着念，中间没说话的空档填静音。所以不会从片头一路念到底。")
+                .font(.caption)
+                .foregroundColor(.secondary)
+            Text("某行改长了 ⇒ 念到下一行原来的起点为止就截断（宁可少念几个字，也不让后面每句话整体挪位）；改短了 ⇒ 后面留静音，下一行还在原处。空行不念、也不占行号。要注意：删掉整行会让后面的行号和锚点错开一位，不想念那一行就把字删空、留着那个空行。自己新加的行没有原起点，接在上一行后面。")
+                .font(.caption)
+                .foregroundColor(.secondary)
+            Text("改完点「按新词配音并回写」：字走 ④ 那条（系统朗读 → ②③④ 换成选中样本的音色），再装回原来那条画面（画面一个像素不动、透传）。口型不再对（字数变了，这一条你明确不要）。音色、音高、去男声用的还是上面那几格。")
                 .font(.caption)
                 .foregroundColor(.secondary)
             if !asrStatus.isEmpty {
@@ -705,6 +758,15 @@ struct ContentView: View {
             }
             if !dubNote.isEmpty {
                 Text(dubNote).font(.caption).foregroundColor(.orange).textSelection(.enabled)
+            }
+            if !dubLines.isEmpty {
+                Text("每行摆到哪儿了（截掉＝改长了没念完的那一截）：")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                Text(dubLines)
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                    .textSelection(.enabled)
             }
 
             if let out = dubOutURL {
@@ -841,9 +903,9 @@ struct ContentView: View {
         // 换片就把稿子换成这一片自己那份：手上那一先按上一个片名存回去（改到一半换片不该丢），
         // 这一片以前听过写过的照原样拿回来 —— 不然每次选同一段都要重听一遍写。
         if let prev = videoURL { saveScript(scriptKey(prev, true)) }
-        videoScript = UserDefaults.standard.string(forKey: scriptKey(dest, true)) ?? ""
+        loadScript(scriptKey(dest, true))
         if !videoScript.isEmpty {
-            VoiceJournal.line("这份稿子从这台手机上取回（\(videoScript.count) 字）键=\(scriptKey(dest, true))")
+            VoiceJournal.line("这份稿子从这台手机上取回（\(videoScript.count) 字／\(scriptAnchors.count) 个起点）键=\(scriptKey(dest, true))")
         }
         pickNote = "已从相册拿进来：" + dest.lastPathComponent + "（原来叫 \(original)）／" + info.line
         VoiceJournal.line("相册视频 \(original) → \(dest.lastPathComponent)：\(info.line)")

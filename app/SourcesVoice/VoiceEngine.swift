@@ -589,8 +589,43 @@ final class VoiceEngine {
                           fedSecs: audioSecs + padSecs)
     }
 
+    /// 一行要念的话。`startSecs` = 它在**原片**上的起点（提台词那一窗第一个字的时刻）。
+    struct DubLine {
+        var startSecs: Double
+        var text: String
+    }
+
+    /// 一行摆回去之后的账。界面上那几行「起点／念了多少／截了多少」全出自这里。
+    struct DubLineReport {
+        var wantedSecs: Double
+        var startSecs: Double
+        var limitSecs: Double
+        /// 真写进 wav 的长度。
+        var readSecs: Double
+        /// 念出来但没地方放、被截掉的长度。
+        var cutSecs: Double
+        /// 起点被前面的话顶到后面去了（改长了／把行序调了才会真）。
+        var pushed: Bool
+        /// 房间用光，这一行剩下的句子干脆没念。
+        var stopped: Bool
+        var chars: Int
+        var spokenChars: Int
+        var text: String
+
+        var line: String {
+            var tags: [String] = []
+            if pushed { tags.append(String(format: "顺延 %.1f s", startSecs - wantedSecs)) }
+            if cutSecs > 0.05 { tags.append(String(format: "截掉 %.1f s", cutSecs)) }
+            if stopped { tags.append("后面没念") }
+            let tail = tags.isEmpty ? "" : "（" + tags.joined(separator: "，") + "）"
+            return String(format: "%.1f s 起：念 %d/%d 字／%.1f s，放到 %.1f s 为止%@",
+                          startSecs, spokenChars, chars, readSecs, limitSecs, tail)
+        }
+    }
+
     /// 一次「按改后的词重配」的读数。
     struct DubResult {
+        var lines: [DubLineReport]
         var textChars: Int
         var tts: SystemTTS.Report
         var passes: Int
@@ -605,36 +640,179 @@ final class VoiceEngine {
         var outURL: URL
     }
 
-    /// 「按改后的词重配」：文本 → ④ 那条（系统朗读 → ②③④）→ 装回原来那条画面。
+    private struct PlaceResult {
+        var reports: [DubLineReport]
+        var tts: SystemTTS.Report
+        var passes: Int
+        var secs: Double
+    }
+
+    /// 「按改后的词重配」：一行一行念，**每行钉回它在原片上的起点**，然后装回原来那条画面。
     ///
-    /// 和 `processVideo` 的唯一区别就是中间那一头：那一条拿**视频自己的音轨**进链，所以时长天生和
-    /// 画面一样、口型对得上；这一条念的是**他改过的字**，字数和原来说的不一样，时长必然不一样 ⇒
-    /// 口型不再谈（用户明确不要），换来的是"视频里那个人说的话可以改成别的"。
-    /// 画面仍是透传，一个像素不动；新声比画面长出去的那一截被回写丢掉，短了就补静音到画面末尾之后。
-    func dubVideo(inputVideo: URL, text: String, sample: SampleStore.Sample?, refWav: URL?,
+    /// 和 `processVideo` 的区别在中间那一头：那一条拿视频自己的音轨进链，时长天生和画面一样；
+    /// 这一条念的是他改过的字，字数和原来说的不一样 ⇒ 口型不再谈（用户明确不要），
+    /// 但**位置要谈**：他定的口径是「每行钉原起点＋超长截断」。
+    ///
+    /// 摆法（一行 = 提台词的一窗 ≈50 s）：
+    /// - 起点 = 这一行原来的时刻；行内的句子连着念，不再句句对位（那一层的时间戳听写给不稳）。
+    /// - 上一行念完到这一行起点之间的空档填静音 ⇒ 没说话的地方还是没说话。
+    /// - 这一行的地板 = 下一行的原起点（最后一行到画面末尾之后）。改长了就念到地板为止截断，
+    ///   **宁可少念几个字，也不让后面每一行整体挪位**。
+    /// - 只有一种情况会顺延：起点已经在过去（他把行序调了，或上一行截断后仍压过了这一行）。
+    ///
+    /// 整趟只开一次图、一份样本条件、一个 TTS 会话：按行重开 = 每行重栽 343 MB 的图。
+    /// 画面仍是透传，一个像素不动。
+    func dubVideo(inputVideo: URL, lines: [DubLine], sample: SampleStore.Sample?, refWav: URL?,
                   outputVideo: URL, pitchCents: Double, voiceID: String?,
                   onStage: @escaping (String) -> Void = { VoiceJournal.line($0) }) async throws -> DubResult {
         let info = VideoClip.probe(inputVideo)
-        VoiceJournal.line("重配开跑 \(inputVideo.lastPathComponent)／\(info.line)／\(text.count) 字")
+        let usable = lines.filter { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        let chars = usable.reduce(0) { $0 + $1.text.count }
+        VoiceJournal.line("重配开跑 \(inputVideo.lastPathComponent)／\(info.line)／\(lines.count) 行（有字 \(usable.count) 行）\(chars) 字")
         guard info.hasVideo else { throw ChainError.input("\(inputVideo.lastPathComponent) 里没有画面轨") }
+        guard !usable.isEmpty else { throw ChainError.input("稿子一行字都没有 ⇒ 先「提取台词」，或者自己写几句再配") }
         let outDir = outputVideo.deletingLastPathComponent()
         VoiceEngine.sweepVideoTemps(dir: outDir)
         let base = outputVideo.deletingPathExtension().lastPathComponent
-        let docs = outDir
         // 名字照 ⑤ 那套：中间量叫 `_chain.wav`，崩在半路时 `sweepVideoTemps` 下次开跑能扫掉
-        let chainWav = docs.appendingPathComponent(base + "_chain.wav")
-        let rawWav = docs.appendingPathComponent(base + "_raw.wav")
+        let chainWav = outDir.appendingPathComponent(base + "_chain.wav")
+        let rawWav = outDir.appendingPathComponent(base + "_raw.wav")
         let t0 = Date()
+        let picEnd = info.videoStart + info.videoSecs
+        let dir = modelDir
 
-        let r = try await readNovel(text: text, sample: sample, refWav: refWav,
-                                    outputWav: chainWav, rawTTSWav: rawWav,
-                                    pitchCents: pitchCents, voiceID: voiceID, onStage: onStage)
+        let put = try await Task.detached(priority: .userInitiated) { () -> PlaceResult in
+            let sr = AudioProcessor.sampleRate
+            let est = Double(chars) / 4.1          // PC 实测：系统 TTS 念中文 ≈4.1 字/秒
+            let cap = VoiceEngine.novelSecondsCap(dir: outDir)
+            guard est <= cap else {
+                throw ChainError.input(String(format: "%d 字 ≈ %.0f 分钟音频，这台机剩下的盘只够 %.0f 分钟"
+                                                + "（两条 wav 每秒共占 64 KB，另留 1 GB 余量）⇒ 请把稿子分短些",
+                                              chars, est / 60, cap / 60))
+            }
+            let voice = SystemTTS.pickVoice(identifier: voiceID)
+            let how = voice.map { "语音 \($0.identifier)（\($0.language)）" } ?? "系统默认语音"
+            VoiceJournal.line(String(format: "重配预算：%d 字 ≈ %.1f s 音频／%@／画面到 %.2f s／%d 行",
+                                     chars, est, how, picEnd, usable.count))
+            onStage("TTS 探针：\(how)")
+
+            let driver = try ChainDriver(modelDir: dir)
+            driver.onStage = { s in
+                VoiceJournal.line(s)
+                onStage(s)
+            }
+            let parts: ChainDriver.SampleParts
+            if let s = sample {
+                parts = try SampleStore.load(s)
+                onStage("音色用样本「\(s.info.name)」：跳过 ①，不载 sv 图")
+            } else if let r = refWav {
+                let reference = try AudioProcessor.loadWAV16K(r, maxSeconds: ChainDriver.svMaxSecs)
+                onStage("音色用现场参考 \(r.lastPathComponent)：读数 \(reference.count) 样本")
+                parts = try driver.makeSample(reference: reference)
+            } else {
+                throw ChainError.input("既没在清单里选样本，也没有参考音频")
+            }
+
+            let pump = TTSPump(voice: voice)
+            let outWriter = try AudioProcessor.WAVWriter(url: chainWav)
+            let rawWriter = try AudioProcessor.WAVWriter(url: rawWav)
+            var reports: [DubLineReport] = []
+            var cursor = 0            // 已写进去的样本数 = 时间轴现在走到哪儿
+            var passes = 0
+
+            for (i, line) in usable.enumerated() {
+                let wanted = max(0.0, line.startSecs)
+                // 地板：下一行的原起点；最后一行放到画面末尾之后 0.6 s（回写那条规矩）
+                let next = i + 1 < usable.count ? usable[i + 1].startSecs : picEnd + 0.6
+                let start = max(wanted, Double(cursor) / sr)
+                let limit = max(next, start + 0.5)
+                let pushed = start > wanted + 0.05
+                let room = max(0.5, limit - start)
+                let roomN = Int(room * sr)
+
+                // 空档填静音：一片最多 1 s，和 writeBack 那趟同一写法（峰值守卫是每片一次的）
+                var gap = max(0, Int(start * sr) - cursor)
+                while gap > 0 {
+                    let n = min(gap, Int(sr))
+                    let z = [Float](repeating: 0, count: n)
+                    try outWriter.append(z)
+                    try rawWriter.append(z)
+                    cursor += n
+                    gap -= n
+                }
+
+                let sents = SystemTTS.sentences(from: line.text)
+                var pending: [Float] = []
+                var fedN = 0            // 这一行喂进 TTS 的原声样本数（判断房间够不够用它，省得白念）
+                var madeN = 0           // 这一行进链后念出来的样本数（截掉的账拿它减，才是同一个域）
+                var written = 0         // 这一行真写进去的样本数
+                var spokenChars = 0
+                var stopped = false
+
+                // 一片走完「转换 → 移调 → 截到地板 → 落盘」就丢掉，常驻只有这一片。
+                func flush() throws {
+                    guard !pending.isEmpty else { return }
+                    passes += 1
+                    let inSec = Double(pending.count) / sr
+                    onStage(String(format: "第 %d/%d 行第 %d 片进链（%.0f s 音频）", i + 1, usable.count, passes, inSec))
+                    let shaped = PostProcessor.pitchShift(
+                        try driver.convert(source: pending, sample: parts), cents: pitchCents)
+                    madeN += shaped.count
+                    let take = min(shaped.count, max(0, roomN - written))
+                    if take > 0 {
+                        try outWriter.append(Array(shaped[0..<take]))
+                        try rawWriter.append(Array(pending[0..<min(pending.count, take)]))
+                        written += take
+                        cursor += take
+                    }
+                    if take < shaped.count { stopped = true }
+                    pending.removeAll(keepingCapacity: true)
+                }
+
+                for (j, s) in sents.enumerated() {
+                    // 房间用光就别再念了：截断的口径是「宁可少念几个字」，白念一大段再扔掉是纯浪费
+                    if Double(fedN) / sr >= room { stopped = true; break }
+                    let got = try pump.speak(s)
+                    pending.append(contentsOf: got)
+                    fedN += got.count
+                    spokenChars += s.count
+                    if Double(pending.count) / sr >= VoiceEngine.convPassSeconds || j == sents.count - 1 {
+                        try flush()
+                    }
+                    if stopped { break }
+                }
+                try flush()
+
+                let rep = DubLineReport(wantedSecs: wanted, startSecs: start, limitSecs: limit,
+                                        readSecs: Double(written) / sr,
+                                        cutSecs: Double(max(0, madeN - written)) / sr,
+                                        pushed: pushed, stopped: stopped,
+                                        chars: line.text.count, spokenChars: spokenChars, text: line.text)
+                reports.append(rep)
+                VoiceJournal.line("重配第 \(i + 1)/\(usable.count) 行｜" + rep.line)
+                onStage(String(format: "第 %d/%d 行已摆好：%.1f s 起，念 %.1f s%@",
+                               i + 1, usable.count, start, rep.readSecs,
+                               rep.cutSecs > 0.05 ? String(format: "（截掉 %.1f s）", rep.cutSecs) : ""))
+            }
+            pump.finish()
+            try outWriter.finish()
+            try rawWriter.finish()
+            let secs = Double(cursor) / sr
+            VoiceJournal.line(pump.report.line)
+            let nPush = reports.filter { $0.pushed }.count
+            let nCut = reports.filter { $0.cutSecs > 0.05 || $0.stopped }.count
+            let cut = reports.reduce(0.0) { $0 + $1.cutSecs }
+            VoiceJournal.line(String(format: "重配摆位完成：%d 行／%d 片／音频 %.2f s（画面到 %.2f s）"
+                                     + "／顺延 %d 行／截断 %d 行共 %.1f s／墙钟 %.0f s（本片最大峰值 %.3f）",
+                                     reports.count, passes, secs, picEnd, nPush, nCut, cut,
+                                     Date().timeIntervalSince(t0), outWriter.maxPeak))
+            return PlaceResult(reports: reports, tts: pump.report, passes: passes, secs: secs)
+        }.value
         try? FileManager.default.removeItem(at: rawWav)
 
-        let picEnd = info.videoStart + info.videoSecs
         let back = try await Task.detached(priority: .userInitiated) {
             try VoiceEngine.writeBack(video: inputVideo, audioWav: chainWav, padded: nil,
-                                      audioSecs: r.convertedSeconds, picEnd: picEnd,
+                                      audioSecs: put.secs, picEnd: picEnd,
                                       outDir: outDir, base: base, outputVideo: outputVideo,
                                       onStage: onStage)
         }.value
@@ -649,14 +827,14 @@ final class VoiceEngine {
                 VoiceJournal.line("中间量没删掉 \(u.lastPathComponent)：\(ne.domain)#\(ne.code)｜\(ne.localizedDescription)")
             }
         }
-        let over = max(0.0, r.convertedSeconds - picEnd)
+        let over = max(0.0, put.secs - picEnd)
         VoiceJournal.line(String(format: "重配完成：%d 字 → 朗读 %.1f s → 链子 %.1f s／画面到 %.1f s"
                                  + "／补静音 %.1f s／超出丢掉 %.1f s｜口径 \(back.mux.cfgName) → %@ %.1f MB／墙钟 %.0f s",
-                                 text.count, r.tts.seconds, r.convertedSeconds, picEnd,
+                                 chars, put.tts.seconds, put.secs, picEnd,
                                  back.padSecs, over, back.landed.lastPathComponent,
                                  Double(back.mux.bytes) / 1_048_576, Date().timeIntervalSince(t0)))
-        return DubResult(textChars: text.count, tts: r.tts, passes: r.passes,
-                         dubSecs: r.convertedSeconds, picEnd: picEnd, padSecs: back.padSecs,
+        return DubResult(lines: put.reports, textChars: chars, tts: put.tts, passes: put.passes,
+                         dubSecs: put.secs, picEnd: picEnd, padSecs: back.padSecs,
                          overSecs: over, fedSecs: back.fedSecs, mux: back.mux, outURL: back.landed)
     }
 
