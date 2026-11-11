@@ -13,16 +13,25 @@ import Foundation
 /// - 间距＝把两张图互相推远或拉近，图本身大小不变（＋ 拉开、中缝出黑边；− 靠近、外侧各裁一条），±25% 封顶；
 /// - 鱼眼＝把每只眼那半幅按镜片的桶形弯一遍：画面外圈挤向中心，直边的中段就往外弓，
 ///   黑只落在画框外，源图一个像素都不裁（0＝不弯＝手持直看；顶格黑边最厚），0~1，没存过默认 0.35。
+/// - 缩放＝全屏那一档把整幅左右眼等比推远拉近（显示层面的事，不在这条换算里，所以这里只存上下限和键）：
+///   1＝等比撑到上下到底（默认，多出来的宽度往屏幕外去）；小于一＝连上下黑边一起露出来、两只眼外侧看全。
 enum SwapSbs {
     static let shiftRange: Double = 0.12
     static let gapRange: Double = 0.25
     static let fishMax: Double = 1.0
     static let fishDefault: Double = 0.35
 
+    /// 全屏那一档的等比缩放（只动显示、不重算画面）：1＝整幅左右眼等比撑到上下到底（默认），
+    /// 往小＝连上下黑边一起退出来，两只眼外侧那两条也看全；往大＝只把中间那块放大。
+    static let zoomMin: Double = 0.4
+    static let zoomMax: Double = 2.0
+    static let zoomDefault: Double = 1.0
+
     /// 三个数各存各的：镜片间距与弯度是硬件定的，一次对好就一直用
     static let shiftKey = "swap.sbs.shift"
     static let gapKey = "swap.sbs.gap"
     static let fishKey = "swap.sbs.fish"
+    static let zoomKey = "swap.sbs.zoom"
 
     struct Cfg {
         var shiftPct: Double

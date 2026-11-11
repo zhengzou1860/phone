@@ -904,8 +904,8 @@ struct SwapContentView: View {
 }
 
 /// 全屏横屏那一档：看的还是引擎往 SwapPreviewMirror 上递的那一格画面（两处同一份，不另开一趟预览），
-/// 摆法照 iPhone VR 那条左右眼的样子：画面铺满，点一下才出控制条，4 秒没动静自己收回去（预览停着不收），
-/// 条里 停／开＋进度＋「一起移／间距／鱼眼」三条滑杆，三个数各存各的键、下次进来照用。
+/// 摆法：整幅左右眼等比撑到上下到底（多出来的宽度往屏幕左右外面去），点一下才出控制条，4 秒没动静自己收回去（预览停着不收），
+/// 条里 停／开＋进度＋「缩放／一起移／间距／鱼眼」四条滑杆，四个数各存各的键、下次进来照用。
 /// 左右眼是引擎那一趟在递图前展好的（见 SwapPreview.publish／SwapSbs），这一页只管摆和调。
 /// 声音不在这里——在引擎那一趟里，跟着它自己那把「素材 1 s ≈ 墙钟 1 s」的钟走。
 struct SwapPreviewFull: View {
@@ -916,10 +916,12 @@ struct SwapPreviewFull: View {
     var onSeek: (Double) -> Void
     var onClose: () -> Void
 
-    // 三条滑杆落到这三条键（量纲与 VR3D 那三条一样）：镜片间距与弯度是硬件定的，一次对好就一直用
+    // 三条要重采样画面才落地的滑杆各自一条键（量纲与 VR3D 那三条一样）：镜片间距与弯度是硬件定的，一次对好就一直用
     @AppStorage(SwapSbs.shiftKey) private var shiftPct = 0.0
     @AppStorage(SwapSbs.gapKey) private var gapPct = 0.0
     @AppStorage(SwapSbs.fishKey) private var fishPct = SwapSbs.fishDefault
+    /// 等比缩放这一条只挪显示倍率，不叫引擎重算，所以直接绑到存着的数上：拖着就跟着变
+    @AppStorage(SwapSbs.zoomKey) private var zoom = SwapSbs.zoomDefault
     /// 手拖着过程中的显示值：松手才落到上面三条键并送进引擎——每改一个数每一格都要重采一遍
     @State private var dShift = 0.0
     @State private var dGap = 0.0
@@ -933,10 +935,19 @@ struct SwapPreviewFull: View {
             ZStack {
                 Color.black
                 if let im = pv.img {
-                    // 整幅左右眼拉满整个屏面（不保比例）：VR3D 那一档就是 videoGravity = .resize，
-                    // 每半幅正好占半个屏、上下到底。保比例的 scaledToFit 会留上下大黑边，
-                    // 镜片里看到的小一圈；拉满后剩下的形变由「一起移／间距／鱼眼」那三条对着镜片调。
-                    Image(uiImage: im).resizable()
+                    // 默认等比撑到上下到底（不保比例地拉满会留一大圈形变，这里换成 fill＋裁）：
+                    // 整幅左右眼按同一倍率撑到屏高，多出来的宽度往屏幕左右外面去——中缝在屏心，
+                    // 所以两只眼各被裁掉外侧那一条，「一起移」可以把想看的那一条再挪进来。
+                    // 缩放只动这一层的显示倍率（不动引擎那一趟的重采样），所以拖着就跟着变，不用松手。
+                    GeometryReader { geo in
+                        Image(uiImage: im)
+                            .resizable()
+                            .aspectRatio(contentMode: .fill)
+                            .frame(width: geo.size.width, height: geo.size.height)
+                            .scaleEffect(CGFloat(zoom))
+                            .clipped()
+                    }
+                    .ignoresSafeArea()
                 } else {
                     Text(block.isEmpty ? (pv.on ? "开跑了，第一格要等两张网装好" : "（还没开）") : block)
                         .font(.footnote).foregroundColor(.gray)
@@ -944,7 +955,6 @@ struct SwapPreviewFull: View {
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .ignoresSafeArea()
             .contentShape(Rectangle())
             .onTapGesture { tap() }
 
@@ -987,6 +997,14 @@ struct SwapPreviewFull: View {
                     .font(.caption2).monospacedDigit()
             }
             HStack(spacing: 8) {
+                Slider(value: $zoom, in: SwapSbs.zoomMin ... SwapSbs.zoomMax) { editing in
+                    if !editing { SwapJournal.line("实时 缩放 \(tZoom(zoom))") }
+                    armHide()
+                }
+                .tint(.blue)
+                Text(tZoom(zoom)).font(.caption).monospacedDigit().frame(width: 104, alignment: .leading)
+            }
+            HStack(spacing: 8) {
                 Slider(value: $dShift, in: -SwapSbs.shiftRange ... SwapSbs.shiftRange) { editing in
                     if !editing {
                         shiftPct = dShift
@@ -1019,7 +1037,7 @@ struct SwapPreviewFull: View {
             if !pv.person.isEmpty {
                 Text("这一趟目标表：\(pv.person)").font(.caption2).foregroundColor(.gray)
             }
-            Text("第一条拖进度｜第二条「一起移」＝两张图同方向挪，对准两只镜片中心｜第三条「间距」＝把两张图互相推远或拉近，图本身大小不变（＋ 拉开、中缝出黑边；− 靠近、外侧各裁一条）｜第四条「鱼眼」＝把每只眼那半幅按镜片的桶形弯一遍：画面外圈挤向中心，直边的中段就往外弓，黑只落在画框外，源图一个像素都不裁（拉到 0＝不弯＝手持直看；顶格黑边最厚）｜这些都存下来下次照用")
+            Text("第一条拖进度｜第二条「缩放」＝整幅左右眼等比推远拉近（100%＝刚好撑到上下到底，多出来的宽度在屏幕左右外面；往小＝连上下黑边一起露出来、两只眼外侧看全；往大＝只看中间那块。这一条拖着就跟着变）｜第三条「一起移」＝两张图同方向挪，对准两只镜片中心｜第四条「间距」＝把两张图互相推远或拉近，图本身大小不变（＋ 拉开、中缝出黑边；− 靠近、外侧各裁一条）｜第五条「鱼眼」＝把每只眼那半幅按镜片的桶形弯一遍：画面外圈挤向中心，直边的中段就往外弓，黑只落在画框外，源图一个像素都不裁（拉到 0＝不弯＝手持直看；顶格黑边最厚）｜后四条松手才落地，这些都存下来下次照用")
                 .font(.system(size: 10)).foregroundColor(.white.opacity(0.6))
         }
         .padding(10)
@@ -1050,6 +1068,7 @@ struct SwapPreviewFull: View {
 
     /// 到底那一格要说人话：它不是「弯得小一点」，是完全不弯
     private func tFish(_ v: Double) -> String { "鱼眼 " + (v < 0.005 ? "不弯" : String(format: "%.0f%%", v * 100)) }
+    private func tZoom(_ v: Double) -> String { "缩放 " + String(format: "%.0f%%", v * 100) }
     private func tShift(_ v: Double) -> String { "一起移 " + String(format: "%+.1f%%", v * 100) }
     private func tGap(_ v: Double) -> String { "间距 " + String(format: "%+.1f%%", v * 100) }
     private func fmt(_ t: Double) -> String {
