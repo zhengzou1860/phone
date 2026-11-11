@@ -176,7 +176,7 @@ enum SpeechText {
             if let res = res {
                 let text = res.bestTranscription.formattedString
                 let pieces = res.bestTranscription.segments.map {
-                    Segment(startSecs: Double($0.timestamp), text: $0.text)
+                    Segment(startSecs: Double($0.timestamp), text: $0.substring)
                 }
                 box.put(text: text, pieces: pieces, isFinal: res.isFinal)
             } else if let err = err {
