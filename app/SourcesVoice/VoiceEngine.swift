@@ -79,9 +79,14 @@ final class VoiceEngine {
     /// 一个字都不差，写两遍迟早分叉——到那时视频那条出的片口型偏了，查起来还得先对两份代码。
     ///
     /// `writer` 由调用方开着：峰值守卫是**每片**一次的，收尾（回填 wav 头）也归调用方。
+    ///
+    /// `blank` 是「去掉男声」那些已经在**源**里清零的块（源域样本下标）。为什么输出侧还要再钉一次：
+    /// ②③④ 不知道那一段没人说话，会从一片全零里合成出含噪的假人声——真机 0.1/43 那条几乎
+    /// 整条被清零的访谈就是这样变成「男女声都换了但含糊」的。源域到输出域按这一片的实际倍率映射，
+    /// 一片之内误差 ≤ 几毫秒，而且落在本来就该静音的地方。
     static func runSegments(driver: ChainDriver, parts: ChainDriver.SampleParts,
                             source: [Float], writer: AudioProcessor.WAVWriter,
-                            pitchCents: Double,
+                            pitchCents: Double, blank: [(start: Int, end: Int)] = [],
                             onStage: (String) -> Void) throws -> (passes: Int, samples: Int) {
         let totalSec = Double(source.count) / AudioProcessor.sampleRate
         let passSamples = Int(convPassSeconds * AudioProcessor.sampleRate)
@@ -106,8 +111,21 @@ final class VoiceEngine {
                                      Double(chunk.count) / AudioProcessor.sampleRate, totalSec))
             onStage(String(format: "第 %d 片进链（%.0f s 音频，整条 %.0f s）",
                            passes, Double(chunk.count) / AudioProcessor.sampleRate, totalSec))
-            let shaped = PostProcessor.pitchShift(try driver.convert(source: chunk, sample: parts),
+            var shaped = PostProcessor.pitchShift(try driver.convert(source: chunk, sample: parts),
                                                   cents: pitchCents)
+            if !blank.isEmpty {
+                let ratio = shaped.count > 0
+                    ? Double(shaped.count) / Double(max(1, end - start)) : 1.0
+                for sp in blank where sp.start < end && sp.end > start {
+                    let lo = Int((Double(max(sp.start, start) - start) * ratio).rounded())
+                    let hi = Int((Double(min(sp.end, end) - start) * ratio).rounded())
+                    var i = max(0, min(lo, shaped.count))
+                    while i < min(hi, shaped.count) {
+                        shaped[i] = 0
+                        i += 1
+                    }
+                }
+            }
             try writer.append(shaped)
             // 「后面吐字不清」这种指控要能分账：同一片的源和输出各量一遍逐格清晰度。
             // 两条一起往下走＝素材/解音轨那一头，只有输出往下走＝链子这一头。
@@ -122,20 +140,22 @@ final class VoiceEngine {
         return (passes, outSamples)
     }
 
-    /// 「只留一个人」：① 录音转换和 ⑤ 视频换声两个入口共用的那一趟。
+    /// 「去掉男声」：① 录音转换和 ⑤ 视频换声两个入口共用的一趟。判据是源自己的基频，
+    /// 和「换成谁的音色」没有任何关系，所以不需要参考、不载 sv 图。
     ///
-    /// 判据是选定样本存盘的那条 `spk` 向量，所以音色必须先备好（样本或现场参考都行）——
-    /// 没有参考就没有「留谁」这一个问题。账（块数／留块数／逐块 cos／墙钟）落两行磁盘日志：
-    /// 门限那 0.45 是 PC 上量的，真机上合不合适，要看他那一趟的分布。
-    static func gateSpeaker(driver: ChainDriver, parts: ChainDriver.SampleParts,
-                            source: inout [Float],
-                            onStage: (String) -> Void) throws -> SpeakerGate.Report {
-        onStage("只留一个人：逐块判音色（块界落在停顿上，≤\(String(format: "%.1f", SpeakerGate.maxPieceSecs)) s／块）…")
-        let rep = try driver.gateToSpeaker(&source, refSpk: parts.spk)
+    /// 返回的 `droppedSpans` 必须交给 `runSegments` 去钉输出侧：源里清零了，链子照样会在那一段
+    /// 合成出含噪的假人声——0.1/43 那次「整条含糊」就是这么来的。
+    static func gateMale(source: inout [Float],
+                         onStage: (String) -> Void) throws -> PitchGate.Report {
+        onStage("去掉男声：逐块量基频（块界落在停顿上，≤\(String(format: "%.1f", PitchGate.maxPieceSecs)) s／块，"
+                + "低于 \(String(format: "%.0f", PitchGate.maleHz)) Hz 判男声）…")
+        let rep = try PitchGate.run(&source, onProgress: { done, all in
+            if done % 40 == 0 { onStage("去掉男声：量到第 \(done)/\(all) 块") }
+        })
         VoiceJournal.line(rep.line)
-        VoiceJournal.line(rep.cosineLine)
-        onStage(String(format: "只留一个人：删掉 %.0f s 里别人的声音（多花 %.1f s）",
-                       rep.droppedSecs, rep.addedSeconds))
+        VoiceJournal.line(rep.hzLine)
+        onStage(String(format: "去掉男声：删掉 %.0f s 的低音那头的声音（多花 %.2f s）",
+                       rep.droppedSecs, rep.wallSeconds))
         return rep
     }
 
@@ -143,9 +163,9 @@ final class VoiceEngine {
     /// sample / refWav: 目标音色，二选一（sample 优先）
     /// outputWav: 落盘路径
     /// pitchCents: 链外移调（±1200 音分），加在 ④ 声码之后的波形上；语速不做，播放器都有
-    /// keepOnlyOneSpeaker: 进链前先把不像目标音色那个人说的窗清零（见 `SpeakerGate`）
+    /// dropMale: 进链前先把基频低于男声线那些块清零，并把输出侧同一段钉成静音（见 `PitchGate`）
     func convert(inputWav: URL, sample: SampleStore.Sample?, refWav: URL?,
-                 outputWav: URL, pitchCents: Double = 0.0, keepOnlyOneSpeaker: Bool = false,
+                 outputWav: URL, pitchCents: Double = 0.0, dropMale: Bool = false,
                  onStage: @escaping (String) -> Void = { VoiceJournal.line($0) }) async throws {
         let dir = modelDir
         try await Task.detached(priority: .userInitiated) {
@@ -180,16 +200,18 @@ final class VoiceEngine {
 
             let t0 = Date()
             var gateSecs = 0.0
-            if keepOnlyOneSpeaker {
-                gateSecs = try VoiceEngine.gateSpeaker(driver: driver, parts: parts,
-                                                       source: &source, onStage: onStage).addedSeconds
+            var blank: [(start: Int, end: Int)] = []
+            if dropMale {
+                let g = try VoiceEngine.gateMale(source: &source, onStage: onStage)
+                gateSecs = g.wallSeconds
+                blank = g.droppedSpans
             }
             let writer = try AudioProcessor.WAVWriter(url: outputWav)
             let (passes, outSamples) = try VoiceEngine.runSegments(
                 driver: driver, parts: parts, source: source, writer: writer,
-                pitchCents: pitchCents, onStage: onStage)
+                pitchCents: pitchCents, blank: blank, onStage: onStage)
             try writer.finish()
-            VoiceJournal.line(String(format: "转换完成：%d 片 → 输出 %.2f s／墙钟 %.1f s（其中闸门 %.1f s）／%@（单片峰值最高 %.3f）",
+            VoiceJournal.line(String(format: "转换完成：%d 片 → 输出 %.2f s／墙钟 %.1f s（其中去男声 %.1f s）／%@（单片峰值最高 %.3f）",
                                      passes, Double(outSamples) / AudioProcessor.sampleRate,
                                      Date().timeIntervalSince(t0), gateSecs,
                                      outputWav.lastPathComponent, writer.maxPeak))
@@ -206,7 +228,7 @@ final class VoiceEngine {
         var fitRate: Double
         var passes: Int
         var mux: VideoClip.MuxResult
-        /// 「只留一个人」那一趟多花的秒数（判定 + ① 载入）；开关没开就是 0。
+        /// 「去掉男声」那一趟多花的秒数（逐块量基频）；开关没开就是 0。
         var gateSeconds: Double
         /// 成片真正落在哪儿：口径表里 `mov` 那两组会换扩展名，调用方不能再拿自己拼的那个名字。
         var outURL: URL
@@ -281,7 +303,7 @@ final class VoiceEngine {
     /// 音色来源和 `readNovel` 一样只有两条，且必须有：视频里那个人本来就有的嗓子就是「自转换」，
     /// 转给自己听没意义。
     func processVideo(inputVideo: URL, sample: SampleStore.Sample?, refWav: URL?,
-                      outputVideo: URL, pitchCents: Double = 0.0, keepOnlyOneSpeaker: Bool = false,
+                      outputVideo: URL, pitchCents: Double = 0.0, dropMale: Bool = false,
                       onStage: @escaping (String) -> Void = { VoiceJournal.line($0) }) async throws -> VideoResult {
         let dir = modelDir
         return try await Task.detached(priority: .userInitiated) {
@@ -336,14 +358,16 @@ final class VoiceEngine {
             let chainWav = outDir.appendingPathComponent(base + "_chain.wav")
             let t0 = Date()
             var gateSecs = 0.0
-            if keepOnlyOneSpeaker {
-                gateSecs = try VoiceEngine.gateSpeaker(driver: driver, parts: parts,
-                                                       source: &source, onStage: onStage).addedSeconds
+            var blank: [(start: Int, end: Int)] = []
+            if dropMale {
+                let g = try VoiceEngine.gateMale(source: &source, onStage: onStage)
+                gateSecs = g.wallSeconds
+                blank = g.droppedSpans
             }
             let writer = try AudioProcessor.WAVWriter(url: chainWav)
             let (passes, outSamples) = try VoiceEngine.runSegments(
                 driver: driver, parts: parts, source: source, writer: writer,
-                pitchCents: pitchCents, onStage: onStage)
+                pitchCents: pitchCents, blank: blank, onStage: onStage)
             try writer.finish()
             let convSecs = Double(outSamples) / AudioProcessor.sampleRate
 
@@ -452,7 +476,7 @@ final class VoiceEngine {
             }
 
             VoiceJournal.line(String(format: "视频换声完成：%d 片／转换 %.2f s／对齐 %.2f s／墙钟 %.1f s"
-                                     + "（其中闸门 %.1f s）／口径 \(won.cfgName) → %@ %.1f MB",
+                                     + "（其中去男声 %.1f s）／口径 \(won.cfgName) → %@ %.1f MB",
                                      passes, convSecs, fitSecs, Date().timeIntervalSince(t0), gateSecs,
                                      landed.lastPathComponent,
                                      Double(won.bytes) / 1_048_576))
