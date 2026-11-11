@@ -141,6 +141,9 @@ struct ContentView: View {
                     .tabItem { Label("视频", systemImage: "film") }
             }
             .navigationTitle("声音克隆 \(appVersion())")
+            // 键盘顶上那条「完成」只挂一次，挂在两个标签的外面：
+            // 一个标签挂一份 ⇒ 输入栏上可能并排出现两个「完成」（同导出面板那条理由）。
+            .toolbar { keyboardDone }
             .onAppear {
                 VoiceJournal.line("ContentView.onAppear")
                 samples = SampleStore.list()
@@ -180,6 +183,24 @@ struct ContentView: View {
         isConverting || isMakingSample || isReading || isVideoing || dubBusy
     }
 
+    /// 收键盘。`TextEditor` 是多行的，回车只会换行、不会收；ScrollView 里点空白也不收
+    /// （SwiftUI 没有「点外面收键盘」这一说）⇒ 必须自己给一条出路，否则输入栏一直挂在屏幕上。
+    /// 走 UIResponder 链而不是 @FocusState：这一页有四个输入框分散在各自的格子里，
+    /// 挨个绑焦点等于把「谁在用键盘」这件事再记一遍，记漏一个就又是一个收不掉的。
+    private func hideKeyboard() {
+        UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder),
+                                        to: nil, from: nil, for: nil)
+    }
+
+    /// 键盘顶上那条「完成」：不管焦点在哪个输入框都挂得上，手不用离开键盘就能收。
+    @ToolbarContentBuilder
+    private var keyboardDone: some ToolbarContent {
+        ToolbarItemGroup(placement: .keyboard) {
+            Spacer()
+            Button("完成") { hideKeyboard() }
+        }
+    }
+
     /// 「声音」标签：模型、①② 两个槽、样本清单、旋钮、① 转换、④ 读小说、⑥ 聊天，
     /// 加上下面的历史文件／日志两格（这两格不分标签 —— 模型没下好时留下的录音照样要能删）。
     @ViewBuilder
@@ -206,6 +227,8 @@ struct ContentView: View {
             }
             .padding()
         }
+        // 往下拖也能收键盘（⑥ 那一页同一个做法）。光靠它不够：拖不动的时候还得有「完成」。
+        .scrollDismissesKeyboard(.interactively)
     }
 
     /// 「视频」标签：⑤ 视频换声和新的「改台词重配」都在这儿。
@@ -232,6 +255,7 @@ struct ContentView: View {
             }
             .padding()
         }
+        .scrollDismissesKeyboard(.interactively)
     }
 
     /// 一个呈现七种内容：`.chat` 是 ⑥ 那一整页、`.voice` 是自己铺的嗓音清单、`.history` 是自己铺的历史文件清单、
@@ -520,6 +544,7 @@ struct ContentView: View {
     /// 每次都盖掉编辑器里现在那一份 —— 改到一半重听会丢字，所以旧那一份先落在日志里（发到你电脑上），
     /// 找回来的路子是日志，不靠界面记着。
     private func runASR() {
+        hideKeyboard()
         let isVideo = videoURL != nil
         guard let input = isVideo ? videoURL : sourceURL else {
             asrNote = "没素材可提：先在「视频」标签选一段视频，或在 ① 放一段音频"
@@ -582,6 +607,7 @@ struct ContentView: View {
 
     /// 「按新词配音并回写」：改过的字 → ④ 那条（系统朗读 → ②③④）→ 装回原来那条画面。
     private func startDub() {
+        hideKeyboard()
         guard let input = videoURL else {
             dubNote = "这一条要选视频（画面照原样透传，只把声音换成念新词的那一份）"
             return
