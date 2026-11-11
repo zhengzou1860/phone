@@ -122,12 +122,30 @@ final class VoiceEngine {
         return (passes, outSamples)
     }
 
+    /// 「只留一个人」：① 录音转换和 ⑤ 视频换声两个入口共用的那一趟。
+    ///
+    /// 判据是选定样本存盘的那条 `spk` 向量，所以音色必须先备好（样本或现场参考都行）——
+    /// 没有参考就没有「留谁」这一个问题。账（块数／留块数／逐块 cos／墙钟）落两行磁盘日志：
+    /// 门限那 0.45 是 PC 上量的，真机上合不合适，要看他那一趟的分布。
+    static func gateSpeaker(driver: ChainDriver, parts: ChainDriver.SampleParts,
+                            source: inout [Float],
+                            onStage: (String) -> Void) throws -> SpeakerGate.Report {
+        onStage("只留一个人：逐块判音色（块界落在停顿上，≤\(String(format: "%.1f", SpeakerGate.maxPieceSecs)) s／块）…")
+        let rep = try driver.gateToSpeaker(&source, refSpk: parts.spk)
+        VoiceJournal.line(rep.line)
+        VoiceJournal.line(rep.cosineLine)
+        onStage(String(format: "只留一个人：删掉 %.0f s 里别人的声音（多花 %.1f s）",
+                       rep.droppedSecs, rep.addedSeconds))
+        return rep
+    }
+
     /// inputWav: 用户要转换的那段
     /// sample / refWav: 目标音色，二选一（sample 优先）
     /// outputWav: 落盘路径
     /// pitchCents: 链外移调（±1200 音分），加在 ④ 声码之后的波形上；语速不做，播放器都有
+    /// keepOnlyOneSpeaker: 进链前先把不像目标音色那个人说的窗清零（见 `SpeakerGate`）
     func convert(inputWav: URL, sample: SampleStore.Sample?, refWav: URL?,
-                 outputWav: URL, pitchCents: Double = 0.0,
+                 outputWav: URL, pitchCents: Double = 0.0, keepOnlyOneSpeaker: Bool = false,
                  onStage: @escaping (String) -> Void = { VoiceJournal.line($0) }) async throws {
         let dir = modelDir
         try await Task.detached(priority: .userInitiated) {
@@ -141,7 +159,7 @@ final class VoiceEngine {
                 throw ChainError.input("既没在清单里选样本，也没有参考音频")
             }
             VoiceJournal.line("VoiceEngine 开始 \(srcName) / \(how)")
-            let source = try AudioProcessor.loadWAV16K(inputWav)
+            var source = try AudioProcessor.loadWAV16K(inputWav)
             onStage("读数完成：源 \(source.count) 样本")
             let driver = try ChainDriver(modelDir: dir)
             driver.onStage = { text in
@@ -161,15 +179,20 @@ final class VoiceEngine {
             }
 
             let t0 = Date()
+            var gateSecs = 0.0
+            if keepOnlyOneSpeaker {
+                gateSecs = try VoiceEngine.gateSpeaker(driver: driver, parts: parts,
+                                                       source: &source, onStage: onStage).addedSeconds
+            }
             let writer = try AudioProcessor.WAVWriter(url: outputWav)
             let (passes, outSamples) = try VoiceEngine.runSegments(
                 driver: driver, parts: parts, source: source, writer: writer,
                 pitchCents: pitchCents, onStage: onStage)
             try writer.finish()
-            VoiceJournal.line(String(format: "转换完成：%d 片 → 输出 %.2f s／墙钟 %.1f s／%@（单片峰值最高 %.3f）",
+            VoiceJournal.line(String(format: "转换完成：%d 片 → 输出 %.2f s／墙钟 %.1f s（其中闸门 %.1f s）／%@（单片峰值最高 %.3f）",
                                      passes, Double(outSamples) / AudioProcessor.sampleRate,
-                                     Date().timeIntervalSince(t0), outputWav.lastPathComponent,
-                                     writer.maxPeak))
+                                     Date().timeIntervalSince(t0), gateSecs,
+                                     outputWav.lastPathComponent, writer.maxPeak))
         }.value
     }
 
@@ -183,6 +206,8 @@ final class VoiceEngine {
         var fitRate: Double
         var passes: Int
         var mux: VideoClip.MuxResult
+        /// 「只留一个人」那一趟多花的秒数（判定 + ① 载入）；开关没开就是 0。
+        var gateSeconds: Double
         /// 成片真正落在哪儿：口径表里 `mov` 那两组会换扩展名，调用方不能再拿自己拼的那个名字。
         var outURL: URL
     }
@@ -256,7 +281,7 @@ final class VoiceEngine {
     /// 音色来源和 `readNovel` 一样只有两条，且必须有：视频里那个人本来就有的嗓子就是「自转换」，
     /// 转给自己听没意义。
     func processVideo(inputVideo: URL, sample: SampleStore.Sample?, refWav: URL?,
-                      outputVideo: URL, pitchCents: Double = 0.0,
+                      outputVideo: URL, pitchCents: Double = 0.0, keepOnlyOneSpeaker: Bool = false,
                       onStage: @escaping (String) -> Void = { VoiceJournal.line($0) }) async throws -> VideoResult {
         let dir = modelDir
         return try await Task.detached(priority: .userInitiated) {
@@ -289,7 +314,7 @@ final class VoiceEngine {
                                      info.audioSecs / 2.5))
 
             onStage("解音轨（\(String(format: "%.0f", info.audioSecs)) s）…")
-            let source = try VideoClip.extractAudio(inputVideo, say: VoiceJournal.line)
+            var source = try VideoClip.extractAudio(inputVideo, say: VoiceJournal.line)
             let driver = try ChainDriver(modelDir: dir)
             driver.onStage = { text in
                 VoiceJournal.line(text)
@@ -310,6 +335,11 @@ final class VoiceEngine {
             let base = outputVideo.deletingPathExtension().lastPathComponent
             let chainWav = outDir.appendingPathComponent(base + "_chain.wav")
             let t0 = Date()
+            var gateSecs = 0.0
+            if keepOnlyOneSpeaker {
+                gateSecs = try VoiceEngine.gateSpeaker(driver: driver, parts: parts,
+                                                       source: &source, onStage: onStage).addedSeconds
+            }
             let writer = try AudioProcessor.WAVWriter(url: chainWav)
             let (passes, outSamples) = try VoiceEngine.runSegments(
                 driver: driver, parts: parts, source: source, writer: writer,
@@ -422,13 +452,13 @@ final class VoiceEngine {
             }
 
             VoiceJournal.line(String(format: "视频换声完成：%d 片／转换 %.2f s／对齐 %.2f s／墙钟 %.1f s"
-                                     + "／口径 \(won.cfgName) → %@ %.1f MB",
-                                     passes, convSecs, fitSecs, Date().timeIntervalSince(t0),
+                                     + "（其中闸门 %.1f s）／口径 \(won.cfgName) → %@ %.1f MB",
+                                     passes, convSecs, fitSecs, Date().timeIntervalSince(t0), gateSecs,
                                      landed.lastPathComponent,
                                      Double(won.bytes) / 1_048_576))
             return VideoResult(sourceSeconds: Double(source.count) / AudioProcessor.sampleRate,
                                convertedSeconds: convSecs, fitSeconds: fitSecs, fitRate: rate,
-                               passes: passes, mux: won, outURL: landed)
+                               passes: passes, mux: won, gateSeconds: gateSecs, outURL: landed)
         }.value
     }
 

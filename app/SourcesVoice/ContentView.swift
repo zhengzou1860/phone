@@ -54,6 +54,9 @@ struct ContentView: View {
 
     // 链外旋钮：只要音高（语速不做——播放软件都有）
     @State private var semitones: Double = 0
+    /// 「只留一个人」开关：进链前把不像选中样本那个人的窗清零。存 UserDefaults，因为这是
+    /// 整段素材的性质（这条片子有两个人说话），重开 app 不该再翻一遍页面。
+    @State private var keepOneSpeaker = (UserDefaults.standard.object(forKey: "gateOneSpeaker") as? Bool) ?? false
     @State private var showShare = false
 
     // 读小说：文本 → 系统 TTS → 现有样本那条链（②③④）。音色仍然来自上面选中的样本。
@@ -290,6 +293,21 @@ struct ContentView: View {
             Button("归零") { semitones = 0 }
                 .buttonStyle(.bordered)
             Text("加在④声码之后的波形上（链外移调，官方模型自己没这个参数）：只动音高不动时长。男声转女声一般抬 +2 ~ +5。语速不做——播放器都有。")
+                .font(.caption)
+                .foregroundColor(.secondary)
+
+            Divider()
+            Button {
+                keepOneSpeaker.toggle()
+                UserDefaults.standard.set(keepOneSpeaker, forKey: "gateOneSpeaker")
+                VoiceJournal.line("「只留一个人」开关 → \(keepOneSpeaker)")
+            } label: {
+                Label(keepOneSpeaker ? "只留一个人：开" : "只留一个人：关",
+                      systemImage: keepOneSpeaker ? "checkmark.square.fill" : "square")
+            }
+            .buttonStyle(.bordered)
+            .disabled(isConverting || isVideoing)
+            Text("源里有两个人轮流说话时才用：进链之前先在停顿的地方把话切成块（每块 ≤2.5 秒），逐块过一次 ①、和选中的样本比音色余弦（门限 0.45），不像那个人说的块就地清零。清零不动时间轴，所以 ⑤ 的口型不偏。代价照实说：被清掉的块照样进链，省不下链子的时间，只多出一趟 ①——PC 上拿同一张图量到每块 0.5~0.6 秒，即每 1 分钟源多花约 15 秒（链子自己 ≈24 秒），真机上以日志「闸门」那一行的实测为准。判得开的是音色真的不一样：PC 上男↔女是同人 0.75~0.94 对对方 0.03~0.28，一刀两断；两个像的女声（或真女声对女声 TTS）能贴到 0.4~0.67，那一种会漏——漏的后果只是那句别人的声音还在，不会删错人（40 组配置扫下来，误删她自己的只占 2%）。躲不掉的另一种：换了人又完全不换气、中间不留任何低谷，那种块里两个人混着，判不准。一块都没留下＝样本选错了人，会一句话报错，不会交一条从头到尾没声音的成片。")
                 .font(.caption)
                 .foregroundColor(.secondary)
         }
@@ -1143,8 +1161,9 @@ struct ContentView: View {
         } else {
             using = "现场参考 \(refURL!.lastPathComponent)"
         }
-        VoiceJournal.line(String(format: "点「开始换声」片源=%@ 音色=%@ 音高 %+.0f 半音",
-                                 input.lastPathComponent, using, semitones))
+        VoiceJournal.line(String(format: "点「开始换声」片源=%@ 音色=%@ 音高 %+.0f 半音／只留一个人=%@",
+                                 input.lastPathComponent, using, semitones,
+                                 keepOneSpeaker ? "开" : "关"))
         if engine == nil { engine = VoiceEngine(modelDir: modelDir) }
         let eng = engine!
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
@@ -1158,6 +1177,7 @@ struct ContentView: View {
                                                    refWav: picked != nil ? nil : refURL,
                                                    outputVideo: output,
                                                    pitchCents: semitones * 100.0,
+                                                   keepOnlyOneSpeaker: keepOneSpeaker,
                                                    onStage: { txt in
                     DispatchQueue.main.async { videoStatus = txt }
                 })
@@ -1167,10 +1187,10 @@ struct ContentView: View {
                     isVideoing = false
                     history = FileHistory.scan()
                     videoNote = String(format: "换完：%d 片／音轨 %.1f s → 链子 %.1f s → 对齐 %.1f s（倍率 %.5f）"
-                                       + "｜成片 \(r.mux.cfgName)：画面 %d 块＋音频 %d 块／%.1f MB／墙钟 %.0f s",
+                                       + "｜成片 \(r.mux.cfgName)：画面 %d 块＋音频 %d 块／%.1f MB／墙钟 %.0f s／闸门 %.1f s",
                                        r.passes, r.sourceSeconds, r.convertedSeconds, r.fitSeconds,
                                        r.fitRate, r.mux.frames, r.mux.audioBlocks,
-                                       Double(r.mux.bytes) / 1_048_576, wall)
+                                       Double(r.mux.bytes) / 1_048_576, wall, r.gateSeconds)
                     videoStatus = "换声完成（\(r.mux.cfgName)）｜音轨 \(r.mux.note)"
                     VoiceJournal.line("视频换声界面收尾：\(videoNote)")
                 }
@@ -1346,8 +1366,9 @@ struct ContentView: View {
 
         isConverting = true
         convertStatus = "加载模型…"
-        VoiceJournal.line(String(format: "开始转换 源=%@ 音色=%@ 音高 %+.0f 半音",
-                                 inputURL.lastPathComponent, using, semitones))
+        VoiceJournal.line(String(format: "开始转换 源=%@ 音色=%@ 音高 %+.0f 半音／只留一个人=%@",
+                                 inputURL.lastPathComponent, using, semitones,
+                                 keepOneSpeaker ? "开" : "关"))
         if engine == nil {
             engine = VoiceEngine(modelDir: modelDir)
         }
@@ -1366,6 +1387,7 @@ struct ContentView: View {
                                       refWav: refForJob,
                                       outputWav: output,
                                       pitchCents: semitones * 100.0,
+                                      keepOnlyOneSpeaker: keepOneSpeaker,
                                       onStage: { text in
                     // 推理线程回调 → 跳回主线程改文案（ContentView 是 struct，
                     // @State 的 setter 是 nonmutating，闭包里捕获的副本写回同一块存储）。

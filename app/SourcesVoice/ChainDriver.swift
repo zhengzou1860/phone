@@ -180,6 +180,37 @@ final class ChainDriver {
         return emb
     }
 
+    // MARK: - ① 的第二次用途：逐块判「是不是这个人」
+
+    /// 「只留一个人」那一趟：有话的块各过一次 ①，和选定样本存盘的 `spk` 比余弦，不像的块原地清零。
+    ///
+    /// 和 `speakerEmbedding` 的分别只在图的寿命。那句是按「一条参考只算一次」写的
+    /// （`defer { g.close() }`），拿来逐块判＝每块重载一次 386 MB；这里整趟只载一次，
+    /// 判完立刻关——②③④ 那 343 MB 紧接着要进来，两张一起顶在头上会撞 iPhone 11
+    /// 前台 2040 MB 的水位线。
+    ///
+    /// 关掉开关时这个方法根本不会被叫到，所以原来的路径一克内存、一秒时间都不多花。
+    func gateToSpeaker(_ source: inout [Float], refSpk: [Float]) throws -> SpeakerGate.Report {
+        onStage("闸门：载入 \(Self.fileSV)（整趟只这一次）")
+        let tl = Date()
+        let g = try graph(Self.fileSV)
+        let loadSecs = Date().timeIntervalSince(tl)
+        defer { g.close() }
+        var rep = try SpeakerGate.run(&source, refSpk: refSpk, onProgress: { done, all in
+            onStage("闸门：判到第 \(done)/\(all) 块")
+        }) { fed in
+            let out = try g.run([feedF32("wave", [1, fed.count], fed)], wants: ["emb"])
+            guard let emb = out.first else { throw ChainError.shape("闸门：sv 没吐出 emb") }
+            guard case .f32(_, let data) = emb else {
+                throw ChainError.shape("闸门：sv 的 emb 不是 f32（\(dimText(emb.dims))）")
+            }
+            return data
+        }
+        rep.loadSeconds = loadSecs
+        onStage("闸门：图已关（后面 ②③④ 独占内存）")
+        return rep
+    }
+
     // MARK: - ② 内容编码（fastu2++ 三态流式）
 
     func encode(fbank: [Float], frames: Int) throws -> ChainRows {
