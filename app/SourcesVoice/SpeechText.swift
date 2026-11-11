@@ -20,9 +20,10 @@ enum SpeechText {
     /// 所以按窗分段；每窗自己的字数单独记一行。
     static let windowSecs = 50.0
 
-    /// 相对实时的喂数倍率。1.0 最稳但太慢（5 分钟素材要等 5 分钟），
-    /// 往上一档掉字的风险就归到上面那条读数里。
-    static let feedPace = 1.5
+    /// 相对实时的喂数倍率。**0.1/53 从 1.5 降回 1.0**：他报「漏采的比较多」，
+    /// 而喂快于实时正是这条管路里唯一明写着会掉字的那一档（下面那句注释原来就在）。
+    /// 代价是等得久：584 s 的素材要等约 10 分钟。掉没掉字看每窗那几行字数。
+    static let feedPace = 1.0
 
     /// 每次喂进请求的那一块有多长（100 ms，和 `AVAudioEngine` 的输入块同一量级）。
     static let bufferSecs = 0.1
@@ -32,16 +33,22 @@ enum SpeechText {
     /// （15 分钟素材 = 18 窗，每窗多等 10 s 就是多 3 分钟）。
     static let graceSecs = 12.0
 
-    /// 认出来的一个词：在源时间轴上的起点 + 字。只在一窗内部用（拿第一个词的起点当这一行的锚）。
+    /// 词与词之间停超过这么久就算换了一句。听写不一定给标点（给了也常给错），
+    /// 但「人停下来喘口气」这个信号是时间戳里实打实的 ⇒ 拿它当第二把切句的尺。
+    static let sentenceGapSecs = 0.8
+
+    /// 认出来的一个词：在这一窗自己时间轴上的起点 / 时长 / 字。切句和取锚都靠它。
     struct Segment {
         var startSecs: Double
+        var duration: Double
         var text: String
     }
 
-    /// 一行 = 一窗（≈50 s 说的话）。`startSecs` 是这一窗第一个字在**原音轨**上的起点。
+    /// 一行 = **一句**（不是一个 50 s 的窗）。`startSecs` 是这一句第一个字在**原音轨**上的起点。
     ///
-    /// 「按新词配音」就靠这一个数把话摆回原处（他定的口径：每行钉原起点，改长了截到下一行起点）。
-    /// 所以这一份不能只给文本 —— 文本他还要改，位置得单独带着走。
+    /// 0.1/51 一行是一窗，实测不行：一窗里可能有三四句话散在 40 s 上，念的时候却从窗头连着念
+    /// ⇒ 第一句之后每句都比嘴型早好几秒（他报的「时间差较大」）。他要的本来就是「每句话位置不变」，
+    /// 所以粒度落到句：每句自己钉自己的起点，改长了截到**下一句**的起点。
     struct Line {
         var startSecs: Double
         var text: String
@@ -56,10 +63,10 @@ enum SpeechText {
         /// 这一趟真走的本机识别（`supportsOnDeviceRecognition` 那条）。false = 落到了需要网络的那头，
         /// 装机时这一行就是证据：手机在飞行模式下能不能提台词，全看这个数。
         var onDevice: Bool
-        /// 每窗：起点 / 窗长 / 认出的字数 / 那一窗的判决（超时、被拒、没认出来都写在这儿）
-        var windows: [(start: Double, secs: Double, chars: Int, note: String)]
+        /// 每窗：起点 / 窗长 / 认出的字数 / 切出几句 / 那一窗的判决（超时、被拒、没认出来都写在这儿）
+        var windows: [(start: Double, secs: Double, chars: Int, nLines: Int, note: String)]
 
-        /// 拼成能编辑的一份稿子：**一窗一行**（≈50 s 说的话），空窗不占行。
+        /// 拼成能编辑的一份稿子：**一句一行**，空窗不占行。
         /// 行数就是 `lines.count`，界面那边按行号取锚点，所以这里绝不能把一行拆成两行。
         var text: String {
             lines.map { $0.text }.joined(separator: "\n")
@@ -67,12 +74,12 @@ enum SpeechText {
 
         var line: String {
             let perWin = windows.map { w -> String in
-                String(format: "%.1fs起/%.0fs:%d字%@", w.start, w.secs, w.chars,
+                String(format: "%.1fs起/%.0fs:%d字%d句%@", w.start, w.secs, w.chars, w.nLines,
                        w.note.isEmpty ? "" : "（\(w.note)）")
             }.joined(separator: " ")
             // 那一串每窗的话里可能有 `%`（系统的报错原文什么都可能写），所以它**不能**进 format 的
             // 格式串 ⇒ 用 + 拼。混进 `String(format:)` 的裸 `%` 是当场崩，不是显示乱码。
-            let head = String(format: "提台词：源 %.1f s ⇒ %d 窗／%d 行／%d 字／墙钟 %.0f s（%@，%@）｜",
+            let head = String(format: "提台词：源 %.1f s ⇒ %d 窗／%d 句／%d 字／墙钟 %.0f s（%@，%@）｜",
                               sourceSecs, windows.count, lines.count, chars, wallSeconds, localeID,
                               onDevice ? "本机" : "需网络")
             return head + perWin
@@ -137,7 +144,7 @@ enum SpeechText {
         let win = Int((windowSecs * sr).rounded())
         let nWin = (samples.count + win - 1) / max(win, 1)
         var lines: [Line] = []
-        var rows: [(start: Double, secs: Double, chars: Int, note: String)] = []
+        var rows: [(start: Double, secs: Double, chars: Int, nLines: Int, note: String)] = []
         var chars = 0
 
         for w in 0..<nWin {
@@ -150,11 +157,11 @@ enum SpeechText {
             let one = try await oneWindow(recognizer: recognizer, samples: samples, from: from, to: to,
                                           onDevice: onDevice)
             chars += one.chars
-            rows.append((one.startSecs, secs, one.chars, one.note))
+            rows.append((one.startSecs, secs, one.chars, one.lines.count, one.note))
             // 空窗不占行：行数 = 稿子里的行数，界面按行号取锚，多出一个空行就会把后面全错开。
-            if !one.text.isEmpty { lines.append(Line(startSecs: one.startSecs, text: one.text)) }
-            VoiceJournal.line(String(format: "提台词第 %d/%d 窗（%.0f s）：认出 %d 字，钉在 %.2f s｜%@",
-                                     w + 1, nWin, secs, one.chars, one.startSecs, one.note))
+            lines.append(contentsOf: one.lines)
+            VoiceJournal.line(String(format: "提台词第 %d/%d 窗（%.0f s）：认出 %d 字／切出 %d 句，头一句钉在 %.2f s｜%@",
+                                     w + 1, nWin, secs, one.chars, one.lines.count, one.startSecs, one.note))
         }
         let bad = rows.filter { !$0.note.isEmpty }.count
         let note = bad == 0 ? "" : "｜有 \(bad) 窗留了话（超时／没认出来），那几段的字可能缺"
@@ -167,11 +174,11 @@ enum SpeechText {
 
     // MARK: - 一窗
 
-    /// 一窗：建请求 → 按节奏喂 → `endAudio()` → 等收尾。
-    /// 返回这一窗认出来的一行字（`text`）+ 它在源音轨上的起点（`startSecs`，取第一个词的时刻）。
+    /// 一窗：建请求 → 按节奏喂 → `endAudio()` → 等收尾 → 把这一窗的词切成句。
+    /// 返回这几句（每句自带在源音轨上的起点）+ 这一窗头一句的起点（只用来记日志）。
     private static func oneWindow(recognizer: SFSpeechRecognizer, samples: [Float],
                                   from: Int, to: Int, onDevice: Bool) async throws
-        -> (text: String, startSecs: Double, chars: Int, note: String) {
+        -> (lines: [Line], startSecs: Double, chars: Int, note: String) {
         let sr = AudioProcessor.sampleRate
         let req = SFSpeechAudioBufferRecognitionRequest()
         req.shouldReportPartialResults = true       // 收尾等不到 final 时，部分结果就是那一窗的全部内容
@@ -189,7 +196,8 @@ enum SpeechText {
             if let res = res {
                 let text = res.bestTranscription.formattedString
                 let pieces = res.bestTranscription.segments.map {
-                    Segment(startSecs: Double($0.timestamp), text: $0.substring)
+                    Segment(startSecs: Double($0.timestamp), duration: Double($0.duration),
+                            text: $0.substring)
                 }
                 box.put(text: text, pieces: pieces, isFinal: res.isFinal)
             } else if let err = err {
@@ -232,7 +240,7 @@ enum SpeechText {
         }
         task.cancel()
 
-        // 一窗只能是一行：听写自己会断句、在中间插换行，留着就把行数和锚点全对不上了。
+        // 听写自己会在中间插换行，留着就把行数和锚点全对不上了 ⇒ 先压成一行备用。
         let trimmed = box.bestText.components(separatedBy: .newlines)
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty }
@@ -245,10 +253,55 @@ enum SpeechText {
         } else if !box.sawFinal {
             note = "等 final 等了 \(Int(graceSecs)) s 没来，用了最后一版部分结果"
         }
-        // 词的时间戳是「这一窗自己」的时间轴 ⇒ 抬到源时间轴上。只回了整串没词表时退回窗头。
+        // 词的时间戳是「这一窗自己」的时间轴 ⇒ 抬到源时间轴上。
         let base = Double(from) / sr
-        let first = box.pieces.map { $0.startSecs }.min() ?? 0
-        return (trimmed, base + max(0, first), trimmed.count, note)
+        let pieces = box.pieces
+        var lines = cutSentences(pieces, base: base)
+        if lines.isEmpty && !trimmed.isEmpty {
+            // 只回了整串、没给词表（有的口音/版本会这样）⇒ 退回一句，锚在窗头。
+            lines = [Line(startSecs: base, text: trimmed)]
+            note += (note.isEmpty ? "" : "；") + "没给词的时间戳，这一窗只能整段钉在窗头"
+        }
+        let chars = lines.reduce(0) { $0 + $1.text.count }
+        return (lines, lines.first?.startSecs ?? base, chars, note)
+    }
+
+    /// 把一窗的词切成句，每句带上自己第一个字的时刻。
+    ///
+    /// 两把尺，哪把先响都算一句：
+    /// 1. 句读标点（`。！？；…`）—— 听写给了就用；
+    /// 2. 词与词之间停了超过 `sentenceGapSecs` —— 听写不给标点时这把照样能切，
+    ///    而「人停下来喘口气」本来就是嘴型对位最该钉的那个点。
+    /// 中文词之间不插空格（插了念出来会顿）；这一份只走普通话那三个 locale。
+    private static func cutSentences(_ pieces: [Segment], base: Double) -> [Line] {
+        let hard: Set<Character> = ["。", "！", "？", "；", "…", "!", "?", ";"]
+        var out: [Line] = []
+        var cur = ""
+        var start = 0.0
+        var have = false
+        var lastEnd = 0.0
+        for p in pieces {
+            let t = p.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if t.isEmpty { continue }
+            if have && !cur.isEmpty && p.startSecs - lastEnd > sentenceGapSecs {
+                out.append(Line(startSecs: base + start, text: cur))
+                cur = ""
+                have = false
+            }
+            if !have {
+                start = max(0, p.startSecs)
+                have = true
+            }
+            cur += t
+            lastEnd = p.startSecs + max(0, p.duration)
+            if let last = t.last, hard.contains(last) {
+                out.append(Line(startSecs: base + start, text: cur))
+                cur = ""
+                have = false
+            }
+        }
+        if have && !cur.isEmpty { out.append(Line(startSecs: base + start, text: cur)) }
+        return out
     }
 
     private static func authText(_ s: SFSpeechRecognizerAuthorizationStatus) -> String {

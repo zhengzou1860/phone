@@ -183,7 +183,12 @@ enum AudioProcessor {
                 VoiceJournal.line(String(format: "%@：本片峰值 %.4f 越过满刻度 ⇒ 乘 %.4f 压回",
                                          url.lastPathComponent, peak, gain))
             }
-            VoiceJournal.line(String(format: "准备落盘 %@：本片 %d 帧", url.lastPathComponent, samples.count))
+            // 纯静音那片不记：补尾巴/填空档是按秒喂的，一条 128 s 的尾巴能刷出 128 行，
+            // 把报表那 200 行窗口整个占满 ⇒ 提台词和逐行摆位的读数一条都送不出去（0.1/52 实测）。
+            // 补了多少静音另有专门一行（writeBack / 重配摆位完成），不缺这笔账。
+            if peak > 0 {
+                VoiceJournal.line(String(format: "准备落盘 %@：本片 %d 帧", url.lastPathComponent, samples.count))
+            }
             var ints = [Int16](repeating: 0, count: samples.count)
             for i in 0..<samples.count {
                 var v = samples[i] * gain

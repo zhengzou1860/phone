@@ -89,8 +89,8 @@ struct ContentView: View {
     @State private var dubLines = ""
     @State private var dubOutURL: URL?
     @State private var showDubShare = false
-    /// 「提取台词」要的整条长度上限。听写按 1.5× 实时喂，所以这条同时也是要等多久：
-    /// 15 分钟素材 ⇒ 解音轨几秒 + 听写约 10 分钟。真机嫌慢就把这段剪短，或自己打字。
+    /// 「提取台词」要的整条长度上限。听写按实时喂，所以这条同时也是要等多久：
+    /// 15 分钟素材 ⇒ 解音轨几秒 + 听写约 15 分钟。真机嫌慢就把这段剪短，或自己打字。
     static let asrMaxSecs = 900.0
     @State private var showShare = false
 
@@ -570,7 +570,7 @@ struct ContentView: View {
                     }
                     videoScript = r.text
                     scriptAnchors = r.lines.map { $0.startSecs }
-                    asrNote = String(format: "认出 %d 字／%d 行／源 %.0f s／墙钟 %.0f s（%@）｜下面直接改，改完点「按新词配音并回写」",
+                    asrNote = String(format: "认出 %d 字／%d 句／源 %.0f s／墙钟 %.0f s（%@）｜下面直接改，改完点「按新词配音并回写」",
                                      r.chars, r.lines.count, r.sourceSecs, r.wallSeconds,
                                      r.onDevice ? "本机识别" : "这一趟走了需要联网那头")
                     saveScript(scriptKey(input, isVideo))
@@ -736,13 +736,13 @@ struct ContentView: View {
                     .foregroundColor(.secondary)
             }
 
-            Text("「提取台词」走系统自带的本机听写（不下载任何模型，包一个字节都不长）：把音轨一段一段喂给它认字，按 1.5× 实时 ⇒ 5 分钟素材要等 3~4 分钟。认出来的字不一定全对（听写本来就有别字、专有名词容易错），所以下面直接改成你要说的。听写包没装／不给权限会一行话说明去哪儿开；实在不行自己打字也一样能配音。")
+            Text("「提取台词」走系统自带的本机听写（不下载任何模型，包一个字节都不长）：把音轨一段一段喂给它认字，按实时速度喂 ⇒ 5 分钟素材要等 5 分钟左右（喂快了会掉字，0.1/53 起不再赶）。认出来的字不一定全对（听写本来就有别字、专有名词容易错），所以下面直接改成你要说的。听写包没装／不给权限会一行话说明去哪儿开；实在不行自己打字也一样能配音。")
                 .font(.caption)
                 .foregroundColor(.secondary)
-            Text("一行 = 原来那一段话（约 50 秒一窗），行号就是它在原片上的位置：配音时每行钉回自己原来的起点，行内的句子连着念，中间没说话的空档填静音。所以不会从片头一路念到底。")
+            Text("一行 = 原来的一句话，行号就是它在原片上的位置：配音时每句钉回自己原来的起点（听写给了每个词的时刻，按句读和停顿切句），句与句之间没说话的空档填静音。所以不会从片头一路念到底，也不会一句早于嘴型好几秒。")
                 .font(.caption)
                 .foregroundColor(.secondary)
-            Text("某行改长了 ⇒ 念到下一行原来的起点为止就截断（宁可少念几个字，也不让后面每句话整体挪位）；改短了 ⇒ 后面留静音，下一行还在原处。空行不念、也不占行号。要注意：删掉整行会让后面的行号和锚点错开一位，不想念那一行就把字删空、留着那个空行。自己新加的行没有原起点，接在上一行后面。")
+            Text("某句改长了 ⇒ 念到下一句原来的起点为止就截断（宁可少念几个字，也不让后面每句话整体挪位）；改短了 ⇒ 后面留静音，下一句还在原处。空行不念、也不占行号。要注意：删掉整行会让后面的行号和锚点错开一位，不想念那一行就把字删空、留着那个空行。自己新加的行没有原起点，接在上一行后面。")
                 .font(.caption)
                 .foregroundColor(.secondary)
             Text("改完点「按新词配音并回写」：字走 ④ 那条（系统朗读 → ②③④ 换成选中样本的音色），再装回原来那条画面（画面一个像素不动、透传）。口型不再对（字数变了，这一条你明确不要）。音色、音高、去男声用的还是上面那几格。")
@@ -2028,7 +2028,7 @@ struct ContentView: View {
             + "\n\n—— 前端自检 ——\n" + fe
             + "\n\n—— 模型状态 ——\n" + models.progressText
             + "\n\n—— 样本清单 ——\n" + names
-            + "\n\n—— 磁盘日志最近 200 行 ——\n" + VoiceJournal.tail(200)
+            + "\n\n—— 磁盘日志最近 400 行 ——\n" + VoiceJournal.tail(400)
         // ContentView 是 struct，不能 [weak self]；@State 的 setter 是 nonmutating，
         // 闭包里捕获的 struct 副本写回去仍然是同一块存储。
         Task.detached {

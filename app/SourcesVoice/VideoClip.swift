@@ -427,7 +427,9 @@ enum VideoClip {
                     return
                 }
                 frames += 1
-                if frames % 200 == 0 {
+                // 每 1000 块报一次（原来 200）：一条 584 s 的片子 8728 块 ⇒ 原来刷 44 行，
+                // 和补静音那 128 行一起把报表的日志窗口占满，真正要看的读数反而送不出去。
+                if frames % 1000 == 0 {
                     say("搬到第 \(frames) 块画面｜音频 \(aOK) 块｜足迹 \(VoiceFacts.footprintMB()) MB")
                 }
             }
