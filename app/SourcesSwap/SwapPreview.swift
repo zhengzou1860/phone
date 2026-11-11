@@ -78,8 +78,9 @@ final class SwapPreview {
     private var gapN = 0, gapMax = 0.0
     private var pointSrc = "—"
     private var duration = 0.0
-    /// 预览的那一条声音：素材副本里的音轨原样交给 AVAudioPlayer 放，画面这条钟慢下来就由它等一等
-    private var audio: AVAudioPlayer?
+    /// 预览的那一条声音：素材副本里的音轨交给 AVPlayer 只放音频（不吃 mp4 里的 lpcm 那档见 audioStart），
+    /// 画面这条钟慢下来就由它等一等
+    private var audio: AVPlayer?
 
     private struct PTrack {
         var id: Int
@@ -496,6 +497,11 @@ final class SwapPreview {
 
     /// 开声音：读的就是 ②那一条副本的音轨（选片时是整份文件原样拷进临时目录，音轨跟着一起进来），不另找文件。
     /// 类别钉 .playback：静音拨片压不住它——全屏横屏里要的就是这个，拨片在下面也能只靠音量键调大小。
+    ///
+    /// 为什么不用 AVAudioPlayer：它不吃 mp4 里的 lpcm。STS 那条换声线真机上 AAC 编码每次都
+    /// `Cannot Encode Media`（-11861），四组口径退到 mp4+PCM（16 kHz 单声道 16 bit）才出得来片，
+    /// 于是相册（AVPlayer）有声、我们这边一句「读不出音轨」就没声了。换成 AVPlayer 只放音轨：
+    /// 把音轨插进一条只含音频的 composition，画面一帧都不解，钟还是我们自己这条。
     private func audioStart(_ url: URL, at sec: Double) {
         audioStop()
         var note = ""
@@ -505,31 +511,43 @@ final class SwapPreview {
         } catch {
             note = "｜会话没开成：\(error.localizedDescription)"
         }
-        // 先把音轨自己的数写进报告：AVAudioPlayer 打不开时只给一句「读不出」，判不了案。
-        // 别的 app 导出的片子有三种实情长得一样——没音轨／音频起点不在 0 s（掐头去尾留下的偏移）／
-        // 子类型这套播放器不收，只有音轨本身能把它们分开。整份文件是字节级拷进来的，不是我们丢了音轨。
+        // 先把音轨自己的数写进报告：条数、子类型、采样率声道、起点。没声音时靠这一行分清
+        // 「这条片子压根没音轨」和「有音轨但这一档播放器不收」。整份文件是字节级拷进来的，不是我们丢了音轨。
         let asset = AVURLAsset(url: url)
         say("预览 声音查档 \(url.lastPathComponent) \(asset.audioTrackNote())\(note)")
+        guard let at = asset.tracks(withMediaType: .audio).first else {
+            say("预览 没声音：这条片子没有音轨")
+            return
+        }
+        let comp = AVMutableComposition()
+        guard let ct = comp.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid) else {
+            say("预览 没声音：只含音轨的 composition 建不出来")
+            return
+        }
         do {
-            let p = try AVAudioPlayer(contentsOf: url)
-            p.prepareToPlay()
-            p.currentTime = max(0, min(sec, p.duration))
-            if p.play() {
-                audio = p
-                say("预览 声音开成 播放器时长 \(String(format: "%.2f", p.duration)) s"
-                    + "｜声道 \(p.numberOfChannels)｜采样 \(String(format: "%.0f", p.sampleRate)) Hz"
-                    + "｜这格从 \(String(format: "%.2f", sec)) s 起播")
-            } else {
-                say("预览 没声音：播放器建出来了但 play 不应（会话没开成或被别人占着）\(note)")
-            }
+            // 起点归到 0：画面这条一直按 0 起算（见上面 reader 那段），音轨自带的偏移不跟着搬
+            try ct.insertTimeRange(at.timeRange, of: at, at: .zero)
         } catch {
             let e = error as NSError
-            say("预览 没声音：AVAudioPlayer 抛错 \(e.domain) #\(e.code)｜\(e.localizedDescription)")
+            say("预览 没声音：音轨插不进 composition \(e.domain) #\(e.code)｜\(e.localizedDescription)")
+            return
         }
+        let item = AVPlayerItem(asset: comp)
+        let p = AVPlayer(playerItem: item)
+        // 画面算不过来时由 audioSync 按住它，别让播放器自己再等一轮缓冲
+        p.automaticallyWaitsToMinimizeStalling = false
+        p.seek(to: CMTime(seconds: max(0, sec), preferredTimescale: 600),
+               toleranceBefore: .zero, toleranceAfter: .zero)
+        p.play()
+        audio = p
+        let dur = CMTimeGetSeconds(at.timeRange.duration)
+        say("预览 声音开成（AVPlayer 只放音轨）音轨长 \(String(format: "%.2f", dur)) s"
+            + "｜这格从 \(String(format: "%.2f", sec)) s 起播｜起播状态 \(p.timeControlStatus.rawValue)"
+            + (item.error.map { "｜item 报错 \($0.localizedDescription)" } ?? ""))
     }
 
     private func audioStop() {
-        audio?.stop()
+        audio?.pause()
         audio = nil
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
     }
@@ -538,13 +556,16 @@ final class SwapPreview {
     /// 画面反过来超前 0.6 s 以上（拖完滑杆重开 reader 那一阵）才把声音拽回画面那一秒。
     private func audioSync(_ sec: Double) {
         guard let p = audio else { return }
-        let d = p.currentTime - sec
-        if !p.isPlaying {
+        let cur = CMTimeGetSeconds(p.currentTime())
+        guard cur.isFinite else { return }
+        let d = cur - sec
+        if p.rate <= 0 {
             if d < 0.10 { p.play() }
         } else if d > 0.30 {
             p.pause()
         } else if d < -0.60 {
-            p.currentTime = max(0, min(sec, p.duration))
+            p.seek(to: CMTime(seconds: max(0, sec), preferredTimescale: 600),
+                   toleranceBefore: .zero, toleranceAfter: .zero)
         }
     }
 
