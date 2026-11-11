@@ -181,6 +181,50 @@ final class VoiceEngine {
         return rep
     }
 
+    // MARK: - 「试听去男声」：只跑闸门那一趟，不进链
+
+    /// 试听最多取源的前这么多秒。真换声整条都判，这里只为省内存和解音轨的时间：
+    /// 块界、每块的 F0 都只看局部窗，所以前 300 s 的判定和整条跑完全一致（不含被并进尾巴的那块）。
+    static let gatePreviewMaxSecs = 300.0
+
+    /// 试听的素材从哪儿来：视频解音轨，wav 直接读。慢的是这一趟（几秒），闸门本身 0.2 s，
+    /// 所以调用方把这一次的返回存着，拖一次线只重跑 `gatePreview`。
+    static func loadGateSource(url: URL, video: Bool) async throws -> [Float] {
+        let name = url.lastPathComponent
+        return try await Task.detached(priority: .userInitiated) {
+            let all: [Float]
+            if video {
+                all = try VideoClip.extractAudio(url, say: VoiceJournal.line)
+            } else {
+                all = try AudioProcessor.loadWAV16K(url)
+            }
+            let cap = Int(VoiceEngine.gatePreviewMaxSecs * AudioProcessor.sampleRate)
+            let used = Array(all.prefix(cap))
+            VoiceJournal.line(String(format: "试听素材 %@：解出 %.1f s／取前 %.1f s 留着（%.1f MB）",
+                                     name, Double(all.count) / AudioProcessor.sampleRate,
+                                     Double(used.count) / AudioProcessor.sampleRate,
+                                     Double(used.count) * 4 / 1_048_576))
+            return used
+        }.value
+    }
+
+    /// 按当前这条男声线把 `source` 判一遍，清零的那几段就地变成静音，落成一条能直接播的 wav。
+    ///
+    /// 听这一条就等于看成片里"哪些声音被摘掉了"：清零是原地的，时间轴一个样本都不动，
+    /// 所以这里 12.4 秒没声，成片里那一段也没声，画面对得上。链子（②③④）一步都不走 ⇒
+    /// 拖一次线、点一次、听一次，全程 1 秒以内。
+    static func gatePreview(source: [Float], outWav: URL) throws -> PitchGate.Report {
+        var gated = source
+        let rep = try PitchGate.run(&gated)
+        let writer = try AudioProcessor.WAVWriter(url: outWav)
+        try writer.append(gated)
+        try writer.finish()
+        VoiceJournal.line(rep.line)
+        VoiceJournal.line(rep.hzLine)
+        VoiceJournal.line("去男声 F0 从小到大：" + rep.sortedLine)
+        return rep
+    }
+
     /// inputWav: 用户要转换的那段
     /// sample / refWav: 目标音色，二选一（sample 优先）
     /// outputWav: 落盘路径

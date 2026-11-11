@@ -35,12 +35,32 @@ enum PitchGate {
 
     /// 男声门限：块内有声帧的 F0 中位数低于这条线 ⇒ 判男声、清零。
     ///
-    /// 150 → 120 的缘由：真机 0.1/46 那条访谈里，男声一整段（30~60 s 那 14 块）稳在 94~108 Hz，
-    /// 线画 120 照样删得掉；而单独一条女声试的时候还有几块被裁，那就是她的低音那一头
-    /// （句尾下沉）压到 120~150 之间去了。宁可漏男声不误删女声，是用户定的方向。
-    /// 注意这条线救不了「读数被拖到一半」那种错（女声 200 Hz 报成 100）：那种落在 120 以下，
+    /// 这条线**能拖**：屏幕上那个滑块（`ContentView` 的「音高」那格）调的就是这一个数，
+    /// 调完记在这台手机上 ⇒ 试听用的是它，真换声用的也是它，不会出现"听的时候一个值、跑的时候另一个值"。
+    ///
+    /// 为什么要给他拖：线画在哪儿本来就看素材。真机 0.1/46 那条访谈里男声整段稳在 94~108 Hz、
+    /// 女声在 186 那一堆，而单独一条女声试的时候还有几块被裁——她那头低音（句尾下沉）压到了
+    /// 120~150 之间。这种账在电脑前猜不出来，只能在手机上边听边挪。
+    ///
+    /// 但这条线救不了「读数被拖到一半」那种错（女声 200 Hz 报成 100）：那种落在 120 以下，
     /// 再降就得把男声整段放进来。所以真机日志的逐块 F0 要留着看——被删的块到底落在哪一堆。
-    static let maleHz = 120.0
+    static let maleHzKey = "gateMaleHz"
+    static let maleHzDefault = 120.0
+
+    /// 滑块范围。下沿 60 是这把尺的搜索下界（`lagHi` = 266 ⇒ 16000/266 ≈ 60 Hz），
+    /// 再低就等于「谁都不删」；上沿 250 已经超过绝大多数男声，再高会把女声整段删光。
+    static let maleHzRange = 60.0...250.0
+
+    /// 现在这条线画在哪儿。没存过 / 存了个离谱的数 ⇒ 默认 120。
+    static var maleHz: Double {
+        let v = UserDefaults.standard.double(forKey: maleHzKey)
+        return maleHzRange.contains(v) ? v : maleHzDefault
+    }
+
+    static func setMaleHz(_ hz: Double) {
+        UserDefaults.standard.set(min(max(hz, maleHzRange.lowerBound), maleHzRange.upperBound),
+                                  forKey: maleHzKey)
+    }
 
     /// 一窗里有声帧占比不到这个数 ⇒ 不判（清音、气口、几乎没人说话的那块），原样留着。
     static let minVoicedRatio = 0.15
@@ -61,6 +81,9 @@ enum PitchGate {
         var quietPieces: Int
         var minHz: Double
         var maxHz: Double
+        /// 这一趟实际用的那条线。它是能拖的，所以日志必须把当时那一个数钉在这一行里，
+        /// 不然过两天回头看「线画 150 那次删了多少」就对不上号了。
+        var maleHz: Double
         /// 逐块判定的墙钟。基频这把尺不载任何图，所以这一个数就是「开这个开关多花了几秒」。
         var wallSeconds: Double
         /// 逐块：块头秒数 + 块内中位 F0（不判的那几块 hz 给 0）。
@@ -75,7 +98,7 @@ enum PitchGate {
                    + "｜F0 最好 %.0f 最差 %.0f Hz（男声线 %.0f Hz）｜墙钟 %.2f s",
                    sourceSecs, pieces, PitchGate.maxPieceSecs, judged, quietPieces,
                    keptPieces, droppedPieces, droppedSecs, maxHz, minHz,
-                   PitchGate.maleHz, wallSeconds)
+                   maleHz, wallSeconds)
         }
 
         /// 逐块 F0：`maleHz` 这条线合不合适，看这一串的分布就知道。
@@ -87,7 +110,17 @@ enum PitchGate {
             }.joined(separator: " ")
             let tail = tracks.count > cap
                 ? String(format: "…（只列前 %d 块，共 %d 块）", cap, tracks.count) : ""
-            return "去男声逐块 F0（男声线 " + String(format: "%.0f", PitchGate.maleHz) + " Hz）：" + body + tail
+            return "去男声逐块 F0（男声线 " + String(format: "%.0f", maleHz) + " Hz）：" + body + tail
+        }
+
+        /// 判过那些块的 F0 从小到大排一遍。拖线的时候看这一串比看上面那串快：两个堆之间
+        /// 那道空档落在哪儿，线就该画在哪儿；被线切走的那几块左边会带个「*」。
+        var sortedLine: String {
+            let vs = tracks.filter { $0.hz > 0 }.map { $0.hz }.sorted()
+            let body = vs.map { hz -> String in
+                (hz < maleHz ? "*" : "") + String(format: "%.0f", hz)
+            }.joined(separator: " ")
+            return body.isEmpty ? "（这条素材一块都没判出基频：全是清音／静音？）" : body
         }
     }
 
@@ -97,6 +130,9 @@ enum PitchGate {
                     onProgress: (Int, Int) -> Void = { _, _ in }) throws -> Report {
         let t0 = Date()
         let sr = AudioProcessor.sampleRate
+        // 读一次就定下来：滑块是主线程的东西，别跑到一半他手又抖了一下，一半块按 120 判、
+        // 另一半按 125 判，那本账就没法对了。
+        let maleLine = maleHz
         let ps = pieces(source)
         var keep = [Bool](repeating: true, count: ps.count)
         var tracks: [(sec: Double, hz: Double, voiced: Double)] = []
@@ -114,7 +150,7 @@ enum PitchGate {
                 judged += 1
                 if hz < lo { lo = hz }
                 if hz > hi { hi = hz }
-                keep[k] = hz >= maleHz
+                keep[k] = hz >= maleLine
             }
             if (k + 1) % 20 == 0 { onProgress(k + 1, ps.count) }
         }
@@ -132,8 +168,9 @@ enum PitchGate {
         if judged > 0, dropped == judged {
             let lowest = tracks.filter { $0.hz > 0 }.map { $0.hz }.max() ?? 0
             throw ChainError.input(String(format: "去男声：判过的 %d 块全低于 %.0f Hz（最尖的一块只有 %.0f Hz）"
-                                          + "⇒ 这条源里没有女声，或者男声都在高音区。源没动，关掉「去掉男声」再来一遍",
-                                          judged, maleHz, lowest))
+                                          + "⇒ 这条源里没有女声，或者线画高了。源没动：把男声线往下拖再试，"
+                                          + "或者关掉「去掉男声」再来一遍",
+                                          judged, maleLine, lowest))
         }
         for k in 0..<ps.count where !keep[k] {
             var i = ps[k].start
@@ -147,6 +184,7 @@ enum PitchGate {
                       keptPieces: ps.count - dropped, droppedPieces: dropped,
                       droppedSecs: droppedSecs, judged: judged, quietPieces: quiet,
                       minHz: lo == Double.greatestFiniteMagnitude ? 0 : lo, maxHz: hi,
+                      maleHz: maleLine,
                       wallSeconds: Date().timeIntervalSince(t0), tracks: tracks, droppedSpans: spans)
     }
 

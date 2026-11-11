@@ -60,6 +60,18 @@ struct ContentView: View {
     /// 「去掉男声」开关：进链前把块内中位基频低于男声线的那些块清零。存 UserDefaults，
     /// 因为这是整段素材的性质（这条片子有男有女），重开 app 不该再翻一遍页面。
     @State private var dropMale = (UserDefaults.standard.object(forKey: "gateDropMale") as? Bool) ?? false
+    /// 男声线画在哪儿（Hz）。`PitchGate.maleHz` 是这块屏幕唯一的出口：试听和真换声读同一个数。
+    @State private var maleHz = PitchGate.maleHz
+    /// 「试听去男声」的素材：解一次音轨存着（最长 300 s，见 `VoiceEngine.gatePreviewMaxSecs`），
+    /// 拖一次线只重跑闸门那一趟。存的是原声，还没判过 —— 每次判都从这份干净的重新来。
+    @State private var gateSrc: [Float] = []
+    @State private var gateSrcKey = ""
+    @State private var gateBusy = false
+    @State private var gateStatus = ""
+    @State private var gateNote = ""
+    @State private var gateHz = ""
+    @State private var gateOutURL: URL?
+    @State private var showGateShare = false
     @State private var showShare = false
 
     // 读小说：文本 → 系统 TTS → 现有样本那条链（②③④）。音色仍然来自上面选中的样本。
@@ -310,9 +322,120 @@ struct ContentView: View {
             }
             .buttonStyle(.bordered)
             .disabled(isConverting || isVideoing)
-            Text("一个人说就不用开。逐块量基频，低于 120 Hz 判男声、就地清零（时间轴不动，⑤ 的口型不偏），和换成谁的音色无关。低沉女声可能被删、压着嗓子的男声可能漏网。")
+            Text("一个人说就不用开。逐块量基频，块内有声帧的 F0 中位数低于下面这条线判男声、就地清零（时间轴不动，⑤ 的口型不偏），和换成谁的音色无关。宁可漏男声不误删女声：低沉女声可能被删、压着嗓子的男声可能漏网。")
                 .font(.caption)
                 .foregroundColor(.secondary)
+
+            // 男声线从 0.1/48 起能在手机上拖了：这条线画在哪儿本来就看素材，在电脑前猜不出来。
+            HStack {
+                Text(String(format: "男声线 %.0f Hz", maleHz))
+                    .frame(width: 112, alignment: .leading)
+                Slider(value: $maleHz, in: PitchGate.maleHzRange, step: 5) { editing in
+                    if !editing { commitMaleHz() }
+                }
+                Button("回 120") {
+                    maleHz = PitchGate.maleHzDefault
+                    commitMaleHz()
+                }
+                .buttonStyle(.bordered)
+                .font(.caption)
+            }
+            .disabled(isConverting || isVideoing)
+
+            Divider()
+            HStack(spacing: 12) {
+                Button(gateBusy ? "判一下…" : "试听去男声") { runGatePreview() }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(gateBusy || busyAnywhere || (videoURL == nil && sourceURL == nil))
+                Spacer()
+                Text(gateSrcKey.isEmpty ? "素材：还没解过（第一次要点几秒）"
+                                        : "素材：\(gateSrcKey) 已存着")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+            Text("先在上面 ⑤ 选一段视频（没选就用 ① 那个源音频），点这个按钮：只把原声里被判成男声的那几段抹掉，链子一步都不走 ⇒ 第一次解音轨要几秒，之后每拖一次线再点只需 1 秒以内，当场就响。听明白哪一条线刚好把男的摘干净、又没啃到女的，就回上面点「开始换声」，用的就是屏幕上这个数。只取前 300 秒（判定只看局部，和整条跑出来一模一样）。")
+                .font(.caption)
+                .foregroundColor(.secondary)
+            if !gateStatus.isEmpty {
+                Text(gateStatus).font(.caption).foregroundColor(.secondary)
+            }
+            if !gateNote.isEmpty {
+                Text(gateNote).font(.caption).foregroundColor(.orange).textSelection(.enabled)
+            }
+            if !gateHz.isEmpty {
+                Text("每块 F0 从小到大（带 * 的是这一刀切掉的）：" + gateHz)
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                    .textSelection(.enabled)
+            }
+            if let u = gateOutURL {
+                playbackSection(url: u, headline: "试听：抹掉男声之后的原声（没换音色，时间轴和画面对得上）",
+                                share: $showGateShare)
+            }
+        }
+    }
+
+    /// 把滑块上那个数落到这台手机上。松手才写（拖的过程中每一格都写太吵），日志里也只在松手时留一行。
+    private func commitMaleHz() {
+        PitchGate.setMaleHz(maleHz)
+        VoiceJournal.line(String(format: "男声线设成 %.0f Hz（试听和真换声都用这一个数）", maleHz))
+    }
+
+    /// 拖一次线、点一次、听一次：只跑闸门那一趟（0.2 s），不进链。
+    private func runGatePreview() {
+        let isVideo = videoURL != nil
+        guard let input = isVideo ? videoURL : sourceURL else {
+            gateNote = "没素材可判：先在 ⑤ 选一段视频，或在 ① 放一段音频"
+            return
+        }
+        let key = (isVideo ? "视频 " : "音频 ") + input.lastPathComponent
+        let hz = maleHz
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+        // 毫秒：连点两次落在同一秒就会撞名，那样下面那句"删掉上一条"会把刚写好的这条一起删了。
+        let out = docs.appendingPathComponent(
+            "gate_\(Int(Date().timeIntervalSince1970 * 1000)).wav")
+        if let old = gateOutURL, old != out {
+            try? FileManager.default.removeItem(at: old)
+            gateOutURL = nil
+        }
+        gateBusy = true
+        gateNote = ""
+        gateStatus = key == gateSrcKey ? "按这条线重判…" : "解音轨（第一次，几秒）…"
+        VoiceJournal.line(String(format: "点「试听去男声」素材=%@ 男声线 %.0f Hz", key, hz))
+        let cached = gateSrc
+        Task {
+            do {
+                let src: [Float]
+                if key == gateSrcKey, !cached.isEmpty {
+                    src = cached
+                } else {
+                    src = try await VoiceEngine.loadGateSource(url: input, video: isVideo)
+                    gateSrc = src
+                    gateSrcKey = key
+                }
+                let rep = try await Task.detached(priority: .userInitiated) {
+                    try VoiceEngine.gatePreview(source: src, outWav: out)
+                }.value
+                await MainActor.run {
+                    gateOutURL = out
+                    gateBusy = false
+                    gateStatus = ""
+                    gateHz = rep.sortedLine
+                    gateNote = String(format: "线 %.0f Hz：留 %d 块／清零 %d 块＝%.1f s｜判过的 F0 最高 %.0f／最低 %.0f Hz"
+                                      + "｜素材 %@（%.0f s）｜判定 %.2f s",
+                                      rep.maleHz, rep.keptPieces, rep.droppedPieces, rep.droppedSecs,
+                                      rep.maxHz, rep.minHz, key, rep.sourceSecs, rep.wallSeconds)
+                    history = FileHistory.scan()
+                    player.play(url: out)
+                }
+            } catch {
+                await MainActor.run {
+                    gateBusy = false
+                    gateStatus = ""
+                    gateNote = "没判成：\(error.localizedDescription)"
+                    VoiceJournal.line("试听去男声失败：\(error.localizedDescription)")
+                }
+            }
         }
     }
 
@@ -1158,9 +1281,9 @@ struct ContentView: View {
         } else {
             using = "现场参考 \(refURL!.lastPathComponent)"
         }
-        VoiceJournal.line(String(format: "点「开始换声」片源=%@ 音色=%@ 音高 %+.0f 半音／去掉男声=%@",
+        VoiceJournal.line(String(format: "点「开始换声」片源=%@ 音色=%@ 音高 %+.0f 半音／去掉男声=%@（线 %.0f Hz）",
                                  input.lastPathComponent, using, semitones,
-                                 dropMale ? "开" : "关"))
+                                 dropMale ? "开" : "关", PitchGate.maleHz))
         if engine == nil { engine = VoiceEngine(modelDir: modelDir) }
         let eng = engine!
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
@@ -1363,9 +1486,9 @@ struct ContentView: View {
 
         isConverting = true
         convertStatus = "加载模型…"
-        VoiceJournal.line(String(format: "开始转换 源=%@ 音色=%@ 音高 %+.0f 半音／去掉男声=%@",
+        VoiceJournal.line(String(format: "开始转换 源=%@ 音色=%@ 音高 %+.0f 半音／去掉男声=%@（线 %.0f Hz）",
                                  inputURL.lastPathComponent, using, semitones,
-                                 dropMale ? "开" : "关"))
+                                 dropMale ? "开" : "关", PitchGate.maleHz))
         if engine == nil {
             engine = VoiceEngine(modelDir: modelDir)
         }
