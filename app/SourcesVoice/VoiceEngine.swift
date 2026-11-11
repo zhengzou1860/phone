@@ -82,8 +82,14 @@ final class VoiceEngine {
     ///
     /// `blank` 是「去掉男声」那些已经在**源**里清零的块（源域样本下标）。为什么输出侧还要再钉一次：
     /// ②③④ 不知道那一段没人说话，会从一片全零里合成出含噪的假人声——真机 0.1/43 那条几乎
-    /// 整条被清零的访谈就是这样变成「男女声都换了但含糊」的。源域到输出域按这一片的实际倍率映射，
-    /// 一片之内误差 ≤ 几毫秒，而且落在本来就该静音的地方。
+    /// 整条被清零的访谈就是这样变成「男女声都换了但含糊」的。下面每片都把自己钉回源长，
+    /// 所以这一句的映射是同一片内一对一的样本下标，不再需要倍率。
+    ///
+    /// 每片出链后为什么必须按片拉平长度：② 的出帧只能落在窗格上（每窗 20 帧 = 0.2 s），一片天生
+    /// 差 ±0.2 s，真机实测最差一片差到 0.73 s（0.1/46 日志 14:33 那趟 128.01 s → 127.28 s）。
+    /// 只在末尾做一次全局拉伸＝把误差摊到整条，于是片内中点偏 0.3~0.4 s——画面还在原处说话，
+    /// 音已经跑了（口型容差只有 ±45 ms）。按片钉死之后每片的头尾都落在源的时间上，累积误差归零，
+    /// 末尾那一次全局拉伸也就基本不再触发（skew 掉到 0.05% 以下会自己跳过）。
     static func runSegments(driver: ChainDriver, parts: ChainDriver.SampleParts,
                             source: [Float], writer: AudioProcessor.WAVWriter,
                             pitchCents: Double, blank: [(start: Int, end: Int)] = [],
@@ -113,14 +119,30 @@ final class VoiceEngine {
                            passes, Double(chunk.count) / AudioProcessor.sampleRate, totalSec))
             var shaped = PostProcessor.pitchShift(try driver.convert(source: chunk, sample: parts),
                                                   cents: pitchCents)
+            let want = end - start
+            if want > 0, shaped.count != want {
+                let r = Double(shaped.count) / Double(want)
+                if abs(r - 1.0) > 0.0005 {
+                    let gotSecs = Double(shaped.count) / AudioProcessor.sampleRate
+                    shaped = PostProcessor.timeStretch(shaped, rate: r)
+                    VoiceJournal.line(String(format: "第 %d 片按片拉平：出链 %.2f s → 钉回源长 %.2f s（倍率 %.5f）",
+                                             passes, gotSecs,
+                                             Double(want) / AudioProcessor.sampleRate, r))
+                }
+                // 拉平只能给个近似值，WSOLA 的收尾窗还会差几帧：尾巴多一刀切掉，不够就补零。
+                // 切/补的量都在毫秒级，且都落在这一片自己已经说完的部分里。
+                if shaped.count > want {
+                    shaped = Array(shaped[..<want])
+                } else {
+                    shaped.append(contentsOf: [Float](repeating: 0, count: want - shaped.count))
+                }
+            }
             if !blank.isEmpty {
-                let ratio = shaped.count > 0
-                    ? Double(shaped.count) / Double(max(1, end - start)) : 1.0
+                // 长度已按片钉回源长 ⇒ 源域下标减去这一片的片头就是输出域下标，一对一。
                 for sp in blank where sp.start < end && sp.end > start {
-                    let lo = Int((Double(max(sp.start, start) - start) * ratio).rounded())
-                    let hi = Int((Double(min(sp.end, end) - start) * ratio).rounded())
-                    var i = max(0, min(lo, shaped.count))
-                    while i < min(hi, shaped.count) {
+                    var i = max(0, sp.start - start)
+                    let hi = min(sp.end - start, shaped.count)
+                    while i < hi {
                         shaped[i] = 0
                         i += 1
                     }
