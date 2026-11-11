@@ -179,7 +179,7 @@ enum PitchGate {
         peak /= Double(n)
         if peak < 1e-8 { return 0 }                    // 这一帧没人说话
 
-        // 前缀平方和：na(lag)=√Σ_{i<n-lag} x²／nb(lag)=√Σ_{i≥lag} x²
+        // 前缀平方和：Σ_{i<n-lag} x² = csum[n−lag]，Σ_{i≥lag} x² = csum[n]−csum[lag]
         var csum = [Double](repeating: 0, count: n + 1)
         var acc = 0.0
         var i = 0
@@ -191,20 +191,26 @@ enum PitchGate {
         let hiLag = min(lagHi, n - 8)
         let cnt = hiLag - lagLo + 1
         guard cnt > 0 else { return 0 }
+        // 归一化自相关：denom = √(Σ前段² · Σ后段²)。这里不能各自取均方再相除——那样分母少一个
+        // √(lag／(n−lag))，越长的 lag 越占便宜，峰会一路滑到搜索范围上端：PC 上拿男女对话仿真的
+        // 素材试这一版，25 块全报 65~74 Hz（真值女 219~250／男 131~138），男女一起被判成男声。
+        // 八度修正只能沿 r 的高原往短 lag 退，跨不过两个峰之间的谷，救不回来。
+        // 现在这个不带倾斜的口径和 PC 上与 librosa.pyin 对拍的那把尺同一套数（probe_pitch.py）。
         var r = [Double](repeating: 0, count: cnt)
         var bestV = 0.0
         var bestLag = 0
         for idx in 0..<cnt {
             let lag = lagLo + idx
-            let na = (csum[n - lag] / Double(n - lag)).squareRoot()
-            let nb = ((csum[n] - csum[lag]) / Double(lag)).squareRoot()
-            if na < 1e-9 || nb < 1e-9 { continue }
-            var dot = 0.0
+            let denom = (csum[n - lag] * (csum[n] - csum[lag])).squareRoot()
+            if denom < 1e-9 { continue }
+            // vDSP_dotpr 只认 Float：求和用 Float，比值再升回 Double。
+            // 语音幅度下 480 项的 Float 累加误差在 1e-7 量级，离 0.30 这条有声线差着好几个数量级。
+            var dotF: Float = 0
             win.withUnsafeBufferPointer { buf in
                 vDSP_dotpr(buf.baseAddress! + lag, 1, buf.baseAddress!, 1,
-                           &dot, vDSP_Length(n - lag))
+                           &dotF, vDSP_Length(n - lag))
             }
-            let v = dot / Double(n - lag) / (na * nb)
+            let v = Double(dotF) / denom
             r[idx] = v
             if v > bestV {
                 bestV = v
