@@ -310,7 +310,7 @@ struct ContentView: View {
             }
             .buttonStyle(.bordered)
             .disabled(isConverting || isVideoing)
-            Text("一个人说就不用开。逐块量基频，低于 150 Hz 判男声、就地清零（时间轴不动，⑤ 的口型不偏），和换成谁的音色无关。低沉女声可能被删、压着嗓子的男声可能漏网。")
+            Text("一个人说就不用开。逐块量基频，低于 120 Hz 判男声、就地清零（时间轴不动，⑤ 的口型不偏），和换成谁的音色无关。低沉女声可能被删、压着嗓子的男声可能漏网。")
                 .font(.caption)
                 .foregroundColor(.secondary)
         }
