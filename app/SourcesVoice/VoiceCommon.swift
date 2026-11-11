@@ -129,10 +129,20 @@ enum VoiceFacts {
 
 enum VoiceUploader {
     /// 8712 归剪辑项目 / 8714 归 VR3D，这个 app 走自己的端口和接收文件，两边不覆盖。
-    static let endpoint = "http://192.168.31.99:8715/report"
+    static let defaultEndpoint = "http://192.168.31.99:8715/report"
+    static let endpointKey = "logEndpointURL"
+
+    /// 电脑上那台接收端在哪儿：IP 和端口都能改（存在这台手机上，下次不用重填）。
+    /// 写死过一次，代价是电脑换了路由器/IP 变了以后「发到电脑」必然超时，而日志恰恰在那种
+    /// 时候要看——所以这一个字段宁可多一个输入框，也不许再写死。
+    static var endpoint: String {
+        get { UserDefaults.standard.string(forKey: endpointKey) ?? defaultEndpoint }
+        set { UserDefaults.standard.set(newValue, forKey: endpointKey) }
+    }
 
     static func send(_ text: String) -> String {
-        guard let url = URL(string: endpoint) else { return "发送失败: 地址非法" }
+        let host = endpoint
+        guard let url = URL(string: host) else { return "发送失败: 地址非法（现在填的是 \(host)）" }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("text/plain; charset=utf-8", forHTTPHeaderField: "Content-Type")
@@ -151,7 +161,7 @@ enum VoiceUploader {
         }.resume()
 
         if done.wait(timeout: .now() + 20) == .timedOut {
-            return "发到电脑：超时 20 s 无回音（手机到 192.168.31.99:8715 不通？电脑上的 8715 接收端没开？）"
+            return "发到电脑：超时 20 s 无回音（手机到 \(host) 不通？电脑上的接收端没开？地址可在上面那格改）"
         }
         if code < 0 { return "发到电脑：失败 \(failure)" }
         return "发到电脑：HTTP \(code) 回执 \(reply)（送出 \(text.count) 字符）"

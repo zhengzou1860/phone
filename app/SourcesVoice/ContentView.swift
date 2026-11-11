@@ -34,6 +34,9 @@ struct ContentView: View {
     @State private var outputURL: URL?          // ①「转换」的成品（④ 走 novelOutURL）
     @State private var sendStatus = ""
     @State private var isSending = false
+    /// 「发到电脑」那台接收端在哪儿。以前写死在代码里，电脑 IP 一变就必然超时，
+    /// 而超时恰恰是最需要看日志的时候 ⇒ 改成能在这台手机上填、填了记住。
+    @State private var logEndpoint = VoiceUploader.endpoint
     @State private var feReport = ""
     @State private var isRunningFE = false
 
@@ -214,7 +217,7 @@ struct ContentView: View {
                     .disabled(refURL == nil || isMakingSample || isConverting || chainGate.chat
                               || srcRec.isRecording || refRec.isRecording)
             }
-            Text("样本 = 音色向量 1 KB + 150 帧 prompt mel 47 KB，做一次反复用。参考音频硬下限 1.5 s（DiT 的 prompts 钉死 150 帧），但 PC 实测像不像随样本长度单调涨：1.5 s→0.636、3 s→0.705、6 s→0.748、10.9 s→0.759（尺：同人 0.928／两人 0.089）⇒ 录 6~10 s 连续干净说话，别只录一两个字。")
+            Text("样本 = 音色向量 + prompt mel，做一次反复用。参考录 6~10 秒连续干净说话最像（1.5 秒 0.64／6 秒 0.75／10.9 秒 0.76；尺：同人 0.93／两人 0.09）。")
                 .font(.caption)
                 .foregroundColor(.secondary)
             if !makeNote.isEmpty {
@@ -307,7 +310,7 @@ struct ContentView: View {
             }
             .buttonStyle(.bordered)
             .disabled(isConverting || isVideoing)
-            Text("源里有两个人轮流说话时才用：进链之前先在停顿的地方把话切成块（每块 ≤2.5 秒），逐块过一次 ①、和选中的样本比音色余弦（门限 0.45），不像那个人说的块就地清零。清零不动时间轴，所以 ⑤ 的口型不偏。代价照实说：被清掉的块照样进链，省不下链子的时间，只多出一趟 ①——PC 上拿同一张图量到每块 0.5~0.6 秒，即每 1 分钟源多花约 15 秒（链子自己 ≈24 秒），真机上以日志「闸门」那一行的实测为准。判得开的是音色真的不一样：PC 上男↔女是同人 0.75~0.94 对对方 0.03~0.28，一刀两断；两个像的女声（或真女声对女声 TTS）能贴到 0.4~0.67，那一种会漏——漏的后果只是那句别人的声音还在，不会删错人（40 组配置扫下来，误删她自己的只占 2%）。躲不掉的另一种：换了人又完全不换气、中间不留任何低谷，那种块里两个人混着，判不准。一块都没留下＝样本选错了人，会一句话报错，不会交一条从头到尾没声音的成片。")
+            Text("源里有两个人轮流说话时才用：切块逐块比音色，不像选中那个人的就地清零（不动时间轴，⑤ 的口型不偏）。多花约 15 秒／每 1 分钟源。男↔女判得开，两个很像的女声会漏；实测秒数和逐块余弦在日志「闸门」那一行。")
                 .font(.caption)
                 .foregroundColor(.secondary)
         }
@@ -769,7 +772,7 @@ struct ContentView: View {
                     .foregroundColor(.secondary)
             }
 
-            Text("音色就用在「样本清单」里点中的那个样本（现在：\(pickedSampleNote)）；没点样本就用 ② 那段参考。嗓音是从手机自带的中文语音里挑，「试听」只外放念一句、不跑链（挑嗓音几十秒就够，别拿整章去试）。实测：系统念中文 ≈4.1 字/秒（≈5.5× 实时），链子 ≈2.5× 实时 ⇒ 6000 字一章约 25 分钟音频、整趟约 12 分钟。念满 120 秒就整片过链子、**转完立刻写盘**，常驻内存只有那一片，所以整章多长都不会撑；上限不再是 30 分钟而变成这台机剩下的盘（两条 wav 每秒共占 64 KB，另留 1 GB 余量），不够会一行话告诉你，不闪退。")
+            Text("音色用「样本清单」里点中的那个，没点就用 ② 那段参考；嗓音从手机自带的中文语音里挑，「试听」只外放念一句、不跑链。实测链子 ≈2.5× 实时 ⇒ 6000 字一章约 12 分钟。整片过链、转完立刻写盘，所以章多长都不撑内存，上限只剩这台机剩下的盘。")
                 .font(.caption)
                 .foregroundColor(.secondary)
 
@@ -975,12 +978,6 @@ struct ContentView: View {
         }
     }
 
-    private var pickedSampleNote: String {
-        if let p = samples.first(where: { $0.id == pickedID }) { return "样本「\(p.info.name)」" }
-        if refURL != nil { return "② 那段参考" }
-        return "还没选"
-    }
-
     private func startReading() {
         guard let modelDir = models.modelDir else { return }
         let fromFile = novelFileURL != nil
@@ -1094,7 +1091,7 @@ struct ContentView: View {
                     .foregroundColor(.orange)
             }
 
-            Text("音轨解出来进的就是上面 ①②③④ 那条链，和「转换」「读小说」同一套分段规矩（一遍 ≤150 s，切在最小声的一格）；音高那格同样生效。实测单价：链子 ≈2.5× 实时 ⇒ 60 s 视频约 24 s 链子＋几秒回写。画面走**透传**：不解码不重编，时间戳一个数都不改，所以口型不会漂；成片体积 ≈ 输入那条另加每秒 8 KB 的新 AAC。链子的输出比源长 +0.15%（PC 试点量的），所以后面有一步「整条拉回源长」，40 s 以上的片子不拉就会累积漂 0.06 s。上限取盘和内存更紧的一条（中间 wav 每秒共占 72 KB、另留 1 GB 余量，内存那条 ≈33 分钟），不够会开跑之前一行话拒掉，不写一半把盘填满。中间那两份 wav 跑成即删；成品留在 app 目录（「文件」app 的 Voice 里点开就能看），要收进相册就用「导出」。")
+            Text("音轨解出来走的就是上面 ①②③④ 那条链，音高那格同样生效。实测单价 ≈2.5× 实时 ⇒ 60 秒视频约 24 秒链子＋几秒回写。画面走透传（不解码不重编、时间戳一个数都不改），所以口型不漂；成片体积 ≈ 输入那条另加音频。开跑前先按盘和内存（≈33 分钟）算一遍，不够就一行话拒掉。")
                 .font(.caption)
                 .foregroundColor(.secondary)
 
@@ -1228,10 +1225,10 @@ struct ContentView: View {
                     .foregroundColor(.secondary)
             }
 
-            Text("问话走局域网到电脑上那个「AI Local Model Manager」代理（它再转给本机 llama-server）：手机这边不装任何语言模型，也不往云上发一个字节。页面和电脑上那个聊天页一样 —— 模型清单、Stream、思考、🔍 联网、📎 附件（图片/文本，也能从相册挑、粘贴截图）、复制、＋ 新开会话；多出来的只有「音色」和「语音回复」两项。回答念出来走的就是 ④ 那条链（系统朗读 → ②③④），所以一样要等载图；两边共用一套图，⑥ 在念时上面那四条一律不给按，反过来也一样。")
+            Text("问话走局域网到电脑上那个「AI Local Model Manager」代理（它再转给本机 llama-server）：手机不装语言模型，也不往云上发一个字节。页面和电脑上那个聊天页一样，多的只有「音色」和「语音回复」；念回答走的就是 ④ 那条链，所以 ⑥ 在念时上面四条不给按，反过来也一样。")
                 .font(.caption)
                 .foregroundColor(.secondary)
-            Text("先决条件：手机和电脑在同一个局域网，电脑上那个代理起着（start.bat，端口 8000、监听 0.0.0.0），聊天页第一行把地址填成 http://<电脑IP>:8000 再点「测试」。第一次连会弹一句「允许访问本地网络吗」——那是 iOS 14 起对直连局域网主机也要问的，点允许；点了不允许就连不上，去 设置 → 隐私与安全性 → 本地网络 里把 LiveContainer 打开。地址、模型、音色、语音回复开关都记在这台手机上，下次不用重填。念出来的成品叫 chat_<时间>.wav，留在 app 目录、在「历史文件」页能删；会话副本是 Documents/chat_feed.json，由聊天页里「＋ 新开会话」清（连那些 wav 一起收）。")
+            Text("先决条件：手机和电脑在同一个局域网，电脑上那个代理起着（start.bat，端口 8000），聊天页第一行把地址填成 http://<电脑IP>:8000 再点「测试」。第一次连会问「允许访问本地网络吗」，点允许；不让就去 设置 → 隐私与安全性 → 本地网络 里把 LiveContainer 打开。地址、模型、音色、语音回复都记在这台手机上，下次不用重填。")
                 .font(.caption)
                 .foregroundColor(.secondary)
         }
@@ -1437,6 +1434,20 @@ struct ContentView: View {
             }
             .buttonStyle(.bordered)
             .disabled(isSending)
+            HStack(spacing: 6) {
+                Text("接收端地址")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                TextField("http://<电脑IP>:8715/report", text: $logEndpoint)
+                    .font(.caption)
+                    .textFieldStyle(.roundedBorder)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled(true)
+                    .onSubmit { saveLogEndpoint() }
+                Button("存") { saveLogEndpoint() }
+                    .font(.caption)
+                    .buttonStyle(.bordered)
+            }
             if !sendStatus.isEmpty {
                 Text(sendStatus)
                     .font(.caption)
@@ -1463,6 +1474,18 @@ struct ContentView: View {
                 isRunningFE = false
             }
         }
+    }
+
+    private func saveLogEndpoint() {
+        let trimmed = logEndpoint.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.range(of: #"^https?://"#, options: .regularExpression) != nil else {
+            sendStatus = "接收端地址得带 http://（现在填的是「\(trimmed)」，没存）"
+            VoiceJournal.line("存接收端地址被拒：\(trimmed)")
+            return
+        }
+        VoiceUploader.endpoint = trimmed
+        sendStatus = "已存：\(trimmed)"
+        VoiceJournal.line("接收端地址 → \(trimmed)")
     }
 
     private func sendReport() {
