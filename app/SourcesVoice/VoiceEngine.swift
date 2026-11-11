@@ -399,7 +399,7 @@ final class VoiceEngine {
             }
             guard let won = mux else {
                 let tried = VideoClip.candidates.map { $0.name }.joined(separator: "、")
-                throw ChainError.input("四组口径全配不出来（试过 \(tried)）｜最后一句：\(lastErr)")
+                throw ChainError.input("\(VideoClip.candidates.count) 组口径全配不出来（试过 \(tried)）｜最后一句：\(lastErr)")
             }
             if landed.path != outputVideo.path {
                 try? FileManager.default.removeItem(at: outputVideo)

@@ -9,7 +9,7 @@ import CoreMedia
 /// 原样把码流块交给 muxer（`outputSettings: nil` + 轨自己的 formatDescriptions 当提示）。
 /// 同一棵树上的换脸线已经拿这套写法在真机把音频原样搬通过（app/SourcesSwap/SwapClip.swift:347-378），
 /// 那里音频是透传、画面是重编；这里反过来。反过来这一半真机上没验过，所以不在一种口径上押死：
-/// 容器（mp4／mov）× 音轨（AAC／原样 PCM）四组按兼容性从好到差挨个试，成哪组用哪组。
+/// 容器（mp4／mov）× 音轨（AAC 三种采样率／原样 PCM 保底）按兼容性从好到差挨个试，成哪组用哪组。
 /// `canAdd` 只回答「加不加得进去」，配不出来是跑到一半的事 ⇒ 每组的失败都带 domain#code 进日志。
 ///
 /// 音频读的是 `withAudioBufferList`：AVFoundation 在闭包里给一份**保证连续**的 AudioBufferList，
@@ -156,12 +156,20 @@ enum VideoClip {
         let audioSettings: [String: Any]
     }
 
-    static let aacSettings: [String: Any] = [
-        AVFormatIDKey: kAudioFormatMPEG4AAC,
-        AVSampleRateKey: AudioProcessor.sampleRate,
-        AVNumberOfChannelsKey: 1,
-        AVEncoderBitRateKey: 64_000,
-    ]
+    /// AAC 的输出口径，采样率单独给。
+    ///
+    /// 0.1/32 那趟真机上 AAC 没赢，而 `canAdd 为假` 那句报错点名的是「16k 单声道这条音轨」——
+    /// Apple 的 AAC 编码器在极低采样率上一向不稳，16 kHz 正好压在边上。链子写出的 wav 仍是 16k，
+    /// 抬到 44.1k 的重采样发生在 writer 内部（`AVAssetWriterInput(outputSettings:)` 吃任意输入），
+    /// 所以中间文件、口型对齐、`fitWav` 的长度都不用动。
+    static func aacSettings(_ rate: Double) -> [String: Any] {
+        [
+            AVFormatIDKey: kAudioFormatMPEG4AAC,
+            AVSampleRateKey: rate,
+            AVNumberOfChannelsKey: 1,
+            AVEncoderBitRateKey: 64_000,
+        ]
+    }
 
     /// 不编音轨：样本原样进容器。真机上「编音轨」这一格从没通过（换脸线是原样透传旧音轨、
     /// VR 线只编画面），所以留这条退路。
@@ -175,12 +183,17 @@ enum VideoClip {
         AVLinearPCMIsBigEndianKey: false,
     ]
 
-    /// 按「他拿去播的兼容性」从好到差排：mp4 在前，AAC 在前。0.1/32 那一跑死在
-    /// `writer failed Cannot Encode Media`，日志分不出是容器不收这条画面码流还是音轨编码器起不来
-    /// ⇒ 一趟里挨个试这四组，成哪组用哪组，每组失败的 domain#code 都留在日志里当判决。
+    /// 按「他拿去播的兼容性」从好到差排。0.1/32 那一跑死在 `writer failed Cannot Encode Media`，
+    /// 日志分不出是容器不收这条画面码流还是音轨编码器起不来 ⇒ 一趟里挨个试，成哪组用哪组，
+    /// 每组失败的 domain#code 都留在日志里当判决。
+    ///
+    /// PCM 那两组只当保底：装进 mp4 合法（`ipcm`/`sowt`）但冷门，微信/抖音上传、浏览器
+    /// `<video>`、多数剪辑软件不认或干脆静音 —— 所以 AAC 三条排在前面，能编成 AAC 就绝不用 PCM。
+    /// 44.1k 是主攻，16k 那条留着：万一某台机只认链子原生的采样率，它还能接住。
     static let candidates: [MuxCfg] = [
-        MuxCfg(name: "mp4+AAC", ext: "mp4", fileType: .mp4, audioSettings: aacSettings),
-        MuxCfg(name: "mov+AAC", ext: "mov", fileType: .mov, audioSettings: aacSettings),
+        MuxCfg(name: "mp4+AAC44100", ext: "mp4", fileType: .mp4, audioSettings: VideoClip.aacSettings(44_100)),
+        MuxCfg(name: "mov+AAC44100", ext: "mov", fileType: .mov, audioSettings: VideoClip.aacSettings(44_100)),
+        MuxCfg(name: "mp4+AAC16000", ext: "mp4", fileType: .mp4, audioSettings: VideoClip.aacSettings(16_000)),
         MuxCfg(name: "mp4+PCM", ext: "mp4", fileType: .mp4, audioSettings: pcmSettings),
         MuxCfg(name: "mov+PCM", ext: "mov", fileType: .mov, audioSettings: pcmSettings),
     ]
@@ -249,8 +262,9 @@ enum VideoClip {
         wReader.add(aOut)
         let ain = AVAssetWriterInput(mediaType: .audio, outputSettings: cfg.audioSettings)
         ain.expectsMediaDataInRealTime = false
+        let wantRate = (cfg.audioSettings[AVSampleRateKey] as? Double) ?? 0
         guard writer.canAdd(ain) else {
-            throw ChainError.input("canAdd 为假［\(cfg.name)］：16k 单声道这条音轨输出本机不收"
+            throw ChainError.input("canAdd 为假［\(cfg.name)］：\(Int(wantRate)) Hz 单声道这条音轨输出本机不收"
                                    + "｜\(errText(writer.error))")
         }
         writer.add(ain)
