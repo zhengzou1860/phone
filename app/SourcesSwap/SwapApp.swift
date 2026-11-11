@@ -933,7 +933,10 @@ struct SwapPreviewFull: View {
             ZStack {
                 Color.black
                 if let im = pv.img {
-                    Image(uiImage: im).resizable().scaledToFit()
+                    // 整幅左右眼拉满整个屏面（不保比例）：VR3D 那一档就是 videoGravity = .resize，
+                    // 每半幅正好占半个屏、上下到底。保比例的 scaledToFit 会留上下大黑边，
+                    // 镜片里看到的小一圈；拉满后剩下的形变由「一起移／间距／鱼眼」那三条对着镜片调。
+                    Image(uiImage: im).resizable()
                 } else {
                     Text(block.isEmpty ? (pv.on ? "开跑了，第一格要等两张网装好" : "（还没开）") : block)
                         .font(.footnote).foregroundColor(.gray)
@@ -941,6 +944,7 @@ struct SwapPreviewFull: View {
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .ignoresSafeArea()
             .contentShape(Rectangle())
             .onTapGesture { tap() }
 
