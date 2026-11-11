@@ -62,16 +62,31 @@ struct ContentView: View {
     @State private var dropMale = (UserDefaults.standard.object(forKey: "gateDropMale") as? Bool) ?? false
     /// 男声线画在哪儿（Hz）。`PitchGate.maleHz` 是这块屏幕唯一的出口：试听和真换声读同一个数。
     @State private var maleHz = PitchGate.maleHz
-    /// 「试听去男声」的素材：解一次音轨存着（最长 300 s，见 `VoiceEngine.gatePreviewMaxSecs`），
-    /// 拖一次线只重跑闸门那一趟。存的是原声，还没判过 —— 每次判都从这份干净的重新来。
-    @State private var gateSrc: [Float] = []
-    @State private var gateSrcKey = ""
+    /// 一条素材的音轨在内存里只存一份，「试听去男声」和「提取台词」共用：
+    /// 要听的往往就是要改的那几句。`audioSrcCap` 记下这一份是按多长的上限解的。
+    @State private var audioSrc: [Float] = []
+    @State private var audioSrcKey = ""
+    @State private var audioSrcCap = 0.0
+    @State private var audioStatus = ""
     @State private var gateBusy = false
-    @State private var gateStatus = ""
     @State private var gateNote = ""
     @State private var gateHz = ""
     @State private var gateOutURL: URL?
     @State private var showGateShare = false
+
+    /// 「改台词重配」那一格：提取出来的台词（可编辑）、听写状态、重配状态和成片。
+    @State private var videoScript = ""
+    @State private var asrBusy = false
+    @State private var asrStatus = ""
+    @State private var asrNote = ""
+    @State private var dubBusy = false
+    @State private var dubStatus = ""
+    @State private var dubNote = ""
+    @State private var dubOutURL: URL?
+    @State private var showDubShare = false
+    /// 「提取台词」要的整条长度上限。听写按 1.5× 实时喂，所以这条同时也是要等多久：
+    /// 15 分钟素材 ⇒ 解音轨几秒 + 听写约 10 分钟。真机嫌慢就把这段剪短，或自己打字。
+    static let asrMaxSecs = 900.0
     @State private var showShare = false
 
     // 读小说：文本 → 系统 TTS → 现有样本那条链（②③④）。音色仍然来自上面选中的样本。
@@ -114,28 +129,11 @@ struct ContentView: View {
 
     var body: some View {
         NavigationView {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 20) {
-                    modelSection
-                    if case .downloaded = models.state {
-                        audioSlot("① 源音频（要转换的那段）", rec: srcRec,
-                                  url: $sourceURL, slot: .source)
-                        refSlot
-                        sampleList
-                        paramSection
-                        if !pickNote.isEmpty {
-                            Text(pickNote).font(.caption).foregroundColor(.secondary)
-                        }
-                        convertSection
-                        novelSection
-                        videoSection
-                        chatSection
-                    }
-                    // 放在 if 外面：模型没下（或像 0.1/24 那样被误删）时，留下的录音照样要能删。
-                    historySection
-                    debugSection
-                }
-                .padding()
+            TabView {
+                soundTab
+                    .tabItem { Label("声音", systemImage: "waveform") }
+                videoTab
+                    .tabItem { Label("视频", systemImage: "film") }
             }
             .navigationTitle("声音克隆 \(appVersion())")
             .onAppear {
@@ -153,13 +151,82 @@ struct ContentView: View {
         .fullScreenCover(item: $pickSlot) { slot in
             coverPage(slot)
         }
+        // 「试听去男声」那一格在两个标签里各铺一份（`paramSection`），所以它的导出面板挂在这儿、只挂一次：
+        // 两份各挂一个面板 ⇒ 点「导出」时弹的是哪一份全看 SwiftUI（屏幕外那份弹出来就是点了没反应）。
+        .sheet(isPresented: $showGateShare) {
+            if let u = gateOutURL {
+                ShareSheet(items: [u],
+                           onDismiss: { showGateShare = false },
+                           onPresent: {
+                    VoiceJournal.line("导出面板已弹起（可「存储到“文件”」）")
+                })
+            } else {
+                Text("试听那一条已经不在了：重跑一次「试听去男声」")
+                    .padding()
+                    .onAppear { showGateShare = false }
+            }
+        }
         // ⑥ 那一页看不见这边的 @State，所以主页面这四条一开跑就把互斥位写过去
         .onChange(of: localChainBusy) { chainGate.main = localChainBusy }
     }
 
-    /// 链子这一头（① 转换／② 生成样本／④ 读小说／⑤ 视频）在不在跑。录音不算：那条不载图。
+    /// 链子这一头（① 转换／② 生成样本／④ 读小说／⑤ 视频／⑤ 改台词重配）在不在跑。录音不算：那条不载图。
     private var localChainBusy: Bool {
-        isConverting || isMakingSample || isReading || isVideoing
+        isConverting || isMakingSample || isReading || isVideoing || dubBusy
+    }
+
+    /// 「声音」标签：模型、①② 两个槽、样本清单、旋钮、① 转换、④ 读小说、⑥ 聊天，
+    /// 加上下面的历史文件／日志两格（这两格不分标签 —— 模型没下好时留下的录音照样要能删）。
+    @ViewBuilder
+    private var soundTab: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 20) {
+                modelSection
+                if case .downloaded = models.state {
+                    audioSlot("① 源音频（要转换的那段）", rec: srcRec,
+                              url: $sourceURL, slot: .source)
+                    refSlot
+                    sampleList
+                    paramSection
+                    if !pickNote.isEmpty {
+                        Text(pickNote).font(.caption).foregroundColor(.secondary)
+                    }
+                    convertSection
+                    novelSection
+                    chatSection
+                }
+                // 放在 if 外面：模型没下（或像 0.1/24 那样被误删）时，留下的录音照样要能删。
+                historySection
+                debugSection
+            }
+            .padding()
+        }
+    }
+
+    /// 「视频」标签：⑤ 视频换声和新的「改台词重配」都在这儿。
+    /// 样本清单和那三个旋钮（音高／去男声／男声线）在这里再铺一遍 —— 换声和配音用的就是这两格里的选择，
+    /// 让人在两个标签之间来回跳着找「我刚才那条线拖到哪儿了」是找不自在的。
+    /// 它们是同一份 `@State`（`semitones`／`dropMale`／`maleHz`／`pickedID`），所以两边永远是一个数。
+    @ViewBuilder
+    private var videoTab: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 20) {
+                if case .downloaded = models.state {
+                    sampleList
+                    paramSection
+                    if !pickNote.isEmpty {
+                        Text(pickNote).font(.caption).foregroundColor(.secondary)
+                    }
+                    videoSection
+                    dubSection
+                } else {
+                    Text("模型还没下好：换声和配音都要用它。去「声音」标签第一格点「下载模型」（581 MB）。")
+                        .font(.body)
+                        .foregroundColor(.secondary)
+                }
+            }
+            .padding()
+        }
     }
 
     /// 一个呈现七种内容：`.chat` 是 ⑥ 那一整页、`.voice` 是自己铺的嗓音清单、`.history` 是自己铺的历史文件清单、
@@ -348,16 +415,16 @@ struct ContentView: View {
                     .buttonStyle(.borderedProminent)
                     .disabled(gateBusy || busyAnywhere || (videoURL == nil && sourceURL == nil))
                 Spacer()
-                Text(gateSrcKey.isEmpty ? "素材：还没解过（第一次要点几秒）"
-                                        : "素材：\(gateSrcKey) 已存着")
+                Text(audioSrcKey.isEmpty ? "素材：还没解过（第一次要点几秒）"
+                                         : "素材：\(audioSrcKey) 已存着")
                     .font(.caption)
                     .foregroundColor(.secondary)
             }
-            Text("先在上面 ⑤ 选一段视频（没选就用 ① 那个源音频），点这个按钮：只把原声里被判成男声的那几段抹掉，链子一步都不走 ⇒ 第一次解音轨要几秒，之后每拖一次线再点只需 1 秒以内，当场就响。听明白哪一条线刚好把男的摘干净、又没啃到女的，就回上面点「开始换声」，用的就是屏幕上这个数。只取前 300 秒（判定只看局部，和整条跑出来一模一样）。")
+            Text("先在「视频」标签选一段视频（没选就用「声音」标签 ① 那段音频），点这个按钮：只把原声里被判成男声的那几段抹掉，链子一步都不走 ⇒ 第一次解音轨要几秒，之后每拖一次线再点只需 1 秒以内，当场就响。听明白哪一条线刚好把男的摘干净、又没啃到女的，就点「开始换声」（视频标签）或「开始转换」（声音标签），两条用的都是屏幕上这一个数。只取前 300 秒（判定只看局部，和整条跑出来一模一样）。")
                 .font(.caption)
                 .foregroundColor(.secondary)
-            if !gateStatus.isEmpty {
-                Text(gateStatus).font(.caption).foregroundColor(.secondary)
+            if !audioStatus.isEmpty {
+                Text(audioStatus).font(.caption).foregroundColor(.secondary)
             }
             if !gateNote.isEmpty {
                 Text(gateNote).font(.caption).foregroundColor(.orange).textSelection(.enabled)
@@ -369,8 +436,8 @@ struct ContentView: View {
                     .textSelection(.enabled)
             }
             if let u = gateOutURL {
-                playbackSection(url: u, headline: "试听：抹掉男声之后的原声（没换音色，时间轴和画面对得上）",
-                                share: $showGateShare)
+                playbackSlot(url: u, headline: "试听：抹掉男声之后的原声（没换音色，时间轴和画面对得上）",
+                             share: $showGateShare)
             }
         }
     }
@@ -381,11 +448,25 @@ struct ContentView: View {
         VoiceJournal.line(String(format: "男声线设成 %.0f Hz（试听和真换声都用这一个数）", maleHz))
     }
 
+    /// 一条素材的音轨只解一次，存着给「试听去男声」和「提取台词」共用。
+    /// 要的长度比存着的长 ⇒ 重解（听写要整条，试听只要前 300 s）。
+    private func audioCache(url: URL, video: Bool, capSecs: Double) async throws -> [Float] {
+        let key = (video ? "视频 " : "音频 ") + url.lastPathComponent
+        if key == audioSrcKey, capSecs <= audioSrcCap, !audioSrc.isEmpty { return audioSrc }
+        audioStatus = "解音轨（第一次，几秒）…"
+        let got = try await VoiceEngine.loadAudioSource(url: url, video: video, maxSecs: capSecs)
+        audioSrc = got
+        audioSrcKey = key
+        audioSrcCap = capSecs
+        audioStatus = ""
+        return got
+    }
+
     /// 拖一次线、点一次、听一次：只跑闸门那一趟（0.2 s），不进链。
     private func runGatePreview() {
         let isVideo = videoURL != nil
         guard let input = isVideo ? videoURL : sourceURL else {
-            gateNote = "没素材可判：先在 ⑤ 选一段视频，或在 ① 放一段音频"
+            gateNote = "没素材可判：先在「视频」标签选一段视频，或在 ① 放一段音频"
             return
         }
         let key = (isVideo ? "视频 " : "音频 ") + input.lastPathComponent
@@ -400,26 +481,17 @@ struct ContentView: View {
         }
         gateBusy = true
         gateNote = ""
-        gateStatus = key == gateSrcKey ? "按这条线重判…" : "解音轨（第一次，几秒）…"
         VoiceJournal.line(String(format: "点「试听去男声」素材=%@ 男声线 %.0f Hz", key, hz))
-        let cached = gateSrc
         Task {
             do {
-                let src: [Float]
-                if key == gateSrcKey, !cached.isEmpty {
-                    src = cached
-                } else {
-                    src = try await VoiceEngine.loadGateSource(url: input, video: isVideo)
-                    gateSrc = src
-                    gateSrcKey = key
-                }
+                let src = try await audioCache(url: input, video: isVideo,
+                                               capSecs: VoiceEngine.gatePreviewMaxSecs)
                 let rep = try await Task.detached(priority: .userInitiated) {
                     try VoiceEngine.gatePreview(source: src, outWav: out)
                 }.value
                 await MainActor.run {
                     gateOutURL = out
                     gateBusy = false
-                    gateStatus = ""
                     gateHz = rep.sortedLine
                     gateNote = String(format: "线 %.0f Hz：留 %d 块／清零 %d 块＝%.1f s｜判过的 F0 最高 %.0f／最低 %.0f Hz"
                                       + "｜素材 %@（%.0f s）｜判定 %.2f s",
@@ -431,10 +503,234 @@ struct ContentView: View {
             } catch {
                 await MainActor.run {
                     gateBusy = false
-                    gateStatus = ""
                     gateNote = "没判成：\(error.localizedDescription)"
                     VoiceJournal.line("试听去男声失败：\(error.localizedDescription)")
                 }
+            }
+        }
+    }
+
+    /// 「提取台词」：整条音轨喂给系统本机听写，认出来的字进编辑器。
+    ///
+    /// 每次都盖掉编辑器里现在那一份 —— 改到一半重听会丢字，所以旧那一份先落在日志里（发到你电脑上），
+    /// 找回来的路子是日志，不靠界面记着。
+    private func runASR() {
+        let isVideo = videoURL != nil
+        guard let input = isVideo ? videoURL : sourceURL else {
+            asrNote = "没素材可提：先在「视频」标签选一段视频，或在 ① 放一段音频"
+            return
+        }
+        let key = (isVideo ? "视频 " : "音频 ") + input.lastPathComponent
+        asrBusy = true
+        asrNote = ""
+        asrStatus = "准备听写…"
+        VoiceJournal.line("点「提取台词」素材=\(key)")
+        let oldScript = videoScript
+        Task {
+            do {
+                let src = try await audioCache(url: input, video: isVideo, capSecs: ContentView.asrMaxSecs)
+                let r = try await SpeechText.transcribe(samples: src) { txt in
+                    DispatchQueue.main.async { asrStatus = txt }
+                }
+                await MainActor.run {
+                    asrBusy = false
+                    asrStatus = ""
+                    if !oldScript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        VoiceJournal.line("提台词覆盖了编辑器里原来那份（\(oldScript.count) 字）：\(oldScript)")
+                    }
+                    videoScript = r.text
+                    asrNote = String(format: "认出 %d 字／源 %.0f s／墙钟 %.0f s（%@）｜下面直接改，改完点「按新词配音并回写」",
+                                     r.chars, r.sourceSecs, r.wallSeconds,
+                                     r.onDevice ? "本机识别" : "这一趟走了需要联网那头")
+                    saveScript(scriptKey(input, isVideo))
+                }
+            } catch {
+                await MainActor.run {
+                    asrBusy = false
+                    asrStatus = ""
+                    asrNote = "没提出来：\(error.localizedDescription)"
+                    VoiceJournal.line("提取台词失败：\(error.localizedDescription)")
+                }
+            }
+        }
+    }
+
+    /// 稿子按素材名存在这台手机上：解说什么中途退出 app 不用重听一遍（听写是按实时的）。
+    /// 这个键就是存进 `UserDefaults` 的那一个键，三处（存、取、配音前再存一次）必须同一个算法。
+    private func scriptKey(_ url: URL, _ video: Bool) -> String {
+        "dubScript:" + (video ? "v" : "a") + url.lastPathComponent
+    }
+
+    private func saveScript(_ key: String) {
+        UserDefaults.standard.set(videoScript, forKey: key)
+    }
+
+    /// 「按新词配音并回写」：改过的字 → ④ 那条（系统朗读 → ②③④）→ 装回原来那条画面。
+    private func startDub() {
+        guard let input = videoURL else {
+            dubNote = "这一条要选视频（画面照原样透传，只把声音换成念新词的那一份）"
+            return
+        }
+        let picked = samples.first { $0.id == pickedID }
+        guard picked != nil || refURL != nil else {
+            dubNote = "先在样本清单点一个样本（或让 ② 有段参考音频）"
+            return
+        }
+        let text = videoScript.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else {
+            dubNote = "稿子是空的：先点「提取台词」，或者自己打几句"
+            return
+        }
+        guard let modelDir = models.modelDir else {
+            dubNote = "模型还没下好（去「声音」标签第一格）"
+            return
+        }
+        let using = picked != nil ? "样本「\(picked!.info.name)」" : "现场参考 \(refURL!.lastPathComponent)"
+        dubBusy = true
+        dubNote = ""
+        dubStatus = "念稿…"
+        dubOutURL = nil
+        VoiceJournal.line(String(format: "点「按新词配音并回写」片源=%@ 音色=%@ 稿子 %d 字／音高 %+.0f 半音",
+                                 input.lastPathComponent, using, text.count, semitones))
+        if engine == nil { engine = VoiceEngine(modelDir: modelDir) }
+        let eng = engine!
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+        let output = docs.appendingPathComponent("dub_\(Int(Date().timeIntervalSince1970)).mp4")
+        let key = scriptKey(input, true)
+        let t0 = Date()
+        saveScript(key)
+        Task {
+            do {
+                let r = try await eng.dubVideo(inputVideo: input,
+                                               text: text,
+                                               sample: picked,
+                                               refWav: picked != nil ? nil : refURL,
+                                               outputVideo: output,
+                                               pitchCents: semitones * 100.0,
+                                               voiceID: voiceID.isEmpty ? nil : voiceID,
+                                               onStage: { txt in
+                    DispatchQueue.main.async { dubStatus = txt }
+                })
+                let wall = Date().timeIntervalSince(t0)
+                await MainActor.run {
+                    dubOutURL = r.outURL
+                    dubBusy = false
+                    history = FileHistory.scan()
+                    dubNote = String(format: "%d 字 → 朗读 %.0f s → 链子 %.0f s／画面到 %.0f s｜补静音 %.0f s／超出丢掉 %.0f s"
+                                      + "｜成片 %@（口径 \(r.mux.cfgName)／%.1f MB／墙钟 %.0f s）",
+                                      r.textChars, r.tts.seconds, r.dubSecs, r.picEnd,
+                                      r.padSecs, r.overSecs, r.outURL.lastPathComponent,
+                                      Double(r.mux.bytes) / 1_048_576, wall)
+                    dubStatus = "重配完成"
+                    VoiceJournal.line("重配界面收尾：\(dubNote)")
+                }
+            } catch {
+                await MainActor.run {
+                    dubBusy = false
+                    dubStatus = "失败：\(error.localizedDescription)"
+                    dubNote = "没配成，原因在上面那一行。中间那两份 wav 会留在盘上，下一趟开跑先扫掉，也可以在「历史文件」页删。"
+                    history = FileHistory.scan()
+                    VoiceJournal.line("重配失败：\(error.localizedDescription)")
+                }
+            }
+        }
+    }
+
+    /// 开跑前把账摊在按钮旁边：画面多长、这份稿子大概念多长、差多少。
+    private var dubEstimateLine: String {
+        guard let i = videoProbe else { return "还没选视频" }
+        let pic = i.videoStart + i.videoSecs
+        let n = videoScript.trimmingCharacters(in: .whitespacesAndNewlines).count
+        let secs = Double(n) / 4.1
+        return String(format: "画面 %.0f s｜稿子 %d 字 ≈ 念 %.0f s（差 %+.0f s）", pic, n, secs, secs - pic)
+    }
+
+    @ViewBuilder
+    private var dubSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("改台词重配（把视频里那个人说的话改成别的，口型不管）").font(.headline)
+
+            HStack(spacing: 12) {
+                Button(asrBusy ? "听写中…" : "提取台词") { runASR() }
+                    .buttonStyle(.bordered)
+                    .disabled(asrBusy || busyAnywhere || (videoURL == nil && sourceURL == nil))
+                Button("清空稿子") { videoScript = "" }
+                    .buttonStyle(.bordered)
+                    .font(.caption)
+                Spacer()
+                Text(dubEstimateLine)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+
+            Text("「提取台词」走系统自带的本机听写（不下载任何模型，包一个字节都不长）：把音轨一段一段喂给它认字，按 1.5× 实时 ⇒ 5 分钟素材要等 3~4 分钟。认出来的字不一定全对（听写本来就有别字、专有名词容易错），所以下面直接改成你要说的。听写包没装／不给权限会一行话说明去哪儿开；实在不行自己打字也一样能配音。")
+                .font(.caption)
+                .foregroundColor(.secondary)
+            Text("改完点「按新词配音并回写」：这几句字走 ④ 那条（系统朗读 → ②③④ 换成选中样本的音色），再装回原来那条画面（画面一个像素不动、透传）。字数和原来不一样 ⇒ 声音长度必然和画面对不齐，这一条就是不管口型；新声比画面短就补静音到画面末尾，比画面长的那一截被回写丢掉（上面那行「差」就是这一头的账）。音色、音高、去男声用的还是上面那几格。")
+                .font(.caption)
+                .foregroundColor(.secondary)
+            if !asrStatus.isEmpty {
+                Text(asrStatus).font(.caption).foregroundColor(.secondary)
+            }
+            if !asrNote.isEmpty {
+                Text(asrNote).font(.caption).foregroundColor(.orange).textSelection(.enabled)
+            }
+
+            // 编辑器：稿子在这儿改。切到别的标签不丢（同一个 @State），退出 app 靠下面那条存回这台手机。
+            TextEditor(text: $videoScript)
+                .frame(minHeight: 220)
+                .font(.body)
+                .overlay(RoundedRectangle(cornerRadius: 6).stroke(.secondary.opacity(0.4)))
+
+            HStack(spacing: 12) {
+                Button(dubBusy ? "重配中…" : "按新词配音并回写") { startDub() }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(dubBusy || busyAnywhere || videoURL == nil
+                              || videoScript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                              || (pickedID == nil && refURL == nil)
+                              || models.modelDir == nil)
+                Spacer()
+                Text(videoURL == nil ? "这一条必须选视频" : "稿子改好就能点")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+            Text("稿子按素材名记在这台手机上：中途退出再进来还在（切标签本来就不丢）。")
+                .font(.caption2)
+                .foregroundColor(.secondary)
+            if !dubStatus.isEmpty {
+                Text(dubStatus)
+                    .font(.caption)
+                    .foregroundColor(dubBusy ? .secondary : .accentColor)
+                    .textSelection(.enabled)
+            }
+            if !dubNote.isEmpty {
+                Text(dubNote).font(.caption).foregroundColor(.orange).textSelection(.enabled)
+            }
+
+            if let out = dubOutURL {
+                HStack(spacing: 12) {
+                    Button {
+                        VoiceJournal.line("点「导出重配成片」 \(out.lastPathComponent)")
+                        showDubShare = true
+                    } label: {
+                        Label("导出成片", systemImage: "square.and.arrow.up")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    Text("放不进界面里，用「导出」存进相册或「文件」")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
+                .sheet(isPresented: $showDubShare) {
+                    ShareSheet(items: [out],
+                               onDismiss: { showDubShare = false },
+                               onPresent: {
+                        VoiceJournal.line("重配导出面板已弹起")
+                    })
+                }
+                Text(out.path)
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                    .textSelection(.enabled)
             }
         }
     }
@@ -541,6 +837,13 @@ struct ContentView: View {
             pickNote = "这一条读不出内容：" + dest.lastPathComponent + "／" + info.line
             VoiceJournal.line("相册视频 \(original) → \(dest.lastPathComponent)：\(info.line)（当没选到）")
             return nil
+        }
+        // 换片就把稿子换成这一片自己那份：手上那一先按上一个片名存回去（改到一半换片不该丢），
+        // 这一片以前听过写过的照原样拿回来 —— 不然每次选同一段都要重听一遍写。
+        if let prev = videoURL { saveScript(scriptKey(prev, true)) }
+        videoScript = UserDefaults.standard.string(forKey: scriptKey(dest, true)) ?? ""
+        if !videoScript.isEmpty {
+            VoiceJournal.line("这份稿子从这台手机上取回（\(videoScript.count) 字）键=\(scriptKey(dest, true))")
         }
         pickNote = "已从相册拿进来：" + dest.lastPathComponent + "（原来叫 \(original)）／" + info.line
         VoiceJournal.line("相册视频 \(original) → \(dest.lastPathComponent)：\(info.line)")
@@ -1174,6 +1477,7 @@ struct ContentView: View {
     private var busyAnywhere: Bool {
         isConverting || isReading || isVideoing || isMakingSample || chainGate.chat
             || srcRec.isRecording || refRec.isRecording
+            || gateBusy || asrBusy || dubBusy
     }
 
     @ViewBuilder
@@ -1403,6 +1707,29 @@ struct ContentView: View {
     /// 共用一个 PlayController，所以「播放中」只点亮正在响的那一行。
     @ViewBuilder
     private func playbackSection(url: URL, headline: String, share: Binding<Bool>) -> some View {
+        playbackBody(url: url, headline: headline, share: share)
+            .sheet(isPresented: share) {
+                // LiveContainer 里 UIActivityViewController 没实测过；起不来就是这一片空白，
+                // 日志里那句「导出面板已弹起」不出现即是证据，兜底是路径本身就在屏幕上。
+                ShareSheet(items: [url],
+                           onDismiss: { share.wrappedValue = false },
+                           onPresent: {
+                    VoiceJournal.line("导出面板已弹起（可「存储到“文件”」）")
+                })
+            }
+    }
+
+    /// 同一份四件套，但**不挂**导出面板：面板挂在页面顶层只挂一次（见 body 里那条）。
+    /// 理由是 0.1/50 的分标签：「试听去男声」那一格现在两个标签各铺一份，
+    /// 两份各自挂 `.sheet($showGateShare)` ⇒ 一点「导出」两个呈现器同时被置位，
+    /// 弹出来的可能是屏幕外那一份（TabView 不在屏幕上的那一页照样在视图树里）⇒ 点了没反应。
+    @ViewBuilder
+    private func playbackSlot(url: URL, headline: String, share: Binding<Bool>) -> some View {
+        playbackBody(url: url, headline: headline, share: share)
+    }
+
+    @ViewBuilder
+    private func playbackBody(url: URL, headline: String, share: Binding<Bool>) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             Text(headline)
                 .font(.headline)
@@ -1446,15 +1773,6 @@ struct ContentView: View {
                     Label("导出", systemImage: "square.and.arrow.up")
                 }
                 .buttonStyle(.bordered)
-            }
-            .sheet(isPresented: share) {
-                // LiveContainer 里 UIActivityViewController 没实测过；起不来就是这一片空白，
-                // 日志里那句「导出面板已弹起」不出现即是证据，兜底是路径本身就在屏幕上。
-                ShareSheet(items: [url],
-                           onDismiss: { share.wrappedValue = false },
-                           onPresent: {
-                    VoiceJournal.line("导出面板已弹起（可「存储到“文件”」）")
-                })
             }
 
             if isMine(url), !player.status.isEmpty {

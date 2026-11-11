@@ -189,21 +189,25 @@ final class VoiceEngine {
 
     /// 试听的素材从哪儿来：视频解音轨，wav 直接读。慢的是这一趟（几秒），闸门本身 0.2 s，
     /// 所以调用方把这一次的返回存着，拖一次线只重跑 `gatePreview`。
-    static func loadGateSource(url: URL, video: Bool) async throws -> [Float] {
+    ///
+    /// `maxSecs` 由调用方定：只听效果的前 300 s 够用，而「提取台词」要的是一整条的字，
+    /// 截一半他就少一段稿子 ⇒ 同一个取数口，两个上限。
+    static func loadAudioSource(url: URL, video: Bool, maxSecs: Double) async throws -> [Float] {
         let name = url.lastPathComponent
         return try await Task.detached(priority: .userInitiated) {
+            // 上限一路传到解码那一头，不是"整条解完再切前一段"：16k float 每秒 64 KB，
+            // 1 小时就是 230 MB 白占着，而 iPhone 11 上这个进程超线是被系统直接杀掉（日志一句不留）。
             let all: [Float]
             if video {
-                all = try VideoClip.extractAudio(url, say: VoiceJournal.line)
+                all = try VideoClip.extractAudio(url, say: VoiceJournal.line, maxSecs: maxSecs)
             } else {
-                all = try AudioProcessor.loadWAV16K(url)
+                all = try AudioProcessor.loadWAV16K(url, maxSeconds: maxSecs)
             }
-            let cap = Int(VoiceEngine.gatePreviewMaxSecs * AudioProcessor.sampleRate)
-            let used = Array(all.prefix(cap))
-            VoiceJournal.line(String(format: "试听素材 %@：解出 %.1f s／取前 %.1f s 留着（%.1f MB）",
+            let used = Array(all.prefix(Int(maxSecs * AudioProcessor.sampleRate)))
+            VoiceJournal.line(String(format: "取素材 %@：解出 %.1f s／留着 %.1f s（%.1f MB，上限 %.0f s）",
                                      name, Double(all.count) / AudioProcessor.sampleRate,
                                      Double(used.count) / AudioProcessor.sampleRate,
-                                     Double(used.count) * 4 / 1_048_576))
+                                     Double(used.count) * 4 / 1_048_576, maxSecs))
             return used
         }.value
     }
@@ -438,7 +442,6 @@ final class VoiceEngine {
             let convSecs = Double(outSamples) / AudioProcessor.sampleRate
 
             // 对齐：把整条拉伸回源的长度。倍率 = 输出长 / 源长，>1 就是念得比源快 ⇒ 加快（变短）。
-            var fitWav = chainWav
             var fitSecs = convSecs
             var rate = 1.0
             let want = source.count
@@ -459,75 +462,16 @@ final class VoiceEngine {
                                          skew * 100, chainWav.lastPathComponent))
             }
 
-            // 结尾补静音，把这条音频垫到画面末尾之后：muxer 那条规矩是画面样本不许越过最后喂进去那块音频
-            //（0.1/33 实测 584 s 那条画面搬到 581.800 s 就不收了——解出来的音轨本来比画面短 3.07 s，
-            //   而拉伸是按音轨长度对齐的，补的那一截本来就没人说）。只往尾巴加零，已对齐的一段一个样本不动。
+            // 结尾补静音 + 回写画面（和「按改后的词重配」共用那一步，见 `writeBack`）
             let picEnd = info.videoStart + info.videoSecs
-            let padSecs = max(0.0, picEnd + 0.6 - fitSecs)
-            if padSecs > 0.05 {
-                fitWav = outDir.appendingPathComponent(base + "_fit.wav")
-                let w2 = try AudioProcessor.WAVWriter(url: fitWav)
-                // 一片一片喂进去：峰值守卫是**每片**一次的，整条一次 append 等于又变回全局长峰压小整章
-                let hop = Int(VoiceEngine.convPassSeconds * AudioProcessor.sampleRate)
-                let body: [Float]
-                if let s = stretched {
-                    body = s
-                } else {
-                    body = try AudioProcessor.loadWAV16K(chainWav)
-                }
-                var p = 0
-                while p < body.count {
-                    try w2.append(Array(body[p..<min(p + hop, body.count)]))
-                    p += hop
-                }
-                var left = Int(padSecs * AudioProcessor.sampleRate)
-                while left > 0 {
-                    let n = min(left, Int(AudioProcessor.sampleRate))
-                    try w2.append([Float](repeating: 0, count: n))
-                    left -= n
-                }
-                try w2.finish()
-                VoiceJournal.line(String(format: "结尾补静音 %.2f s：画面到 %.2f s／对齐那条到 %.2f s ⇒ 交给回写的 %@ %.2f s",
-                                         padSecs, picEnd, fitSecs, fitWav.lastPathComponent,
-                                         fitSecs + padSecs))
-            } else {
-                VoiceJournal.line(String(format: "结尾不用补：对齐那条 %.2f s 已盖住画面末尾 %.2f s",
-                                         fitSecs, picEnd))
-            }
-
-            onStage("回写画面（一个像素都不动，只换声音）…")
-            // 真机上「哪一组口径配得出成片」我手上没有数：这台机器上从没让 AVAssetWriter 编过音轨，
-            // 0.1/32 那一跑就死在 writer failed「Cannot Encode Media」。所以按兼容性从好到差挨个试，
-            // 成哪组用哪组，每组的判决都留在日志里——下一趟就不用再猜了。
-            var mux: VideoClip.MuxResult? = nil
-            var landed = outputVideo
-            var lastErr = ""
-            for cfg in VideoClip.candidates {
-                let target = cfg.ext == outputVideo.pathExtension
-                    ? outputVideo
-                    : outputVideo.deletingPathExtension().appendingPathExtension(cfg.ext)
-                do {
-                    mux = try VideoClip.mux(video: inputVideo, audioWav: fitWav,
-                                            out: target, cfg: cfg, say: VoiceJournal.line)
-                    landed = target
-                    break
-                } catch {
-                    lastErr = error.localizedDescription
-                    VoiceJournal.line("换口径：\(lastErr)")
-                    onStage("这一组配不出来，换下一组…")
-                }
-            }
-            guard let won = mux else {
-                let tried = VideoClip.candidates.map { $0.name }.joined(separator: "、")
-                throw ChainError.input("\(VideoClip.candidates.count) 组口径全配不出来（试过 \(tried)）｜最后一句：\(lastErr)")
-            }
-            if landed.path != outputVideo.path {
-                try? FileManager.default.removeItem(at: outputVideo)
-                VoiceJournal.line("原打算叫 \(outputVideo.lastPathComponent)，换成 \(landed.lastPathComponent)")
-            }
-
+            let back = try VoiceEngine.writeBack(video: inputVideo, audioWav: chainWav,
+                                                 padded: stretched, audioSecs: fitSecs,
+                                                 picEnd: picEnd, outDir: outDir, base: base,
+                                                 outputVideo: outputVideo, onStage: onStage)
+            let won = back.mux
+            let landed = back.landed
             var temps = [chainWav]
-            if fitWav.path != chainWav.path { temps.append(fitWav) }
+            if let p = back.padWav { temps.append(p) }
             for t in temps {
                 let sz = (try? t.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
                 do {
@@ -552,8 +496,171 @@ final class VoiceEngine {
         }.value
     }
 
-    // MARK: - 读小说（文本 → 系统 TTS → 现有样本链）
+    /// 交给回写的那条音频的最后一段处理：需要就补尾巴静音，然后按兼容性挨个试口径。
+    ///
+    /// `processVideo`（照原声换音色）和 `dubVideo`（照改后的词重配）用的是同一条画面泵、同一组口径表，
+    /// 这一头写过两遍迟早分叉 —— 到那时"哪组口径配得出来"的账在两条路上就不一样了。
+    ///
+    /// 为什么要补尾巴：muxer 那条规矩是画面样本不许越过最后喂进去那块音频（0.1/33 实测 584 s 那条
+    /// 画面搬到 581.800 s 就不收了）。只往尾巴加零，前面已经摆好的一个样本不动。
+    ///
+    /// `padded` 非空＝拉伸过的那一份只在内存里（`processVideo` 的对齐那一步），必须落成文件才能回写；
+    /// 原来那版只在"要补尾巴"时才落盘，于是"拉伸了但画面已经盖住"那一格会把拉伸结果丢掉、
+    /// 拿没拉伸的那条去 mux —— 一并堵在这里。
+    struct BackResult {
+        var mux: VideoClip.MuxResult
+        var landed: URL
+        /// 为了补尾巴／落拉伸结果另写过一份 wav；非空就得由调用方删。
+        var padWav: URL?
+        var padSecs: Double
+        /// 真正交给回写的那条有多长（含补的静音）。
+        var fedSecs: Double
+    }
 
+    static func writeBack(video: URL, audioWav: URL, padded: [Float]?, audioSecs: Double,
+                          picEnd: Double, outDir: URL, base: String, outputVideo: URL,
+                          onStage: (String) -> Void) throws -> BackResult {
+        let padSecs = max(0.0, picEnd + 0.6 - audioSecs)
+        var fedWav = audioWav
+        var padWav: URL? = nil
+        if padded != nil || padSecs > 0.05 {
+            let fitWav = outDir.appendingPathComponent(base + "_fit.wav")
+            let w2 = try AudioProcessor.WAVWriter(url: fitWav)
+            // 一片一片喂进去：峰值守卫是**每片**一次的，整条一次 append 等于又变回全局长峰压小整章
+            let hop = Int(VoiceEngine.convPassSeconds * AudioProcessor.sampleRate)
+            let body: [Float]
+            if let s = padded {
+                body = s
+            } else {
+                body = try AudioProcessor.loadWAV16K(audioWav)
+            }
+            var p = 0
+            while p < body.count {
+                try w2.append(Array(body[p..<min(p + hop, body.count)]))
+                p += hop
+            }
+            var left = Int(padSecs * AudioProcessor.sampleRate)
+            while left > 0 {
+                let n = min(left, Int(AudioProcessor.sampleRate))
+                try w2.append([Float](repeating: 0, count: n))
+                left -= n
+            }
+            try w2.finish()
+            VoiceJournal.line(String(format: "结尾补静音 %.2f s：画面到 %.2f s／交给回写那条到 %.2f s ⇒ 落成 %@ %.2f s",
+                                     padSecs, picEnd, audioSecs, fitWav.lastPathComponent,
+                                     audioSecs + padSecs))
+            fedWav = fitWav
+            padWav = fitWav
+        } else {
+            VoiceJournal.line(String(format: "结尾不用补：%.2f s 已盖住画面末尾 %.2f s", audioSecs, picEnd))
+        }
+
+        onStage("回写画面（一个像素都不动，只换声音）…")
+        // 真机上「哪一组口径配得出成片」我手上没有数：这台机器上从没让 AVAssetWriter 编过音轨，
+        // 0.1/32 那一跑就死在 writer failed「Cannot Encode Media」。所以按兼容性从好到差挨个试，
+        // 成哪组用哪组，每组的判决都留在日志里——下一趟就不用再猜了。
+        var mux: VideoClip.MuxResult? = nil
+        var landed = outputVideo
+        var lastErr = ""
+        for cfg in VideoClip.candidates {
+            let target = cfg.ext == outputVideo.pathExtension
+                ? outputVideo
+                : outputVideo.deletingPathExtension().appendingPathExtension(cfg.ext)
+            do {
+                mux = try VideoClip.mux(video: video, audioWav: fedWav,
+                                         out: target, cfg: cfg, say: VoiceJournal.line)
+                landed = target
+                break
+            } catch {
+                lastErr = error.localizedDescription
+                VoiceJournal.line("换口径：\(lastErr)")
+                onStage("这一组配不出来，换下一组…")
+            }
+        }
+        guard let won = mux else {
+            let tried = VideoClip.candidates.map { $0.name }.joined(separator: "、")
+            throw ChainError.input("\(VideoClip.candidates.count) 组口径全配不出来（试过 \(tried)）｜最后一句：\(lastErr)")
+        }
+        if landed.path != outputVideo.path {
+            try? FileManager.default.removeItem(at: outputVideo)
+            VoiceJournal.line("原打算叫 \(outputVideo.lastPathComponent)，换成 \(landed.lastPathComponent)")
+        }
+        return BackResult(mux: won, landed: landed, padWav: padWav, padSecs: padSecs,
+                          fedSecs: audioSecs + padSecs)
+    }
+
+    /// 一次「按改后的词重配」的读数。
+    struct DubResult {
+        var textChars: Int
+        var tts: SystemTTS.Report
+        var passes: Int
+        /// 新配音（进链后）有多长。
+        var dubSecs: Double
+        var picEnd: Double
+        /// 新配音比画面短 ⇒ 补的静音；比画面长 ⇒ 丢掉的那一截（`overSecs`）。
+        var padSecs: Double
+        var overSecs: Double
+        var fedSecs: Double
+        var mux: VideoClip.MuxResult
+        var outURL: URL
+    }
+
+    /// 「按改后的词重配」：文本 → ④ 那条（系统朗读 → ②③④）→ 装回原来那条画面。
+    ///
+    /// 和 `processVideo` 的唯一区别就是中间那一头：那一条拿**视频自己的音轨**进链，所以时长天生和
+    /// 画面一样、口型对得上；这一条念的是**他改过的字**，字数和原来说的不一样，时长必然不一样 ⇒
+    /// 口型不再谈（用户明确不要），换来的是"视频里那个人说的话可以改成别的"。
+    /// 画面仍是透传，一个像素不动；新声比画面长出去的那一截被回写丢掉，短了就补静音到画面末尾之后。
+    func dubVideo(inputVideo: URL, text: String, sample: SampleStore.Sample?, refWav: URL?,
+                  outputVideo: URL, pitchCents: Double, voiceID: String?,
+                  onStage: @escaping (String) -> Void = { VoiceJournal.line($0) }) async throws -> DubResult {
+        let info = VideoClip.probe(inputVideo)
+        VoiceJournal.line("重配开跑 \(inputVideo.lastPathComponent)／\(info.line)／\(text.count) 字")
+        guard info.hasVideo else { throw ChainError.input("\(inputVideo.lastPathComponent) 里没有画面轨") }
+        let outDir = outputVideo.deletingLastPathComponent()
+        VoiceEngine.sweepVideoTemps(dir: outDir)
+        let base = outputVideo.deletingPathExtension().lastPathComponent
+        let docs = outDir
+        // 名字照 ⑤ 那套：中间量叫 `_chain.wav`，崩在半路时 `sweepVideoTemps` 下次开跑能扫掉
+        let chainWav = docs.appendingPathComponent(base + "_chain.wav")
+        let rawWav = docs.appendingPathComponent(base + "_raw.wav")
+        let t0 = Date()
+
+        let r = try await readNovel(text: text, sample: sample, refWav: refWav,
+                                    outputWav: chainWav, rawTTSWav: rawWav,
+                                    pitchCents: pitchCents, voiceID: voiceID, onStage: onStage)
+        try? FileManager.default.removeItem(at: rawWav)
+
+        let picEnd = info.videoStart + info.videoSecs
+        let back = try await Task.detached(priority: .userInitiated) {
+            try VoiceEngine.writeBack(video: inputVideo, audioWav: chainWav, padded: nil,
+                                      audioSecs: r.convertedSeconds, picEnd: picEnd,
+                                      outDir: outDir, base: base, outputVideo: outputVideo,
+                                      onStage: onStage)
+        }.value
+        for t in [chainWav, back.padWav] {
+            guard let u = t else { continue }
+            let sz = (try? u.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
+            do {
+                try FileManager.default.removeItem(at: u)
+                VoiceJournal.line("中间量已清 \(u.lastPathComponent) \(FileHistory.human(Int64(sz)))")
+            } catch {
+                let ne = error as NSError
+                VoiceJournal.line("中间量没删掉 \(u.lastPathComponent)：\(ne.domain)#\(ne.code)｜\(ne.localizedDescription)")
+            }
+        }
+        let over = max(0.0, r.convertedSeconds - picEnd)
+        VoiceJournal.line(String(format: "重配完成：%d 字 → 朗读 %.1f s → 链子 %.1f s／画面到 %.1f s"
+                                 + "／补静音 %.1f s／超出丢掉 %.1f s｜口径 \(back.mux.cfgName) → %@ %.1f MB／墙钟 %.0f s",
+                                 text.count, r.tts.seconds, r.convertedSeconds, picEnd,
+                                 back.padSecs, over, back.landed.lastPathComponent,
+                                 Double(back.mux.bytes) / 1_048_576, Date().timeIntervalSince(t0)))
+        return DubResult(textChars: text.count, tts: r.tts, passes: r.passes,
+                         dubSecs: r.convertedSeconds, picEnd: picEnd, padSecs: back.padSecs,
+                         overSecs: over, fedSecs: back.fedSecs, mux: back.mux, outURL: back.landed)
+    }
+
+    // MARK: - 读小说（文本 → 系统 TTS → 现有样本链）
     /// 一次朗读的读数。`tts.line` 就是 A0 那一格的证据。
     struct NovelResult {
         var tts: SystemTTS.Report

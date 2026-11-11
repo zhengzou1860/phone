@@ -74,7 +74,12 @@ enum VideoClip {
     ///
     /// 一次解到底、不在这里分段：分段是 `VoiceEngine` 的事（② 的绝对位置表只有 5000 行 ⇒ 一遍 200 s），
     /// 那一层已经会挑最安静的一格下刀，切点得在同一条连续时间轴上找。
-    static func extractAudio(_ url: URL, say: (String) -> Void) throws -> [Float] {
+    /// `maxSecs`：只解到这么多秒就收。给「试听去男声」（前 300 s）和「提取台词」（前 15 分钟）用：
+    /// 那两条根本拿不到尾巴，整条解完只是白占内存（16k 单声道 float 每秒 64 KB ⇒ 1 小时 230 MB，
+    /// 而 iPhone 11 上这个进程的头顶也就 1 GB 出头，超线是系统直接杀掉、日志一句都不会留）。
+    /// 整条换声那一条不传 ⇒ 照旧解完。
+    static func extractAudio(_ url: URL, say: (String) -> Void,
+                             maxSecs: Double = .infinity) throws -> [Float] {
         let asset = AVURLAsset(url: url)
         guard let track = asset.tracks(withMediaType: .audio).first else {
             throw ChainError.input("\(url.lastPathComponent) 里没有音轨")
@@ -102,10 +107,13 @@ enum VideoClip {
             throw ChainError.input("音轨 startReading 失败：\(reader.error?.localizedDescription ?? "-")")
         }
         let est = Int(secs(track.timeRange.duration) * AudioProcessor.sampleRate)
+        // `.infinity` 直接乘会掉进 `Int(无限)` 那个陷阱（当场崩）⇒ 先问一句有没有边。
+        let capN = maxSecs.isFinite ? Int(maxSecs * AudioProcessor.sampleRate) : Int.max
         var buf = [Float]()
-        buf.reserveCapacity(max(est, 0))
+        buf.reserveCapacity(max(0, min(est, capN)))
         var blocks = 0
         var empty = 0
+        var cut = false
         while let sb = out.copyNextSampleBuffer() {
             blocks += 1
             let before = buf.count
@@ -122,6 +130,18 @@ enum VideoClip {
                 throw ChainError.input("第 \(blocks) 块音频取不出样本：\(error.localizedDescription)")
             }
             if buf.count == before { empty += 1 }
+            if buf.count >= capN {
+                cut = true
+                break
+            }
+        }
+        if cut {
+            // 提前收：reader 还挂在音轨上，不 cancel 就把那条解码线程留在后台跑完一整条。
+            reader.cancelReading()
+            let got = String(format: "%.0f", Double(buf.count) / AudioProcessor.sampleRate)
+            let all = String(format: "%.0f", secs(track.timeRange.duration))
+            let lim = maxSecs.isFinite ? String(format: "%.0f", maxSecs) : "无限"
+            say("音轨截着解：整条 \(all) s／上限 \(lim) s ⇒ 只解到 \(got) s 就收（\(blocks) 块，\(url.lastPathComponent)）")
         }
         if reader.status.rawValue == 4 {   // failed：只认编号，这个枚举不保证每个成员都有 Swift 名字
             throw ChainError.input("解到一半 reader 报错：\(reader.error?.localizedDescription ?? "-")")

@@ -36,7 +36,7 @@ targets:
         CFBundleIdentifier: com.qoder.voice
         CFBundlePackageType: APPL
         CFBundleShortVersionString: "0.1"
-        CFBundleVersion: "49"
+        CFBundleVersion: "50"
         CFBundleInfoDictionaryVersion: "6.0"
         # 「导出到手机」的第二条路：开了这两个开关后 Documents 整个出现在「文件」app 里，
         # 录的音、样本、输出 wav 可以就地看和播，不必每条都点一次分享面板。
@@ -45,6 +45,10 @@ targets:
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true
         NSMicrophoneUsageDescription: "要录你的声音来做声音转换"
+        # 「提取台词」那条走系统自带的本机听写（`SFSpeechRecognizer`）。这句缺了，一调就当场崩：
+        # "Speech framework usage description must be provided for NSSpeechRecognitionUsageDescription"。
+        # 和上面两条一样：装机进 LiveContainer 时弹窗归宿主那份 plist 管，这里写上是为了单独签也能通。
+        NSSpeechRecognitionUsageDescription: "要把视频或音频里那个人说的话认成字，好让你改成分词再配音；识别在这台手机上完成，录音不出这个网"
         # ⑥ 打字问电脑那条是直连局域网主机的 unicast HTTP。Apple 的 NSLocalNetworkUsageDescription
         # 文档把这一种明确算进去了（不只是 Bonjour／组播）⇒ 缺这条，iOS 14+ 那句授权弹窗就没有理由可写。
         # 装机只进 LiveContainer，弹窗归宿主那份 plist 管，这里写上是为了单独签时也能通。
