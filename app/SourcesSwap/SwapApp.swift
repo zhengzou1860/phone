@@ -904,7 +904,10 @@ struct SwapContentView: View {
 }
 
 /// 全屏横屏那一档：看的还是引擎往 SwapPreviewMirror 上递的那一格画面（两处同一份，不另开一趟预览），
-/// 底下只留停／开、位置、退出三样。声音不在这里——在引擎那一趟里，跟着它自己那把「素材 1 s ≈ 墙钟 1 s」的钟走。
+/// 摆法照 iPhone VR 那条左右眼的样子：画面铺满，点一下才出控制条，4 秒没动静自己收回去（预览停着不收），
+/// 条里 停／开＋进度＋「一起移／间距／鱼眼」三条滑杆，三个数各存各的键、下次进来照用。
+/// 左右眼是引擎那一趟在递图前展好的（见 SwapPreview.publish／SwapSbs），这一页只管摆和调。
+/// 声音不在这里——在引擎那一趟里，跟着它自己那把「素材 1 s ≈ 墙钟 1 s」的钟走。
 struct SwapPreviewFull: View {
     @ObservedObject var pv: SwapPreviewMirror
     /// 开跑前那一句被挡的理由（从外面递进来：这一版预览的闸门还是 SwapContentView 那一套）
@@ -913,8 +916,20 @@ struct SwapPreviewFull: View {
     var onSeek: (Double) -> Void
     var onClose: () -> Void
 
+    // 三条滑杆落到这三条键（量纲与 VR3D 那三条一样）：镜片间距与弯度是硬件定的，一次对好就一直用
+    @AppStorage(SwapSbs.shiftKey) private var shiftPct = 0.0
+    @AppStorage(SwapSbs.gapKey) private var gapPct = 0.0
+    @AppStorage(SwapSbs.fishKey) private var fishPct = SwapSbs.fishDefault
+    /// 手拖着过程中的显示值：松手才落到上面三条键并送进引擎——每改一个数每一格都要重采一遍
+    @State private var dShift = 0.0
+    @State private var dGap = 0.0
+    @State private var dFish = SwapSbs.fishDefault
+    @State private var shown = false
+    /// 收起控制栏那一次预约的号：每次碰控件就换一个号，旧预约一看号不对就不作数
+    @State private var hideSeq = 0
+
     var body: some View {
-        VStack(spacing: 8) {
+        ZStack(alignment: .bottom) {
             ZStack {
                 Color.black
                 if let im = pv.img {
@@ -926,30 +941,116 @@ struct SwapPreviewFull: View {
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .contentShape(Rectangle())
+            .onTapGesture { tap() }
 
-            HStack(spacing: 10) {
-                Button(pv.on ? "停" : "开始预览") { onToggle() }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(!pv.on && !block.isEmpty)
-                Slider(value: $pv.pos, in: 0 ... max(0.1, pv.dur), onEditingChanged: { began in
-                    pv.dragging = began
-                    if !began { onSeek(pv.pos) }
-                })
-                .disabled(!pv.on)
-                Text(String(format: "%.0f／%.0f s", pv.pos, pv.dur))
-                    .font(.caption2).monospacedDigit()
-                Button("退出全屏") { onClose() }.buttonStyle(.bordered)
-            }
-            .padding(.horizontal)
-            if !pv.person.isEmpty {
-                Text("这一趟目标表：\(pv.person)").font(.caption2).foregroundColor(.gray)
-            }
+            if shown { bar }
+
+            // 常驻这一颗：VR3D 那页右上角也留着一个「停止」，别让人困在只 picture 的那一屏里
+            Button("退出全屏") { onClose() }
+                .buttonStyle(.bordered)
+                .padding(10)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
         }
         .background(Color.black)
         .preferredColorScheme(.dark)
         .statusBarHidden(true)
-        // cover 挂上之后再叫一次：外面那一次是在它还没上屏时发的，系统那会儿还按竖屏的口径给拒了
-        .onAppear { SwapRotate.apply(true) }
+        .onAppear {
+            // cover 挂上之后再叫一次方向：外面那一次是在它还没上屏时发的，系统那会儿还按竖屏的口径给拒了
+            SwapRotate.apply(true)
+            dShift = shiftPct
+            dGap = gapPct
+            dFish = fishPct
+            push(nil)
+            shown = true
+            armHide()
+        }
+        .onDisappear { SwapContentView.engine.setStereo(nil) }   // 出了这一档就还回单眼，小窗预览不该被展宽
+    }
+
+    private var bar: some View {
+        VStack(spacing: 6) {
+            HStack(spacing: 10) {
+                Button(pv.on ? "停" : "开始预览") { onToggle(); armHide() }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(!pv.on && !block.isEmpty)
+                Slider(value: $pv.pos, in: 0 ... max(0.1, pv.dur), onEditingChanged: { began in
+                    pv.dragging = began
+                    if !began { onSeek(pv.pos); armHide() }
+                })
+                .disabled(!pv.on)
+                Text(fmt(pv.pos) + "／" + fmt(pv.dur))
+                    .font(.caption2).monospacedDigit()
+            }
+            HStack(spacing: 8) {
+                Slider(value: $dShift, in: -SwapSbs.shiftRange ... SwapSbs.shiftRange) { editing in
+                    if !editing {
+                        shiftPct = dShift
+                        push("实时 一起移 \(String(format: "%+.1f%%", dShift * 100))")
+                    }
+                }
+                .tint(.orange)
+                Text(tShift(dShift)).font(.caption).monospacedDigit().frame(width: 104, alignment: .leading)
+            }
+            HStack(spacing: 8) {
+                Slider(value: $dGap, in: -SwapSbs.gapRange ... SwapSbs.gapRange) { editing in
+                    if !editing {
+                        gapPct = dGap
+                        push("实时 间距 \(String(format: "%+.1f%%", dGap * 100))")
+                    }
+                }
+                .tint(.purple)
+                Text(tGap(dGap)).font(.caption).monospacedDigit().frame(width: 104, alignment: .leading)
+            }
+            HStack(spacing: 8) {
+                Slider(value: $dFish, in: 0 ... SwapSbs.fishMax) { editing in
+                    if !editing {
+                        fishPct = dFish
+                        push("实时 鱼眼 \(String(format: "%.0f%%", dFish * 100))")
+                    }
+                }
+                .tint(.teal)
+                Text(tFish(dFish)).font(.caption).monospacedDigit().frame(width: 104, alignment: .leading)
+            }
+            if !pv.person.isEmpty {
+                Text("这一趟目标表：\(pv.person)").font(.caption2).foregroundColor(.gray)
+            }
+            Text("第一条拖进度｜第二条「一起移」＝两张图同方向挪，对准两只镜片中心｜第三条「间距」＝把两张图互相推远或拉近，图本身大小不变（＋ 拉开、中缝出黑边；− 靠近、外侧各裁一条）｜第四条「鱼眼」＝把每只眼那半幅按镜片的桶形弯一遍：画面外圈挤向中心，直边的中段就往外弓，黑只落在画框外，源图一个像素都不裁（拉到 0＝不弯＝手持直看；顶格黑边最厚）｜这些都存下来下次照用")
+                .font(.system(size: 10)).foregroundColor(.white.opacity(0.6))
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity)
+        .background(Color.black.opacity(0.75))
+    }
+
+    private func tap() {
+        withAnimation(.easeOut(duration: 0.15)) { shown.toggle() }
+        if shown { armHide() }
+    }
+
+    /// 控件出来 4 秒没动静就自己收回去；预览停着不收——那正是停下来慢慢调的时候
+    private func armHide() {
+        hideSeq += 1
+        let mine = hideSeq
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
+            guard hideSeq == mine, shown, pv.on else { return }
+            withAnimation(.easeOut(duration: 0.2)) { shown = false }
+        }
+    }
+
+    /// 三个数送进引擎那一趟（引擎每格读一次），顺带把这一句记进流水
+    private func push(_ log: String?) {
+        SwapContentView.engine.setStereo(SwapSbs.Cfg(shiftPct: shiftPct, gapPct: gapPct, fishPct: fishPct))
+        if let log = log { SwapJournal.line("\(log)｜左右眼 间距 \(String(format: "%+.1f%%", gapPct * 100))｜\(tFish(fishPct))") }
+    }
+
+    /// 到底那一格要说人话：它不是「弯得小一点」，是完全不弯
+    private func tFish(_ v: Double) -> String { "鱼眼 " + (v < 0.005 ? "不弯" : String(format: "%.0f%%", v * 100)) }
+    private func tShift(_ v: Double) -> String { "一起移 " + String(format: "%+.1f%%", v * 100) }
+    private func tGap(_ v: Double) -> String { "间距 " + String(format: "%+.1f%%", v * 100) }
+    private func fmt(_ t: Double) -> String {
+        let s = Int(max(0, t).rounded(.down))
+        return String(format: "%d:%02d", s / 60, s % 60)
     }
 }
 

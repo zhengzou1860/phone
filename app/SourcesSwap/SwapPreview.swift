@@ -51,6 +51,8 @@ final class SwapPreview {
     private let lock = NSLock()
     private var stopping = false
     private var seekTo: Double?
+    /// 全屏那一档要不要左右眼（nil＝不要：小窗预览永远单眼，只有 cover 挂着时界面才给非 nil）
+    private var sbs: SwapSbs.Cfg?
     private var pendingCast: [SwapCastMember] = []
     private var cfg = Cfg()
     private var busy = false
@@ -62,6 +64,9 @@ final class SwapPreview {
     private var rep: [String] = []
     private var work: CVPixelBuffer?
     private var held: CVPixelBuffer?
+    /// 左右眼那一块上屏缓冲（2 倍宽），攒着重复用；尺寸变了才重造
+    private var sbsBuf: CVPixelBuffer?
+    private var sbsW = 0, sbsH = 0, sbsFail = 0
     private var frameW = 0, frameH = 0
     private var att = [Float](), face = [Float]()
     private var c112 = [Float](repeating: 0, count: 3 * FsxGeo.side112 * FsxGeo.side112)
@@ -137,6 +142,10 @@ final class SwapPreview {
 
     /// 拖滑杆：重开 reader 跳到那一秒（预览不缓存画面，拖回去就是把那一秒重算一遍）
     func seek(_ sec: Double) { lock.lock(); seekTo = max(0, sec); lock.unlock() }
+
+    /// 全屏那一档要不要左右眼：nil＝单眼（小窗预览一直是）。滑杆松手时把三个数换进来，
+    /// 拖着不许连续发——每一格都要重算一遍 0.46 Mpx 的重采样（VR3D 那边也是松手才落地）。
+    func setStereo(_ cfg: SwapSbs.Cfg?) { lock.lock(); sbs = cfg; lock.unlock() }
 
     var isActive: Bool {
         lock.lock()
@@ -651,7 +660,35 @@ final class SwapPreview {
     }
 
     private func publish(_ pb: CVPixelBuffer) {
-        let im = CIImage(cvPixelBuffer: pb)
+        // 全屏那一档开了左右眼：先把这一格展成两倍宽再递出去（换算见 SwapSbs，和 VR3D 那条同源）。
+        // 展不出就照原样递单眼那一幅——画面宁可不像镜片里那个样子，也不许停在这格不画。
+        lock.lock()
+        let cfg = sbs
+        lock.unlock()
+        var shown = pb
+        if let cfg = cfg {
+            let w = CVPixelBufferGetWidth(pb) * 2, h = CVPixelBufferGetHeight(pb)
+            if sbsW != w || sbsH != h || sbsBuf == nil {
+                sbsBuf = SwapTech.pixelBuffer(w, h).pb
+                sbsW = w
+                sbsH = h
+            }
+            var why = "左右眼缓冲 \(w)x\(h) 造不出"
+            if let out = sbsBuf {
+                let note = SwapSbs.expand(pb, cfg, into: out)
+                if note.isEmpty {
+                    shown = out
+                    why = ""
+                } else {
+                    why = note
+                }
+            }
+            if !why.isEmpty, sbsFail < 2 {
+                sbsFail += 1
+                say("预览 左右眼展不出（\(why)）→ 这一格仍递单眼")
+            }
+        }
+        let im = CIImage(cvPixelBuffer: shown)
         guard let cg = SwapPreview.ci.createCGImage(im, from: im.extent) else {
             if nSwap < 2 { say("预览 画面转不成图（CoreImage 没给 CGImage）") }
             return
