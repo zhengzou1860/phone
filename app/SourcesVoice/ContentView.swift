@@ -25,6 +25,10 @@ struct ContentView: View {
     @StateObject private var models = ModelManager()
     @StateObject private var srcRec = AudioEngine()
     @StateObject private var refRec = AudioEngine()
+    /// 「配音」那一格自己一支麦克风、自己一台画面泵：和 ①② 那两支互不相干，
+    /// 那两支录的是素材，这一支录的是他对着画面念的那一条。
+    @StateObject private var voRec = AudioEngine()
+    @StateObject private var voPlayer = MutedVideoPlayer()
     @StateObject private var player = PlayController()
     /// 与 ⑥ 共用的链子互斥位：主页面这四条在跑时写 `main`，⑥ 念语音时写 `chat`。
     @StateObject private var chainGate = ChainGate()
@@ -126,6 +130,21 @@ struct ContentView: View {
     /// 和音频那条的 `showShare` 分开：一个开关同时挂两个 sheet，弹起来的是哪一个全看 SwiftUI 的心情。
     @State private var showVideoShare = false
 
+    // 配音：画面静音从头放，他对着画面自己念；念完那一条录音进链换成选中样本的音色，再装回原画面。
+    /// 停下来那一刻的录音。转换用的就是它（重录会另存一条，这里只指最后停下来的那条）。
+    @State private var voRecURL: URL?
+    /// 录音头上要补的静音＝起录音那一刻画面已经走掉的秒数（`MutedVideoPlayer.now`）。
+    @State private var voLead = 0.0
+    @State private var voRecNote = ""
+    /// 点了「配音」但录音还没起来那一段（等画面归零、等首帧，最长几秒）。
+    /// 不立这一位，这几秒里「配音」还能再点一次 ⇒ 两台画面泵叠着放，对时全乱。
+    @State private var voArming = false
+    @State private var voBusy = false
+    @State private var voStatus = ""
+    @State private var voNote = ""
+    @State private var voOutURL: URL?
+    @State private var showVoShare = false
+
     /// 历史文件清理页：Documents 根目录里留下的源/中间/成品。
     /// `wipeArmed` 是「全部删除」的第一次按下 —— 删的是他的录音，一指点没了找不回来，要连点两次。
     @State private var history: [FileHistory.Item] = []
@@ -178,9 +197,9 @@ struct ContentView: View {
         .onChange(of: localChainBusy) { chainGate.main = localChainBusy }
     }
 
-    /// 链子这一头（① 转换／② 生成样本／④ 读小说／⑤ 视频／⑤ 改台词重配）在不在跑。录音不算：那条不载图。
+    /// 链子这一头（① 转换／② 生成样本／④ 读小说／⑤ 视频／⑤ 配音／⑤ 改台词重配）在不在跑。录音不算：那条不载图。
     private var localChainBusy: Bool {
-        isConverting || isMakingSample || isReading || isVideoing || dubBusy
+        isConverting || isMakingSample || isReading || isVideoing || dubBusy || voBusy
     }
 
     /// 收键盘。`TextEditor` 是多行的，回车只会换行、不会收；ScrollView 里点空白也不收
@@ -246,6 +265,7 @@ struct ContentView: View {
                         Text(pickNote).font(.caption).foregroundColor(.secondary)
                     }
                     videoSection
+                    voiceOverSection
                     dubSection
                 } else {
                     Text("模型还没下好：换声和配音都要用它。去「声音」标签第一格点「下载模型」（581 MB）。")
@@ -836,7 +856,7 @@ struct ContentView: View {
     @ViewBuilder
     private func audioSlotBody(_ title: String, rec: AudioEngine,
                                url: Binding<URL?>, slot: PickSlot) -> some View {
-        let anyRecording = srcRec.isRecording || refRec.isRecording
+        let anyRecording = srcRec.isRecording || refRec.isRecording || voRec.isRecording
         VStack(alignment: .leading, spacing: 10) {
             Text(title).font(.headline)
             HStack(spacing: 12) {
@@ -930,6 +950,14 @@ struct ContentView: View {
         // 这一片以前听过写过的照原样拿回来 —— 不然每次选同一段都要重听一遍写。
         if let prev = videoURL { saveScript(scriptKey(prev, true)) }
         loadScript(scriptKey(dest, true))
+        // 配音那一格跟着片源走：画面换一条，上一条的录音就不能再拿去转换了（时间轴不是同一条）。
+        voPlayer.load(dest, picSecs: info.videoStart + info.videoSecs)
+        voRecURL = nil
+        voLead = 0
+        voRecNote = ""
+        voOutURL = nil
+        voNote = ""
+        voStatus = ""
         if !videoScript.isEmpty {
             VoiceJournal.line("这份稿子从这台手机上取回（\(videoScript.count) 字／\(scriptAnchors.count) 个起点）键=\(scriptKey(dest, true))")
         }
@@ -1108,7 +1136,8 @@ struct ContentView: View {
     /// 界面上这些槽现在指着哪些文件（删掉时要一起清引用，清单里也要标出来）。
     private var currentPaths: Set<String> {
         var s = Set<String>()
-        for u in [sourceURL, refURL, outputURL, novelOutURL, rawTTSURL, videoURL, videoOutURL] {
+        for u in [sourceURL, refURL, outputURL, novelOutURL, rawTTSURL, videoURL, videoOutURL,
+                  voRecURL, voOutURL] {
             if let u = u { s.insert(u.path) }
         }
         return s
@@ -1147,8 +1176,13 @@ struct ContentView: View {
         if let u = videoURL, paths.contains(u.path) {
             videoURL = nil
             videoProbe = nil      // 体检数跟着片源走：不清的话界面会拿着上一条的秒数说下一条
+            voPlayer.stop()
+            voRecURL = nil
+            voOutURL = nil
         }
         if let u = videoOutURL, paths.contains(u.path) { videoOutURL = nil }
+        if let u = voRecURL, paths.contains(u.path) { voRecURL = nil }
+        if let u = voOutURL, paths.contains(u.path) { voOutURL = nil }
     }
 
     // MARK: - 模型状态
@@ -1564,8 +1598,8 @@ struct ContentView: View {
     /// ⑥ 在念回答也算一条 —— 它用的是同一套图。
     private var busyAnywhere: Bool {
         isConverting || isReading || isVideoing || isMakingSample || chainGate.chat
-            || srcRec.isRecording || refRec.isRecording
-            || gateBusy || asrBusy || dubBusy
+            || srcRec.isRecording || refRec.isRecording || voRec.isRecording
+            || gateBusy || asrBusy || dubBusy || voBusy || voArming
     }
 
     @ViewBuilder
@@ -1714,6 +1748,258 @@ struct ContentView: View {
                     history = FileHistory.scan()
                     VoiceJournal.line("视频换声失败：\(error.localizedDescription)")
                 }
+            }
+        }
+    }
+
+    // MARK: - ⑤b 配音（对着静音画面自己念 → 换声 → 装回原画面）
+
+    @ViewBuilder
+    private var voiceOverSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("配音（画面静音播放，你对着画面念；念完换成选中样本的音色）").font(.headline)
+
+            HStack(spacing: 12) {
+                Button(voRec.isRecording ? "录音中…" : "配音") { startVoiceOver() }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(videoURL == nil || voArming || busyAnywhere)
+                Button("停止") { stopVoiceOver() }
+                    .buttonStyle(.bordered)
+                    .disabled(!voRec.isRecording)
+                Button(voBusy ? "转换中…" : "转换") { convertVoiceOver() }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(voRecURL == nil || videoURL == nil || busyAnywhere
+                              || (pickedID == nil && refURL == nil))
+                Spacer()
+            }
+
+            if videoURL != nil {
+                MutedVideoView(player: voPlayer.player)
+                    .frame(height: 220)
+                    .frame(maxWidth: .infinity)
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                HStack(spacing: 14) {
+                    Text(String(format: "画面 %.1f s", voPlayer.seconds))
+                    if voRec.isRecording {
+                        Text(String(format: "已录 %.1f s", max(0, voPlayer.seconds - voLead)))
+                            .foregroundColor(.red)
+                    }
+                    if !voPlayer.status.isEmpty {
+                        Text(voPlayer.status)
+                    }
+                    Spacer()
+                }
+                .font(.caption)
+                .foregroundColor(.secondary)
+            } else {
+                Text("先在上面「选视频」挑一段，画面就铺在这儿（不出声）。")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+
+            Text("点「配音」：画面从头开始放、一个声音都不出（片子里原来那条音轨整个不要），麦克风同时开始录。你看着画面里那个人的嘴，用自己的话跟着念 —— 口型由你自己对，程序不再猜时间。念完点「停止」（画面放完也会自己停）。")
+                .font(.caption)
+                .foregroundColor(.secondary)
+            Text("画面先起、录音跟着起，中间差的那零点几秒会自动补在录音头上（日志里「配音对时」那行就是它），所以录音和画面是同一条时间轴。再点「转换」：录音走上面 ①②③④ 那条链换成选中样本的音色，音高那格同样生效，然后装回原来那条画面（一个像素不动）。这一条不做整条拉伸 —— 你自己对好的位置不能再被推走。")
+                .font(.caption)
+                .foregroundColor(.secondary)
+            Text("录音比画面长 ⇒ 多出来的尾巴丢掉；比画面短 ⇒ 结尾补静音。念错了就「停止」再「配音」重录一遍：重录另存一条，转换用的是最后停下来的那条，旧的在「历史文件」页删。麦克风有没有真录到声音，日志里「录音实测」那行写着峰值和 rms（基本全零就是宿主没把麦克风给过来）。")
+                .font(.caption)
+                .foregroundColor(.secondary)
+
+            if let u = voRecURL {
+                HStack(spacing: 12) {
+                    Button(isMine(u) && player.isPlaying ? "停止试听" : "试听配音") {
+                        if isMine(u) && player.isPlaying { player.stop() } else { player.play(url: u) }
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(voRec.isRecording || voBusy)
+                    Text(voRecNote)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    Spacer()
+                }
+            }
+            if pickedID == nil && refURL == nil {
+                Text("没选样本、② 也空的 ⇒ 「转换」不给按：换成谁的音色得先有个目标。")
+                    .font(.caption)
+                    .foregroundColor(.orange)
+            }
+            if voBusy || !voStatus.isEmpty {
+                Text(voStatus)
+                    .font(.caption)
+                    .foregroundColor(voBusy ? .secondary : .accentColor)
+                    .textSelection(.enabled)
+            }
+            if !voNote.isEmpty {
+                Text(voNote).font(.caption).foregroundColor(.orange).textSelection(.enabled)
+            }
+
+            if let out = voOutURL {
+                HStack(spacing: 12) {
+                    Button {
+                        VoiceJournal.line("点「导出配音成片」 \(out.lastPathComponent)")
+                        showVoShare = true
+                    } label: {
+                        Label("导出成片", systemImage: "square.and.arrow.up")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    Text("放不进界面里，用「导出」存进相册或「文件」")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
+                .sheet(isPresented: $showVoShare) {
+                    ShareSheet(items: [out],
+                               onDismiss: { showVoShare = false },
+                               onPresent: {
+                        VoiceJournal.line("配音导出面板已弹起（可「存储到“文件”」／存到相册）")
+                    })
+                }
+                Text(out.path)
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                    .textSelection(.enabled)
+            }
+        }
+    }
+
+    /// 点「配音」：画面从头静音放，麦克风跟着起。
+    ///
+    /// 顺序是**画面先、录音后**，而且等画面真在走了才起录音。反过来（录音先起）那一段差值
+    /// 只能拿墙钟猜，而会话激活和首帧解码各花多久在这台机上都没准数；画面自己的时钟是唯一
+    /// 的准绳 ⇒ 起录音那一刻它走到哪儿，录音头上就补多少静音（`voLead`）。
+    @MainActor
+    private func startVoiceOver() {
+        hideKeyboard()
+        guard !voArming, !voRec.isRecording else { return }
+        guard let input = videoURL else {
+            voNote = "先在上面「选视频」挑一段"
+            return
+        }
+        player.stop()                       // 试听那条先把音频会话让出来
+        if !voPlayer.holds(input) {
+            let i = videoProbe ?? VideoClip.probe(input)
+            voPlayer.load(input, picSecs: i.videoStart + i.videoSecs)
+        }
+        voPlayer.onEnd = { stopVoiceOver() }
+        voArming = true
+        voNote = ""
+        voStatus = ""
+        voRecURL = nil
+        voRecNote = ""
+        voOutURL = nil
+        VoiceJournal.line("点「配音」片源=\(input.lastPathComponent)（画面静音从头放，麦克风跟着起）")
+        Task { @MainActor in
+            await voPlayer.playFromStart()
+            // 片子太短的话，等画面起这几秒里它可能已经放完了 ⇒ 别对着一张停住的画面录。
+            guard voPlayer.isPlaying else {
+                voArming = false
+                voNote = "画面已经放完了（这一段太短，或者起播等太久）：再点一次「配音」。"
+                VoiceJournal.line("配音：画面在起录音之前就放完了，这一趟不录")
+                return
+            }
+            voRec.startRecording()
+            voLead = voPlayer.now
+            voArming = false
+            if voRec.isRecording {
+                voRecNote = String(format: "头上补静音 %.2f s（起录音时画面已走这么多）", voLead)
+                VoiceJournal.line(String(format: "配音对时：起录音那一刻画面在 %.3f s ⇒ 录音头上补这么多静音", voLead))
+            } else {
+                voPlayer.stop()
+                voLead = 0
+                voNote = "麦克风没起来（日志里「录音启动失败」那行有原因）。装机在 LiveContainer 里，麦克风权限归宿主：去 设置 → LiveContainer 看麦克风给没给。"
+                VoiceJournal.line("配音：录音没起来，画面已停")
+            }
+        }
+    }
+
+    /// 点「停止」（画面放完也走这儿）：两台泵一起停，录音落到 `voRecURL`，转换用的就是它。
+    @MainActor
+    private func stopVoiceOver() {
+        let wasRecording = voRec.isRecording
+        voRec.stopRecording()
+        voPlayer.stop()
+        guard wasRecording, let u = voRec.recordedURL else { return }
+        voRecURL = u
+        history = FileHistory.scan()
+        let secs = probeSeconds(u)
+        voRecNote = String(format: "%@／%.1f s／头上补静音 %.2f s", u.lastPathComponent, secs, voLead)
+        VoiceJournal.line(String(format: "配音停下来：录音 %@ %.2f s ＋ 补头 %.3f s ＝ %.2f s（画面到 %.1f s）",
+                                 u.lastPathComponent, secs, voLead, secs + voLead,
+                                 (videoProbe?.videoStart ?? 0) + (videoProbe?.videoSecs ?? 0)))
+        if secs < 0.3 {
+            voNote = "这一条不到 0.3 秒，太短了：重录一遍。"
+        }
+    }
+
+    /// 一条 wav 有多长（只读文件头，不解码）。读不出来就是 0，界面上照实显示。
+    private func probeSeconds(_ url: URL) -> Double {
+        guard let f = try? AVAudioFile(forReading: url) else { return 0 }
+        return Double(f.length) / f.processingFormat.sampleRate
+    }
+
+    /// 点「转换」：录的那一条 → 选中样本那条链 → 装回原来那条画面。
+    @MainActor
+    private func convertVoiceOver() {
+        hideKeyboard()
+        guard let input = videoURL, let rec = voRecURL else {
+            voNote = "先「配音」录一段，再点「转换」"
+            return
+        }
+        let picked = samples.first { $0.id == pickedID }
+        guard picked != nil || refURL != nil else {
+            voNote = "先在样本清单点一个样本（或让 ② 有段参考音频）"
+            return
+        }
+        guard let modelDir = models.modelDir else {
+            voNote = "模型还没下好（去「声音」标签第一格）"
+            return
+        }
+        player.stop()
+        voBusy = true
+        voStatus = "读录音…"
+        voNote = ""
+        voOutURL = nil
+        let using = picked != nil ? "样本「\(picked!.info.name)」" : "现场参考 \(refURL!.lastPathComponent)"
+        VoiceJournal.line(String(format: "点「配音转换」片源=%@ 录音=%@ 补头 %.3f s 音色=%@ 音高 %+.0f 半音",
+                                 input.lastPathComponent, rec.lastPathComponent, voLead, using, semitones))
+        if engine == nil { engine = VoiceEngine(modelDir: modelDir) }
+        let eng = engine!
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+        // 前缀照 ⑤ 那套（video_）：中间那两份 wav 崩在半路时，下一趟开跑的 sweepVideoTemps 认得出来，
+        // 「历史文件」页也归在「视频（成品与中间）」那一格。
+        let output = docs.appendingPathComponent("video_\(Int(Date().timeIntervalSince1970))_vo.mp4")
+        let lead = voLead
+        let t0 = Date()
+        Task { @MainActor in
+            do {
+                let r = try await eng.voiceOverVideo(inputVideo: input,
+                                                     recordedWav: rec,
+                                                     leadSecs: lead,
+                                                     sample: picked,
+                                                     refWav: picked != nil ? nil : refURL,
+                                                     outputVideo: output,
+                                                     pitchCents: semitones * 100.0,
+                                                     onStage: { txt in
+                    DispatchQueue.main.async { voStatus = txt }
+                })
+                let wall = Date().timeIntervalSince(t0)
+                voOutURL = r.outURL
+                voBusy = false
+                history = FileHistory.scan()
+                voNote = String(format: "配完：录音 %.1f s＋补头 %.2f s → 链子 %.1f s（%d 片，不拉伸）／画面到 %.1f s"
+                                  + "｜补静音 %.1f s／超出丢掉 %.1f s｜成片 %@（口径 \(r.mux.cfgName)／%.1f MB／墙钟 %.0f s）",
+                                  r.recordedSeconds, r.leadSeconds, r.convertedSeconds, r.passes, r.picEnd,
+                                  r.padSecs, r.overSecs, r.outURL.lastPathComponent,
+                                  Double(r.mux.bytes) / 1_048_576, wall)
+                voStatus = "配音完成（\(r.mux.cfgName)）｜音轨 \(r.mux.note)"
+                VoiceJournal.line("配音界面收尾：\(voNote)")
+            } catch {
+                voBusy = false
+                voStatus = "失败：\(error.localizedDescription)"
+                voNote = "没配成，原因在上面那一行。中间那份 wav 会留在盘上，下一趟开跑先扫掉，也可以在「历史文件」页删。"
+                history = FileHistory.scan()
+                VoiceJournal.line("配音转换失败：\(error.localizedDescription)")
             }
         }
     }

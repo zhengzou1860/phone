@@ -838,6 +838,128 @@ final class VoiceEngine {
                          overSecs: over, fedSecs: back.fedSecs, mux: back.mux, outURL: back.landed)
     }
 
+    // MARK: - 配音（对着静音画面自己念 → 换成选中样本的音色 → 装回原画面）
+
+    /// 一次配音的读数。`leadSeconds` 是补在录音头上的静音：画面先起、录音跟着起，
+    /// 中间差的那一点由 `MutedVideoPlayer.now` 量出来，不是猜的。
+    struct VoiceOverResult {
+        var recordedSeconds: Double
+        var leadSeconds: Double
+        var convertedSeconds: Double
+        var passes: Int
+        var picEnd: Double
+        var padSecs: Double
+        var overSecs: Double
+        var mux: VideoClip.MuxResult
+        var outURL: URL
+    }
+
+    /// 和 `processVideo` 只差两头，中间那趟分段进链一个字都不改：
+    /// - 源不是片子里那条音轨，而是他对着画面录的那一条（片子有没有音轨都不看，原声整个不要）。
+    /// - **不做整条拉伸**。录音本来就长在画面的时间轴上（头上补了 `leadSecs` 的静音），
+    ///   再按「输出拉回源长」推一次，等于把他自己对着嘴型念好的位置又整体挪走。
+    ///   分片那一趟仍按片钉回源长（`runSegments`），所以片与片之间不会累积偏移。
+    ///
+    /// 画面照旧透传，一个像素不动。
+    func voiceOverVideo(inputVideo: URL, recordedWav: URL, leadSecs: Double,
+                        sample: SampleStore.Sample?, refWav: URL?, outputVideo: URL,
+                        pitchCents: Double = 0.0,
+                        onStage: @escaping (String) -> Void = { VoiceJournal.line($0) }) async throws -> VoiceOverResult {
+        let dir = modelDir
+        let info = VideoClip.probe(inputVideo)
+        let picEnd = info.videoStart + info.videoSecs
+        let outDir = outputVideo.deletingLastPathComponent()
+        let base = outputVideo.deletingPathExtension().lastPathComponent
+        let lead = max(0.0, leadSecs)
+        let t0 = Date()
+        return try await Task.detached(priority: .userInitiated) {
+            let name = inputVideo.lastPathComponent
+            let how: String
+            if let s = sample {
+                how = "样本「\(s.info.name)」"
+            } else if let r = refWav {
+                how = "现场参考 \(r.lastPathComponent)"
+            } else {
+                throw ChainError.input("既没在清单里选样本，也没有参考音频（配音这一条没有自转换）")
+            }
+            VoiceJournal.line("配音开跑 \(name)／录音 \(recordedWav.lastPathComponent)／\(how)／\(info.line)")
+            guard info.hasVideo else { throw ChainError.input("\(name) 里没有画面轨") }
+
+            VoiceEngine.sweepVideoTemps(dir: outDir)
+            let sr = AudioProcessor.sampleRate
+            let rec = try AudioProcessor.loadWAV16K(recordedWav)
+            let recSecs = Double(rec.count) / sr
+            guard rec.count > 0 else { throw ChainError.input("录音是空的：先点「配音」对着画面念一段") }
+            let total = recSecs + lead
+            let cap = VoiceEngine.videoSecondsCap(dir: outDir, inputBytes: info.bytes)
+            guard total <= cap else {
+                throw ChainError.input(String(format: "录音 %.1f 分钟，这台机的盘和内存只够 %.1f 分钟"
+                                                + "（中间 wav 每秒共占 72 KB，成片另算 ≈ 输入那条的 \(FileHistory.human(info.bytes))，"
+                                                + "另留 1 GB 余量）⇒ 请分段配",
+                                              total / 60, cap / 60))
+            }
+            var source = [Float](repeating: 0, count: Int(lead * sr))
+            source.append(contentsOf: rec)
+            VoiceJournal.line(String(format: "配音对时：录音 %.3f s ＋ 头上补静音 %.3f s ＝ %.3f s"
+                                             + "（画面到 %.3f s／额度 %.1f s）｜链子按 2.5× 实时估 ≈ %.0f s 墙钟",
+                                     recSecs, lead, total, picEnd, cap, total / 2.5))
+            onStage("录音进链（\(String(format: "%.0f", total)) s）…")
+
+            let driver = try ChainDriver(modelDir: dir)
+            driver.onStage = { text in
+                VoiceJournal.line(text)
+                onStage(text)
+            }
+            let parts: ChainDriver.SampleParts
+            if let s = sample {
+                parts = try SampleStore.load(s)
+                onStage("音色用样本「\(s.info.name)」：跳过 ①，不载 sv 图")
+            } else if let r = refWav {
+                let reference = try AudioProcessor.loadWAV16K(r, maxSeconds: ChainDriver.svMaxSecs)
+                onStage("音色用现场参考 \(r.lastPathComponent)：读数 \(reference.count) 样本")
+                parts = try driver.makeSample(reference: reference)
+            } else {
+                throw ChainError.input("参考没准备起来")
+            }
+
+            let chainWav = outDir.appendingPathComponent(base + "_chain.wav")
+            let writer = try AudioProcessor.WAVWriter(url: chainWav)
+            let (passes, outSamples) = try VoiceEngine.runSegments(
+                driver: driver, parts: parts, source: source, writer: writer,
+                pitchCents: pitchCents, onStage: onStage)
+            try writer.finish()
+            let convSecs = Double(outSamples) / sr
+            VoiceJournal.line(String(format: "配音进链完成：%d 片／录音 %.2f s → 链子 %.2f s（不拉伸，位置照他自己对的）",
+                                     passes, total, convSecs))
+
+            let back = try VoiceEngine.writeBack(video: inputVideo, audioWav: chainWav,
+                                                 padded: nil, audioSecs: convSecs,
+                                                 picEnd: picEnd, outDir: outDir, base: base,
+                                                 outputVideo: outputVideo, onStage: onStage)
+            for t in [chainWav, back.padWav] {
+                guard let u = t else { continue }
+                let sz = (try? u.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
+                do {
+                    try FileManager.default.removeItem(at: u)
+                    VoiceJournal.line("中间量已清 \(u.lastPathComponent) \(FileHistory.human(Int64(sz)))")
+                } catch {
+                    let ne = error as NSError
+                    VoiceJournal.line("中间量没删掉 \(u.lastPathComponent)：\(ne.domain)#\(ne.code)｜\(ne.localizedDescription)")
+                }
+            }
+            let over = max(0.0, convSecs - picEnd)
+            VoiceJournal.line(String(format: "配音完成：录音 %.1f s＋补头 %.3f s → 链子 %.1f s／画面到 %.1f s"
+                                     + "／补静音 %.1f s／超出丢掉 %.1f s｜口径 \(back.mux.cfgName) → %@ %.1f MB／墙钟 %.0f s",
+                                     recSecs, lead, convSecs, picEnd, back.padSecs, over,
+                                     back.landed.lastPathComponent,
+                                     Double(back.mux.bytes) / 1_048_576, Date().timeIntervalSince(t0)))
+            return VoiceOverResult(recordedSeconds: recSecs, leadSeconds: lead,
+                                   convertedSeconds: convSecs, passes: passes, picEnd: picEnd,
+                                   padSecs: back.padSecs, overSecs: over,
+                                   mux: back.mux, outURL: back.landed)
+        }.value
+    }
+
     // MARK: - 读小说（文本 → 系统 TTS → 现有样本链）
     /// 一次朗读的读数。`tts.line` 就是 A0 那一格的证据。
     struct NovelResult {
