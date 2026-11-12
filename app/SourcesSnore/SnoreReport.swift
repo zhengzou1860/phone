@@ -306,8 +306,8 @@ enum SnoreAnalyze {
     private static func headline(_ s: SnoreSummary, hours: [(date: Date, sec: Double)]) -> String {
         if s.tooShort { return "这一场太短，说明不了整晚的情况。" }
         let amount = s.snoreSec < 1
-            ? "昨晚几乎没打鼾"
-            : "昨晚打鼾 \(snoreDurCN(s.snoreSec))（\(coverageCN(s))）"
+            ? "\(whenCN(s))几乎没打鼾"
+            : "\(whenCN(s))打鼾 \(snoreDurCN(s.snoreSec))（\(coverageCN(s))）"
         let when = s.snoreSec < 1 ? "" : "，\(whenPhrase(hours))"
         let gap = s.gapCount == 0
             ? "，没有鼾声停住"
@@ -332,11 +332,23 @@ enum SnoreAnalyze {
         return "鼾声不算多。"
     }
 
+    /// 「整晚」还是「录到的这段时间」：分母本来就是录到的时长，下午随手试的十几分钟写成
+    /// 「占整晚 17.7%」是误导（CI 合成样例那 15 分钟就是这样）。够不上一晚就别叫一晚。
+    private static func spanCN(_ s: SnoreSummary) -> String {
+        s.totalSec >= 3 * 3600 ? "占整晚" : "占录到的这段时间"
+    }
+
+    /// 「昨晚」还是「这一场」，同上。
+    private static func whenCN(_ s: SnoreSummary) -> String {
+        s.totalSec >= 3 * 3600 ? "昨晚" : "这一场"
+    }
+
     /// 占比那一格：不到 0.05% 就写「不到 0.1%」。「打了 4 秒（占整晚 0.0%）」读着像自相矛盾，
     /// 而那一晚（11-10）确实判到了 4 秒鼾，不是零。
     private static func coverageCN(_ s: SnoreSummary) -> String {
         let pct = s.coverage * 100
-        return pct < 0.05 ? "占整晚不到 0.1%" : String(format: "占整晚 %.1f%%", pct)
+        if pct < 0.05 { return "\(spanCN(s))不到 0.1%" }
+        return "\(spanCN(s)) \(String(format: "%.1f%%", pct))"
     }
 
     /// 「响不响」：拿鼾声期均值跟这一晚的房间底噪比，只给差值、不下「响/轻」的断语。
@@ -376,7 +388,7 @@ enum SnoreAnalyze {
         if s.coverage < 0.005 && s.gapCount == 0 {
             // 别在这里质疑麦克风权限：这一晚判到了鼾、也记了别的动静，权限显然是给了的。
             // 开头说「睡得挺安静」，这里再说「可能没给权限」就自相矛盾了。
-            return "这一晚几乎没听到鼾声，先按「睡得安静」读。要是你或伴侣觉得其实打了，"
+            return "\(whenCN(s))几乎没听到鼾声，先按「睡得安静」读。要是你或伴侣觉得其实打了，"
                 + "把手机挪到离嘴 30–60 厘米、别被枕头压住，再连记几晚对一对。"
         }
         return "鼾声和停住都不算突出。连着记 3–5 晚看趋势，单晚的数字别当结论。"

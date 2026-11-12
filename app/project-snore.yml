@@ -24,7 +24,7 @@ targets:
         CFBundleIdentifier: com.qoder.snorebench
         CFBundlePackageType: APPL
         CFBundleShortVersionString: "0.11"
-        CFBundleVersion: "11"
+        CFBundleVersion: "12"
         CFBundleInfoDictionaryVersion: "6.0"
         NSMicrophoneUsageDescription: "整晚只在手机自己这儿判定鼾声和鼾声停住：不存录音、声音不上传，落到手机上的只有文字和数字（曲线、事件、报告），你按「发到电脑」才发出去。"
         # 「发到电脑」是往同一张网里的电脑 POST 日志，iOS 14 起连本地地址要先过这道授权，
