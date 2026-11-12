@@ -5,10 +5,14 @@ import Combine
 @MainActor
 final class AudioEngine: ObservableObject {
     @Published var isRecording = false
+    /// 暂停中（还在录这一条，只是暂时不往文件里写）。`isRecording` 仍为真 ⇒ 互斥位照样拦着别的动作。
+    @Published var isPaused = false
     @Published var recordedURL: URL?
 
     private let engine = AVAudioEngine()
     private var audioFile: AVAudioFile?
+    /// 续录要按同一个格式重挂 tap，所以起录时把它留着。
+    private var tapFormat: AVAudioFormat?
 
     func startRecording() {
         guard !isRecording else { return }
@@ -44,6 +48,7 @@ final class AudioEngine: ObservableObject {
                 guard let self = self, let file = self.audioFile else { return }
                 try? file.write(from: buffer)
             }
+            tapFormat = format
 
             try engine.start()
             isRecording = true
@@ -53,13 +58,49 @@ final class AudioEngine: ObservableObject {
         }
     }
 
+    /// 暂停：**摘掉 tap**，文件不关。
+    ///
+    /// 不在 tap 里读一个「暂停位」——那是音频渲染线程，主线程写它读，天然是一场数据竞争。
+    /// 没有 tap 就没人往文件里写，续录时按原格式重挂一个，接着往同一条后面写。
+    /// 画面那一头同时暂停 ⇒ 暂停多久都不影响录音和画面的对位（两边一起冻住）。
+    func pauseRecording() {
+        guard isRecording, !isPaused else { return }
+        engine.inputNode.removeTap(onBus: 0)
+        engine.pause()
+        isPaused = true
+        VoiceJournal.line("录音暂停：tap 已摘、文件不关，续录接着写同一条")
+    }
+
+    /// 续录。调用方必须**先让画面真在走了**再调这一条：反过来（录音先续）每暂停一次
+    /// 就把声音整体往后推一点（画面起播那几十毫秒里录进去的是空白）。
+    func resumeRecording() {
+        guard isRecording, isPaused else { return }
+        guard let format = tapFormat, audioFile != nil else {
+            VoiceJournal.line("续录失败：格式或文件已经不在了（这一条只能停止）")
+            return
+        }
+        do {
+            engine.inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
+                guard let self = self, let file = self.audioFile else { return }
+                try? file.write(from: buffer)
+            }
+            try engine.start()
+            isPaused = false
+            VoiceJournal.line("录音已续：接着往同一条后面写")
+        } catch {
+            VoiceJournal.line("续录失败：\(error.localizedDescription)（这一条可以「停止」，已录下的还在）")
+        }
+    }
+
     func stopRecording() {
         guard isRecording else { return }
 
         engine.inputNode.removeTap(onBus: 0)
         engine.stop()
         audioFile = nil
+        tapFormat = nil
         isRecording = false
+        isPaused = false
         if let url = recordedURL { measure(url) }
     }
 

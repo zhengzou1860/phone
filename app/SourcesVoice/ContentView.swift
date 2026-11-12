@@ -136,8 +136,8 @@ struct ContentView: View {
     /// 录音头上要补的静音＝起录音那一刻画面已经走掉的秒数（`MutedVideoPlayer.now`）。
     @State private var voLead = 0.0
     @State private var voRecNote = ""
-    /// 点了「配音」但录音还没起来那一段（等画面归零、等首帧，最长几秒）。
-    /// 不立这一位，这几秒里「配音」还能再点一次 ⇒ 两台画面泵叠着放，对时全乱。
+    /// 点了「配音」／「继续」但录音还没跟上那一段（等画面归零、等首帧，最长几秒）。
+    /// 不立这一位，这几秒里那个键还能再点一次 ⇒ 两台画面泵叠着放，对时全乱。
     @State private var voArming = false
     @State private var voBusy = false
     @State private var voStatus = ""
@@ -1760,12 +1760,16 @@ struct ContentView: View {
             Text("配音（画面静音播放，你对着画面念；念完换成选中样本的音色）").font(.headline)
 
             HStack(spacing: 12) {
-                Button(voRec.isRecording ? "录音中…" : "配音") { startVoiceOver() }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(videoURL == nil || voArming || busyAnywhere)
-                Button("停止") { stopVoiceOver() }
+                // 配音中这一个键自己就是「停止」：点它结束这一条（留着给「转换」用）；
+                // 停完再点「配音」是从头重配一条新的，不是接着上一条念。
+                Button(voRec.isRecording ? "停止" : "配音") {
+                    if voRec.isRecording { stopVoiceOver() } else { startVoiceOver() }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(voArming || (voRec.isRecording ? false : (videoURL == nil || busyAnywhere)))
+                Button(voRec.isPaused ? "继续" : "暂停") { pauseVoiceOver() }
                     .buttonStyle(.bordered)
-                    .disabled(!voRec.isRecording)
+                    .disabled(!voRec.isRecording || voArming)
                 Button(voBusy ? "转换中…" : "转换") { convertVoiceOver() }
                     .buttonStyle(.borderedProminent)
                     .disabled(voRecURL == nil || videoURL == nil || busyAnywhere
@@ -1782,7 +1786,10 @@ struct ContentView: View {
                     Text(String(format: "画面 %.1f s", voPlayer.seconds))
                     if voRec.isRecording {
                         Text(String(format: "已录 %.1f s", max(0, voPlayer.seconds - voLead)))
-                            .foregroundColor(.red)
+                            .foregroundColor(voRec.isPaused ? .orange : .red)
+                    }
+                    if voRec.isPaused {
+                        Text("已暂停").foregroundColor(.orange)
                     }
                     if !voPlayer.status.isEmpty {
                         Text(voPlayer.status)
@@ -1797,7 +1804,10 @@ struct ContentView: View {
                     .foregroundColor(.secondary)
             }
 
-            Text("点「配音」：画面从头开始放、一个声音都不出（片子里原来那条音轨整个不要），麦克风同时开始录。你看着画面里那个人的嘴，用自己的话跟着念 —— 口型由你自己对，程序不再猜时间。念完点「停止」（画面放完也会自己停）。")
+            Text("点「配音」：画面从头开始放、一个声音都不出（片子里原来那条音轨整个不要），麦克风同时开始录。你看着画面里那个人的嘴，用自己的话跟着念 —— 口型由你自己对，程序不再猜时间。")
+                .font(.caption)
+                .foregroundColor(.secondary)
+            Text("配音中那个键自己变成「停止」：点它就结束这一条，留着给「转换」用；再点「配音」是从头重配一条新的。中途要歇口气点「暂停」—— 画面和录音一起冻住，点「继续」再接着往下念，位置不会跑（续的时候同样是画面先走、录音跟上）。画面放完也会自己停。")
                 .font(.caption)
                 .foregroundColor(.secondary)
             Text("画面先起、录音跟着起，中间差的那零点几秒会自动补在录音头上（日志里「配音对时」那行就是它），所以录音和画面是同一条时间轴。再点「转换」：录音走上面 ①②③④ 那条链换成选中样本的音色，音高那格同样生效，然后装回原来那条画面（一个像素不动）。这一条不做整条拉伸 —— 你自己对好的位置不能再被推走。")
@@ -1929,6 +1939,38 @@ struct ContentView: View {
                                  (videoProbe?.videoStart ?? 0) + (videoProbe?.videoSecs ?? 0)))
         if secs < 0.3 {
             voNote = "这一条不到 0.3 秒，太短了：重录一遍。"
+        }
+    }
+
+    /// 点「暂停」／「继续」：画面和录音一起冻住、一起接着走。
+    ///
+    /// 两边一起停，暂停多久都不影响对位（录音不写、画面不走）。续的时候顺序和起播一样：
+    /// **先让画面真在走了再续录音** —— 反过来的话，画面起播那几十毫秒里录进去的是空白，
+    /// 每暂停一次就把声音整体往后推一点。
+    @MainActor
+    private func pauseVoiceOver() {
+        guard voRec.isRecording, !voArming else { return }
+        if !voRec.isPaused {
+            voRec.pauseRecording()
+            voPlayer.pause()
+            VoiceJournal.line(String(format: "配音暂停：画面停在 %.3f s／录音已录 %.2f s",
+                                     voPlayer.now, max(0, voPlayer.now - voLead)))
+            return
+        }
+        voArming = true
+        Task { @MainActor in
+            await voPlayer.resumeFromPause()
+            voArming = false
+            // 续播这几秒里画面可能正好放到末尾 ⇒ onEnd 已经把这一条收了，别再往上写「继续」。
+            guard voRec.isRecording else { return }
+            voRec.resumeRecording()
+            if voRec.isPaused {
+                voNote = "续录没起来（日志里「续录失败」那行有原因）：点「停止」，已经录下的那一段还在，照样能转换。"
+            } else {
+                voNote = ""
+                VoiceJournal.line(String(format: "配音继续：画面 %.3f s／录音已录 %.2f s（补头仍是 %.3f s）",
+                                         voPlayer.now, max(0, voPlayer.now - voLead), voLead))
+            }
         }
     }
 

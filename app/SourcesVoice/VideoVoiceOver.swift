@@ -118,6 +118,31 @@ final class MutedVideoPlayer: ObservableObject {
         if was { status = "画面已停" }
     }
 
+    /// 暂停：画面冻在这儿，录音那一头同时摘 tap ⇒ 两边一起停，对位不动。
+    func pause() {
+        player.pause()
+        isPlaying = false
+        status = String(format: "画面暂停在 %.1f s（录音也暂停）", now)
+    }
+
+    /// 续播，并且**等到画面真在走了**才返回，调用方这才续录。
+    /// 顺序和起播一样：录音先续的话，画面起播那几十毫秒里录进去的是空白，
+    /// 每暂停一次就把声音整体往后推一点。
+    func resumeFromPause() async {
+        let at = now
+        player.play()
+        isPlaying = true
+        status = "画面播放中（静音）"
+        var rolled = false
+        for _ in 0..<150 {
+            if now > at + 0.02 { rolled = true; break }
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+        seconds = now
+        VoiceJournal.line(String(format: "配音续播：从 %.3f s 走到 %.3f s（%@）",
+                                 at, now, rolled ? "真在走" : "等了 3 s 还没走"))
+    }
+
     /// 这一条还是不是当前备着的那一片（换片之后旧录音不能再拿去转换）。
     func holds(_ url: URL) -> Bool { loadedPath == url.path }
 }
