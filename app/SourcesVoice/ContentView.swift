@@ -951,7 +951,8 @@ struct ContentView: View {
         if let prev = videoURL { saveScript(scriptKey(prev, true)) }
         loadScript(scriptKey(dest, true))
         // 配音那一格跟着片源走：画面换一条，上一条的录音就不能再拿去转换了（时间轴不是同一条）。
-        voPlayer.load(dest, picSecs: info.videoStart + info.videoSecs)
+        // 这儿只卸上一片，**不建新的 item** —— 0.1/55 选视频闪退就死在这儿原来那句 load 里。
+        voPlayer.unload()
         voRecURL = nil
         voLead = 0
         voRecNote = ""
@@ -1176,7 +1177,7 @@ struct ContentView: View {
         if let u = videoURL, paths.contains(u.path) {
             videoURL = nil
             videoProbe = nil      // 体检数跟着片源走：不清的话界面会拿着上一条的秒数说下一条
-            voPlayer.stop()
+            voPlayer.unload()     // 文件都删了，item 不能再指着它
             voRecURL = nil
             voOutURL = nil
         }
@@ -1799,7 +1800,7 @@ struct ContentView: View {
                 .font(.caption)
                 .foregroundColor(.secondary)
             } else {
-                Text("先在上面「选视频」挑一段，画面就铺在这儿（不出声）。")
+                Text("先在上面「选视频」挑一段；点「配音」画面才铺在这儿（不出声）。")
                     .font(.caption)
                     .foregroundColor(.secondary)
             }
@@ -1887,10 +1888,6 @@ struct ContentView: View {
             return
         }
         player.stop()                       // 试听那条先把音频会话让出来
-        if !voPlayer.holds(input) {
-            let i = videoProbe ?? VideoClip.probe(input)
-            voPlayer.load(input, picSecs: i.videoStart + i.videoSecs)
-        }
         voPlayer.onEnd = { stopVoiceOver() }
         voArming = true
         voNote = ""
@@ -1900,6 +1897,11 @@ struct ContentView: View {
         voOutURL = nil
         VoiceJournal.line("点「配音」片源=\(input.lastPathComponent)（画面静音从头放，麦克风跟着起）")
         Task { @MainActor in
+            // 备画面挪到这儿（选视频那一步不碰播放器）：keys 要等，只能在 async 里做。
+            if !voPlayer.holds(input) {
+                let i = videoProbe ?? VideoClip.probe(input)
+                await voPlayer.prepare(input, picSecs: i.videoStart + i.videoSecs)
+            }
             await voPlayer.playFromStart()
             // 片子太短的话，等画面起这几秒里它可能已经放完了 ⇒ 别对着一张停住的画面录。
             guard voPlayer.isPlaying else {

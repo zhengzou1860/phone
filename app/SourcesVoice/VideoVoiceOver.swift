@@ -26,6 +26,7 @@ final class MutedVideoPlayer: ObservableObject {
     private var endObserver: NSObjectProtocol?
     private var timeObserver: Any?
     private var seekDone = false
+    private var keysReady = false
     private var loadedPath = ""
 
     init() {
@@ -49,21 +50,48 @@ final class MutedVideoPlayer: ObservableObject {
         return t.isNumeric ? max(0, t.seconds) : 0
     }
 
-    /// 换片源。`picSecs` 由调用方给（选片时已经体检过），不再异步等 asset 载入。
-    func load(_ url: URL, picSecs: Double) {
+    /// 换片源时把上一片卸干净。**选视频那一步只做到这儿为止**：不建 item、不 preroll。
+    /// 0.1/55 他选视频当场闪退，日志停在「历史文件扫目录」之后、本类的任何一行之前，
+    /// 而 app 自带的未捕获异常钩子没喊话 ⇒ 不是 ObjC 异常，是硬死。落点就是原来在这儿
+    /// 主线程当场 `AVPlayerItem(url:)` ＋ `preroll` 那两句。画面只有点「配音」时才需要。
+    func unload() {
+        VoiceJournal.line("配音画面卸载：停上一片、清 item（这一步不建新的）")
         stop()
         if let o = endObserver {
             NotificationCenter.default.removeObserver(o)
             endObserver = nil
         }
-        loadedPath = url.path
+        player.replaceCurrentItem(with: nil)
+        loadedPath = ""
         seconds = 0
-        status = String(format: "画面 %.1f s（静音，声音留给麦克风）", picSecs)
-        let item = AVPlayerItem(url: url)
+        status = "点「配音」画面才起来（静音，声音留给麦克风）"
+        VoiceJournal.line("配音画面已卸")
+    }
+
+    /// 备画面，**照剪辑线在这台机上走通的那条顺序**（`app/Sources/Cut.swift:984`）：
+    /// AVURLAsset → tracks/duration 先在分离线程等齐 → 回主线程 `AVPlayerItem(asset:)`。
+    /// 不 preroll：那一句会在主线程把整条播放泵拉起来，剪辑线从来不用它。
+    /// 首帧慢一点没关系 —— 头上补多少静音是读画面自己的钟量出来的，不是猜的。
+    func prepare(_ url: URL, picSecs: Double) async {
+        unload()
+        loadedPath = url.path
+        VoiceJournal.line("配音画面准备 \(url.lastPathComponent)（\(String(format: "%.1f", picSecs)) s）：先等 tracks/duration")
+        let asset = AVURLAsset(url: url)
+        keysReady = false
+        asset.loadValuesAsynchronously(forKeys: ["tracks", "duration"]) { [weak self] in
+            Task { @MainActor in self?.keysReady = true }
+        }
+        // 不用 continuation（同 seekDone 那条理由：宁可轮询也不赌回调一定来），最多等 3 s。
+        for _ in 0..<150 {
+            if keysReady { break }
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+        let d = CMTimeGetSeconds(asset.duration)
+        VoiceJournal.line("配音画面 keys \(keysReady ? "齐了" : "等了 3 s 没齐")／duration \(String(format: "%.2f", d)) s")
+        let item = AVPlayerItem(asset: asset)
         player.replaceCurrentItem(with: item)
         player.isMuted = true
-        // 预备好首帧：等点「配音」时才现建 item，画面起得慢，头上要补的静音就长。
-        player.preroll(atRate: 1.0, completionHandler: nil)
+        VoiceJournal.line("配音画面 item 已挂（不 preroll）")
         endObserver = NotificationCenter.default.addObserver(
             forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main) { [weak self] _ in
             Task { @MainActor in
@@ -74,6 +102,7 @@ final class MutedVideoPlayer: ObservableObject {
                 self.onEnd?()
             }
         }
+        status = String(format: "画面 %.1f s（静音，声音留给麦克风）", picSecs)
         VoiceJournal.line("配音画面已备 \(url.lastPathComponent)（\(String(format: "%.1f", picSecs)) s，静音）")
     }
 
