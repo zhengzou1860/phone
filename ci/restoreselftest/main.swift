@@ -126,7 +126,15 @@ expect(true, "AI inpainting accepts a 12MP output")
 let srSpec = RestoreModelCatalog.spec(for: .localSRFast)!
 expect(srSpec.inputName == "image" && srSpec.outputName == "out", "LocalSR tensor names match the verified model")
 expect(srSpec.inputShape == [1, 3, 384, 384] && srSpec.outputShape == [1, 3, 1536, 1536], "LocalSR tensor shapes match the verified model")
-expect(srSpec.totalByteCount == 350670 && srSpec.treeSHA256 == "26358751077f4e3b9fa428bd5a21354774ad53ec80212fee46b17bcd1877eabc", "LocalSR files use the upstream tree hash")
+let localSRHashes = [
+    "analytics/coremldata.bin": "9b6fc17c23f6b4e8330528fb4d014f0df1bded922b697ce911c293576861b738",
+    "coremldata.bin": "350271dcda9bbd7e6f09da636e182536629707d230bb3a8b358fa1130c2ce589",
+    "metadata.json": "33c6b596410829f25736947cac469f578277a6d39261180a67367e04ce60f915",
+    "model.mil": "b5aaef64302fa4d12134880bd40f08e1408b45bf4b8a24d4088e76fda6f5f321",
+    "weights/weight.bin": "00d5b0fd5d96cdfa5d87b466704dedbe4b51dcc291f4dd853308ac7b3378fb73"
+]
+expect(srSpec.totalByteCount == 350670, "LocalSR artifact sizes are pinned")
+expect(srSpec.artifacts.allSatisfy { localSRHashes[String($0.relativePath.dropFirst(srSpec.bundleRelativePath.count + 1))] == $0.sha256 }, "LocalSR verifies every downloaded file with SHA-256")
 expect(srSpec.artifacts.allSatisfy { $0.relativePath.hasPrefix(srSpec.bundleRelativePath + "/") }, "LocalSR bundle path contains every downloaded artifact")
 expect(srSpec.artifacts.allSatisfy { $0.downloadURLs.count == 4 && $0.downloadURLs.allSatisfy { URL(string: $0)?.scheme == "https" } }, "LocalSR artifacts include HTTPS mirror and API fallbacks")
 expect(srSpec.artifacts.allSatisfy { $0.downloadURLs.contains { $0.contains("fastly.jsdelivr.net") } && $0.downloadURLs.contains { $0.contains("api.github.com") } }, "LocalSR bypasses an unavailable raw GitHub route")

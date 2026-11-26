@@ -151,8 +151,9 @@ final class RestoreModelManager: ObservableObject {
             throw RestoreError.modelLoadFailed("\(artifact.relativePath) 大小校验失败")
         }
         if let expectedHash = artifact.sha256 {
-            guard try sha256(of: destination) == expectedHash.lowercased() else {
-                throw RestoreError.modelLoadFailed("\(artifact.relativePath) 校验失败，请重试")
+            let actualHash = try sha256(of: destination)
+            guard actualHash == expectedHash.lowercased() else {
+                throw RestoreError.modelLoadFailed("\(artifact.relativePath) 校验失败（实际 \(actualHash.prefix(12))）")
             }
         }
     }
@@ -205,16 +206,12 @@ final class RestoreModelManager: ObservableObject {
             RestoreJournal.line("AI 模型下载：\(spec.name) \(index + 1)/\(spec.artifacts.count)")
         }
 
+        RestoreJournal.line("AI 模型文件校验通过：\(spec.name) \(spec.artifacts.count) 个文件")
         try Task.checkCancellation()
         states[spec.id] = .compiling
         let source = staging.appendingPathComponent(spec.bundleRelativePath)
         guard FileManager.default.fileExists(atPath: source.path) else {
             throw RestoreError.modelLoadFailed("模型包不完整")
-        }
-        if let expectedTreeHash = spec.treeSHA256 {
-            guard try sha256Tree(of: source) == expectedTreeHash.lowercased() else {
-                throw RestoreError.modelLoadFailed("模型目录校验失败，请重试")
-            }
         }
         let compiled = root.appendingPathComponent("Compiled", isDirectory: true)
             .appendingPathComponent(spec.id.rawValue, isDirectory: true)
@@ -261,27 +258,6 @@ final class RestoreModelManager: ObservableObject {
     private func removeIncompleteDownloads() {
         let staging = root.appendingPathComponent("Staging", isDirectory: true)
         try? FileManager.default.removeItem(at: staging)
-    }
-
-    private func sha256Tree(of directory: URL) throws -> String {
-        guard let enumerator = FileManager.default.enumerator(at: directory, includingPropertiesForKeys: [.isRegularFileKey]) else {
-            throw RestoreError.modelLoadFailed("无法读取模型目录")
-        }
-        var files: [(path: String, hash: String)] = []
-        for case let file as URL in enumerator {
-            let values = try file.resourceValues(forKeys: [.isRegularFileKey])
-            guard values.isRegularFile == true else { continue }
-            let relative = String(file.path.dropFirst(directory.path.count + 1)).replacingOccurrences(of: "\\", with: "/")
-            files.append((relative, try sha256(of: file)))
-        }
-        var hash = SHA256()
-        for file in files.sorted(by: { $0.path < $1.path }) {
-            hash.update(data: Data(file.path.utf8))
-            hash.update(data: Data([0]))
-            hash.update(data: Data(file.hash.utf8))
-            hash.update(data: Data([0]))
-        }
-        return hash.finalize().map { String(format: "%02x", $0) }.joined()
     }
 
     private func sha256(of url: URL) throws -> String {

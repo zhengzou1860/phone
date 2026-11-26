@@ -45,7 +45,6 @@ struct RestoreModelSpec: Equatable, Identifiable {
     let sourceURL: String
     let bundleRelativePath: String
     let artifacts: [RestoreModelArtifact]
-    let treeSHA256: String?
     let catalogHash: String
     let compute: RestoreModelCompute
     let inputName: String
@@ -80,14 +79,13 @@ enum RestoreModelCatalog {
         sourceURL: "https://github.com/HerRei/local-upscale",
         bundleRelativePath: "mobile/Models/ios/localsr_fast.mlmodelc",
         artifacts: [
-            artifact(localSRCommit, "mobile/Models/ios/localsr_fast.mlmodelc/analytics/coremldata.bin", 243),
-            artifact(localSRCommit, "mobile/Models/ios/localsr_fast.mlmodelc/coremldata.bin", 374),
-            artifact(localSRCommit, "mobile/Models/ios/localsr_fast.mlmodelc/metadata.json", 1790),
-            artifact(localSRCommit, "mobile/Models/ios/localsr_fast.mlmodelc/model.mil", 43207),
-            artifact(localSRCommit, "mobile/Models/ios/localsr_fast.mlmodelc/weights/weight.bin", 305056)
+            artifact(localSRCommit, "mobile/Models/ios/localsr_fast.mlmodelc/analytics/coremldata.bin", 243, "9b6fc17c23f6b4e8330528fb4d014f0df1bded922b697ce911c293576861b738"),
+            artifact(localSRCommit, "mobile/Models/ios/localsr_fast.mlmodelc/coremldata.bin", 374, "350271dcda9bbd7e6f09da636e182536629707d230bb3a8b358fa1130c2ce589"),
+            artifact(localSRCommit, "mobile/Models/ios/localsr_fast.mlmodelc/metadata.json", 1790, "33c6b596410829f25736947cac469f578277a6d39261180a67367e04ce60f915"),
+            artifact(localSRCommit, "mobile/Models/ios/localsr_fast.mlmodelc/model.mil", 43207, "b5aaef64302fa4d12134880bd40f08e1408b45bf4b8a24d4088e76fda6f5f321"),
+            artifact(localSRCommit, "mobile/Models/ios/localsr_fast.mlmodelc/weights/weight.bin", 305056, "00d5b0fd5d96cdfa5d87b466704dedbe4b51dcc291f4dd853308ac7b3378fb73")
         ],
-        treeSHA256: "26358751077f4e3b9fa428bd5a21354774ad53ec80212fee46b17bcd1877eabc",
-        catalogHash: "localsr-fast-bba3019-tree-v1",
+        catalogHash: "localsr-fast-bba3019-files-v2",
         compute: .neuralEngine,
         inputName: "image",
         outputName: "out",
@@ -116,7 +114,6 @@ enum RestoreModelCatalog {
                 "https://api.github.com/repos/john-rocky/AOT-GAN-for-Inpainting-CoreML/git/blobs/0e916772d239c30ce1dc72b5ec2af5df67d5e5a4"
             ]
         )],
-        treeSHA256: nil,
         catalogHash: "aot-gan-8b3dcd14-float32-v1",
         compute: .gpu,
         inputName: "x_1",
@@ -128,12 +125,12 @@ enum RestoreModelCatalog {
         overlap: 32
     )
 
-    private static func artifact(_ commit: String, _ path: String, _ byteCount: Int) -> RestoreModelArtifact {
+    private static func artifact(_ commit: String, _ path: String, _ byteCount: Int, _ sha256: String) -> RestoreModelArtifact {
         RestoreModelArtifact(
             relativePath: path,
             downloadURL: "https://raw.githubusercontent.com/HerRei/local-upscale/\(commit)/\(path)",
             byteCount: byteCount,
-            sha256: nil,
+            sha256: sha256,
             alternateDownloadURLs: [
                 "https://fastly.jsdelivr.net/gh/HerRei/local-upscale@\(commit)/\(path)",
                 "https://gcore.jsdelivr.net/gh/HerRei/local-upscale@\(commit)/\(path)",
