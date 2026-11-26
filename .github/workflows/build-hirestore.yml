@@ -113,13 +113,9 @@ jobs:
               --title "HiRestore build" --prerelease --notes "unsigned sideload build" 2>&1 | ann "REL "
           fi
           gh release upload channel-hirestore hirestore.ipa build.log --clobber 2>&1 | ann "REL "
-          gh release edit channel-hirestore --draft=false --prerelease >/dev/null 2>&1
-          rid=$(gh release view channel-hirestore --json id --jq .id)
-          curl -fsS -X PATCH \
-            -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/$rid" \
-            -d '{"draft":false,"prerelease":true,"tag_name":"channel-hirestore","name":"HiRestore build","body":"Unsigned sideload IPA for commit '"$GITHUB_SHA"'"}' \
-            >/tmp/hirestore-release.json
+          gh release edit channel-hirestore \
+            --draft=false --prerelease \
+            --notes "Unsigned sideload IPA for commit $GITHUB_SHA" >/dev/null 2>&1
           ipa_size=$(wc -c < hirestore.ipa | tr -d ' ')
           hit=0
           for i in 1 2 3; do
