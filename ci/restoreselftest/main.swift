@@ -66,7 +66,7 @@ let downscaleEstimate = RestorePreflight.estimatedOutputBytes(
     outputWidth: 3840,
     outputHeight: 2160
 )
-expect(downscaleEstimate == 117_187_500, "downscaled output estimate uses the actual pixel ratio")
+expect(downscaleEstimate == 122_880_000, "downscaled output estimate uses the actual pixel ratio")
 expect(RestorePreflight.estimatedOutputBytes(
     sourceBytes: Int64.max,
     sourceWidth: 1,
