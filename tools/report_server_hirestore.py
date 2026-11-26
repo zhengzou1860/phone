@@ -6,6 +6,7 @@ POST /report -> tools/phone-reports-hirestore.txt
 POST /upload -> tools/hirestore-uploads/（只接收修复结果，不接收原片）
 """
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -19,9 +20,19 @@ BASE = Path(__file__).resolve().parent
 OUT = BASE / "phone-reports-hirestore.txt"
 UPLOAD_DIR = BASE / "hirestore-uploads"
 PORT = int(os.environ.get("HIRESTORE_PORT", "8719"))
+TOKEN = os.environ.get("HIRESTORE_TOKEN", "hirestore-local").strip() or "hirestore-local"
 MAX_REPORT_BYTES = 1024 * 1024
 MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024
+MAX_RETAINED_UPLOAD_BYTES = int(os.environ.get("HIRESTORE_MAX_UPLOAD_GB", "20")) * 1024 * 1024 * 1024
+MAX_CONCURRENT_UPLOADS = 2
 WRITE_LOCK = threading.Lock()
+STORAGE_LOCK = threading.Lock()
+UPLOAD_SLOTS = threading.Semaphore(MAX_CONCURRENT_UPLOADS)
+RESERVED_UPLOAD_BYTES = 0
+
+
+class Receiver(ThreadingHTTPServer):
+    daemon_threads = True
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -30,21 +41,41 @@ class Handler(BaseHTTPRequestHandler):
 
     def _reply(self, payload, code=200):
         raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(raw)))
-        self.send_header("Connection", "close")
-        self.end_headers()
-        self.wfile.write(raw)
-        self.close_connection = True
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(raw)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(raw)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            self.close_connection = True
+
+    def _authorized(self):
+        supplied = self.headers.get("X-HiRestore-Token", "")
+        return hmac.compare_digest(supplied.encode("utf-8"), TOKEN.encode("utf-8"))
+
+    def _protocol_valid(self):
+        return self.headers.get("X-HiRestore-Protocol") == "1"
 
     def do_GET(self):
         if self.path.split("?", 1)[0] == "/ping":
+            if not self._authorized():
+                self._reply({"status": "error", "message": "unauthorized"}, 401)
+                return
             self._reply({"status": "live", "app": "HiRestore", "protocol": 1})
             return
         self._reply({"status": "error", "message": "unknown route"}, 404)
 
     def do_POST(self):
+        if not self._authorized():
+            self._reply({"status": "error", "message": "unauthorized"}, 401)
+            return
+        if not self._protocol_valid():
+            self._reply({"status": "error", "message": "X-HiRestore-Protocol must be 1"}, 400)
+            return
         path = self.path.split("?", 1)[0]
         if path == "/report":
             self._save_report()
@@ -79,6 +110,21 @@ class Handler(BaseHTTPRequestHandler):
             left -= len(chunk)
         return b"".join(chunks)
 
+    def _reserve_storage(self, length):
+        global RESERVED_UPLOAD_BYTES
+        with STORAGE_LOCK:
+            # Active .part files are already included in RESERVED_UPLOAD_BYTES.
+            used = sum(path.stat().st_size for path in UPLOAD_DIR.iterdir() if path.is_file() and path.suffix != ".part")
+            if used + RESERVED_UPLOAD_BYTES + length > MAX_RETAINED_UPLOAD_BYTES:
+                return False
+            RESERVED_UPLOAD_BYTES += length
+            return True
+
+    def _release_storage(self, length):
+        global RESERVED_UPLOAD_BYTES
+        with STORAGE_LOCK:
+            RESERVED_UPLOAD_BYTES -= length
+
     def _save_report(self):
         length = self._content_length(MAX_REPORT_BYTES)
         if length is None:
@@ -99,20 +145,39 @@ class Handler(BaseHTTPRequestHandler):
         length = self._content_length(MAX_UPLOAD_BYTES)
         if length is None:
             return
+        try:
+            expected_size = int(self.headers["X-HiRestore-Size"])
+        except (KeyError, ValueError):
+            self._reply({"status": "error", "message": "valid X-HiRestore-Size required"}, 400)
+            return
+        if expected_size <= 0 or expected_size != length:
+            self._reply({"status": "error", "message": "upload size does not match Content-Length"}, 400)
+            return
+        expected_hash = (self.headers.get("X-HiRestore-SHA256") or "").lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_hash):
+            self._reply({"status": "error", "message": "valid X-HiRestore-SHA256 required"}, 400)
+            return
         raw_name = unquote(self.headers.get("X-HiRestore-Filename", "restore.bin"))
         name = os.path.basename(raw_name.replace("\\", "/"))
-        name = re.sub(r"[^A-Za-z0-9._-]", "_", name)
+        name = re.sub(r"[^A-Za-z0-9._-]", "_", name)[:180]
         if not name or name in {".", ".."}:
             name = "restore.bin"
-        expected_size = self.headers.get("X-HiRestore-Size")
-        expected_hash = (self.headers.get("X-HiRestore-SHA256") or "").lower()
-        UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-        final_name = f"{time.strftime('%Y%m%d_%H%M%S')}_{time.time_ns()}_{name}"
-        destination = UPLOAD_DIR / final_name
-        partial = destination.with_suffix(destination.suffix + ".part")
-        received = 0
-        digest = hashlib.sha256()
+        if not UPLOAD_SLOTS.acquire(blocking=False):
+            self._reply({"status": "error", "message": "too many concurrent uploads"}, 503)
+            return
+        partial = None
+        reserved = False
         try:
+            UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+            if not self._reserve_storage(length):
+                self._reply({"status": "error", "message": "upload storage limit reached"}, 507)
+                return
+            reserved = True
+            final_name = f"{time.strftime('%Y%m%d_%H%M%S')}_{time.time_ns()}_{name}"
+            destination = UPLOAD_DIR / final_name
+            partial = destination.with_suffix(destination.suffix + ".part")
+            received = 0
+            digest = hashlib.sha256()
             with partial.open("xb") as handle:
                 left = length
                 while left:
@@ -124,19 +189,29 @@ class Handler(BaseHTTPRequestHandler):
                     received += len(chunk)
                     left -= len(chunk)
             actual_hash = digest.hexdigest()
-            if expected_size and int(expected_size) != received:
+            if received != expected_size:
                 raise ValueError("upload size does not match X-HiRestore-Size")
-            if expected_hash and actual_hash != expected_hash:
+            if actual_hash != expected_hash:
                 raise ValueError("upload checksum does not match X-HiRestore-SHA256")
             os.replace(partial, destination)
             self._reply({"status": "ok", "filename": final_name, "bytes": received, "sha256": actual_hash})
             print(f"HiRestore upload: {final_name} ({received} bytes)", flush=True)
         except (ConnectionError, OSError, ValueError) as exc:
-            try:
-                partial.unlink(missing_ok=True)
-            except OSError:
-                pass
+            if partial is not None:
+                try:
+                    partial.unlink(missing_ok=True)
+                except OSError:
+                    pass
             self._reply({"status": "error", "message": str(exc)}, 400)
+        finally:
+            if partial is not None:
+                try:
+                    partial.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            if reserved:
+                self._release_storage(length)
+            UPLOAD_SLOTS.release()
 
     def log_message(self, *args):
         pass
@@ -146,4 +221,4 @@ if __name__ == "__main__":
     print(f"HiRestore listener on 0.0.0.0:{PORT}", flush=True)
     print(f"logs -> {OUT}", flush=True)
     print(f"uploads -> {UPLOAD_DIR}", flush=True)
-    ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
+    Receiver(("0.0.0.0", PORT), Handler).serve_forever()

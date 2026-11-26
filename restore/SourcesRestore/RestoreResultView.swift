@@ -9,6 +9,7 @@ struct RestoreResultView: View {
     @State private var isSaving = false
     @State private var isUploading = false
     @State private var uploadProgress: Double?
+    @State private var uploadTask: Task<Void, Never>?
     @State private var showUploadConfirmation = false
     @State private var message: String?
     @State private var showDeleteConfirmation = false
@@ -63,6 +64,7 @@ struct RestoreResultView: View {
                         .padding(16)
                         .background(RestoreTheme.card, in: RoundedRectangle(cornerRadius: 17))
                     }
+                    .disabled(isSaving || isUploading)
 
                     Button {
                         showUploadConfirmation = true
@@ -96,6 +98,7 @@ struct RestoreResultView: View {
                             .font(.footnote)
                             .frame(maxWidth: .infinity)
                     }
+                    .disabled(isSaving || isUploading)
                     .confirmationDialog("同时删除 App 内的原片副本和修复结果？系统相册中已保存的文件不受影响。", isPresented: $showDeleteConfirmation) {
                         Button("删除", role: .destructive) {
                             store.delete(asset)
@@ -113,6 +116,7 @@ struct RestoreResultView: View {
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("完成") { dismiss() }
+                        .disabled(isUploading)
                 }
             }
             .alert("提示", isPresented: Binding(
@@ -125,6 +129,8 @@ struct RestoreResultView: View {
             }
         }
         .tint(RestoreTheme.cyan)
+        .interactiveDismissDisabled(isUploading)
+        .onDisappear { uploadTask?.cancel() }
     }
 
     private func metric(_ title: String, _ value: String) -> some View {
@@ -138,21 +144,30 @@ struct RestoreResultView: View {
     }
 
     private func uploadResult() {
+        guard !isUploading else { return }
         isUploading = true
         uploadProgress = 0
         let target = RestorePCTransport.savedEndpoint
+        let key = RestorePCTransport.savedToken
         RestoreJournal.line("准备上传修复结果：\(asset.kind.rawValue) \(asset.outputWidth)×\(asset.outputHeight) \(asset.resultBytes) 字节")
-        Task {
+        uploadTask = Task {
             defer {
                 isUploading = false
                 uploadProgress = nil
+                uploadTask = nil
             }
             do {
-                let reply = try await RestorePCTransport.upload(file: resultURL, endpoint: target) { value in
+                let reply = try await RestorePCTransport.upload(
+                    file: resultURL,
+                    endpoint: target,
+                    token: key
+                ) { value in
                     await MainActor.run { uploadProgress = value }
                 }
                 message = reply
                 RestoreJournal.line("修复结果上传成功：\(reply)")
+            } catch is CancellationError {
+                RestoreJournal.line("修复结果上传已取消")
             } catch {
                 message = error.localizedDescription
                 RestoreJournal.line("修复结果上传失败：\(error.localizedDescription)")

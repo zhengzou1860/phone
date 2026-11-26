@@ -4,6 +4,8 @@ import CryptoKit
 enum RestorePCTransport {
     static let defaultEndpoint = "http://192.168.31.100:8719/report"
     static let endpointKey = "hirestore.pcEndpoint"
+    static let tokenKey = "hirestore.pcToken"
+    static let defaultToken = "hirestore-local"
     static let maximumUploadBytes = 2 * 1024 * 1024 * 1024
 
     static var savedEndpoint: String {
@@ -12,6 +14,16 @@ enum RestorePCTransport {
 
     static func saveEndpoint(_ text: String) {
         UserDefaults.standard.set(text.trimmingCharacters(in: .whitespacesAndNewlines), forKey: endpointKey)
+    }
+
+    static var savedToken: String {
+        let saved = UserDefaults.standard.string(forKey: tokenKey)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? defaultToken
+        return saved.isEmpty ? defaultToken : saved
+    }
+
+    static func saveToken(_ text: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        UserDefaults.standard.set(trimmed.isEmpty ? defaultToken : trimmed, forKey: tokenKey)
     }
 
     static func normalizedEndpoint(_ raw: String) -> String? {
@@ -38,25 +50,27 @@ enum RestorePCTransport {
         filename.addingPercentEncoding(withAllowedCharacters: .alphanumerics.union(CharacterSet(charactersIn: "._-"))) ?? "restore.bin"
     }
 
-    static func ping(endpoint: String) async throws -> String {
+    static func ping(endpoint: String, token: String) async throws -> String {
         guard let url = route("/ping", endpoint: endpoint) else { throw RestorePCError.invalidAddress }
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
+        request.setValue(token, forHTTPHeaderField: "X-HiRestore-Token")
+        request.setValue("1", forHTTPHeaderField: "X-HiRestore-Protocol")
         request.timeoutInterval = 6
-        request.timeoutIntervalForResource = 10
         let (data, _) = try await send(request)
         let reply = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "已连接"
         return "连接成功：\(reply)"
     }
 
-    static func sendLog(_ text: String, endpoint: String) async throws -> String {
+    static func sendLog(_ text: String, endpoint: String, token: String) async throws -> String {
         guard !text.isEmpty else { throw RestorePCError.emptyLog }
         guard let url = route("/report", endpoint: endpoint) else { throw RestorePCError.invalidAddress }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("text/plain; charset=utf-8", forHTTPHeaderField: "Content-Type")
+        request.setValue(token, forHTTPHeaderField: "X-HiRestore-Token")
+        request.setValue("1", forHTTPHeaderField: "X-HiRestore-Protocol")
         request.timeoutInterval = 20
-        request.timeoutIntervalForResource = 60
         request.httpBody = Data(text.utf8)
         let (data, _) = try await send(request)
         let reply = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "已接收"
@@ -66,6 +80,7 @@ enum RestorePCTransport {
     static func upload(
         file: URL,
         endpoint: String,
+        token: String,
         progress: @escaping @Sendable (Double) async -> Void
     ) async throws -> String {
         guard FileManager.default.fileExists(atPath: file.path) else { throw RestorePCError.missingFile }
@@ -77,12 +92,12 @@ enum RestorePCTransport {
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
+        request.setValue(token, forHTTPHeaderField: "X-HiRestore-Token")
         request.setValue(encodedFilename(file.lastPathComponent), forHTTPHeaderField: "X-HiRestore-Filename")
         request.setValue(String(size), forHTTPHeaderField: "X-HiRestore-Size")
         request.setValue(checksum, forHTTPHeaderField: "X-HiRestore-SHA256")
         request.setValue("1", forHTTPHeaderField: "X-HiRestore-Protocol")
         request.timeoutInterval = 60
-        request.timeoutIntervalForResource = 1800
 
         let tasks = UploadTaskBox()
         let progressTask = Task {
@@ -95,7 +110,8 @@ enum RestorePCTransport {
         defer { progressTask.cancel() }
         let (data, _) = try await send(request, file: file, tasks: tasks)
         await progress(1)
-        guard let payload = try? JSONDecoder().decode(UploadReply.self, from: data) else {
+        guard let payload = try? JSONDecoder().decode(UploadReply.self, from: data),
+              payload.status == "ok", payload.bytes == size else {
             throw RestorePCError.invalidResponse
         }
         return "上传完成：\(payload.filename)（\(RestoreMath.formatBytes(payload.bytes))）"
@@ -109,6 +125,8 @@ enum RestorePCTransport {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.waitsForConnectivity = false
         configuration.httpMaximumConnectionsPerHost = 1
+        configuration.timeoutIntervalForRequest = request.timeoutInterval
+        configuration.timeoutIntervalForResource = file == nil ? 60 : 1800
         let session = URLSession(configuration: configuration)
         defer { session.finishTasksAndInvalidate() }
         let result: (Data, URLResponse) = try await withTaskCancellationHandler {
@@ -150,6 +168,7 @@ enum RestorePCTransport {
         defer { try? handle.close() }
         var hash = SHA256()
         while let chunk = try handle.read(upToCount: 1024 * 1024), !chunk.isEmpty {
+            try Task.checkCancellation()
             hash.update(data: chunk)
         }
         return hash.finalize().map { String(format: "%02x", $0) }.joined()

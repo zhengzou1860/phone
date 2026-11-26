@@ -3,6 +3,7 @@ import UIKit
 
 struct RestorePCView: View {
     @AppStorage(RestorePCTransport.endpointKey) private var endpoint = RestorePCTransport.defaultEndpoint
+    @AppStorage(RestorePCTransport.tokenKey) private var token = RestorePCTransport.defaultToken
 
     @State private var message = "还没有连接或发送"
     @State private var isBusy = false
@@ -14,13 +15,21 @@ struct RestorePCView: View {
                 Label("上传到电脑", systemImage: "computer")
                     .font(.headline)
                     .foregroundStyle(RestoreTheme.cyan)
-                Text("手机和电脑需在同一 Wi-Fi。电脑运行 tools/report_server_hirestore.py 后，填写电脑的 IPv4 地址和 8719 端口。")
+                Text("手机和电脑需在同一 Wi-Fi。电脑运行 tools/report_server_hirestore.py 后，填写电脑的 IPv4 地址和 8719 端口；上传密钥默认 hirestore-local，改了电脑端 HIRESTORE_TOKEN 时也要同步修改。")
                     .font(.caption)
                     .foregroundStyle(RestoreTheme.secondary)
 
                 TextField("电脑地址", text: $endpoint, prompt: Text(RestorePCTransport.defaultEndpoint))
                     .font(.caption.monospaced())
                     .keyboardType(.URL)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .submitLabel(.done)
+                    .padding(11)
+                    .background(RestoreTheme.cardStrong, in: RoundedRectangle(cornerRadius: 12))
+
+                SecureField("上传密钥", text: $token, prompt: Text(RestorePCTransport.defaultToken))
+                    .font(.caption.monospaced())
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
                     .submitLabel(.done)
@@ -63,10 +72,11 @@ struct RestorePCView: View {
         isBusy = true
         message = "正在测试连接…"
         let target = endpoint
+        let key = RestorePCTransport.savedToken
         Task {
             defer { isBusy = false }
             do {
-                let reply = try await RestorePCTransport.ping(endpoint: target)
+                let reply = try await RestorePCTransport.ping(endpoint: target, token: key)
                 message = reply
                 RestoreJournal.line("电脑连接测试成功：\(reply)")
             } catch {
@@ -82,6 +92,7 @@ struct RestorePCView: View {
         progress = 0
         message = "正在发送运行日志…"
         let target = endpoint
+        let key = RestorePCTransport.savedToken
         let report = RestoreJournal.snapshot(details: deviceDetails(target: target))
         RestoreJournal.line("准备发送运行日志到 \(RestorePCTransport.normalizedEndpoint(target) ?? target)")
         Task {
@@ -90,7 +101,7 @@ struct RestorePCView: View {
                 progress = nil
             }
             do {
-                let reply = try await RestorePCTransport.sendLog(report, endpoint: target)
+                let reply = try await RestorePCTransport.sendLog(report, endpoint: target, token: key)
                 message = reply
                 RestoreJournal.line("运行日志发送成功：\(reply)")
             } catch {
@@ -109,7 +120,7 @@ struct RestorePCView: View {
         return """
         版本：\(version) (\(build))
         系统：\(device.systemName) \(device.systemVersion)
-        设备：\(device.model) · \(device.identifierName)
+        设备：\(device.model)
         电脑地址：\(RestorePCTransport.normalizedEndpoint(target) ?? target)
         可用空间：\(RestoreMath.formatBytes(Int(available)))
         """
