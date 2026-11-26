@@ -4,6 +4,8 @@ tools/
 *.zip
 *.png
 *.json
+!restore/Assets.xcassets/AppIcon.appiconset/AppIcon.png
+!restore/Assets.xcassets/AppIcon.appiconset/Contents.json
 .DS_Store
 xcuserdata/
 app/HelloLC.xcodeproj/

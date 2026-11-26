@@ -1,0 +1,48 @@
+name: HiRestore
+options:
+  createIntermediateGroups: true
+  deploymentTarget:
+    iOS: "18.0"
+settings:
+  base:
+    CODE_SIGNING_ALLOWED: "NO"
+    CODE_SIGNING_REQUIRED: "NO"
+    CODE_SIGN_IDENTITY: ""
+    IPHONEOS_DEPLOYMENT_TARGET: "18.0"
+targets:
+  HiRestore:
+    type: application
+    platform: iOS
+    sources:
+      - SourcesRestore
+      - Assets.xcassets
+    info:
+      path: Info-HiRestore.plist
+      properties:
+        CFBundleDisplayName: 高清修复
+        CFBundleName: HiRestore
+        CFBundleExecutable: HiRestore
+        CFBundleIdentifier: com.qoder.hirestore
+        CFBundlePackageType: APPL
+        CFBundleShortVersionString: "0.1"
+        CFBundleVersion: "1"
+        CFBundleInfoDictionaryVersion: "6.0"
+        NSPhotoLibraryAddUsageDescription: 修复完成后，需要你的允许才能把照片或视频保存到系统相册。
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
+        LSRequiresIPhoneOS: true
+        UILaunchScreen: {}
+        UIUserInterfaceStyle: Dark
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.qoder.hirestore
+        PRODUCT_NAME: HiRestore
+        TARGETED_DEVICE_FAMILY: "1"
+        ARCHS: arm64
+        SWIFT_VERSION: "5.0"
+        SWIFT_STRICT_CONCURRENCY: minimal
+        ENABLE_BITCODE: "NO"
+        GENERATE_INFOPLIST_FILE: "NO"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon

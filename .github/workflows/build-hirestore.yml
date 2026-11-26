@@ -1,0 +1,168 @@
+name: build-hirestore-ipa
+
+on:
+  push:
+    branches: [restore]
+    paths:
+      - 'restore/**'
+      - 'ci/restoreselftest/**'
+      - '.github/workflows/build-hirestore.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: hirestore
+  cancel-in-progress: true
+
+jobs:
+  hirestore:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: show toolchain
+        run: sw_vers && xcodebuild -version && xcodebuild -showsdks | grep -i ios
+
+      - name: geometry selftest
+        run: |
+          set -euo pipefail
+          touch /tmp/selftest.log /tmp/build.log
+          xcrun swiftc -O \
+            restore/SourcesRestore/RestoreMath.swift \
+            ci/restoreselftest/main.swift \
+            -o /tmp/restoretest 2>&1 | tee -a /tmp/selftest.log
+          /tmp/restoretest 2>&1 | tee -a /tmp/selftest.log
+          grep -q '^RESTORE-VERDICT PASS$' /tmp/selftest.log
+
+      - name: install xcodegen
+        run: |
+          set -euo pipefail
+          curl -sL -o /tmp/xg.zip https://github.com/yonaskolb/XcodeGen/releases/download/2.46.0/xcodegen.zip
+          rm -rf /tmp/xg && unzip -q /tmp/xg.zip -d /tmp/xg
+          sudo /tmp/xg/xcodegen/install.sh
+          xcodegen --version
+
+      - name: generate project
+        working-directory: restore
+        run: xcodegen --spec project.yml
+
+      - name: build
+        working-directory: restore
+        run: |
+          set -euo pipefail
+          rm -rf build
+          xcodebuild -project HiRestore.xcodeproj -scheme HiRestore \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY= EXPANDED_CODE_SIGN_IDENTITY= \
+            build 2>&1 | tee -a /tmp/build.log
+
+      - name: package ipa
+        working-directory: restore
+        run: |
+          set -euo pipefail
+          APP=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' | awk 'NR==1{print}')
+          test -n "$APP"
+          file "$APP/HiRestore" | tee -a /tmp/build.log
+          plutil -p "$APP/Info.plist" > /tmp/hirestore-info.txt
+          bundle_id=$(awk -F' => ' '/"CFBundleIdentifier"/{gsub(/"/,"",$2); print $2; exit}' /tmp/hirestore-info.txt)
+          version=$(awk -F' => ' '/"CFBundleShortVersionString"/{gsub(/"/,"",$2); print $2; exit}' /tmp/hirestore-info.txt)
+          echo "I-VERDICT bundle=$bundle_id version=$version" | tee -a /tmp/selftest.log
+          test "$bundle_id" = "com.qoder.hirestore"
+          test -n "$version"
+          grep -q NSPhotoLibraryAddUsageDescription /tmp/hirestore-info.txt
+          grep -q UIFileSharingEnabled /tmp/hirestore-info.txt
+          icon_name=$(plutil -extract CFBundleIcons.CFBundleIconName raw -o - "$APP/Info.plist" 2>/dev/null || true)
+          if [ -z "$icon_name" ]; then
+            icon_name=$(plutil -extract CFBundleIcons.CFBundlePrimaryIcon.CFBundleIconName raw -o - "$APP/Info.plist" 2>/dev/null || true)
+          fi
+          test "$icon_name" = "AppIcon"
+          test -s "$APP/Assets.car"
+          echo "I-VERDICT icon=$icon_name assets=$(wc -c < "$APP/Assets.car" | tr -d ' ')B" | tee -a /tmp/selftest.log
+          rm -rf Payload hirestore.ipa
+          mkdir Payload
+          cp -R "$APP" Payload/
+          ditto -c -k --keepParent Payload hirestore.ipa
+          wc -c hirestore.ipa | tee -a /tmp/build.log
+          cat /tmp/selftest.log /tmp/build.log > build.log
+
+      - name: upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: HiRestore-unsigned-ipa
+          path: |
+            restore/hirestore.ipa
+            restore/build.log
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: publish release
+        working-directory: restore
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          ann() { sed -e 's/%/%25/g' -e 's/:/%3A/g' | awk -v p="$1" 'NR<=6{print "::error::" p substr($0,1,230)}'; }
+          if ! gh release view channel-hirestore >/dev/null 2>&1; then
+            gh release create channel-hirestore \
+              --title "HiRestore build" --prerelease --notes "unsigned sideload build" 2>&1 | ann "REL "
+          fi
+          gh release upload channel-hirestore hirestore.ipa build.log --clobber 2>&1 | ann "REL "
+          gh release edit channel-hirestore --draft=false --prerelease >/dev/null 2>&1
+          rid=$(gh release view channel-hirestore --json id --jq .id)
+          curl -fsS -X PATCH \
+            -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/$rid" \
+            -d '{"draft":false,"prerelease":true,"tag_name":"channel-hirestore","name":"HiRestore build","body":"Unsigned sideload IPA for commit '"$GITHUB_SHA"'"}' \
+            >/tmp/hirestore-release.json
+          ipa_size=$(wc -c < hirestore.ipa | tr -d ' ')
+          hit=0
+          for i in 1 2 3; do
+            draft=$(gh release view channel-hirestore --json isDraft --jq .isDraft 2>/dev/null || true)
+            names=$(gh release view channel-hirestore --json assets --jq '.assets[] | .name + "=" + (.size|tostring)' 2>/dev/null | tr '\n' ' ' || true)
+            remote_size=$(gh release view channel-hirestore --json assets --jq '.assets[] | select(.name=="hirestore.ipa") | .size' 2>/dev/null || true)
+            if ! anon=$(curl -fsSIL -o /dev/null -w '%{http_code}' --max-time 90 \
+              "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/channel-hirestore/hirestore.ipa" 2>/dev/null); then
+              anon=000
+            fi
+            echo "try=$i draft=$draft anonymous_head=$anon size=$remote_size expected=$ipa_size assets=[$names]" | ann "REL-GATE "
+            if [ "$draft" = "false" ] && [ "$anon" = 200 ] && [ "$remote_size" = "$ipa_size" ]; then
+              hit=1
+              break
+            fi
+            sleep 10
+          done
+          if [ "$hit" = 1 ]; then
+            echo "url=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/channel-hirestore/hirestore.ipa" | ann "REL "
+            exit 0
+          fi
+          echo "::error::REL-GATE release asset did not pass verification"
+          exit 1
+
+      - name: report compile errors
+        if: failure()
+        working-directory: restore
+        run: |
+          set +e
+          ann() { sed -e 's/%/%25/g' -e 's/:/%3A/g' | awk -v p="$1" 'NR<=10{print "::error::" p substr($0,1,230)}'; }
+          cat /tmp/selftest.log /tmp/build.log > build.log 2>/dev/null || cp /tmp/build.log build.log 2>/dev/null || echo 'no build log' > build.log
+          grep -nE 'error:|fatal error:' build.log | ann "ERR "
+          exit 0
+
+      - name: publish failure log
+        if: failure()
+        working-directory: restore
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set +e
+          ann() { sed -e 's/%/%25/g' -e 's/:/%3A/g' | awk -v p="$1" 'NR<=6{print "::error::" p substr($0,1,230)}'; }
+          cat /tmp/selftest.log /tmp/build.log > build.log 2>/dev/null || cp /tmp/build.log build.log 2>/dev/null || echo 'no build log' > build.log
+          gh release delete channel-hirestore-fail --cleanup-tag -y >/dev/null 2>&1 || true
+          gh release create channel-hirestore-fail build.log \
+            --title "HiRestore CI failed log" --prerelease --notes "no IPA this round" 2>&1 | ann "GH-FAIL "
