@@ -8,9 +8,13 @@ enum RestoreEngine {
     static func restoreImage(
         from url: URL,
         settings: RestorationSettings,
+        modelURL: URL? = nil,
         maxLongEdge: Int = 4096,
         progress: @escaping @Sendable (Double, String) async -> Void
     ) async throws -> URL {
+        if settings.mode.isAI {
+            return try await restoreAIImage(from: url, settings: settings, modelURL: modelURL, maxLongEdge: maxLongEdge, progress: progress)
+        }
         RestoreJournal.line("照片处理：读取原片")
         try Task.checkCancellation()
         await progress(0.08, "读取照片")
@@ -68,6 +72,55 @@ enum RestoreEngine {
         RestoreJournal.line("照片处理：结果已写入临时文件")
         await progress(1, "照片修复完成")
         return outputURL
+    }
+
+    private static func restoreAIImage(
+        from url: URL,
+        settings: RestorationSettings,
+        modelURL: URL?,
+        maxLongEdge: Int,
+        progress: @escaping @Sendable (Double, String) async -> Void
+    ) async throws -> URL {
+        guard let modelURL else { throw RestoreError.modelNotInstalled }
+        guard FileManager.default.fileExists(atPath: modelURL.path) else { throw RestoreError.modelNotInstalled }
+        let geometry = try RestoreInferenceCore.geometry(url)
+        try RestoreAIMath.validateSource(width: geometry.width, height: geometry.height)
+        let target = RestoreMath.fittedSize(
+            width: geometry.width,
+            height: geometry.height,
+            scale: settings.scale,
+            maxLongEdge: maxLongEdge
+        )
+        try RestoreAIMath.validateOutput(width: target.width, height: target.height, isSuperResolution: settings.mode == .superResolution)
+        try Task.checkCancellation()
+        await progress(0.06, "加载本地 AI 模型")
+        RestoreJournal.line("照片 AI 处理：\(settings.mode.rawValue)，模型 \(modelURL.lastPathComponent)")
+        switch settings.mode {
+        case .superResolution:
+            guard let spec = settings.mode.model.flatMap({ RestoreModelCatalog.spec(for: $0) }) else { throw RestoreError.modelNotInstalled }
+            return try await RestoreSuperResolutionRunner.run(
+                from: url,
+                modelURL: modelURL,
+                spec: spec,
+                outputWidth: target.width,
+                outputHeight: target.height,
+                progress: progress
+            )
+        case .inpainting:
+            guard let mask = settings.mask, !mask.isEmpty else { throw RestoreError.emptyMask }
+            guard let spec = settings.mode.model.flatMap({ RestoreModelCatalog.spec(for: $0) }) else { throw RestoreError.modelNotInstalled }
+            return try await RestoreInpaintingRunner.run(
+                from: url,
+                modelURL: modelURL,
+                spec: spec,
+                mask: mask,
+                outputWidth: target.width,
+                outputHeight: target.height,
+                progress: progress
+            )
+        case .native:
+            throw RestoreError.fileOperation("修复模式无效")
+        }
     }
 
     static func restoreVideo(

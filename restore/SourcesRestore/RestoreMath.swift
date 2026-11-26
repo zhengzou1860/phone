@@ -116,26 +116,3 @@ enum RestorePreflight {
         return bytes > maximum ? Int64.max : bytes + safetyBytes
     }
 }
-
-enum RestorePreflightError: LocalizedError {
-    case invalidDimensions
-    case invalidDuration
-    case videoTooLong
-    case resolutionTooLarge(isVideo: Bool)
-    case insufficientSpace(required: Int64, available: Int64)
-
-    var errorDescription: String? {
-        switch self {
-        case .invalidDimensions:
-            return "图片或视频尺寸无效"
-        case .invalidDuration:
-            return "无法确认视频时长，请重新选择"
-        case .videoTooLong:
-            return "视频超过 15 分钟，请先分段再导入"
-        case .resolutionTooLarge(let isVideo):
-            return isVideo ? "视频超过 4K 或 12MP 限制，请先降低分辨率或分段处理" : "照片分辨率过大，请先缩小后再导入"
-        case .insufficientSpace(let required, let available):
-            return "可用空间不足：预计需要 \(RestoreMath.formatBytes(Int(required)))，当前只有 \(RestoreMath.formatBytes(Int(available)))"
-        }
-    }
-}

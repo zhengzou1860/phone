@@ -4,6 +4,7 @@ import UIKit
 struct RestoreEditorView: View {
     let media: ImportedMedia
     @ObservedObject var processor: RestoreProcessor
+    @EnvironmentObject private var models: RestoreModelManager
 
     @Environment(\.dismiss) private var dismiss
     @State private var settings = RestorePreset.smart.settings(scale: 2)
@@ -11,8 +12,9 @@ struct RestoreEditorView: View {
     @State private var availableBytes: Int64?
     @State private var isCheckingSpace = false
     @State private var spaceCheckFailed = false
+    @State private var showMaskEditor = false
 
-    private var maxEdge: Int { media.kind == .image ? 4096 : 3840 }
+    private var maxEdge: Int { media.kind == .image ? settings.mode.maximumOutputLongEdge : 3840 }
     private var output: (width: Int, height: Int) {
         RestoreMath.fittedSize(width: media.width, height: media.height, scale: settings.scale, maxLongEdge: maxEdge)
     }
@@ -40,16 +42,29 @@ struct RestoreEditorView: View {
     private var actualScale: Double {
         RestoreMath.actualScale(width: media.width, height: media.height, requested: settings.scale, maxLongEdge: maxEdge)
     }
+    private var canStart: Bool {
+        guard !processor.isProcessing, !isCheckingSpace, !hasInsufficientSpace, !spaceCheckFailed else { return false }
+        guard !settings.mode.isAI else {
+            guard let id = settings.mode.model, models.isInstalled(id),
+                  media.width <= RestoreAIMath.maximumSourceLongEdge,
+                  Double(media.width) * Double(media.height) <= Double(RestoreAIMath.maximumSourcePixels) else { return false }
+            return settings.mode != .inpainting || !(settings.mask?.isEmpty ?? true)
+        }
+        return true
+    }
 
     var body: some View {
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
                     sourceSection
-                    presetSection
-                    scaleSection
+                    if media.kind == .image { modeSection }
+                    if media.kind == .image && settings.mode == .native { presetSection }
+                    if media.kind == .video || settings.mode == .native || settings.mode == .superResolution { scaleSection }
+                    if media.kind == .image && settings.mode.isAI { aiModelSection }
+                    if media.kind == .image && settings.mode == .inpainting { maskSection }
                     outputSection
-                    advancedSection
+                    if settings.mode == .native { advancedSection }
                     disclosure
                     startButton
                 }
@@ -69,9 +84,22 @@ struct RestoreEditorView: View {
                 }
             }
             .interactiveDismissDisabled(processor.isProcessing)
+            .sheet(isPresented: $showMaskEditor) {
+                RestoreMaskEditor(
+                    mask: Binding(
+                        get: { settings.mask ?? RestoreMask() },
+                        set: { settings.mask = $0 }
+                    ),
+                    imageURL: media.url
+                )
+            }
             .overlay {
                 if processor.isProcessing {
-                    ProcessingOverlay(progress: processor.progress, phase: processor.phase) {
+                    ProcessingOverlay(
+                        progress: processor.progress,
+                        phase: processor.phase,
+                        detail: media.kind == .video ? "视频会逐帧处理，请保持 App 在前台" : (settings.mode.isAI ? "照片按小块推理，请保持 App 在前台" : "正在本机生成高清照片")
+                    ) {
                         processor.cancel()
                     }
                 }
@@ -86,7 +114,7 @@ struct RestoreEditorView: View {
             }
         }
         .tint(RestoreTheme.cyan)
-        .task(id: settings.scale) { await refreshAvailableSpace() }
+        .task(id: "\(settings.mode.rawValue)-\(settings.scale)") { await refreshAvailableSpace() }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
             Task { await refreshAvailableSpace() }
         }
@@ -122,6 +150,44 @@ struct RestoreEditorView: View {
                 Text("限长 15 分钟 · 最高 4K / 12MP · 流式逐帧处理")
                     .font(.caption2)
                     .foregroundStyle(RestoreTheme.secondary)
+            } else if settings.mode.isAI {
+                Text("AI 原片限制：最长边 8192 px · 最多 40MP · 分块本机推理")
+                    .font(.caption2)
+                    .foregroundStyle(RestoreTheme.secondary)
+            }
+        }
+    }
+
+    private var modeSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("修复方式").font(.headline)
+            ForEach(RestoreProcessingMode.allCases) { mode in
+                Button {
+                    settings.mode = mode
+                    if mode == .inpainting { settings.scale = 1 }
+                    if mode == .native && settings.scale > 2 { settings.scale = 2 }
+                } label: {
+                    HStack(spacing: 12) {
+                        Image(systemName: mode.systemImage)
+                            .font(.headline)
+                            .foregroundStyle(settings.mode == mode ? RestoreTheme.cyan : RestoreTheme.secondary)
+                            .frame(width: 28)
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(mode.title).font(.subheadline.weight(.bold))
+                            Text(mode.subtitle).font(.caption2).foregroundStyle(RestoreTheme.secondary)
+                        }
+                        Spacer()
+                        Image(systemName: settings.mode == mode ? "checkmark.circle.fill" : "circle")
+                            .foregroundStyle(settings.mode == mode ? RestoreTheme.cyan : RestoreTheme.secondary)
+                    }
+                    .padding(13)
+                    .background(settings.mode == mode ? RestoreTheme.cyan.opacity(0.1) : RestoreTheme.card, in: RoundedRectangle(cornerRadius: 16))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 16)
+                            .stroke(settings.mode == mode ? RestoreTheme.cyan.opacity(0.45) : RestoreTheme.stroke)
+                    )
+                }
+                .buttonStyle(.plain)
             }
         }
     }
@@ -181,15 +247,93 @@ struct RestoreEditorView: View {
                         .font(.caption.monospacedDigit())
                         .foregroundStyle(RestoreTheme.cyan)
                 }
-                Picker("放大倍数", selection: $settings.scale) {
-                    Text("原尺寸").tag(1.0)
-                    Text("1.5×").tag(1.5)
-                    Text("2×").tag(2.0)
+                if settings.mode == .superResolution {
+                    Picker("放大倍数", selection: $settings.scale) {
+                        Text("1×").tag(1.0)
+                        Text("1.5×").tag(1.5)
+                        Text("2×").tag(2.0)
+                        Text("4×").tag(4.0)
+                    }
+                    .pickerStyle(.segmented)
+                } else {
+                    Picker("放大倍数", selection: $settings.scale) {
+                        Text("原尺寸").tag(1.0)
+                        Text("1.5×").tag(1.5)
+                        Text("2×").tag(2.0)
+                    }
+                    .pickerStyle(.segmented)
                 }
-                .pickerStyle(.segmented)
                 Text("\(media.width) × \(media.height)  →  \(output.width) × \(output.height)")
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(RestoreTheme.secondary)
+                if settings.mode == .superResolution {
+                    Text("模型先生成 4 倍细节，再缩放到所选输出尺寸；长边 6144 px、最多 32MP。")
+                        .font(.caption2)
+                        .foregroundStyle(RestoreTheme.secondary)
+                }
+            }
+        }
+    }
+
+    private var aiModelSection: some View {
+        guard let id = settings.mode.model, let spec = RestoreModelCatalog.spec(for: id) else { return EmptyView() }
+        let state = models.state(for: id)
+        return RestoreCard {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    Label(spec.name, systemImage: "cpu")
+                    Spacer()
+                    if models.isInstalled(id) {
+                        Label("已就绪", systemImage: "checkmark.circle.fill").foregroundStyle(RestoreTheme.green)
+                    } else {
+                        Label("需要模型", systemImage: "arrow.down.circle").foregroundStyle(.orange)
+                    }
+                }
+                .font(.caption.weight(.semibold))
+                Text("模型单独下载并校验；照片推理不联网，不上传原片。")
+                    .font(.caption2)
+                    .foregroundStyle(RestoreTheme.secondary)
+                switch state {
+                case .downloading(let value):
+                    ProgressView(value: value).tint(RestoreTheme.cyan)
+                    Button("取消下载") { models.cancelDownload(id) }.font(.caption2)
+                case .compiling:
+                    ProgressView().controlSize(.small)
+                case .failed(let message):
+                    Text(message).font(.caption2).foregroundStyle(.red)
+                    Button("重试下载") { models.download(id) }.font(.caption2.weight(.semibold))
+                case .notInstalled:
+                    Button("下载 \(RestoreMath.formatBytes(spec.totalByteCount)) 模型") { models.download(id) }
+                        .font(.caption.weight(.semibold))
+                case .installed:
+                    EmptyView()
+                }
+            }
+            .font(.caption)
+        }
+    }
+
+    private var maskSection: some View {
+        RestoreCard {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    Label("缺损区域", systemImage: "bandage.fill")
+                    Spacer()
+                    if !(settings.mask?.isEmpty ?? true) {
+                        Text("\(settings.mask?.strokes.count ?? 0) 笔").font(.caption2.monospacedDigit()).foregroundStyle(RestoreTheme.green)
+                    }
+                }
+                Text("涂抹划痕、破损或缺失位置。模型只修改蒙版区域，周围画面保持原样。")
+                    .font(.caption2)
+                    .foregroundStyle(RestoreTheme.secondary)
+                Button {
+                    showMaskEditor = true
+                } label: {
+                    Label(settings.mask?.isEmpty == false ? "修改蒙版" : "涂抹缺损区域", systemImage: "paintbrush.fill")
+                        .font(.caption.weight(.semibold))
+                }
+                .buttonStyle(.bordered)
+                .tint(RestoreTheme.cyan)
             }
         }
     }
@@ -277,13 +421,24 @@ struct RestoreEditorView: View {
 
     private var disclosure: some View {
         Label {
-            Text("本版本使用系统原生降噪、色彩、锐化和边缘保留放大。它可以改善观感，但不能凭空恢复已经丢失的细节；视频处理速度取决于时长和分辨率。")
+            Text(disclosureText)
                 .font(.caption)
                 .foregroundStyle(RestoreTheme.secondary)
         } icon: {
             Image(systemName: "info.circle").foregroundStyle(RestoreTheme.cyan)
         }
         .padding(.horizontal, 4)
+    }
+
+    private var disclosureText: String {
+        switch settings.mode {
+        case .native:
+            return "原生增强使用系统降噪、色彩、锐化和边缘保留放大。它不生成新细节；视频处理速度取决于时长和分辨率。"
+        case .superResolution:
+            return "AI 超分按 384px 小块生成 4 倍细节并融合重叠区。生成内容不一定等于真实原貌，处理时间取决于照片尺寸。"
+        case .inpainting:
+            return "AI 修补按 512px 上下文块补全蒙版区域。大面积缺失可能没有唯一正确答案，请对比原片并保留重要照片的原件。"
+        }
     }
 
     private var startButton: some View {
@@ -305,7 +460,7 @@ struct RestoreEditorView: View {
                 in: RoundedRectangle(cornerRadius: 18, style: .continuous)
             )
         }
-        .disabled(processor.isProcessing || isCheckingSpace || hasInsufficientSpace)
+        .disabled(!canStart)
     }
 
     private func icon(for preset: RestorePreset) -> String {

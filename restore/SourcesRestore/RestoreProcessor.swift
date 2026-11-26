@@ -11,17 +11,34 @@ final class RestoreProcessor: ObservableObject {
     @Published private(set) var completedAsset: RestoredAsset?
 
     private let store: RestoreStore
+    private let models: RestoreModelManager
     private var workTask: Task<Void, Never>?
     private var exportSession: AVAssetExportSession?
 
-    init(store: RestoreStore) {
+    init(store: RestoreStore, models: RestoreModelManager) {
         self.store = store
+        self.models = models
     }
 
     func start(media: ImportedMedia, settings: RestorationSettings) {
         guard !isProcessing else { return }
         do {
             try RestorePreflight.validate(width: media.width, height: media.height, duration: media.duration, isVideo: media.kind == .video)
+            var modelURL: URL?
+            if settings.mode.isAI {
+                guard media.kind == .image, let id = settings.mode.model else {
+                    throw RestoreError.fileOperation("当前 AI 模型仅支持照片")
+                }
+                try RestoreAIMath.validateSource(width: media.width, height: media.height)
+                modelURL = try models.modelURL(for: id)
+                if settings.mode == .inpainting {
+                    guard let mask = settings.mask, !mask.isEmpty else { throw RestoreError.emptyMask }
+                }
+            }
+            let preliminaryOutput = outputSize(for: media, settings: settings)
+            if settings.mode.isAI {
+                try RestoreAIMath.validateOutput(width: preliminaryOutput.width, height: preliminaryOutput.height, isSuperResolution: settings.mode == .superResolution)
+            }
             guard FileManager.default.fileExists(atPath: media.url.path) else {
                 throw RestoreError.fileOperation("要处理的原片已不存在")
             }
@@ -53,7 +70,7 @@ final class RestoreProcessor: ObservableObject {
         UIApplication.shared.isIdleTimerDisabled = true
         RestoreJournal.line("开始处理：\(media.kind.rawValue) \(media.width)×\(media.height) \(settings.summary)")
 
-        workTask = Task.detached(priority: .userInitiated) { [weak self] in
+        workTask = Task.detached(priority: .userInitiated) { [weak self, modelURL] in
             guard let self else { return }
             var temporaryOutput: URL?
             do {
@@ -61,6 +78,8 @@ final class RestoreProcessor: ObservableObject {
                     temporaryOutput = try await RestoreEngine.restoreImage(
                         from: media.url,
                         settings: settings,
+                        modelURL: modelURL,
+                        maxLongEdge: settings.mode.maximumOutputLongEdge,
                         progress: { [weak self] value, text in
                             await MainActor.run {
                                 self?.progress = value
@@ -86,7 +105,7 @@ final class RestoreProcessor: ObservableObject {
                 }
                 guard let temporaryOutput else { throw RestoreError.fileOperation("没有生成结果文件") }
                 let output = outputSize(for: media, settings: settings)
-                let maxEdge = media.kind == .image ? 4096 : 3840
+                let maxEdge = media.kind == .image ? settings.mode.maximumOutputLongEdge : 3840
                 let actualScale = RestoreMath.actualScale(
                     width: media.width,
                     height: media.height,
@@ -129,7 +148,7 @@ final class RestoreProcessor: ObservableObject {
             width: media.width,
             height: media.height,
             scale: settings.scale,
-            maxLongEdge: media.kind == .image ? 4096 : 3840
+            maxLongEdge: media.kind == .image ? settings.mode.maximumOutputLongEdge : 3840
         )
     }
 

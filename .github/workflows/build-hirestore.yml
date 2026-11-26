@@ -35,6 +35,10 @@ jobs:
           touch /tmp/selftest.log /tmp/build.log
           xcrun swiftc -O \
             restore/SourcesRestore/RestoreMath.swift \
+            restore/SourcesRestore/RestoreErrors.swift \
+            restore/SourcesRestore/RestoreAIMath.swift \
+            restore/SourcesRestore/RestoreModelCatalog.swift \
+            restore/SourcesRestore/RestoreMask.swift \
             restore/SourcesRestore/RestorePCTransport.swift \
             restore/SourcesRestore/RestoreJournal.swift \
             ci/restoreselftest/main.swift \
@@ -85,7 +89,7 @@ jobs:
           version=$(awk -F' => ' '/"CFBundleShortVersionString"/{gsub(/"/,"",$2); print $2; exit}' /tmp/hirestore-info.txt)
           echo "I-VERDICT bundle=$bundle_id version=$version" | tee -a /tmp/selftest.log
           test "$bundle_id" = "com.qoder.hirestore"
-          test "$version" = "0.3.2"
+          test "$version" = "0.3.3"
           grep -q NSPhotoLibraryAddUsageDescription /tmp/hirestore-info.txt
           grep -q NSLocalNetworkUsageDescription /tmp/hirestore-info.txt
           grep -q NSAllowsLocalNetworking /tmp/hirestore-info.txt

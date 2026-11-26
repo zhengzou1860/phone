@@ -13,21 +13,22 @@ struct RestoreSettingsView: View {
                     appIdentity
                     RestoreCard {
                         VStack(alignment: .leading, spacing: 14) {
-                            infoRow("处理方式", "iOS 原生 Core Image")
+                            infoRow("处理方式", "原生增强 + 本地 Core ML")
                             Divider().overlay(RestoreTheme.stroke)
                             infoRow("视频导出", "AVFoundation · 保留原声音")
                             Divider().overlay(RestoreTheme.stroke)
-                            infoRow("照片输出上限", "长边 4096 px")
+                            infoRow("照片输出上限", "原生 4096 px · AI 超分 6144 px")
                             Divider().overlay(RestoreTheme.stroke)
                             infoRow("视频输出上限", "长边 3840 px")
                             Divider().overlay(RestoreTheme.stroke)
                             infoRow("适配设备", "iPhone 11 及更新机型")
                         }
                     }
+                    modelCard
                     pcCard
                     privacyCard
                     fileCard
-                    Text("系统增强不等于 AI 超分：降噪、锐化和边缘保留放大可以改善观感，但无法重建传感器从未记录到的细节。")
+                    Text("AI 超分和缺损修补会生成合理细节，但不保证还原真实原貌；原生增强仍可作为无需模型的备用方式。")
                         .font(.caption)
                         .foregroundStyle(RestoreTheme.secondary)
                         .padding(.horizontal, 4)
@@ -54,6 +55,25 @@ struct RestoreSettingsView: View {
         .padding(.vertical, 8)
     }
 
+    private var modelCard: some View {
+        RestoreCard {
+            NavigationLink {
+                RestoreModelView()
+            } label: {
+                HStack(spacing: 12) {
+                    Image(systemName: "square.stack.3d.down.forward.line.vertical").foregroundStyle(RestoreTheme.cyan)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("AI 模型").font(.subheadline.weight(.bold))
+                        Text("下载、校验和管理照片超分与修补模型").font(.caption2).foregroundStyle(RestoreTheme.secondary)
+                    }
+                    Spacer()
+                    Image(systemName: "chevron.right").font(.caption).foregroundStyle(RestoreTheme.secondary)
+                }
+            }
+            .buttonStyle(.plain)
+        }
+    }
+
     private var pcCard: some View {
         RestorePCView()
     }
@@ -64,7 +84,7 @@ struct RestoreSettingsView: View {
                 Label("隐私优先", systemImage: "lock.shield.fill")
                     .font(.headline)
                     .foregroundStyle(RestoreTheme.green)
-                Text("原片和修复结果只保存在这台 iPhone 的 App 沙盒中。处理过程不访问网络，也不会自动上传照片或视频。只有你点击「发送运行日志」或在结果页点击「上传到电脑」时，App 才会连接你填写的电脑地址；日志不包含媒体内容。")
+                Text("原片和修复结果只保存在这台 iPhone 的 App 沙盒中。AI 推理不访问网络，也不会自动上传照片或视频。只有你主动下载模型、发送运行日志或点击「上传到电脑」时，App 才会联网；日志不包含媒体内容。")
                     .font(.caption)
                     .foregroundStyle(RestoreTheme.secondary)
             }

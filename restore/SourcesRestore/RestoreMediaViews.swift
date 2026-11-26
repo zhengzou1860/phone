@@ -153,6 +153,7 @@ struct AssetThumbnail: View {
 struct ProcessingOverlay: View {
     let progress: Double
     let phase: String
+    var detail: String = "请保持 App 在前台"
     let onCancel: () -> Void
 
     var body: some View {
@@ -176,7 +177,7 @@ struct ProcessingOverlay: View {
 
                 Text(phase)
                     .font(.headline)
-                Text("视频会逐帧处理，请保持 App 在前台")
+                Text(detail)
                     .font(.footnote)
                     .foregroundStyle(RestoreTheme.secondary)
 

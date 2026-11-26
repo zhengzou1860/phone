@@ -43,16 +43,64 @@ enum RestorePreset: String, Codable, CaseIterable, Identifiable {
     }
 }
 
-struct RestorationSettings: Equatable {
+enum RestoreProcessingMode: String, Codable, CaseIterable, Identifiable {
+    case native
+    case superResolution
+    case inpainting
+
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .native: return "原生增强"
+        case .superResolution: return "AI 智能超分"
+        case .inpainting: return "AI 缺损修补"
+        }
+    }
+    var subtitle: String {
+        switch self {
+        case .native: return "无需模型，改善噪点和色彩"
+        case .superResolution: return "生成 4 倍细节，再按输出上限缩放"
+        case .inpainting: return "涂抹破损区域，按周围内容补全"
+        }
+    }
+    var systemImage: String {
+        switch self {
+        case .native: return "slider.horizontal.3"
+        case .superResolution: return "sparkles"
+        case .inpainting: return "bandage.fill"
+        }
+    }
+    var model: RestoreModelID? {
+        switch self {
+        case .native: return nil
+        case .superResolution: return .localSRFast
+        case .inpainting: return .aotGAN
+        }
+    }
+    var maximumOutputLongEdge: Int { self == .superResolution ? 6144 : 4096 }
+    var isAI: Bool { self != .native }
+}
+
+struct RestorationSettings: Equatable, Codable {
     var preset: RestorePreset = .smart
+    var mode: RestoreProcessingMode = .native
     var scale: Double = 2
     var denoise: Double = 0.28
     var sharpen: Double = 0.52
     var color: Double = 0.12
+    var mask: RestoreMask?
 
     var summary: String {
-        let scaleText = scale == scale.rounded() ? String(Int(scale)) : String(format: "%.1f", scale)
-        return "\(preset.title) · \(scaleText)× · 降噪 \(Int(denoise * 100))% · 锐化 \(Int(sharpen * 100))%"
+        switch mode {
+        case .native:
+            let scaleText = scale == scale.rounded() ? String(Int(scale)) : String(format: "%.1f", scale)
+            return "\(preset.title) · \(scaleText)× · 降噪 \(Int(denoise * 100))% · 锐化 \(Int(sharpen * 100))%"
+        case .superResolution:
+            let scaleText = scale == scale.rounded() ? String(Int(scale)) : String(format: "%.1f", scale)
+            return "AI 超分 · 模型 4× · 输出 \(scaleText)×"
+        case .inpainting:
+            return "AI 缺损修补 · 原尺寸输出"
+        }
     }
 }
 
@@ -93,30 +141,6 @@ struct RestoredAsset: Identifiable, Codable {
         case id, kindRaw, title, createdAt, summary, duration
         case sourceFilename, resultFilename, sourceWidth, sourceHeight
         case outputWidth, outputHeight, resultBytes
-    }
-}
-
-enum RestoreError: LocalizedError {
-    case cancelled
-    case unreadableImage
-    case missingVideoTrack
-    case invalidDimensions
-    case filterFailed(String)
-    case exportFailed(String)
-    case photoPermissionDenied
-    case fileOperation(String)
-
-    var errorDescription: String? {
-        switch self {
-        case .cancelled: return "已停止处理"
-        case .unreadableImage: return "无法读取这张照片"
-        case .missingVideoTrack: return "视频里没有可处理的画面"
-        case .invalidDimensions: return "照片或视频尺寸无效"
-        case .filterFailed(let message): return "画面处理失败：\(message)"
-        case .exportFailed(let message): return "视频导出失败：\(message)"
-        case .photoPermissionDenied: return "没有相册写入权限，请在系统设置中允许"
-        case .fileOperation(let message): return message
-        }
     }
 }
 

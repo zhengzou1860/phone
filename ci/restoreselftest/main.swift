@@ -100,4 +100,45 @@ let largeLines = (0..<1000).map { _ in String(repeating: "x", count: 1000) }
 let compacted = RestoreJournal.compact(largeLines)
 expect(compacted.joined(separator: "\n").utf8.count <= 512 * 1024, "runtime journal respects its byte cap")
 
+let singleAITile = RestoreAIMath.tilePlan(width: 300, height: 200, tileSize: 384, overlap: 8, outputScale: 1)
+expect(singleAITile.count == 1 && singleAITile[0].originX == -8 && singleAITile[0].originY == -8, "small AI image uses one padded tile")
+let edgeAITiles = RestoreAIMath.tilePlan(width: 384, height: 384, tileSize: 384, overlap: 8, outputScale: 1)
+expect(edgeAITiles.count == 4 && edgeAITiles.contains { $0.originX == 376 }, "AI tile grid covers both edges with overlap")
+expect(RestoreAIMath.tilePlan(width: 100, height: 100, tileSize: 16, overlap: 8, outputScale: 1).isEmpty, "invalid AI tile geometry is rejected")
+expect(RestoreAIMath.tilePlan(width: 100, height: 100, tileSize: 384, overlap: 8, outputScale: 0).isEmpty, "invalid AI output scale is rejected")
+try RestoreAIMath.validateSource(width: 8192, height: 4882)
+expect(true, "AI source accepts the documented geometry boundary")
+expectPreflightError({ try RestoreAIMath.validateSource(width: 8193, height: 100) }, "8192")
+expectPreflightError({ try RestoreAIMath.validateOutput(width: 8000, height: 4001, isSuperResolution: true) }, "32MP")
+try RestoreAIMath.validateOutput(width: 4096, height: 3072, isSuperResolution: false)
+expect(true, "AI inpainting accepts a 12MP output")
+
+let srSpec = RestoreModelCatalog.spec(for: .localSRFast)!
+expect(srSpec.inputName == "image" && srSpec.outputName == "out", "LocalSR tensor names match the verified model")
+expect(srSpec.inputShape == [1, 3, 384, 384] && srSpec.outputShape == [1, 3, 1536, 1536], "LocalSR tensor shapes match the verified model")
+expect(srSpec.totalByteCount == 350670 && srSpec.treeSHA256 == "26358751077f4e3b9fa428bd5a21354774ad53ec80212fee46b17bcd1877eabc", "LocalSR files use the upstream tree hash")
+let inpaintSpec = RestoreModelCatalog.spec(for: .aotGAN)!
+expect(inpaintSpec.inputName == "x_1" && inpaintSpec.outputName == "var_915", "AOT-GAN tensor names match the verified model")
+expect(inpaintSpec.dataType == .float32 && inpaintSpec.outputShape == nil, "AOT-GAN Float32 flexible output is validated at runtime")
+expect(inpaintSpec.totalByteCount == 60818996 && inpaintSpec.artifacts[0].sha256 == "6090945f20e4971113457fa0bb90bca42e4569dcaf9ab7c183d2749ee4718b68", "AOT-GAN artifact size and SHA are pinned")
+
+let emptyMask = RestoreMask()
+expect(emptyMask.isEmpty, "empty repair mask is detected")
+let paint = RestoreMaskStroke(points: [RestoreMaskPoint(x: 0.5, y: 0.5)], brushSize: 0.04)
+let erase = RestoreMaskStroke(points: [RestoreMaskPoint(x: 0.5, y: 0.5)], brushSize: 0.04, erasing: true)
+let erasedMask = RestoreMask(strokes: [paint, erase])
+expect(erasedMask.isEmpty, "erase-only mask does not request repair")
+var mask = RestoreMask()
+mask.append(RestoreMaskStroke(points: [RestoreMaskPoint(x: -1, y: 2)], brushSize: 0.04))
+mask.append(RestoreMaskStroke(points: [RestoreMaskPoint(x: 0.5, y: 0.5)], brushSize: -0.1))
+expect(mask.strokes[0].points[0] == RestoreMaskPoint(x: 0, y: 1) && mask.strokes[0].brushSize == 0.04, "mask input is normalized and clamped")
+expect(mask.strokes[1].brushSize == 0.002, "mask brush has a safe minimum")
+let maskImage = try mask.rasterized(width: 64, height: 64)
+let maskProvider = maskImage.dataProvider!
+let maskData = maskProvider.data! as Data
+let maskBytes = (maskData as NSData).bytes.assumingMemoryBound(to: UInt8.self)
+expect(maskBytes[31 * maskImage.bytesPerRow + 0] > 0, "normalized mask coordinates rasterize at the expected edge")
+let decodedMask = try JSONDecoder().decode(RestoreMask.self, from: JSONEncoder().encode(mask))
+expect(decodedMask == mask, "repair mask survives codable round trip")
+
 print("RESTORE-VERDICT PASS")
