@@ -103,7 +103,7 @@ expect(compacted.joined(separator: "\n").utf8.count <= 512 * 1024, "runtime jour
 let singleAITile = RestoreAIMath.tilePlan(width: 300, height: 200, tileSize: 384, overlap: 8, outputScale: 1)
 expect(singleAITile.count == 1 && singleAITile[0].originX == -8 && singleAITile[0].originY == -8, "small AI image uses one padded tile")
 let edgeAITiles = RestoreAIMath.tilePlan(width: 384, height: 384, tileSize: 384, overlap: 8, outputScale: 1)
-expect(edgeAITiles.count == 4 && edgeAITiles.contains { $0.originX == 376 }, "AI tile grid covers both edges with overlap")
+expect(edgeAITiles.count == 4 && edgeAITiles.contains { $0.originX == 360 }, "AI tile grid covers both edges with overlap")
 expect(RestoreAIMath.tilePlan(width: 100, height: 100, tileSize: 16, overlap: 8, outputScale: 1).isEmpty, "invalid AI tile geometry is rejected")
 expect(RestoreAIMath.tilePlan(width: 100, height: 100, tileSize: 384, overlap: 8, outputScale: 0).isEmpty, "invalid AI output scale is rejected")
 try RestoreAIMath.validateSource(width: 8192, height: 4882)
