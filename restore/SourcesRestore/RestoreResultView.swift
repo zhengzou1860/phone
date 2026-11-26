@@ -7,6 +7,9 @@ struct RestoreResultView: View {
     @Environment(\.dismiss) private var dismiss
 
     @State private var isSaving = false
+    @State private var isUploading = false
+    @State private var uploadProgress: Double?
+    @State private var showUploadConfirmation = false
     @State private var message: String?
     @State private var showDeleteConfirmation = false
 
@@ -48,7 +51,7 @@ struct RestoreResultView: View {
                         .padding(16)
                         .background(RestoreTheme.cyan, in: RoundedRectangle(cornerRadius: 17))
                     }
-                    .disabled(isSaving)
+                    .disabled(isSaving || isUploading)
 
                     ShareLink(item: resultURL) {
                         HStack {
@@ -59,6 +62,31 @@ struct RestoreResultView: View {
                         .font(.subheadline.weight(.semibold))
                         .padding(16)
                         .background(RestoreTheme.card, in: RoundedRectangle(cornerRadius: 17))
+                    }
+
+                    Button {
+                        showUploadConfirmation = true
+                    } label: {
+                        HStack {
+                            if isUploading {
+                                ProgressView().tint(RestoreTheme.cyan)
+                                Text("上传中 \(Int((uploadProgress ?? 0) * 100))%")
+                            } else {
+                                Image(systemName: "computer")
+                                Text("上传修复结果到电脑")
+                            }
+                            Spacer()
+                        }
+                        .font(.subheadline.weight(.semibold))
+                        .padding(16)
+                        .background(RestoreTheme.card, in: RoundedRectangle(cornerRadius: 17))
+                    }
+                    .disabled(isSaving || isUploading)
+                    .confirmationDialog("只发送这条修复结果（\(RestoreMath.formatBytes(asset.resultBytes))），不发送 App 内保留的原片。继续上传吗？", isPresented: $showUploadConfirmation) {
+                        Button("上传到电脑") { uploadResult() }
+                        Button("取消", role: .cancel) {}
+                    } message: {
+                        Text("电脑地址：\(RestorePCTransport.normalizedEndpoint(RestorePCTransport.savedEndpoint) ?? RestorePCTransport.defaultEndpoint)")
                     }
 
                     Button(role: .destructive) {
@@ -107,6 +135,29 @@ struct RestoreResultView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(14)
         .background(RestoreTheme.card, in: RoundedRectangle(cornerRadius: 16))
+    }
+
+    private func uploadResult() {
+        isUploading = true
+        uploadProgress = 0
+        let target = RestorePCTransport.savedEndpoint
+        RestoreJournal.line("准备上传修复结果：\(asset.kind.rawValue) \(asset.outputWidth)×\(asset.outputHeight) \(asset.resultBytes) 字节")
+        Task {
+            defer {
+                isUploading = false
+                uploadProgress = nil
+            }
+            do {
+                let reply = try await RestorePCTransport.upload(file: resultURL, endpoint: target) { value in
+                    await MainActor.run { uploadProgress = value }
+                }
+                message = reply
+                RestoreJournal.line("修复结果上传成功：\(reply)")
+            } catch {
+                message = error.localizedDescription
+                RestoreJournal.line("修复结果上传失败：\(error.localizedDescription)")
+            }
+        }
     }
 
     private func save() {

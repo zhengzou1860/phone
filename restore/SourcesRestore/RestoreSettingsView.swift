@@ -24,6 +24,7 @@ struct RestoreSettingsView: View {
                             infoRow("适配设备", "iPhone 11 及更新机型")
                         }
                     }
+                    pcCard
                     privacyCard
                     fileCard
                     Text("系统增强不等于 AI 超分：降噪、锐化和边缘保留放大可以改善观感，但无法重建传感器从未记录到的细节。")
@@ -53,13 +54,17 @@ struct RestoreSettingsView: View {
         .padding(.vertical, 8)
     }
 
+    private var pcCard: some View {
+        RestorePCView()
+    }
+
     private var privacyCard: some View {
         RestoreCard {
             VStack(alignment: .leading, spacing: 10) {
                 Label("隐私优先", systemImage: "lock.shield.fill")
                     .font(.headline)
                     .foregroundStyle(RestoreTheme.green)
-                Text("原片和修复结果只保存在这台 iPhone 的 App 沙盒中。处理过程不访问网络，也不上传照片、视频或其内容。只有你点击「保存到系统相册」或「分享」时，系统才会把结果交给相应功能。")
+                Text("原片和修复结果只保存在这台 iPhone 的 App 沙盒中。处理过程不访问网络，也不会自动上传照片或视频。只有你点击「发送运行日志」或在结果页点击「上传到电脑」时，App 才会连接你填写的电脑地址；日志不包含媒体内容。")
                     .font(.caption)
                     .foregroundStyle(RestoreTheme.secondary)
             }

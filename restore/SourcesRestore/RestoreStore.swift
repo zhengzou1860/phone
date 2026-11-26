@@ -50,6 +50,7 @@ final class RestoreStore: ObservableObject {
                 duration = geometry.duration
             }
             let size = (try? destination.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+            RestoreJournal.line("媒体已复制到沙盒：\(kind.rawValue) \(size) 字节")
             return ImportedMedia(
                 id: id,
                 url: destination,
@@ -104,6 +105,7 @@ final class RestoreStore: ObservableObject {
         try? FileManager.default.removeItem(at: sourceURL(for: asset))
         try? FileManager.default.removeItem(at: results.appendingPathComponent("\(asset.id.uuidString).json"))
         reload()
+        RestoreJournal.line("已删除修复记录：\(asset.kind.rawValue)")
     }
 
     func saveToPhotos(_ asset: RestoredAsset) async throws {
@@ -134,6 +136,7 @@ final class RestoreStore: ObservableObject {
                 }
             }
         }
+        RestoreJournal.line("已保存到系统相册：\(asset.kind.rawValue)")
     }
 
     func thumbnail(for asset: RestoredAsset, maxPixel: Int = 720) async -> UIImage? {

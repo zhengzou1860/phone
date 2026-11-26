@@ -238,8 +238,10 @@ struct RestoreHomeView: View {
             defer { isImporting = false }
             do {
                 let media = try await store.importMedia(from: url, kind: kind)
+                RestoreJournal.line("导入完成：\(kind.rawValue) \(media.width)×\(media.height) \(media.byteCount) 字节")
                 editorMedia = media
             } catch {
+                RestoreJournal.line("导入失败：\(error.localizedDescription)")
                 importError = error.localizedDescription
             }
         }

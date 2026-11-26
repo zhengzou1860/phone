@@ -1,4 +1,5 @@
-tools/
+tools/*
+!tools/report_server_hirestore.py
 *.ipa
 *.msi
 *.zip

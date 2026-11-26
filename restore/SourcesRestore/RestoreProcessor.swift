@@ -26,6 +26,7 @@ final class RestoreProcessor: ObservableObject {
         errorMessage = nil
         completedAsset = nil
         UIApplication.shared.isIdleTimerDisabled = true
+        RestoreJournal.line("开始处理：\(media.kind.rawValue) \(media.width)×\(media.height) \(settings.summary)")
 
         workTask = Task.detached(priority: .userInitiated) { [weak self] in
             guard let self else { return }
@@ -107,6 +108,7 @@ final class RestoreProcessor: ObservableObject {
         workTask?.cancel()
         exportSession?.cancelExport()
         phase = "正在停止"
+        RestoreJournal.line("用户停止处理")
     }
 
     func clearError() {
@@ -121,9 +123,11 @@ final class RestoreProcessor: ObservableObject {
         UIApplication.shared.isIdleTimerDisabled = false
         if store.register(record) {
             completedAsset = record
+            RestoreJournal.line("处理完成：\(record.kind.rawValue) 输出 \(record.outputWidth)×\(record.outputHeight) \(record.resultBytes) 字节")
         } else {
             try? FileManager.default.removeItem(at: store.resultURL(for: record))
             errorMessage = "结果已生成，但历史记录写入失败"
+            RestoreJournal.line("处理完成但历史记录写入失败")
         }
     }
 
@@ -133,12 +137,15 @@ final class RestoreProcessor: ObservableObject {
         UIApplication.shared.isIdleTimerDisabled = false
         if Task.isCancelled || error is CancellationError {
             phase = "已停止"
+            RestoreJournal.line("处理已停止")
             return
         }
         if let restoreError = error as? RestoreError, case .cancelled = restoreError {
             phase = "已停止"
+            RestoreJournal.line("处理已停止")
             return
         }
         errorMessage = error.localizedDescription
+        RestoreJournal.line("处理失败：\(error.localizedDescription)")
     }
 }

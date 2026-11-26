@@ -26,4 +26,18 @@ expect(abs(memory - 96) < 0.001, "working memory estimate is deterministic")
 let small = RestoreMath.fittedSize(width: 640, height: 480, scale: 1.5, maxLongEdge: 3840)
 expect(small.width == 960 && small.height == 720, "1.5x upscale keeps exact aspect ratio")
 
+let pcEndpoint = "192.168.1.8:8719/report"
+expect(RestorePCTransport.normalizedEndpoint(pcEndpoint) == "http://192.168.1.8:8719/report", "PC endpoint gets an HTTP scheme automatically")
+expect(RestorePCTransport.route("/ping", endpoint: pcEndpoint)?.path == "/ping", "connection test uses the ping route")
+expect(RestorePCTransport.route("/upload", endpoint: "https://pc.local:8719/report?old=1")?.scheme == "https", "explicit HTTPS endpoint is preserved")
+expect(RestorePCTransport.normalizedEndpoint("ftp://192.168.1.8:8719/report") == nil, "unsupported PC endpoint scheme is rejected")
+let encodedName = RestorePCTransport.encodedFilename("../../my clip.mov")
+expect(!encodedName.contains("/") && encodedName.contains("%20"), "upload filename header cannot introduce path separators")
+
+let manyLines = (0..<1005).map { "line \($0)" }
+expect(RestoreJournal.compact(manyLines).count == 1000, "runtime journal keeps only the latest 1000 lines")
+let largeLines = (0..<1000).map { _ in String(repeating: "x", count: 1000) }
+let compacted = RestoreJournal.compact(largeLines)
+expect(compacted.joined(separator: "\n").utf8.count <= 512 * 1024, "runtime journal respects its byte cap")
+
 print("RESTORE-VERDICT PASS")

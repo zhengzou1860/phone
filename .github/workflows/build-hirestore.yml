@@ -6,6 +6,8 @@ on:
     paths:
       - 'restore/**'
       - 'ci/restoreselftest/**'
+      - 'ci/hirestorepctest.py'
+      - 'tools/report_server_hirestore.py'
       - '.github/workflows/build-hirestore.yml'
   workflow_dispatch:
 
@@ -32,10 +34,18 @@ jobs:
           touch /tmp/selftest.log /tmp/build.log
           xcrun swiftc -O \
             restore/SourcesRestore/RestoreMath.swift \
+            restore/SourcesRestore/RestorePCTransport.swift \
+            restore/SourcesRestore/RestoreJournal.swift \
             ci/restoreselftest/main.swift \
             -o /tmp/restoretest 2>&1 | tee -a /tmp/selftest.log
           /tmp/restoretest 2>&1 | tee -a /tmp/selftest.log
           grep -q '^RESTORE-VERDICT PASS$' /tmp/selftest.log
+
+      - name: PC receiver selftest
+        run: |
+          set -euo pipefail
+          python3 ci/hirestorepctest.py 2>&1 | tee -a /tmp/selftest.log
+          grep -q '^HIRESTORE-PC-VERDICT PASS$' /tmp/selftest.log
 
       - name: install xcodegen
         run: |
