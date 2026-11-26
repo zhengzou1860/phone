@@ -138,10 +138,11 @@ enum RestoreInpaintingRunner {
                 bitsPerPixel: 32,
                 bytesPerRow: bytesPerRow,
                 space: space,
-                bitmapInfo: CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.premultipliedLast.rawValue,
+                bitmapInfo: CGBitmapInfo(rawValue: CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.premultipliedLast.rawValue),
                 provider: provider,
                 decode: nil,
-                shouldInterpolate: true
+                shouldInterpolate: true,
+                intent: .defaultIntent
               ) else {
             throw RestoreError.inferenceFailed("无法生成修补图像")
         }

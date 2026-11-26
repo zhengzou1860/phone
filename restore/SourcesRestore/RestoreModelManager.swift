@@ -123,7 +123,7 @@ final class RestoreModelManager: ObservableObject {
         try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: staging) }
 
-        let total = spec.artifacts.reduce(Int64(0)) { $0 + $1.byteCount }
+        let total = spec.artifacts.reduce(Int64(0)) { $0 + Int64($1.byteCount) }
         var completed: Int64 = 0
         for (index, artifact) in spec.artifacts.enumerated() {
             try Task.checkCancellation()
@@ -148,7 +148,7 @@ final class RestoreModelManager: ObservableObject {
                     throw RestoreError.modelLoadFailed("\(artifact.relativePath) 校验失败，请重试")
                 }
             }
-            completed += artifact.byteCount
+            completed += Int64(artifact.byteCount)
             states[spec.id] = .downloading(Double(completed) / Double(max(1, total)))
             RestoreJournal.line("AI 模型下载：\(spec.name) \(index + 1)/\(spec.artifacts.count)")
         }

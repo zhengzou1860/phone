@@ -24,7 +24,7 @@ struct RestoreModelArtifact: Equatable {
     let sha256: String?
 }
 
-struct RestoreModelSpec: Equatable {
+struct RestoreModelSpec: Equatable, Identifiable {
     let id: RestoreModelID
     let name: String
     let version: String

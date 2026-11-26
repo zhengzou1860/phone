@@ -112,14 +112,14 @@ struct RestoreMaskEditor: View {
 
 private final class RestoreMaskCanvasPlatformView: UIView {
     var image: UIImage?
-    var mask: RestoreMask
+    var repairMask: RestoreMask
     var tool: RestoreMaskTool
     var brushSize: Double
     weak var coordinator: MaskCanvasCoordinator?
 
     init(image: UIImage?, mask: RestoreMask, tool: RestoreMaskTool, brushSize: Double, onChange: @escaping (RestoreMask) -> Void) {
         self.image = image
-        self.mask = mask
+        self.repairMask = mask
         self.tool = tool
         self.brushSize = brushSize
         self.coordinator = MaskCanvasCoordinator()
@@ -138,13 +138,13 @@ private final class RestoreMaskCanvasPlatformView: UIView {
         format.scale = 1
         let overlay = UIGraphicsImageRenderer(size: bounds.size, format: format).image { renderer in
             let context = renderer.cgContext
-            let color = RestoreTheme.cyan.withAlphaComponent(0.52).uiColor.cgColor
+            let color = RestoreTheme.cyan.opacity(0.52).uiColor.cgColor
             context.setLineCap(.round)
             context.setLineJoin(.round)
             context.setStrokeColor(color)
             context.setFillColor(color)
             let scale = Double(min(image.size.width, image.size.height))
-            for stroke in mask.sanitized().strokes {
+            for stroke in repairMask.sanitized().strokes {
                 context.setBlendMode(stroke.erasing ? .clear : .normal)
                 context.setLineWidth(stroke.brushSize * scale * imageRect.width / image.size.width)
                 guard let first = stroke.points.first else { continue }
@@ -209,9 +209,9 @@ private final class RestoreMaskCanvasPlatformView: UIView {
             y: Double(1 - (point.y - imageRect.minY) / imageRect.height)
         ).clamped()
         var stroke = RestoreMaskStroke(points: [normalized], brushSize: brushSize, erasing: tool == .erase)
-        var updated = mask
+        var updated = repairMask
         updated.append(stroke)
-        mask = updated
+        repairMask = updated
         coordinator?.activeStrokeID = stroke.id
         coordinator?.onChange(updated)
         setNeedsDisplay()
@@ -229,9 +229,9 @@ private final class MaskCanvasCoordinator: NSObject {
             x: Double((point.x - imageRect.minX) / imageRect.width),
             y: Double(1 - (point.y - imageRect.minY) / imageRect.height)
         ).clamped()
-        guard let index = canvas.mask.strokes.firstIndex(where: { $0.id == activeStrokeID }) else { return }
-        canvas.mask.strokes[index].points.append(normalized)
-        canvas.onChange(canvas.mask)
+        guard let index = canvas.repairMask.strokes.firstIndex(where: { $0.id == activeStrokeID }) else { return }
+        canvas.repairMask.strokes[index].points.append(normalized)
+        onChange(canvas.repairMask)
         canvas.setNeedsDisplay()
     }
 }
@@ -250,7 +250,7 @@ private struct MaskCanvasUIView: UIViewRepresentable {
 
     func updateUIView(_ uiView: RestoreMaskCanvasPlatformView, context: Context) {
         uiView.image = image
-        uiView.mask = mask
+        uiView.repairMask = mask
         uiView.tool = tool
         uiView.brushSize = brushSize
         uiView.setNeedsDisplay()

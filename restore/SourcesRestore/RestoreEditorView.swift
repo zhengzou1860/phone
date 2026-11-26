@@ -275,7 +275,7 @@ struct RestoreEditorView: View {
         }
     }
 
-    private var aiModelSection: some View {
+    @ViewBuilder private var aiModelSection: some View {
         guard let id = settings.mode.model, let spec = RestoreModelCatalog.spec(for: id) else { return EmptyView() }
         let state = models.state(for: id)
         return RestoreCard {

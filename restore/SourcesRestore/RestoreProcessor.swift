@@ -22,9 +22,9 @@ final class RestoreProcessor: ObservableObject {
 
     func start(media: ImportedMedia, settings: RestorationSettings) {
         guard !isProcessing else { return }
+        var modelURL: URL?
         do {
             try RestorePreflight.validate(width: media.width, height: media.height, duration: media.duration, isVideo: media.kind == .video)
-            var modelURL: URL?
             if settings.mode.isAI {
                 guard media.kind == .image, let id = settings.mode.model else {
                     throw RestoreError.fileOperation("当前 AI 模型仅支持照片")
