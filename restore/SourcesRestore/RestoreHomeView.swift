@@ -128,7 +128,7 @@ struct RestoreHomeView: View {
                     importButton(for: .image)
                     importButton(for: .video)
                 }
-                Text("视频预检：最长 15 分钟、最高 4K；导入和修复前都会检查可用空间。")
+                Text("视频预检：最长 15 分钟、最高 4K / 12MP；导入和修复前都会检查可用空间。")
                     .font(.caption2)
                     .foregroundStyle(RestoreTheme.secondary)
                 HStack(spacing: 8) {

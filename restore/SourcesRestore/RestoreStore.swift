@@ -26,6 +26,11 @@ final class RestoreStore: ObservableObject {
         let id = UUID()
         let extensionName = temporaryURL.pathExtension.isEmpty ? (kind == .image ? "jpg" : "mov") : temporaryURL.pathExtension
         let destination = inputs.appendingPathComponent("source_\(id.uuidString).\(extensionName)")
+        let cleanupTemporary = temporaryURL.path.hasPrefix(FileManager.default.temporaryDirectory.path + "/")
+            && temporaryURL.lastPathComponent.hasPrefix("hirestore_pick_")
+        defer {
+            if cleanupTemporary { try? FileManager.default.removeItem(at: temporaryURL) }
+        }
         let values = try temporaryURL.resourceValues(forKeys: [.fileSizeKey, .volumeAvailableCapacityForImportantUsageKey])
         guard let sourceSize = values.fileSize, sourceSize > 0, let available = values.volumeAvailableCapacityForImportantUsage else {
             throw RestoreError.fileOperation("无法读取原片大小或可用空间")
@@ -51,10 +56,6 @@ final class RestoreStore: ObservableObject {
         do {
             try await Task.detached(priority: .userInitiated) {
                 try FileManager.default.copyItem(at: temporaryURL, to: destination)
-                if temporaryURL.path.hasPrefix(FileManager.default.temporaryDirectory.path + "/"),
-                   temporaryURL.lastPathComponent.hasPrefix("hirestore_pick_") {
-                    try? FileManager.default.removeItem(at: temporaryURL)
-                }
             }.value
         } catch {
             try? FileManager.default.removeItem(at: destination)

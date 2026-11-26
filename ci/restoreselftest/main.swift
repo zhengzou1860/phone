@@ -34,6 +34,9 @@ func expectPreflightError(_ body: () throws -> Void, _ message: String) {
 
 try RestorePreflight.validate(width: 3840, height: 2160, duration: 900, isVideo: true)
 expect(true, "4K video at the 15 minute boundary is accepted")
+try RestorePreflight.validate(width: 4000, height: 3000, duration: 60, isVideo: true)
+expect(true, "video at the exact 12MP boundary is accepted")
+expectPreflightError({ try RestorePreflight.validate(width: 0, height: 1080, duration: 60, isVideo: true) }, "尺寸无效")
 expectPreflightError({ try RestorePreflight.validate(width: 1920, height: 1080, duration: 901, isVideo: true) }, "15 分钟")
 expectPreflightError({ try RestorePreflight.validate(width: 4097, height: 2160, duration: 60, isVideo: true) }, "4K")
 expectPreflightError({ try RestorePreflight.validate(width: 4000, height: 3001, duration: 60, isVideo: true) }, "4K")
@@ -56,6 +59,22 @@ let upscaleRequired = RestorePreflight.requiredExportBytes(
     outputHeight: 2160
 )
 expect(upscaleRequired == 1012 * megabyte, "export preflight reserves 512 MB safety space")
+let downscaleEstimate = RestorePreflight.estimatedOutputBytes(
+    sourceBytes: 100 * megabyte,
+    sourceWidth: 4096,
+    sourceHeight: 2160,
+    outputWidth: 3840,
+    outputHeight: 2160
+)
+expect(downscaleEstimate == 117_187_500, "downscaled output estimate uses the actual pixel ratio")
+expect(RestorePreflight.estimatedOutputBytes(
+    sourceBytes: Int64.max,
+    sourceWidth: 1,
+    sourceHeight: 1,
+    outputWidth: 4096,
+    outputHeight: 4096
+) == Int64.max / 2, "output estimate saturates instead of overflowing")
+expect(RestorePreflight.requiredImportBytes(sourceBytes: Int64.max) == Int64.max, "required space saturates instead of overflowing")
 try RestorePreflight.validateSpace(required: upscaleRequired, available: upscaleRequired)
 expectPreflightError({ try RestorePreflight.validateSpace(required: upscaleRequired, available: upscaleRequired - 1) }, "可用空间不足")
 expect(RestorePreflight.requiredImportBytes(sourceBytes: 1024 * megabyte) == 1536 * megabyte, "import preflight includes source copy and safety space")

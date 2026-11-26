@@ -80,7 +80,7 @@ enum RestorePreflight {
     ) -> Int64 {
         let sourcePixels = Double(max(1, sourceWidth)) * Double(max(1, sourceHeight))
         let outputPixels = Double(max(1, outputWidth)) * Double(max(1, outputHeight))
-        let pixelRatio = max(1, outputPixels / sourcePixels)
+        let pixelRatio = outputPixels / sourcePixels
         let estimate = ceil(Double(max(1, sourceBytes)) * pixelRatio * 1.25)
         return Int64(min(estimate, Double(Int64.max / 2)))
     }
@@ -131,7 +131,7 @@ enum RestorePreflightError: LocalizedError {
         case .videoTooLong:
             return "视频超过 15 分钟，请先分段再导入"
         case .resolutionTooLarge(let isVideo):
-            return isVideo ? "视频超过 4K 限制，请先降低分辨率或分段处理" : "照片分辨率过大，请先缩小后再导入"
+            return isVideo ? "视频超过 4K 或 12MP 限制，请先降低分辨率或分段处理" : "照片分辨率过大，请先缩小后再导入"
         case .insufficientSpace(let required, let available):
             return "可用空间不足：预计需要 \(RestoreMath.formatBytes(Int(required)))，当前只有 \(RestoreMath.formatBytes(Int(available)))"
         }

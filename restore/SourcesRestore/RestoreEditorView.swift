@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 struct RestoreEditorView: View {
     let media: ImportedMedia
@@ -8,6 +9,8 @@ struct RestoreEditorView: View {
     @State private var settings = RestorePreset.smart.settings(scale: 2)
     @State private var showAdvanced = false
     @State private var availableBytes: Int64?
+    @State private var isCheckingSpace = false
+    @State private var spaceCheckFailed = false
 
     private var maxEdge: Int { media.kind == .image ? 4096 : 3840 }
     private var output: (width: Int, height: Int) {
@@ -83,9 +86,22 @@ struct RestoreEditorView: View {
             }
         }
         .tint(RestoreTheme.cyan)
-        .task(id: settings.scale) {
-            let values = try? media.url.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
-            availableBytes = values?.volumeAvailableCapacityForImportantUsage
+        .task(id: settings.scale) { await refreshAvailableSpace() }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
+            Task { await refreshAvailableSpace() }
+        }
+    }
+
+    private func refreshAvailableSpace() async {
+        isCheckingSpace = true
+        spaceCheckFailed = false
+        defer { isCheckingSpace = false }
+        let values = try? media.url.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
+        if let available = values?.volumeAvailableCapacityForImportantUsage {
+            availableBytes = available
+        } else {
+            availableBytes = nil
+            spaceCheckFailed = true
         }
     }
 
@@ -103,7 +119,7 @@ struct RestoreEditorView: View {
                     .foregroundStyle(RestoreTheme.secondary)
             }
             if media.kind == .video {
-                Text("限长 15 分钟 · 最高 4K · 流式逐帧处理")
+                Text("限长 15 分钟 · 最高 4K / 12MP · 流式逐帧处理")
                     .font(.caption2)
                     .foregroundStyle(RestoreTheme.secondary)
             }
@@ -192,14 +208,24 @@ struct RestoreEditorView: View {
                     Text("需可用 \(RestoreMath.formatBytes(Int(requiredBytes)))")
                 }
                 HStack {
-                    Text(availableBytes.map { "当前可用 \(RestoreMath.formatBytes(Int($0)))" } ?? "正在检查可用空间…")
+                    if isCheckingSpace {
+                        Text("正在检查可用空间…")
+                    } else if let availableBytes {
+                        Text("当前可用 \(RestoreMath.formatBytes(Int(availableBytes)))")
+                    } else {
+                        Text("无法检查可用空间")
+                            .foregroundStyle(.orange)
+                    }
                     Spacer()
                     if hasInsufficientSpace {
                         Label("空间不足", systemImage: "exclamationmark.triangle.fill")
                             .foregroundStyle(.red)
+                    } else if spaceCheckFailed {
+                        Button("重试") { Task { await refreshAvailableSpace() } }
+                            .font(.caption2.weight(.semibold))
                     }
                 }
-                Text("按原片体积和像素比估算，已预留 512 MB 安全空间。")
+                Text("按原片体积、像素比和 25% 压缩余量估算，已预留 512 MB 安全空间。")
                     .font(.caption2)
                     .foregroundStyle(RestoreTheme.secondary)
             }
@@ -279,7 +305,7 @@ struct RestoreEditorView: View {
                 in: RoundedRectangle(cornerRadius: 18, style: .continuous)
             )
         }
-        .disabled(processor.isProcessing || hasInsufficientSpace)
+        .disabled(processor.isProcessing || isCheckingSpace || hasInsufficientSpace)
     }
 
     private func icon(for preset: RestorePreset) -> String {
