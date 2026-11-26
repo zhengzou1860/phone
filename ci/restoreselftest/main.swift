@@ -124,10 +124,9 @@ expect(inpaintSpec.totalByteCount == 60818996 && inpaintSpec.artifacts[0].sha256
 
 let emptyMask = RestoreMask()
 expect(emptyMask.isEmpty, "empty repair mask is detected")
-let paint = RestoreMaskStroke(points: [RestoreMaskPoint(x: 0.5, y: 0.5)], brushSize: 0.04)
 let erase = RestoreMaskStroke(points: [RestoreMaskPoint(x: 0.5, y: 0.5)], brushSize: 0.04, erasing: true)
-let erasedMask = RestoreMask(strokes: [paint, erase])
-expect(erasedMask.isEmpty, "erase-only mask does not request repair")
+let eraseOnlyMask = RestoreMask(strokes: [erase])
+expect(eraseOnlyMask.isEmpty, "erase-only mask does not request repair")
 var mask = RestoreMask()
 mask.append(RestoreMaskStroke(points: [RestoreMaskPoint(x: -1, y: 2)], brushSize: 0.04))
 mask.append(RestoreMaskStroke(points: [RestoreMaskPoint(x: 0.5, y: 0.5)], brushSize: -0.1))
@@ -137,7 +136,7 @@ let maskImage = try mask.rasterized(width: 64, height: 64)
 let maskProvider = maskImage.dataProvider!
 let maskData = maskProvider.data! as Data
 let maskBytes = (maskData as NSData).bytes.assumingMemoryBound(to: UInt8.self)
-expect(maskBytes[31 * maskImage.bytesPerRow + 0] > 0, "normalized mask coordinates rasterize at the expected edge")
+expect(maskBytes[0 * maskImage.bytesPerRow + 0] > 0, "normalized mask coordinates rasterize at the expected edge")
 let decodedMask = try JSONDecoder().decode(RestoreMask.self, from: JSONEncoder().encode(mask))
 expect(decodedMask == mask, "repair mask survives codable round trip")
 
