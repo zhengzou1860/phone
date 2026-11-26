@@ -10,6 +10,7 @@ import hmac
 import json
 import os
 import re
+import socket
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -29,6 +30,19 @@ WRITE_LOCK = threading.Lock()
 STORAGE_LOCK = threading.Lock()
 UPLOAD_SLOTS = threading.Semaphore(MAX_CONCURRENT_UPLOADS)
 RESERVED_UPLOAD_BYTES = 0
+
+
+def local_ipv4_addresses():
+    try:
+        entries = socket.getaddrinfo(socket.gethostname(), PORT, socket.AF_INET, socket.SOCK_STREAM)
+    except OSError:
+        return []
+    addresses = []
+    for entry in entries:
+        address = entry[4][0]
+        if not address.startswith("127.") and address not in addresses:
+            addresses.append(address)
+    return addresses
 
 
 class Receiver(ThreadingHTTPServer):
@@ -218,7 +232,16 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    server = Receiver(("0.0.0.0", PORT), Handler)
     print(f"HiRestore listener on 0.0.0.0:{PORT}", flush=True)
+    addresses = local_ipv4_addresses()
+    if addresses:
+        print("Phone endpoint:", flush=True)
+        for address in addresses:
+            print(f"  http://{address}:{PORT}/report", flush=True)
+    else:
+        print("Run ipconfig and use the active Wi-Fi IPv4 address with port 8719.", flush=True)
+    print("If Windows Firewall asks, allow Python on private networks.", flush=True)
     print(f"logs -> {OUT}", flush=True)
     print(f"uploads -> {UPLOAD_DIR}", flush=True)
-    Receiver(("0.0.0.0", PORT), Handler).serve_forever()
+    server.serve_forever()

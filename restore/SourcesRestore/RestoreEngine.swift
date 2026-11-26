@@ -1,5 +1,6 @@
 import Foundation
 import CoreImage
+import ImageIO
 import AVFoundation
 import UIKit
 
@@ -10,6 +11,7 @@ enum RestoreEngine {
         maxLongEdge: Int = 4096,
         progress: @escaping @Sendable (Double, String) async -> Void
     ) async throws -> URL {
+        RestoreJournal.line("照片处理：读取原片")
         try Task.checkCancellation()
         await progress(0.08, "读取照片")
         guard let image = UIImage(contentsOfFile: url.path), let cgImage = image.cgImage else {
@@ -24,24 +26,46 @@ enum RestoreEngine {
             maxLongEdge: maxLongEdge
         )
         guard target.width > 0, target.height > 0 else { throw RestoreError.invalidDimensions }
+        RestoreJournal.line("照片处理：原片 \(Int(source.extent.width))×\(Int(source.extent.height))，目标 \(target.width)×\(target.height)")
 
         await progress(0.28, "降噪与色彩修复")
+        RestoreJournal.line("照片处理：应用降噪、色彩和锐化")
         let enhanced = enhance(source, settings: settings)
+        RestoreJournal.line("照片处理：缩放图像")
         let output = scaled(enhanced, to: CGSize(width: target.width, height: target.height))
 
         try Task.checkCancellation()
         await progress(0.72, "生成高清照片")
-        let context = CIContext(options: [.cacheIntermediates: false])
-        guard let rendered = context.createCGImage(output, from: output.extent) else {
+        RestoreJournal.line("照片处理：CPU 渲染")
+        let context = CIContext(options: [
+            .cacheIntermediates: false,
+            .useSoftwareRenderer: true
+        ])
+        guard let rendered = context.createCGImage(
+            output,
+            from: output.extent,
+            format: .RGBA8,
+            colorSpace: CGColorSpaceCreateDeviceRGB()
+        ) else {
             throw RestoreError.filterFailed("系统无法渲染修复结果")
         }
-        guard let data = UIImage(cgImage: rendered, scale: 1, orientation: .up).jpegData(compressionQuality: 0.94) else {
+        RestoreJournal.line("照片处理：渲染完成，编码 JPEG")
+        let data = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(data, "public.jpeg" as CFString, 1, nil) else {
             throw RestoreError.fileOperation("照片编码失败")
         }
+        CGImageDestinationAddImage(destination, rendered, [
+            kCGImageDestinationLossyCompressionQuality: 0.94
+        ] as CFDictionary)
+        guard CGImageDestinationFinalize(destination) else {
+            throw RestoreError.fileOperation("照片编码失败")
+        }
+        RestoreJournal.line("照片处理：JPEG 编码完成 \(data.length) 字节")
         try Task.checkCancellation()
         let outputURL = FileManager.default.temporaryDirectory
             .appendingPathComponent(RestoreMath.timestampName(prefix: "restore", ext: "jpg"))
-        try data.write(to: outputURL, options: Data.WritingOptions.atomic)
+        try (data as Data).write(to: outputURL, options: Data.WritingOptions.atomic)
+        RestoreJournal.line("照片处理：结果已写入临时文件")
         await progress(1, "照片修复完成")
         return outputURL
     }
@@ -113,8 +137,8 @@ enum RestoreEngine {
         let target = CGRect(origin: .zero, size: size)
         if scale > 1.01 {
             let filtered = source.applyingFilter(
-                "CIEdgePreserveUpsampleFilter",
-                parameters: ["inputScaleFactor": scale]
+                "CILanczosScaleTransform",
+                parameters: ["inputScale": scale, "inputAspectRatio": 1.0]
             )
             let normalized = filtered.transformed(by: CGAffineTransform(
                 translationX: -filtered.extent.minX,

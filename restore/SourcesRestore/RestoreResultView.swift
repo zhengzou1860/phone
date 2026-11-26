@@ -169,8 +169,8 @@ struct RestoreResultView: View {
             } catch is CancellationError {
                 RestoreJournal.line("修复结果上传已取消")
             } catch {
-                message = error.localizedDescription
-                RestoreJournal.line("修复结果上传失败：\(error.localizedDescription)")
+                message = RestorePCTransport.userMessage(for: error)
+                RestoreJournal.line("修复结果上传失败：\(RestorePCTransport.userMessage(for: error))")
             }
         }
     }

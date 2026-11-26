@@ -15,7 +15,7 @@ struct RestorePCView: View {
                 Label("上传到电脑", systemImage: "computer")
                     .font(.headline)
                     .foregroundStyle(RestoreTheme.cyan)
-                Text("手机和电脑需在同一 Wi-Fi。电脑运行 tools/report_server_hirestore.py 后，填写电脑的 IPv4 地址和 8719 端口；上传密钥默认 hirestore-local，改了电脑端 HIRESTORE_TOKEN 时也要同步修改。")
+                Text("手机和电脑需在同一 Wi-Fi。电脑双击 tools/start_hirestore.bat 并保持窗口打开；若 Windows 防火墙询问，允许 Python 访问专用网络。按窗口显示的局域网地址填写，密钥默认 hirestore-local。")
                     .font(.caption)
                     .foregroundStyle(RestoreTheme.secondary)
 
@@ -80,8 +80,9 @@ struct RestorePCView: View {
                 message = reply
                 RestoreJournal.line("电脑连接测试成功：\(reply)")
             } catch {
-                message = error.localizedDescription
-                RestoreJournal.line("电脑连接测试失败：\(error.localizedDescription)")
+                let diagnostic = RestorePCTransport.userMessage(for: error)
+                message = diagnostic
+                RestoreJournal.line("电脑连接测试失败：\(diagnostic)")
             }
         }
     }
@@ -105,8 +106,9 @@ struct RestorePCView: View {
                 message = reply
                 RestoreJournal.line("运行日志发送成功：\(reply)")
             } catch {
-                message = error.localizedDescription
-                RestoreJournal.line("运行日志发送失败：\(error.localizedDescription)")
+                let diagnostic = RestorePCTransport.userMessage(for: error)
+                message = diagnostic
+                RestoreJournal.line("运行日志发送失败：\(diagnostic)")
             }
         }
     }

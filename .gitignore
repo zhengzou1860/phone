@@ -1,5 +1,6 @@
 tools/*
 !tools/report_server_hirestore.py
+!tools/start_hirestore.bat
 *.ipa
 *.msi
 *.zip

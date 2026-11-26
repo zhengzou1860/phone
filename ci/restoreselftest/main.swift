@@ -89,6 +89,10 @@ expect(RestorePCTransport.route("/upload", endpoint: "https://pc.local:8719/repo
 expect(RestorePCTransport.normalizedEndpoint("ftp://192.168.1.8:8719/report") == nil, "unsupported PC endpoint scheme is rejected")
 let encodedName = RestorePCTransport.encodedFilename("../../my clip.mov")
 expect(!encodedName.contains("/") && encodedName.contains("%20"), "upload filename header cannot introduce path separators")
+let timeoutMessage = RestorePCTransport.userMessage(for: URLError(.timedOut))
+expect(timeoutMessage.contains("同一 Wi-Fi") && timeoutMessage.contains("start_hirestore.bat"), "timeout diagnostic explains receiver and firewall checks")
+let authMessage = RestorePCTransport.userMessage(for: RestorePCError.http(401, "unauthorized"))
+expect(authMessage.contains("上传密钥不一致"), "unauthorized diagnostic explains token mismatch")
 
 let manyLines = (0..<1005).map { "line \($0)" }
 expect(RestoreJournal.compact(manyLines).count == 1000, "runtime journal keeps only the latest 1000 lines")

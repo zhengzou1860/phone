@@ -50,6 +50,38 @@ enum RestorePCTransport {
         filename.addingPercentEncoding(withAllowedCharacters: .alphanumerics.union(CharacterSet(charactersIn: "._-"))) ?? "restore.bin"
     }
 
+    static func userMessage(for error: Error) -> String {
+        if error is CancellationError { return "已取消" }
+        if let transportError = error as? RestorePCError, case let .http(code, message) = transportError {
+            switch code {
+            case 401:
+                return "电脑拒绝了连接：手机和电脑的上传密钥不一致，请使用电脑端 HIRESTORE_TOKEN 对应的密钥。"
+            case 404:
+                return "电脑已响应，但没有 HiRestore 接收接口；请确认电脑运行的是最新版 report_server_hirestore.py。"
+            default:
+                return "电脑返回 HTTP \(code)：\(message)"
+            }
+        }
+        if let transportError = error as? RestorePCError { return transportError.localizedDescription }
+        guard let urlError = error as? URLError else { return error.localizedDescription }
+        switch urlError.code {
+        case .notConnectedToInternet:
+            return "iPhone 当前没有网络连接，请先连接 Wi-Fi。"
+        case .cannotFindHost, .dnsLookupFailed:
+            return "找不到电脑地址：请按电脑启动窗口显示的 IPv4 地址填写，并带上 8719 端口。"
+        case .timedOut:
+            return "连接超时：请确认手机和电脑在同一 Wi-Fi、电脑已启动 start_hirestore.bat，并允许 Windows 防火墙中的 Python 访问专用网络。"
+        case .cannotConnectToHost, .networkConnectionLost:
+            return "无法连接电脑：请确认接收器窗口仍开着、地址和 8719 端口正确，并检查 Windows 防火墙是否允许 Python 访问专用网络。"
+        case .secureConnectionFailed, .appTransportSecurityRequiresSecureConnection:
+            return "安全连接失败：本地接收器使用 http://，请检查电脑地址是否误填成了 https://。"
+        case .badURL, .unsupportedURL:
+            return RestorePCError.invalidAddress.localizedDescription
+        default:
+            return error.localizedDescription
+        }
+    }
+
     static func ping(endpoint: String, token: String) async throws -> String {
         guard let url = route("/ping", endpoint: endpoint) else { throw RestorePCError.invalidAddress }
         var request = URLRequest(url: url)
