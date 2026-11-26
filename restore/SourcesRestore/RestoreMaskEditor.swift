@@ -115,7 +115,7 @@ private final class RestoreMaskCanvasPlatformView: UIView {
     var repairMask: RestoreMask
     var tool: RestoreMaskTool
     var brushSize: Double
-    weak var coordinator: MaskCanvasCoordinator?
+    let coordinator: MaskCanvasCoordinator
 
     init(image: UIImage?, mask: RestoreMask, tool: RestoreMaskTool, brushSize: Double, onChange: @escaping (RestoreMask) -> Void) {
         self.image = image
@@ -126,8 +126,8 @@ private final class RestoreMaskCanvasPlatformView: UIView {
         super.init(frame: .zero)
         backgroundColor = RestoreTheme.background.uiColor
         isMultipleTouchEnabled = false
-        coordinator?.canvas = self
-        coordinator?.onChange = onChange
+        coordinator.canvas = self
+        coordinator.onChange = onChange
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
@@ -180,15 +180,15 @@ private final class RestoreMaskCanvasPlatformView: UIView {
 
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
         guard let point = touches.first?.location(in: self) else { return }
-        coordinator?.extendStroke(with: point)
+        coordinator.extendStroke(with: point)
     }
 
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
-        coordinator?.activeStrokeID = nil
+        coordinator.activeStrokeID = nil
     }
 
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
-        coordinator?.activeStrokeID = nil
+        coordinator.activeStrokeID = nil
     }
 
     fileprivate var fittedImageRect: CGRect? {
@@ -209,12 +209,12 @@ private final class RestoreMaskCanvasPlatformView: UIView {
             x: Double((point.x - imageRect.minX) / imageRect.width),
             y: Double(1 - (point.y - imageRect.minY) / imageRect.height)
         ).clamped()
-        var stroke = RestoreMaskStroke(points: [normalized], brushSize: brushSize, erasing: tool == .erase)
+        let stroke = RestoreMaskStroke(points: [normalized], brushSize: brushSize, erasing: tool == .erase)
         var updated = repairMask
         updated.append(stroke)
         repairMask = updated
-        coordinator?.activeStrokeID = stroke.id
-        coordinator?.onChange(updated)
+        coordinator.activeStrokeID = stroke.id
+        coordinator.onChange(updated)
         setNeedsDisplay()
     }
 }
