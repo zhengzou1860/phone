@@ -146,14 +146,15 @@ private final class RestoreMaskCanvasPlatformView: UIView {
             let scale = Double(min(image.size.width, image.size.height))
             for stroke in repairMask.sanitized().strokes {
                 context.setBlendMode(stroke.erasing ? .clear : .normal)
-                context.setLineWidth(stroke.brushSize * scale * imageRect.width / image.size.width)
+                let lineWidth = stroke.brushSize * scale * imageRect.width / image.size.width
+                context.setLineWidth(lineWidth)
                 guard let first = stroke.points.first else { continue }
                 let firstPoint = CGPoint(
                     x: imageRect.minX + first.x * imageRect.width,
                     y: imageRect.minY + (1 - first.y) * imageRect.height
                 )
                 if stroke.points.count == 1 {
-                    let radius = context.lineWidth / 2
+                    let radius = lineWidth / 2
                     context.fillEllipse(in: CGRect(x: firstPoint.x - radius, y: firstPoint.y - radius, width: radius * 2, height: radius * 2))
                     continue
                 }
@@ -203,7 +204,7 @@ private final class RestoreMaskCanvasPlatformView: UIView {
     }
 
     private func beginStroke(at point: CGPoint) {
-        guard let imageRect = fittedImageRect, imageRect.contains(point), let image else { return }
+        guard let imageRect = fittedImageRect, imageRect.contains(point) else { return }
         let normalized = RestoreMaskPoint(
             x: Double((point.x - imageRect.minX) / imageRect.width),
             y: Double(1 - (point.y - imageRect.minY) / imageRect.height)

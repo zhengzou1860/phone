@@ -15,7 +15,11 @@ struct RestoreModelView: View {
                     modelCard(spec)
                 }
 
-                Label("AI 生成是对周围纹理和语义的合理补全，不等于找回传感器从未记录的真实细节。重要照片请先保留原片。")
+                Label {
+                    Text("AI 生成是对周围纹理和语义的合理补全，不等于找回传感器从未记录的真实细节。重要照片请先保留原片。")
+                } icon: {
+                    Image(systemName: "info.circle")
+                }
                     .font(.caption)
                     .foregroundStyle(RestoreTheme.secondary)
                     .padding(.horizontal, 4)

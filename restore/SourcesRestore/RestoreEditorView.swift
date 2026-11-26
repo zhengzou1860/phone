@@ -276,40 +276,41 @@ struct RestoreEditorView: View {
     }
 
     @ViewBuilder private var aiModelSection: some View {
-        guard let id = settings.mode.model, let spec = RestoreModelCatalog.spec(for: id) else { return EmptyView() }
-        let state = models.state(for: id)
-        return RestoreCard {
-            VStack(alignment: .leading, spacing: 10) {
-                HStack {
-                    Label(spec.name, systemImage: "cpu")
-                    Spacer()
-                    if models.isInstalled(id) {
-                        Label("已就绪", systemImage: "checkmark.circle.fill").foregroundStyle(RestoreTheme.green)
-                    } else {
-                        Label("需要模型", systemImage: "arrow.down.circle").foregroundStyle(.orange)
+        if let id = settings.mode.model, let spec = RestoreModelCatalog.spec(for: id) {
+            let state = models.state(for: id)
+            RestoreCard {
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack {
+                        Label(spec.name, systemImage: "cpu")
+                        Spacer()
+                        if models.isInstalled(id) {
+                            Label("已就绪", systemImage: "checkmark.circle.fill").foregroundStyle(RestoreTheme.green)
+                        } else {
+                            Label("需要模型", systemImage: "arrow.down.circle").foregroundStyle(.orange)
+                        }
+                    }
+                    .font(.caption.weight(.semibold))
+                    Text("模型单独下载并校验；照片推理不联网，不上传原片。")
+                        .font(.caption2)
+                        .foregroundStyle(RestoreTheme.secondary)
+                    switch state {
+                    case .downloading(let value):
+                        ProgressView(value: value).tint(RestoreTheme.cyan)
+                        Button("取消下载") { models.cancelDownload(id) }.font(.caption2)
+                    case .compiling:
+                        ProgressView().controlSize(.small)
+                    case .failed(let message):
+                        Text(message).font(.caption2).foregroundStyle(.red)
+                        Button("重试下载") { models.download(id) }.font(.caption2.weight(.semibold))
+                    case .notInstalled:
+                        Button("下载 \(RestoreMath.formatBytes(spec.totalByteCount)) 模型") { models.download(id) }
+                            .font(.caption.weight(.semibold))
+                    case .installed:
+                        EmptyView()
                     }
                 }
-                .font(.caption.weight(.semibold))
-                Text("模型单独下载并校验；照片推理不联网，不上传原片。")
-                    .font(.caption2)
-                    .foregroundStyle(RestoreTheme.secondary)
-                switch state {
-                case .downloading(let value):
-                    ProgressView(value: value).tint(RestoreTheme.cyan)
-                    Button("取消下载") { models.cancelDownload(id) }.font(.caption2)
-                case .compiling:
-                    ProgressView().controlSize(.small)
-                case .failed(let message):
-                    Text(message).font(.caption2).foregroundStyle(.red)
-                    Button("重试下载") { models.download(id) }.font(.caption2.weight(.semibold))
-                case .notInstalled:
-                    Button("下载 \(RestoreMath.formatBytes(spec.totalByteCount)) 模型") { models.download(id) }
-                        .font(.caption.weight(.semibold))
-                case .installed:
-                    EmptyView()
-                }
+                .font(.caption)
             }
-            .font(.caption)
         }
     }
 
