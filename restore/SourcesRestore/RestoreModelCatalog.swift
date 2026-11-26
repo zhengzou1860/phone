@@ -78,7 +78,7 @@ enum RestoreModelCatalog {
         licenseLabel: "仓库 MIT；权重许可未单列",
         attribution: "HerRei / LocalSR · local-upscale",
         sourceURL: "https://github.com/HerRei/local-upscale",
-        bundleRelativePath: "localsr_fast.mlmodelc",
+        bundleRelativePath: "mobile/Models/ios/localsr_fast.mlmodelc",
         artifacts: [
             artifact(localSRCommit, "mobile/Models/ios/localsr_fast.mlmodelc/analytics/coremldata.bin", 243),
             artifact(localSRCommit, "mobile/Models/ios/localsr_fast.mlmodelc/coremldata.bin", 374),

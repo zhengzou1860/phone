@@ -127,6 +127,7 @@ let srSpec = RestoreModelCatalog.spec(for: .localSRFast)!
 expect(srSpec.inputName == "image" && srSpec.outputName == "out", "LocalSR tensor names match the verified model")
 expect(srSpec.inputShape == [1, 3, 384, 384] && srSpec.outputShape == [1, 3, 1536, 1536], "LocalSR tensor shapes match the verified model")
 expect(srSpec.totalByteCount == 350670 && srSpec.treeSHA256 == "26358751077f4e3b9fa428bd5a21354774ad53ec80212fee46b17bcd1877eabc", "LocalSR files use the upstream tree hash")
+expect(srSpec.artifacts.allSatisfy { $0.relativePath.hasPrefix(srSpec.bundleRelativePath + "/") }, "LocalSR bundle path contains every downloaded artifact")
 expect(srSpec.artifacts.allSatisfy { $0.downloadURLs.count == 4 && $0.downloadURLs.allSatisfy { URL(string: $0)?.scheme == "https" } }, "LocalSR artifacts include HTTPS mirror and API fallbacks")
 expect(srSpec.artifacts.allSatisfy { $0.downloadURLs.contains { $0.contains("fastly.jsdelivr.net") } && $0.downloadURLs.contains { $0.contains("api.github.com") } }, "LocalSR bypasses an unavailable raw GitHub route")
 expect(srSpec.artifacts.allSatisfy { $0.downloadURLs.first?.contains("jsdelivr.net") == true }, "LocalSR tries working mirrors before the raw GitHub route")
