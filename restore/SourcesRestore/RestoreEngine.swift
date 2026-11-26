@@ -16,7 +16,7 @@ enum RestoreEngine {
             throw RestoreError.unreadableImage
         }
         let source = CIImage(cgImage: cgImage)
-            .oriented(forExifOrientation: image.imageOrientation.exifOrientation.rawValue)
+            .oriented(forExifOrientation: Int32(image.imageOrientation.exifOrientation.rawValue))
         let target = RestoreMath.fittedSize(
             width: Int(source.extent.width),
             height: Int(source.extent.height),
