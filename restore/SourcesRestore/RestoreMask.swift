@@ -50,10 +50,12 @@ struct RestoreMask: Codable, Equatable {
         guard width > 0, height > 0 else { throw RestoreError.invalidDimensions }
         guard !isEmpty else { throw RestoreError.emptyMask }
         let bytesPerRow = ((width + 15) / 16) * 16
-        guard let data = NSMutableData(length: bytesPerRow * height),
-              let bytes = data.mutableBytes,
-              let space = CGColorSpace(name: CGColorSpace.deviceGray),
-              let context = CGContext(
+        guard let data = NSMutableData(length: bytesPerRow * height) else {
+            throw RestoreError.fileOperation("无法创建修补蒙版")
+        }
+        let bytes = data.mutableBytes
+        let space = CGColorSpaceCreateDeviceGray()
+        guard let context = CGContext(
                 data: bytes,
                 width: width,
                 height: height,

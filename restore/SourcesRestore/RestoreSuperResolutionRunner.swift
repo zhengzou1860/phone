@@ -80,11 +80,11 @@ enum RestoreSuperResolutionRunner {
         let count = 3 * width * height
         let source = array.dataPointer.bindMemory(to: Float16.self, capacity: count)
         let bytesPerRow = width * 4
-        guard let data = NSMutableData(length: bytesPerRow * height),
-              let destination = data.mutableBytes.assumingMemoryBound(to: UInt8.self),
-              let space = CGColorSpace(name: CGColorSpace.deviceRGB) else {
+        guard let data = NSMutableData(length: bytesPerRow * height) else {
             throw RestoreError.inferenceFailed("无法转换超分输出")
         }
+        let destination = data.mutableBytes.assumingMemoryBound(to: UInt8.self)
+        let space = CGColorSpaceCreateDeviceRGB()
         let plane = width * height
         for y in 0..<height {
             for x in 0..<width {

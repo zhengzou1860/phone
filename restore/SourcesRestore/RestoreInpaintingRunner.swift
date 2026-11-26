@@ -113,11 +113,11 @@ enum RestoreInpaintingRunner {
         let plane = width * height
         let source = array.dataPointer.bindMemory(to: Float.self, capacity: 3 * plane)
         let bytesPerRow = width * 4
-        guard let data = NSMutableData(length: bytesPerRow * height),
-              let destination = data.mutableBytes.assumingMemoryBound(to: UInt8.self),
-              let space = CGColorSpace(name: CGColorSpace.deviceRGB) else {
+        guard let data = NSMutableData(length: bytesPerRow * height) else {
             throw RestoreError.inferenceFailed("无法转换修补输出")
         }
+        let destination = data.mutableBytes.assumingMemoryBound(to: UInt8.self)
+        let space = CGColorSpaceCreateDeviceRGB()
         for y in 0..<height {
             for x in 0..<width {
                 let offset = y * width + x

@@ -26,9 +26,9 @@ struct RestorePixelCanvas {
             throw RestoreError.fileOperation("无法分配照片画布内存")
         }
         self.data = data
-        guard let bytes = data.mutableBytes,
-              let space = CGColorSpace(name: CGColorSpace.deviceRGB),
-              let context = CGContext(
+        let bytes = data.mutableBytes
+        let space = CGColorSpaceCreateDeviceRGB()
+        guard let context = CGContext(
                 data: bytes,
                 width: width,
                 height: height,
