@@ -98,7 +98,7 @@ enum RestorePCTransport {
         guard let payload = try? JSONDecoder().decode(UploadReply.self, from: data) else {
             throw RestorePCError.invalidResponse
         }
-        return "上传完成：\(payload.filename)（\(RestoreMath.formatBytes(payload.bytes)））"
+        return "上传完成：\(payload.filename)（\(RestoreMath.formatBytes(payload.bytes))）"
     }
 
     private static func send(
