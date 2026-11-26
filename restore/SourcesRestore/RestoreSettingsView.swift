@@ -24,8 +24,8 @@ struct RestoreSettingsView: View {
                             infoRow("适配设备", "iPhone 11 及更新机型")
                         }
                     }
-                    modelCard
                     pcCard
+                    modelCard
                     privacyCard
                     fileCard
                     Text("AI 超分和缺损修补会生成合理细节，但不保证还原真实原貌；原生增强仍可作为无需模型的备用方式。")

@@ -22,6 +22,17 @@ struct RestoreModelArtifact: Equatable {
     let downloadURL: String
     let byteCount: Int
     let sha256: String?
+    let alternateDownloadURLs: [String]
+
+    var downloadURLs: [String] { alternateDownloadURLs + [downloadURL] }
+
+    init(relativePath: String, downloadURL: String, byteCount: Int, sha256: String?, alternateDownloadURLs: [String] = []) {
+        self.relativePath = relativePath
+        self.downloadURL = downloadURL
+        self.byteCount = byteCount
+        self.sha256 = sha256
+        self.alternateDownloadURLs = alternateDownloadURLs
+    }
 }
 
 struct RestoreModelSpec: Equatable, Identifiable {
@@ -100,7 +111,10 @@ enum RestoreModelCatalog {
             relativePath: "aotgan.mlmodel",
             downloadURL: "https://raw.githubusercontent.com/john-rocky/AOT-GAN-for-Inpainting-CoreML/\(aotCommit)/AOT-GAN-for-Inpainting-CoreML/aotgan.mlmodel",
             byteCount: 60_818_996,
-            sha256: "6090945f20e4971113457fa0bb90bca42e4569dcaf9ab7c183d2749ee4718b68"
+            sha256: "6090945f20e4971113457fa0bb90bca42e4569dcaf9ab7c183d2749ee4718b68",
+            alternateDownloadURLs: [
+                "https://api.github.com/repos/john-rocky/AOT-GAN-for-Inpainting-CoreML/git/blobs/0e916772d239c30ce1dc72b5ec2af5df67d5e5a4"
+            ]
         )],
         treeSHA256: nil,
         catalogHash: "aot-gan-8b3dcd14-float32-v1",
@@ -119,7 +133,12 @@ enum RestoreModelCatalog {
             relativePath: path,
             downloadURL: "https://raw.githubusercontent.com/HerRei/local-upscale/\(commit)/\(path)",
             byteCount: byteCount,
-            sha256: nil
+            sha256: nil,
+            alternateDownloadURLs: [
+                "https://fastly.jsdelivr.net/gh/HerRei/local-upscale@\(commit)/\(path)",
+                "https://gcore.jsdelivr.net/gh/HerRei/local-upscale@\(commit)/\(path)",
+                "https://api.github.com/repos/HerRei/local-upscale/contents/\(path)?ref=\(commit)"
+            ]
         )
     }
 }

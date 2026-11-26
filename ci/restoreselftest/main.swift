@@ -127,10 +127,14 @@ let srSpec = RestoreModelCatalog.spec(for: .localSRFast)!
 expect(srSpec.inputName == "image" && srSpec.outputName == "out", "LocalSR tensor names match the verified model")
 expect(srSpec.inputShape == [1, 3, 384, 384] && srSpec.outputShape == [1, 3, 1536, 1536], "LocalSR tensor shapes match the verified model")
 expect(srSpec.totalByteCount == 350670 && srSpec.treeSHA256 == "26358751077f4e3b9fa428bd5a21354774ad53ec80212fee46b17bcd1877eabc", "LocalSR files use the upstream tree hash")
+expect(srSpec.artifacts.allSatisfy { $0.downloadURLs.count == 4 && $0.downloadURLs.allSatisfy { URL(string: $0)?.scheme == "https" } }, "LocalSR artifacts include HTTPS mirror and API fallbacks")
+expect(srSpec.artifacts.allSatisfy { $0.downloadURLs.contains { $0.contains("fastly.jsdelivr.net") } && $0.downloadURLs.contains { $0.contains("api.github.com") } }, "LocalSR bypasses an unavailable raw GitHub route")
+expect(srSpec.artifacts.allSatisfy { $0.downloadURLs.first?.contains("jsdelivr.net") == true }, "LocalSR tries working mirrors before the raw GitHub route")
 let inpaintSpec = RestoreModelCatalog.spec(for: .aotGAN)!
 expect(inpaintSpec.inputName == "x_1" && inpaintSpec.outputName == "var_915", "AOT-GAN tensor names match the verified model")
 expect(inpaintSpec.dataType == .float32 && inpaintSpec.outputShape == nil, "AOT-GAN Float32 flexible output is validated at runtime")
 expect(inpaintSpec.totalByteCount == 60818996 && inpaintSpec.artifacts[0].sha256 == "6090945f20e4971113457fa0bb90bca42e4569dcaf9ab7c183d2749ee4718b68", "AOT-GAN artifact size and SHA are pinned")
+expect(inpaintSpec.artifacts[0].downloadURLs.contains("https://api.github.com/repos/john-rocky/AOT-GAN-for-Inpainting-CoreML/git/blobs/0e916772d239c30ce1dc72b5ec2af5df67d5e5a4"), "AOT-GAN has a pinned GitHub API raw-file fallback")
 
 let emptyMask = RestoreMask()
 expect(emptyMask.isEmpty, "empty repair mask is detected")

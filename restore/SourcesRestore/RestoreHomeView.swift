@@ -23,6 +23,7 @@ struct RestoreHomeView: View {
     @State private var selectedResult: RestoredAsset?
     @State private var isImporting = false
     @State private var importError: String?
+    @State private var showPC = false
 
     var body: some View {
         NavigationStack {
@@ -31,6 +32,7 @@ struct RestoreHomeView: View {
                     header
                     hero
                     importCard
+                    pcShortcut
                     recentSection
                 }
                 .padding(.horizontal, 18)
@@ -54,6 +56,25 @@ struct RestoreHomeView: View {
             }
             .sheet(item: $selectedResult) { asset in
                 RestoreResultView(asset: asset)
+            }
+            .sheet(isPresented: $showPC) {
+                NavigationStack {
+                    ScrollView {
+                        VStack {
+                            RestorePCView()
+                            Spacer(minLength: 0)
+                        }
+                        .padding(18)
+                    }
+                    .background(RestoreTheme.background.ignoresSafeArea())
+                    .navigationTitle("电脑传输")
+                    .toolbar {
+                        ToolbarItem(placement: .cancellationAction) {
+                            Button("完成") { showPC = false }
+                        }
+                    }
+                }
+                .tint(RestoreTheme.cyan)
             }
             .onChange(of: processor.completedAsset?.id) { _, newValue in
                 guard let newValue, let asset = store.assets.first(where: { $0.id == newValue }) else { return }
@@ -138,6 +159,33 @@ struct RestoreHomeView: View {
                 }
             }
         }
+    }
+
+    private var pcShortcut: some View {
+        Button {
+            showPC = true
+        } label: {
+            HStack(spacing: 13) {
+                Image(systemName: "computer")
+                    .font(.title3.weight(.semibold))
+                    .foregroundStyle(RestoreTheme.cyan)
+                    .frame(width: 34, height: 34)
+                    .background(RestoreTheme.cyan.opacity(0.1), in: RoundedRectangle(cornerRadius: 10))
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("发给电脑").font(.subheadline.weight(.bold))
+                    Text("发送运行日志 · 上传修复结果").font(.caption2).foregroundStyle(RestoreTheme.secondary)
+                }
+                Spacer()
+                Image(systemName: "chevron.right").font(.caption).foregroundStyle(RestoreTheme.secondary)
+            }
+            .padding(15)
+            .background(RestoreTheme.card, in: RoundedRectangle(cornerRadius: 18))
+            .overlay(
+                RoundedRectangle(cornerRadius: 18)
+                    .stroke(RestoreTheme.stroke, lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
     }
 
     private func importButton(for kind: MediaKind) -> some View {

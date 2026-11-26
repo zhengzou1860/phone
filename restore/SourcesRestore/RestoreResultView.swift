@@ -75,7 +75,7 @@ struct RestoreResultView: View {
                                 Text("上传中 \(Int((uploadProgress ?? 0) * 100))%")
                             } else {
                                 Image(systemName: "computer")
-                                Text("上传修复结果到电脑")
+                                Text("发给电脑 · 上传修复结果")
                             }
                             Spacer()
                         }

@@ -131,6 +131,32 @@ final class RestoreModelManager: ObservableObject {
         return url
     }
 
+    private func downloadArtifact(_ artifact: RestoreModelArtifact, from source: String, session: URLSession, staging: URL) async throws {
+        guard let url = URL(string: source), url.scheme?.lowercased() == "https" else {
+            throw RestoreError.modelLoadFailed("模型下载地址无效")
+        }
+        var request = URLRequest(url: url)
+        request.setValue("application/vnd.github.raw+json", forHTTPHeaderField: "Accept")
+        let (temporary, response) = try await session.download(for: request)
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            throw RestoreError.modelLoadFailed("模型服务器返回 HTTP \((response as? HTTPURLResponse)?.statusCode ?? 0)")
+        }
+        let destination = staging.appendingPathComponent(artifact.relativePath)
+        try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? FileManager.default.removeItem(at: destination)
+        try FileManager.default.moveItem(at: temporary, to: destination)
+        let values = try destination.resourceValues(forKeys: [.fileSizeKey])
+        guard values.fileSize == artifact.byteCount else {
+            throw RestoreError.modelLoadFailed("\(artifact.relativePath) 大小校验失败")
+        }
+        if let expectedHash = artifact.sha256 {
+            guard try sha256(of: destination) == expectedHash.lowercased() else {
+                throw RestoreError.modelLoadFailed("\(artifact.relativePath) 校验失败，请重试")
+            }
+        }
+    }
+
     private func install(_ spec: RestoreModelSpec) async throws {
         let values = try root.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
         guard let available = values.volumeAvailableCapacityForImportantUsage else {
@@ -156,25 +182,23 @@ final class RestoreModelManager: ObservableObject {
         for (index, artifact) in spec.artifacts.enumerated() {
             try Task.checkCancellation()
             states[spec.id] = .downloading(Double(completed) / Double(max(1, total)))
-            guard let url = URL(string: artifact.downloadURL), url.scheme?.lowercased() == "https" else {
-                throw RestoreError.modelLoadFailed("模型下载地址无效")
-            }
-            let (temporary, response) = try await session.download(for: URLRequest(url: url))
-            guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-                throw RestoreError.modelLoadFailed("模型服务器返回 HTTP \((response as? HTTPURLResponse)?.statusCode ?? 0)")
-            }
-            let destination = staging.appendingPathComponent(artifact.relativePath)
-            try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try? FileManager.default.removeItem(at: destination)
-            try FileManager.default.moveItem(at: temporary, to: destination)
-            let values = try destination.resourceValues(forKeys: [.fileSizeKey])
-            guard values.fileSize == artifact.byteCount else {
-                throw RestoreError.modelLoadFailed("\(artifact.relativePath) 大小校验失败")
-            }
-            if let expectedHash = artifact.sha256 {
-                guard try sha256(of: destination) == expectedHash.lowercased() else {
-                    throw RestoreError.modelLoadFailed("\(artifact.relativePath) 校验失败，请重试")
+            var downloadError: Error?
+            var downloaded = false
+            for source in artifact.downloadURLs {
+                try Task.checkCancellation()
+                do {
+                    try await downloadArtifact(artifact, from: source, session: session, staging: staging)
+                    downloaded = true
+                    break
+                } catch {
+                    if Task.isCancelled { throw error }
+                    downloadError = error
+                    let host = URL(string: source)?.host ?? source
+                    RestoreJournal.line("AI 模型下载源失败：\(host) \(error.localizedDescription)")
                 }
+            }
+            guard downloaded else {
+                throw downloadError ?? RestoreError.modelLoadFailed("模型没有可用下载源")
             }
             completed += Int64(artifact.byteCount)
             states[spec.id] = .downloading(Double(completed) / Double(max(1, total)))
