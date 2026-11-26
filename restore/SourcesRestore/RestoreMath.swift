@@ -82,7 +82,9 @@ enum RestorePreflight {
         let outputPixels = Double(max(1, outputWidth)) * Double(max(1, outputHeight))
         let pixelRatio = outputPixels / sourcePixels
         let estimate = ceil(Double(max(1, sourceBytes)) * pixelRatio * 1.25)
-        return Int64(min(estimate, Double(Int64.max / 2)))
+        let maximum = Int64.max / 2
+        guard estimate.isFinite, estimate < Double(maximum) else { return maximum }
+        return Int64(estimate)
     }
 
     static func requiredImportBytes(sourceBytes: Int64) -> Int64 {
