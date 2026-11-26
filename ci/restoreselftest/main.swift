@@ -104,6 +104,16 @@ let singleAITile = RestoreAIMath.tilePlan(width: 300, height: 200, tileSize: 384
 expect(singleAITile.count == 1 && singleAITile[0].originX == -8 && singleAITile[0].originY == -8, "small AI image uses one padded tile")
 let edgeAITiles = RestoreAIMath.tilePlan(width: 384, height: 384, tileSize: 384, overlap: 8, outputScale: 1)
 expect(edgeAITiles.count == 4 && edgeAITiles.contains { $0.originX == 360 }, "AI tile grid covers both edges with overlap")
+let overlapWeightsSum = (360..<376).allSatisfy { pixel in
+    let first = RestoreAIMath.featherWeight(pixel: pixel, origin: -8, size: 384, sourceOrigin: -8, sourceSize: 384, sourceImageSize: 800, halo: 16)
+    let second = RestoreAIMath.featherWeight(pixel: pixel, origin: 360, size: 384, sourceOrigin: 360, sourceSize: 384, sourceImageSize: 800, halo: 16)
+    return abs(first + second - 1) < 0.00001
+}
+expect(overlapWeightsSum, "AI feather weights span the full overlap and sum to one")
+let cappedEdgeWeight = RestoreAIMath.featherWeight(pixel: 6263, origin: 5880, size: 384, sourceOrigin: 5880, sourceSize: 384, sourceImageSize: 8192, halo: 16)
+expect(abs(cappedEdgeWeight - 1.0 / 16) < 0.00001, "AI feather edge detection uses source dimensions after output capping")
+let sourceEdgeWeight = RestoreAIMath.featherWeight(pixel: 8191, origin: 7908, size: 384, sourceOrigin: 7908, sourceSize: 384, sourceImageSize: 8192, halo: 16)
+expect(sourceEdgeWeight == 1, "AI source boundary keeps full tile weight")
 expect(RestoreAIMath.tilePlan(width: 100, height: 100, tileSize: 16, overlap: 8, outputScale: 1).isEmpty, "invalid AI tile geometry is rejected")
 expect(RestoreAIMath.tilePlan(width: 100, height: 100, tileSize: 384, overlap: 8, outputScale: 0).isEmpty, "invalid AI output scale is rejected")
 try RestoreAIMath.validateSource(width: 8192, height: 4882)

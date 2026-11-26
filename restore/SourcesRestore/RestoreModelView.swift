@@ -36,7 +36,7 @@ struct RestoreModelView: View {
         )) {
             Button("取消", role: .cancel) { deleteCandidate = nil }
             Button("删除", role: .destructive) {
-                if let id = deleteCandidate { models.delete(id) }
+                if let id = deleteCandidate { Task { await models.delete(id) } }
                 deleteCandidate = nil
             }
         } message: {

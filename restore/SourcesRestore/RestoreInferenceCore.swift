@@ -145,6 +145,8 @@ enum RestoreInferenceCore {
         tileSize: Int,
         overlap: Int,
         scale: Double,
+        sourceImageWidth: Int,
+        sourceImageHeight: Int,
         maskImage: CGImage?
     ) throws {
         let outputWidth = max(1, Int((Double(tileSize) * scale).rounded()))
@@ -167,28 +169,28 @@ enum RestoreInferenceCore {
         let maxX = min(canvas.width, outputOriginX + outputWidth)
         let minY = max(0, outputOriginY)
         let maxY = min(canvas.height, outputOriginY + outputHeight)
-        let halo = max(1, (Double(overlap) * scale).rounded())
+        let halo = max(1, (Double(overlap) * 2 * scale).rounded())
         guard minX < maxX, minY < maxY else { return }
 
         for y in minY..<maxY {
             let localY = y - outputOriginY
-            let vertical = feather(
+            let vertical = RestoreAIMath.featherWeight(
                 pixel: y,
                 origin: outputOriginY,
                 size: outputHeight,
                 sourceOrigin: originY,
                 sourceSize: tileSize,
-                sourceImageSize: canvas.height,
+                sourceImageSize: sourceImageHeight,
                 halo: halo
             )
             for x in minX..<maxX {
-                let horizontal = feather(
+                let horizontal = RestoreAIMath.featherWeight(
                     pixel: x,
                     origin: outputOriginX,
                     size: outputWidth,
                     sourceOrigin: originX,
                     sourceSize: tileSize,
-                    sourceImageSize: canvas.width,
+                    sourceImageSize: sourceImageWidth,
                     halo: halo
                 )
                 var alpha = min(horizontal, vertical)
@@ -208,16 +210,24 @@ enum RestoreInferenceCore {
         }
     }
 
-    static func writeJPEG(_ image: CGImage) throws -> URL {
+    static func writeJPEG(_ image: CGImage) async throws -> URL {
+        try Task.checkCancellation()
         let data = NSMutableData()
         guard let destination = CGImageDestinationCreateWithData(data, "public.jpeg" as CFString, 1, nil) else {
             throw RestoreError.fileOperation("照片编码失败")
         }
         CGImageDestinationAddImage(destination, image, [kCGImageDestinationLossyCompressionQuality: 0.94] as CFDictionary)
         guard CGImageDestinationFinalize(destination) else { throw RestoreError.fileOperation("照片编码失败") }
+        try Task.checkCancellation()
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent(RestoreMath.timestampName(prefix: "restore", ext: "jpg"))
         try (data as Data).write(to: url, options: .atomic)
+        do {
+            try Task.checkCancellation()
+        } catch {
+            try? FileManager.default.removeItem(at: url)
+            throw error
+        }
         return url
     }
 
@@ -245,12 +255,6 @@ enum RestoreInferenceCore {
             throw RestoreError.inferenceFailed("模型输出尺寸或内存布局无效")
         }
         return (shape[3], shape[2])
-    }
-
-    private static func feather(pixel: Int, origin: Int, size: Int, sourceOrigin: Int, sourceSize: Int, sourceImageSize: Int, halo: Double) -> Double {
-        let left = sourceOrigin < 0 ? 1 : min(1, max(0, (Double(pixel) - Double(origin)) / halo))
-        let right = sourceOrigin + sourceSize > sourceImageSize ? 1 : min(1, max(0, (Double(origin + size) - Double(pixel)) / halo))
-        return min(left, right)
     }
 
 }

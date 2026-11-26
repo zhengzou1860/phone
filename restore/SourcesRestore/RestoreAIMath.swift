@@ -34,6 +34,21 @@ enum RestoreAIMath {
         return tiles
     }
 
+    static func featherWeight(
+        pixel: Int,
+        origin: Int,
+        size: Int,
+        sourceOrigin: Int,
+        sourceSize: Int,
+        sourceImageSize: Int,
+        halo: Double
+    ) -> Double {
+        guard halo > 0, halo.isFinite else { return 1 }
+        let left = sourceOrigin < 0 ? 1 : min(1, max(0, (Double(pixel) - Double(origin)) / halo))
+        let right = sourceOrigin + sourceSize > sourceImageSize ? 1 : min(1, max(0, (Double(origin + size) - Double(pixel)) / halo))
+        return min(left, right)
+    }
+
     static let maximumSourceLongEdge = 8192
     static let maximumSourcePixels = 40_000_000
     static let maximumSuperResolutionOutputPixels = 32_000_000

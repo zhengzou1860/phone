@@ -47,6 +47,8 @@ enum RestoreSuperResolutionRunner {
                 tileSize: tileSize,
                 overlap: overlap,
                 scale: scale,
+                sourceImageWidth: decoded.width,
+                sourceImageHeight: decoded.height,
                 maskImage: nil
             )
             await progress(0.1 + Double(index + 1) / Double(tiles.count) * 0.84, "AI 超分 \(index + 1)/\(tiles.count) 块")
@@ -54,7 +56,7 @@ enum RestoreSuperResolutionRunner {
         try Task.checkCancellation()
         await progress(0.96, "编码 AI 超分结果")
         RestoreJournal.line("AI 超分：\(tiles.count) 个分块全部完成")
-        return try RestoreInferenceCore.writeJPEG(canvas.makeImage())
+        return try await RestoreInferenceCore.writeJPEG(canvas.makeImage())
     }
 
     private static func fillRGB(_ array: MLMultiArray, from image: CGImage, channels: Int, minimum: Float, maximum: Float) throws {

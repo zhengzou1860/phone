@@ -26,11 +26,10 @@ final class RestoreProcessor: ObservableObject {
         do {
             try RestorePreflight.validate(width: media.width, height: media.height, duration: media.duration, isVideo: media.kind == .video)
             if settings.mode.isAI {
-                guard media.kind == .image, let id = settings.mode.model else {
+                guard media.kind == .image, settings.mode.model != nil else {
                     throw RestoreError.fileOperation("当前 AI 模型仅支持照片")
                 }
                 try RestoreAIMath.validateSource(width: media.width, height: media.height)
-                modelURL = try models.modelURL(for: id)
                 if settings.mode == .inpainting {
                     guard let mask = settings.mask, !mask.isEmpty else { throw RestoreError.emptyMask }
                 }
@@ -55,6 +54,9 @@ final class RestoreProcessor: ObservableObject {
                 outputHeight: output.height
             )
             try RestorePreflight.validateSpace(required: required, available: available)
+            if settings.mode.isAI, let modelID = settings.mode.model {
+                modelURL = try models.beginProcessing(modelID)
+            }
             RestoreJournal.line("处理预检通过：预计需要 \(RestoreMath.formatBytes(Int(required))) 可用空间，当前 \(RestoreMath.formatBytes(Int(available)))")
         } catch {
             errorMessage = error.localizedDescription
@@ -70,8 +72,13 @@ final class RestoreProcessor: ObservableObject {
         UIApplication.shared.isIdleTimerDisabled = true
         RestoreJournal.line("开始处理：\(media.kind.rawValue) \(media.width)×\(media.height) \(settings.summary)")
 
-        workTask = Task.detached(priority: .userInitiated) { [weak self, modelURL] in
-            guard let self else { return }
+        workTask = Task.detached(priority: .userInitiated) { [weak self, modelURL, models] in
+            guard let self else {
+                if settings.mode.isAI, let modelID = settings.mode.model {
+                    await models.endProcessing(modelID)
+                }
+                return
+            }
             var temporaryOutput: URL?
             do {
                 if media.kind == .image {
@@ -104,6 +111,7 @@ final class RestoreProcessor: ObservableObject {
                     )
                 }
                 guard let temporaryOutput else { throw RestoreError.fileOperation("没有生成结果文件") }
+                try Task.checkCancellation()
                 let output = outputSize(for: media, settings: settings)
                 let maxEdge = media.kind == .image ? settings.mode.maximumOutputLongEdge : 3840
                 let actualScale = RestoreMath.actualScale(
@@ -118,6 +126,11 @@ final class RestoreProcessor: ObservableObject {
                     id: media.id,
                     ext: extensionName
                 )
+                if Task.isCancelled {
+                    let cancelledURL = await self.store.resultURL(filename: filename)
+                    try? FileManager.default.removeItem(at: cancelledURL)
+                    throw CancellationError()
+                }
                 let resultPath = await self.store.resultURL(filename: filename).path
                 let bytes = (try? FileManager.default.attributesOfItem(atPath: resultPath)[.size] as? Int) ?? 0
                 let record = RestoredAsset(
@@ -135,9 +148,15 @@ final class RestoreProcessor: ObservableObject {
                     duration: media.duration,
                     resultBytes: bytes
                 )
+                if settings.mode.isAI, let modelID = settings.mode.model {
+                    await models.endProcessing(modelID)
+                }
                 await self.finish(record: record)
             } catch {
                 if let temporaryOutput { try? FileManager.default.removeItem(at: temporaryOutput) }
+                if settings.mode.isAI, let modelID = settings.mode.model {
+                    await models.endProcessing(modelID)
+                }
                 await self.finish(error: error)
             }
         }
@@ -164,6 +183,11 @@ final class RestoreProcessor: ObservableObject {
     }
 
     private func finish(record: RestoredAsset) {
+        if Task.isCancelled {
+            try? FileManager.default.removeItem(at: store.resultURL(for: record))
+            finish(error: CancellationError())
+            return
+        }
         isProcessing = false
         progress = 1
         phase = "修复完成"

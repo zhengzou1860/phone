@@ -52,6 +52,8 @@ enum RestoreInpaintingRunner {
                 tileSize: tileSize,
                 overlap: overlap,
                 scale: scale,
+                sourceImageWidth: decoded.width,
+                sourceImageHeight: decoded.height,
                 maskImage: maskTile
             )
             await progress(0.1 + Double(index + 1) / Double(tiles.count) * 0.84, "AI 修补 \(index + 1)/\(tiles.count) 块")
@@ -59,7 +61,7 @@ enum RestoreInpaintingRunner {
         try Task.checkCancellation()
         await progress(0.96, "编码 AI 修补结果")
         RestoreJournal.line("AI 修补：\(tiles.count) 个分块全部完成")
-        return try RestoreInferenceCore.writeJPEG(canvas.makeImage())
+        return try await RestoreInferenceCore.writeJPEG(canvas.makeImage())
     }
 
     private static func intersectsMask(_ tile: RestoreAITile, mask: CGImage, imageWidth: Int, imageHeight: Int, tileSize: Int) -> Bool {

@@ -17,6 +17,7 @@ final class RestoreModelManager: ObservableObject {
 
     private let root: URL
     private var tasks: [RestoreModelID: Task<Void, Never>] = [:]
+    private var activeModelUses: [RestoreModelID: Int] = [:]
 
     init() {
         let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -78,14 +79,41 @@ final class RestoreModelManager: ObservableObject {
         message = "正在取消下载 \(RestoreModelCatalog.spec(for: id)?.name ?? "AI 模型")"
     }
 
-    func delete(_ id: RestoreModelID) {
-        tasks[id]?.cancel()
+    func delete(_ id: RestoreModelID) async {
+        if let task = tasks[id] {
+            task.cancel()
+            await task.value
+        }
+        let name = RestoreModelCatalog.spec(for: id)?.name ?? "AI 模型"
+        guard activeModelUses[id, default: 0] == 0 else {
+            message = "\(name) 正在用于照片修复，请完成或停止后再删除"
+            return
+        }
+        guard tasks[id] == nil else {
+            message = "\(name) 正在准备，请稍后再删除"
+            return
+        }
         for component in ["Models", "Compiled", "Ready"] {
             let path = root.appendingPathComponent(component, isDirectory: true).appendingPathComponent(id.rawValue, isDirectory: true)
             try? FileManager.default.removeItem(at: path)
         }
         refresh()
-        message = "已删除 \(RestoreModelCatalog.spec(for: id)?.name ?? "AI 模型")"
+        message = "已删除 \(name)"
+    }
+
+    func beginProcessing(_ id: RestoreModelID) throws -> URL {
+        let url = try modelURL(for: id)
+        activeModelUses[id, default: 0] += 1
+        return url
+    }
+
+    func endProcessing(_ id: RestoreModelID) {
+        let count = activeModelUses[id, default: 0]
+        if count <= 1 {
+            activeModelUses[id] = nil
+        } else {
+            activeModelUses[id] = count - 1
+        }
     }
 
     func modelURL(for id: RestoreModelID) throws -> URL {
@@ -185,6 +213,7 @@ final class RestoreModelManager: ObservableObject {
         try? FileManager.default.removeItem(at: installed)
         try FileManager.default.moveItem(at: staging, to: installed)
         _ = try RestoreInferenceCore.loadModel(compiled, spec: spec)
+        try Task.checkCancellation()
         let record = ReadyRecord(version: spec.version, catalogHash: spec.catalogHash)
         let marker = readyMarker(id: spec.id)
         try FileManager.default.createDirectory(at: marker.deletingLastPathComponent(), withIntermediateDirectories: true)
