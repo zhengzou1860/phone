@@ -84,8 +84,10 @@ jobs:
           version=$(awk -F' => ' '/"CFBundleShortVersionString"/{gsub(/"/,"",$2); print $2; exit}' /tmp/hirestore-info.txt)
           echo "I-VERDICT bundle=$bundle_id version=$version" | tee -a /tmp/selftest.log
           test "$bundle_id" = "com.qoder.hirestore"
-          test -n "$version"
+          test "$version" = "0.3"
           grep -q NSPhotoLibraryAddUsageDescription /tmp/hirestore-info.txt
+          grep -q NSLocalNetworkUsageDescription /tmp/hirestore-info.txt
+          grep -q NSAllowsLocalNetworking /tmp/hirestore-info.txt
           grep -q UIFileSharingEnabled /tmp/hirestore-info.txt
           icon_name=$(plutil -extract CFBundleIcons.CFBundleIconName raw -o - "$APP/Info.plist" 2>/dev/null || true)
           if [ -z "$icon_name" ]; then

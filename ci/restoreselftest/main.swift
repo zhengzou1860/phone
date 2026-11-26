@@ -23,6 +23,43 @@ expect(abs(actual - 4096.0 / 4032.0) < 0.00001, "actual scale reflects memory ca
 let memory = RestoreMath.estimatedMemoryMB(width: 4096, height: 3072)
 expect(abs(memory - 96) < 0.001, "working memory estimate is deterministic")
 
+func expectPreflightError(_ body: () throws -> Void, _ message: String) {
+    do {
+        try body()
+        expect(false, "preflight should reject \(message)")
+    } catch {
+        expect(error.localizedDescription.contains(message), "preflight rejection explains \(message)")
+    }
+}
+
+try RestorePreflight.validate(width: 3840, height: 2160, duration: 900, isVideo: true)
+expect(true, "4K video at the 15 minute boundary is accepted")
+expectPreflightError({ try RestorePreflight.validate(width: 1920, height: 1080, duration: 901, isVideo: true) }, "15 分钟")
+expectPreflightError({ try RestorePreflight.validate(width: 4097, height: 2160, duration: 60, isVideo: true) }, "4K")
+expectPreflightError({ try RestorePreflight.validate(width: 4000, height: 3001, duration: 60, isVideo: true) }, "4K")
+expectPreflightError({ try RestorePreflight.validate(width: 1920, height: 1080, duration: .nan, isVideo: true) }, "时长")
+
+let megabyte: Int64 = 1024 * 1024
+let upscaleEstimate = RestorePreflight.estimatedOutputBytes(
+    sourceBytes: 100 * megabyte,
+    sourceWidth: 1920,
+    sourceHeight: 1080,
+    outputWidth: 3840,
+    outputHeight: 2160
+)
+expect(upscaleEstimate == 500 * megabyte, "4K output estimate scales source bytes by pixel ratio and headroom")
+let upscaleRequired = RestorePreflight.requiredExportBytes(
+    sourceBytes: 100 * megabyte,
+    sourceWidth: 1920,
+    sourceHeight: 1080,
+    outputWidth: 3840,
+    outputHeight: 2160
+)
+expect(upscaleRequired == 1012 * megabyte, "export preflight reserves 512 MB safety space")
+try RestorePreflight.validateSpace(required: upscaleRequired, available: upscaleRequired)
+expectPreflightError({ try RestorePreflight.validateSpace(required: upscaleRequired, available: upscaleRequired - 1) }, "可用空间不足")
+expect(RestorePreflight.requiredImportBytes(sourceBytes: 1024 * megabyte) == 1536 * megabyte, "import preflight includes source copy and safety space")
+
 let small = RestoreMath.fittedSize(width: 640, height: 480, scale: 1.5, maxLongEdge: 3840)
 expect(small.width == 960 && small.height == 720, "1.5x upscale keeps exact aspect ratio")
 

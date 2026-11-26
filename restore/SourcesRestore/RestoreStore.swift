@@ -26,45 +26,51 @@ final class RestoreStore: ObservableObject {
         let id = UUID()
         let extensionName = temporaryURL.pathExtension.isEmpty ? (kind == .image ? "jpg" : "mov") : temporaryURL.pathExtension
         let destination = inputs.appendingPathComponent("source_\(id.uuidString).\(extensionName)")
-        try await Task.detached(priority: .userInitiated) {
-            try FileManager.default.copyItem(at: temporaryURL, to: destination)
-            if temporaryURL.path.hasPrefix(FileManager.default.temporaryDirectory.path + "/"),
-               temporaryURL.lastPathComponent.hasPrefix("hirestore_pick_") {
-                try? FileManager.default.removeItem(at: temporaryURL)
-            }
-        }.value
-
+        let values = try temporaryURL.resourceValues(forKeys: [.fileSizeKey, .volumeAvailableCapacityForImportantUsageKey])
+        guard let sourceSize = values.fileSize, sourceSize > 0, let available = values.volumeAvailableCapacityForImportantUsage else {
+            throw RestoreError.fileOperation("无法读取原片大小或可用空间")
+        }
+        let width: Int
+        let height: Int
+        let duration: Double
+        if kind == .image {
+            let geometry = try ImageGeometry.load(temporaryURL)
+            width = geometry.width
+            height = geometry.height
+            duration = 0
+        } else {
+            let geometry = try await VideoGeometry.load(temporaryURL)
+            width = geometry.width
+            height = geometry.height
+            duration = geometry.duration
+        }
+        try RestorePreflight.validate(width: width, height: height, duration: duration, isVideo: kind == .video)
+        let required = RestorePreflight.requiredImportBytes(sourceBytes: Int64(sourceSize))
+        try RestorePreflight.validateSpace(required: required, available: available)
+        RestoreJournal.line("导入预检通过：需要 \(RestoreMath.formatBytes(Int(required))) 可用空间，当前 \(RestoreMath.formatBytes(Int(available)))")
         do {
-            let width: Int
-            let height: Int
-            let duration: Double
-            if kind == .image {
-                let geometry = try ImageGeometry.load(destination)
-                width = geometry.width
-                height = geometry.height
-                duration = 0
-            } else {
-                let geometry = try await VideoGeometry.load(destination)
-                width = geometry.width
-                height = geometry.height
-                duration = geometry.duration
-            }
-            let size = (try? destination.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
-            RestoreJournal.line("媒体已复制到沙盒：\(kind.rawValue) \(size) 字节")
-            return ImportedMedia(
-                id: id,
-                url: destination,
-                kind: kind,
-                originalName: temporaryURL.lastPathComponent,
-                byteCount: size,
-                width: width,
-                height: height,
-                duration: duration
-            )
+            try await Task.detached(priority: .userInitiated) {
+                try FileManager.default.copyItem(at: temporaryURL, to: destination)
+                if temporaryURL.path.hasPrefix(FileManager.default.temporaryDirectory.path + "/"),
+                   temporaryURL.lastPathComponent.hasPrefix("hirestore_pick_") {
+                    try? FileManager.default.removeItem(at: temporaryURL)
+                }
+            }.value
         } catch {
             try? FileManager.default.removeItem(at: destination)
             throw error
         }
+        RestoreJournal.line("媒体已复制到沙盒：\(kind.rawValue) \(sourceSize) 字节")
+        return ImportedMedia(
+            id: id,
+            url: destination,
+            kind: kind,
+            originalName: temporaryURL.lastPathComponent,
+            byteCount: sourceSize,
+            width: width,
+            height: height,
+            duration: duration
+        )
     }
 
     func resultURL(filename: String) -> URL {

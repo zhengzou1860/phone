@@ -20,6 +20,31 @@ final class RestoreProcessor: ObservableObject {
 
     func start(media: ImportedMedia, settings: RestorationSettings) {
         guard !isProcessing else { return }
+        do {
+            try RestorePreflight.validate(width: media.width, height: media.height, duration: media.duration, isVideo: media.kind == .video)
+            guard FileManager.default.fileExists(atPath: media.url.path) else {
+                throw RestoreError.fileOperation("要处理的原片已不存在")
+            }
+            let values = try media.url.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
+            guard let available = values.volumeAvailableCapacityForImportantUsage else {
+                throw RestoreError.fileOperation("无法读取可用空间")
+            }
+            let output = outputSize(for: media, settings: settings)
+            let required = RestorePreflight.requiredExportBytes(
+                sourceBytes: Int64(media.byteCount),
+                sourceWidth: media.width,
+                sourceHeight: media.height,
+                outputWidth: output.width,
+                outputHeight: output.height
+            )
+            try RestorePreflight.validateSpace(required: required, available: available)
+            RestoreJournal.line("处理预检通过：预计需要 \(RestoreMath.formatBytes(Int(required))) 可用空间，当前 \(RestoreMath.formatBytes(Int(available)))")
+        } catch {
+            errorMessage = error.localizedDescription
+            phase = "预检未通过"
+            RestoreJournal.line("处理预检失败：\(error.localizedDescription)")
+            return
+        }
         isProcessing = true
         progress = 0
         phase = "准备处理"
@@ -60,13 +85,8 @@ final class RestoreProcessor: ObservableObject {
                     )
                 }
                 guard let temporaryOutput else { throw RestoreError.fileOperation("没有生成结果文件") }
+                let output = outputSize(for: media, settings: settings)
                 let maxEdge = media.kind == .image ? 4096 : 3840
-                let output = RestoreMath.fittedSize(
-                    width: media.width,
-                    height: media.height,
-                    scale: settings.scale,
-                    maxLongEdge: maxEdge
-                )
                 let actualScale = RestoreMath.actualScale(
                     width: media.width,
                     height: media.height,
@@ -102,6 +122,15 @@ final class RestoreProcessor: ObservableObject {
                 await self.finish(error: error)
             }
         }
+    }
+
+    nonisolated private func outputSize(for media: ImportedMedia, settings: RestorationSettings) -> (width: Int, height: Int) {
+        RestoreMath.fittedSize(
+            width: media.width,
+            height: media.height,
+            scale: settings.scale,
+            maxLongEdge: media.kind == .image ? 4096 : 3840
+        )
     }
 
     func cancel() {

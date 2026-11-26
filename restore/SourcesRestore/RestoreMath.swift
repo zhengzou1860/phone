@@ -47,3 +47,93 @@ struct RestoreMath {
         return "\(prefix)_\(formatter.string(from: Date())).\(ext)"
     }
 }
+
+enum RestorePreflight {
+    static let maximumVideoDuration: TimeInterval = 15 * 60
+    static let maximumVideoLongEdge = 4096
+    static let maximumVideoPixels = 12_000_000
+    static let maximumImageLongEdge = 16_384
+    static let maximumImagePixels = 100_000_000
+    static let safetyBytes: Int64 = 512 * 1024 * 1024
+
+    static func validate(width: Int, height: Int, duration: Double, isVideo: Bool) throws {
+        guard width > 0, height > 0 else { throw RestorePreflightError.invalidDimensions }
+        let longEdge = max(width, height)
+        let pixels = Double(width) * Double(height)
+        if isVideo {
+            guard duration.isFinite, duration > 0 else { throw RestorePreflightError.invalidDuration }
+            guard duration <= maximumVideoDuration else { throw RestorePreflightError.videoTooLong }
+            guard longEdge <= maximumVideoLongEdge, pixels <= Double(maximumVideoPixels) else {
+                throw RestorePreflightError.resolutionTooLarge(isVideo: true)
+            }
+        } else if longEdge > maximumImageLongEdge || pixels > Double(maximumImagePixels) {
+            throw RestorePreflightError.resolutionTooLarge(isVideo: false)
+        }
+    }
+
+    static func estimatedOutputBytes(
+        sourceBytes: Int64,
+        sourceWidth: Int,
+        sourceHeight: Int,
+        outputWidth: Int,
+        outputHeight: Int
+    ) -> Int64 {
+        let sourcePixels = Double(max(1, sourceWidth)) * Double(max(1, sourceHeight))
+        let outputPixels = Double(max(1, outputWidth)) * Double(max(1, outputHeight))
+        let pixelRatio = max(1, outputPixels / sourcePixels)
+        let estimate = ceil(Double(max(1, sourceBytes)) * pixelRatio * 1.25)
+        return Int64(min(estimate, Double(Int64.max / 2)))
+    }
+
+    static func requiredImportBytes(sourceBytes: Int64) -> Int64 {
+        withSafetyMargin(max(0, sourceBytes))
+    }
+
+    static func requiredExportBytes(
+        sourceBytes: Int64,
+        sourceWidth: Int,
+        sourceHeight: Int,
+        outputWidth: Int,
+        outputHeight: Int
+    ) -> Int64 {
+        withSafetyMargin(estimatedOutputBytes(
+            sourceBytes: sourceBytes,
+            sourceWidth: sourceWidth,
+            sourceHeight: sourceHeight,
+            outputWidth: outputWidth,
+            outputHeight: outputHeight
+        ))
+    }
+
+    static func validateSpace(required: Int64, available: Int64) throws {
+        guard available >= required else { throw RestorePreflightError.insufficientSpace(required: required, available: available) }
+    }
+
+    private static func withSafetyMargin(_ bytes: Int64) -> Int64 {
+        let maximum = Int64.max - safetyBytes
+        return bytes > maximum ? Int64.max : bytes + safetyBytes
+    }
+}
+
+enum RestorePreflightError: LocalizedError {
+    case invalidDimensions
+    case invalidDuration
+    case videoTooLong
+    case resolutionTooLarge(isVideo: Bool)
+    case insufficientSpace(required: Int64, available: Int64)
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidDimensions:
+            return "图片或视频尺寸无效"
+        case .invalidDuration:
+            return "无法确认视频时长，请重新选择"
+        case .videoTooLong:
+            return "视频超过 15 分钟，请先分段再导入"
+        case .resolutionTooLarge(let isVideo):
+            return isVideo ? "视频超过 4K 限制，请先降低分辨率或分段处理" : "照片分辨率过大，请先缩小后再导入"
+        case .insufficientSpace(let required, let available):
+            return "可用空间不足：预计需要 \(RestoreMath.formatBytes(Int(required)))，当前只有 \(RestoreMath.formatBytes(Int(available)))"
+        }
+    }
+}

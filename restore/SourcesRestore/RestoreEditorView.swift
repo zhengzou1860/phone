@@ -7,10 +7,32 @@ struct RestoreEditorView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var settings = RestorePreset.smart.settings(scale: 2)
     @State private var showAdvanced = false
+    @State private var availableBytes: Int64?
 
     private var maxEdge: Int { media.kind == .image ? 4096 : 3840 }
     private var output: (width: Int, height: Int) {
         RestoreMath.fittedSize(width: media.width, height: media.height, scale: settings.scale, maxLongEdge: maxEdge)
+    }
+    private var estimatedOutputBytes: Int64 {
+        RestorePreflight.estimatedOutputBytes(
+            sourceBytes: Int64(media.byteCount),
+            sourceWidth: media.width,
+            sourceHeight: media.height,
+            outputWidth: output.width,
+            outputHeight: output.height
+        )
+    }
+    private var requiredBytes: Int64 {
+        RestorePreflight.requiredExportBytes(
+            sourceBytes: Int64(media.byteCount),
+            sourceWidth: media.width,
+            sourceHeight: media.height,
+            outputWidth: output.width,
+            outputHeight: output.height
+        )
+    }
+    private var hasInsufficientSpace: Bool {
+        availableBytes.map { $0 < requiredBytes } ?? false
     }
     private var actualScale: Double {
         RestoreMath.actualScale(width: media.width, height: media.height, requested: settings.scale, maxLongEdge: maxEdge)
@@ -61,6 +83,10 @@ struct RestoreEditorView: View {
             }
         }
         .tint(RestoreTheme.cyan)
+        .task(id: settings.scale) {
+            let values = try? media.url.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
+            availableBytes = values?.volumeAvailableCapacityForImportantUsage
+        }
     }
 
     private var sourceSection: some View {
@@ -72,8 +98,13 @@ struct RestoreEditorView: View {
                 Spacer()
                 Text(media.kind == .image
                      ? "\(media.width) × \(media.height)"
-                     : String(format: "%.1f 秒", media.duration))
+                     : "\(media.width) × \(media.height) · \(String(format: "%.1f", media.duration)) 秒")
                     .font(.caption.monospacedDigit())
+                    .foregroundStyle(RestoreTheme.secondary)
+            }
+            if media.kind == .video {
+                Text("限长 15 分钟 · 最高 4K · 流式逐帧处理")
+                    .font(.caption2)
                     .foregroundStyle(RestoreTheme.secondary)
             }
         }
@@ -148,14 +179,33 @@ struct RestoreEditorView: View {
     }
 
     private var outputSection: some View {
-        HStack(spacing: 10) {
-            Label("长边上限 \(maxEdge) px", systemImage: "memorychip")
-            Spacer()
-            Label("估算 \(String(format: "%.0f", RestoreMath.estimatedMemoryMB(width: output.width, height: output.height))) MB", systemImage: "internaldrive")
+        RestoreCard {
+            VStack(alignment: .leading, spacing: 9) {
+                HStack {
+                    Label("长边上限 \(maxEdge) px", systemImage: "memorychip")
+                    Spacer()
+                    Label("估算 \(String(format: "%.0f", RestoreMath.estimatedMemoryMB(width: output.width, height: output.height))) MB", systemImage: "internaldrive")
+                }
+                HStack {
+                    Text("预计输出 \(RestoreMath.formatBytes(Int(estimatedOutputBytes)))")
+                    Spacer()
+                    Text("需可用 \(RestoreMath.formatBytes(Int(requiredBytes)))")
+                }
+                HStack {
+                    Text(availableBytes.map { "当前可用 \(RestoreMath.formatBytes(Int($0)))" } ?? "正在检查可用空间…")
+                    Spacer()
+                    if hasInsufficientSpace {
+                        Label("空间不足", systemImage: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.red)
+                    }
+                }
+                Text("按原片体积和像素比估算，已预留 512 MB 安全空间。")
+                    .font(.caption2)
+                    .foregroundStyle(RestoreTheme.secondary)
+            }
+            .font(.caption2)
+            .foregroundStyle(RestoreTheme.secondary)
         }
-        .font(.caption2)
-        .foregroundStyle(RestoreTheme.secondary)
-        .padding(.horizontal, 4)
     }
 
     private var advancedSection: some View {
@@ -229,7 +279,7 @@ struct RestoreEditorView: View {
                 in: RoundedRectangle(cornerRadius: 18, style: .continuous)
             )
         }
-        .disabled(processor.isProcessing)
+        .disabled(processor.isProcessing || hasInsufficientSpace)
     }
 
     private func icon(for preset: RestorePreset) -> String {
