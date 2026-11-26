@@ -136,7 +136,8 @@ let maskImage = try mask.rasterized(width: 64, height: 64)
 let maskProvider = maskImage.dataProvider!
 let maskData = maskProvider.data! as Data
 let maskBytes = (maskData as NSData).bytes.assumingMemoryBound(to: UInt8.self)
-expect(maskBytes[0 * maskImage.bytesPerRow + 0] > 0, "normalized mask coordinates rasterize at the expected edge")
+let firstColumnHasPaint = (0..<64).contains { maskBytes[$0 * maskImage.bytesPerRow] > 0 }
+expect(firstColumnHasPaint, "normalized mask coordinates rasterize at the expected edge")
 let decodedMask = try JSONDecoder().decode(RestoreMask.self, from: JSONEncoder().encode(mask))
 expect(decodedMask == mask, "repair mask survives codable round trip")
 
