@@ -40,14 +40,14 @@ struct RestorePicker: UIViewControllerRepresentable {
                 dispatch(nil, nil)
                 return
             }
-            let type = UTType(kind == .image ? .jpeg : .movie)
+            let type: UTType = kind == .image ? .jpeg : .movie
             if provider.hasItemConformingToTypeIdentifier(type.identifier) {
                 provider.loadFileRepresentation(forTypeIdentifier: type.identifier) { url, error in
                     self.dispatch(url, error?.localizedDescription)
                 }
                 return
             }
-            let fallback = UTType(kind == .image ? .image : .movie)
+            let fallback: UTType = kind == .image ? .image : .movie
             provider.loadFileRepresentation(forTypeIdentifier: fallback.identifier) { url, error in
                 self.dispatch(url, error?.localizedDescription)
             }

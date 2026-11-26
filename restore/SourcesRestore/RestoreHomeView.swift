@@ -56,7 +56,7 @@ struct RestoreHomeView: View {
                 RestoreResultView(asset: asset)
             }
             .onChange(of: processor.completedAsset?.id) { _, newValue in
-                guard let newValue, let asset = store.assets.first(where: { $0.id.uuidString == newValue }) else { return }
+                guard let newValue, let asset = store.assets.first(where: { $0.id == newValue }) else { return }
                 editorMedia = nil
                 selectedResult = asset
             }

@@ -77,7 +77,7 @@ struct RestoreMediaPreview: View {
             }
         }
         .aspectRatio(kind == .image ? nil : 16 / 9, contentMode: .fit)
-        .clip(RoundedRectangle(cornerRadius: 20, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 20, style: .continuous)
                 .stroke(RestoreTheme.stroke, lineWidth: 1)
@@ -139,7 +139,7 @@ struct AssetThumbnail: View {
             }
         }
         .frame(width: 82, height: 82)
-        .clip(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 16, style: .continuous)
                 .stroke(RestoreTheme.stroke, lineWidth: 1)

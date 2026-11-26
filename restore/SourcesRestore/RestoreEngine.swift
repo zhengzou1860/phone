@@ -16,7 +16,7 @@ enum RestoreEngine {
             throw RestoreError.unreadableImage
         }
         let source = CIImage(cgImage: cgImage)
-            .oriented(forExifOrientation: image.imageOrientation.exifOrientation)
+            .oriented(forExifOrientation: image.imageOrientation.exifOrientation.rawValue)
         let target = RestoreMath.fittedSize(
             width: Int(source.extent.width),
             height: Int(source.extent.height),
@@ -41,7 +41,7 @@ enum RestoreEngine {
         try Task.checkCancellation()
         let outputURL = FileManager.default.temporaryDirectory
             .appendingPathComponent(RestoreMath.timestampName(prefix: "restore", ext: "jpg"))
-        try data.write(to: outputURL, options: .atomic)
+        try data.write(to: outputURL, options: Data.WritingOptions.atomic)
         await progress(1, "照片修复完成")
         return outputURL
     }
@@ -65,7 +65,7 @@ enum RestoreEngine {
         )
         guard target.width >= 2, target.height >= 2 else { throw RestoreError.invalidDimensions }
 
-        let composition = AVVideoComposition(asset: asset, applyingCIFiltersWithHandler: { request in
+        let composition = AVMutableVideoComposition(asset: asset, applyingCIFiltersWithHandler: { request in
             let source = request.sourceImage.transformed(by: CGAffineTransform(
                 translationX: -request.sourceImage.extent.minX,
                 y: -request.sourceImage.extent.minY
@@ -132,12 +132,12 @@ enum RestoreEngine {
 
     private static func enhance(_ source: CIImage, settings: RestorationSettings) -> CIImage {
         let originalExtent = source.extent
-        var image = source.clampingToExtent()
+        var image = source.clampedToExtent()
         if settings.denoise > 0.001 {
             image = image.applyingFilter(
                 "CINoiseReduction",
                 parameters: [
-                    kCIInputNoiseLevelKey: 0.008 + settings.denoise * 0.06,
+                    "inputNoiseLevel": 0.008 + settings.denoise * 0.06,
                     kCIInputSharpnessKey: settings.sharpen * 0.3
                 ]
             )

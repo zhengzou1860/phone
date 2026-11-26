@@ -78,9 +78,8 @@ final class RestoreProcessor: ObservableObject {
                     id: media.id,
                     ext: extensionName
                 )
-                let bytes = (try? FileManager.default.attributesOfItem(
-                    atPath: self.store.resultURL(filename: filename).path
-                )[.size] as? Int) ?? 0
+                let resultPath = await self.store.resultURL(filename: filename).path
+                let bytes = (try? FileManager.default.attributesOfItem(atPath: resultPath)[.size] as? Int) ?? 0
                 let record = RestoredAsset(
                     id: media.id,
                     kindRaw: media.kind.rawValue,

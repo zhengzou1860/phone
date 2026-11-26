@@ -55,7 +55,7 @@ final class RestoreStore: ObservableObject {
                 url: destination,
                 kind: kind,
                 originalName: temporaryURL.lastPathComponent,
-                byteCount: size ?? 0,
+                byteCount: size,
                 width: width,
                 height: height,
                 duration: duration
@@ -122,9 +122,9 @@ final class RestoreStore: ObservableObject {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             PHPhotoLibrary.shared().performChanges {
                 if let data {
-                    PHAssetCreationRequest.creationRequestForAsset().addResource(with: .photo, data: data, options: nil)
+                    PHAssetCreationRequest.forAsset().addResource(with: .photo, data: data, options: nil)
                 } else {
-                    PHAssetCreationRequest.creationRequestForAsset().addResource(with: .video, fileURL: url, options: nil)
+                    PHAssetCreationRequest.forAsset().addResource(with: .video, fileURL: url, options: nil)
                 }
             } completionHandler: { success, error in
                 if success {
@@ -152,7 +152,7 @@ final class RestoreStore: ObservableObject {
             generator.maximumSize = CGSize(width: maxPixel, height: maxPixel)
             let semaphore = DispatchSemaphore(value: 0)
             var result: UIImage?
-            generator.generateCGImagesAsynchronously(forTimes: [NSValue(time: .zero)]) { _, cgImage, _, _ in
+            generator.generateCGImagesAsynchronously(forTimes: [NSValue(time: .zero)]) { _, cgImage, _, _, _ in
                 if let cgImage = cgImage { result = UIImage(cgImage: cgImage) }
                 semaphore.signal()
             }
