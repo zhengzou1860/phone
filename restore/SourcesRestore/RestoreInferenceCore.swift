@@ -209,45 +209,51 @@ enum RestoreInferenceCore {
         }
         let validWidth = min(size, image.width - originX)
         let validHeight = min(size, image.height - originY)
-        var replicateEdges = false
         if validWidth > 0, validHeight > 0,
            let cropped = image.cropping(to: CGRect(x: originX, y: originY, width: validWidth, height: validHeight)) {
             tile.draw(cropped, in: CGRect(x: 0, y: 0, width: validWidth, height: validHeight))
-            replicateEdges = !clear
         }
-        _ = tile.makeImage()
-        if replicateEdges {
-            let bytes = data.mutableBytes.assumingMemoryBound(to: UInt8.self)
-            if validWidth < size {
-                for y in 0..<validHeight {
-                    let sourceOffset = y * bytesPerRow + (validWidth - 1) * 4
-                    for x in validWidth..<size {
-                        let destinationOffset = y * bytesPerRow + x * 4
-                        for channel in 0..<4 {
-                            bytes[destinationOffset + channel] = bytes[sourceOffset + channel]
-                        }
+        guard let rendered = tile.makeImage() else { throw RestoreError.inferenceFailed("无法生成推理小块") }
+        guard !clear, let provider = rendered.dataProvider, let rawData = provider.data else {
+            return rendered
+        }
+        let sourceData = rawData as NSData
+        let rowBytes = rendered.bytesPerRow
+        guard sourceData.length >= rowBytes * size,
+              let outputData = NSMutableData(length: sourceData.length) else {
+            throw RestoreError.inferenceFailed("无法复制推理小块像素")
+        }
+        outputData.replaceBytes(in: NSRange(location: 0, length: sourceData.length), withBytes: sourceData.bytes)
+        let bytes = outputData.mutableBytes.assumingMemoryBound(to: UInt8.self)
+        if validWidth < size {
+            for y in 0..<validHeight {
+                let sourceOffset = y * rowBytes + (validWidth - 1) * 4
+                for x in validWidth..<size {
+                    let destinationOffset = y * rowBytes + x * 4
+                    for channel in 0..<4 {
+                        bytes[destinationOffset + channel] = bytes[sourceOffset + channel]
                     }
                 }
             }
-            if validHeight < size {
-                let sourceOffset = (validHeight - 1) * bytesPerRow
-                for y in validHeight..<size {
-                    let destinationOffset = y * bytesPerRow
-                    for offset in 0..<bytesPerRow {
-                        bytes[destinationOffset + offset] = bytes[sourceOffset + offset]
-                    }
+        }
+        if validHeight < size {
+            let sourceOffset = (validHeight - 1) * rowBytes
+            for y in validHeight..<size {
+                let destinationOffset = y * rowBytes
+                for offset in 0..<rowBytes {
+                    bytes[destinationOffset + offset] = bytes[sourceOffset + offset]
                 }
             }
         }
         guard let result = CGImage(
             width: size,
             height: size,
-            bitsPerComponent: 8,
-            bitsPerPixel: 32,
-            bytesPerRow: bytesPerRow,
-            space: CGColorSpaceCreateDeviceRGB(),
-            bitmapInfo: CGBitmapInfo(rawValue: CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.premultipliedLast.rawValue),
-            provider: CGDataProvider(data: data as CFData)!,
+            bitsPerComponent: rendered.bitsPerComponent,
+            bitsPerPixel: rendered.bitsPerPixel,
+            bytesPerRow: rowBytes,
+            space: rendered.colorSpace ?? CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: rendered.bitmapInfo,
+            provider: CGDataProvider(data: outputData as CFData)!,
             decode: nil,
             shouldInterpolate: false,
             intent: .defaultIntent
