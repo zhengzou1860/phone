@@ -183,12 +183,14 @@ let validPrediction = gradientImage(width: 300 * modelScale, height: 200 * model
 let modelPadding = try RestorePixelCanvas(width: 768, height: 768)
 modelPadding.context.setFillColor(CGColor(red: 1, green: 0, blue: 1, alpha: 1))
 modelPadding.context.fill(CGRect(x: 0, y: 0, width: 768, height: 768))
-modelPadding.context.draw(validPrediction, in: CGRect(x: 0, y: 0, width: 600, height: 400))
+modelPadding.context.draw(validPrediction, in: CGRect(x: 0, y: 768 - 400, width: 600, height: 400))
+let modelPaddingImage = try modelPadding.makeImage()
+expect(colorsClose(color(modelPaddingImage, x: 0, y: 0), color(validPrediction, x: 0, y: 0)), "model padding fixture keeps valid prediction at the top-left")
 let smallModelCanvas = try RestorePixelCanvas(width: 600, height: 400)
 try RestoreInferenceCore.blend(
     canvas: smallModelCanvas,
     weights: try RestoreBlendWeights(width: 600, height: 400),
-    tileImage: try modelPadding.makeImage(),
+    tileImage: modelPaddingImage,
     originX: 0,
     originY: 0,
     tileSize: 384,
@@ -198,9 +200,13 @@ try RestoreInferenceCore.blend(
     maskImage: nil
 )
 let smallModelImage = try smallModelCanvas.makeImage()
-expect(colorsClose(color(smallModelImage, x: 0, y: 0), color(validPrediction, x: 0, y: 0)), "small 2x model output starts at the first valid source pixel")
-expect(colorsClose(color(smallModelImage, x: 599, y: 399), color(validPrediction, x: 599, y: 399)), "small 2x model output excludes padding instead of squeezing it into the photo")
-expect(colorsClose(color(smallModelImage, x: 250, y: 200), color(validPrediction, x: 250, y: 200)), "small 2x model output keeps valid content at native model coordinates")
+let smallModelFirst = color(smallModelImage, x: 0, y: 0)
+let smallModelLast = color(smallModelImage, x: 599, y: 399)
+let smallModelMiddle = color(smallModelImage, x: 250, y: 200)
+print("RESTORE-TILE DETAIL model first=\(smallModelFirst)/\(color(validPrediction, x: 0, y: 0)) last=\(smallModelLast)/\(color(validPrediction, x: 599, y: 399)) middle=\(smallModelMiddle)/\(color(validPrediction, x: 250, y: 200))")
+expect(colorsClose(smallModelFirst, color(validPrediction, x: 0, y: 0)), "small 2x model output starts at the first valid source pixel")
+expect(colorsClose(smallModelLast, color(validPrediction, x: 599, y: 399)), "small 2x model output excludes padding instead of squeezing it into the photo")
+expect(colorsClose(smallModelMiddle, color(validPrediction, x: 250, y: 200)), "small 2x model output keeps valid content at native model coordinates")
 
 let edgePrediction = try RestorePixelCanvas(width: 768, height: 768)
 edgePrediction.context.setFillColor(CGColor(red: 1, green: 0, blue: 1, alpha: 1))
