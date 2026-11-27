@@ -66,8 +66,11 @@ struct RestoreModelView: View {
                 Text(spec.technicalSummary)
                     .font(.caption2.monospacedDigit())
                     .foregroundStyle(RestoreTheme.secondary)
-                if case .downloading(let value) = state {
-                    ProgressView(value: value).tint(RestoreTheme.cyan)
+                if case .downloading(let progress) = state {
+                    ProgressView(value: progress.fraction).tint(RestoreTheme.cyan)
+                    Text(progress.summary)
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(RestoreTheme.secondary)
                 }
                 if case .failed(let message) = state {
                     Text(message).font(.caption2).foregroundStyle(.red)
@@ -114,8 +117,8 @@ struct RestoreModelView: View {
             switch state {
             case .notInstalled:
                 Label("未下载", systemImage: "arrow.down.circle")
-            case .downloading:
-                Label("下载中", systemImage: "arrow.down.circle")
+            case .downloading(let progress):
+                Label(progress.phase.title, systemImage: "arrow.down.circle")
             case .compiling:
                 Label("准备中", systemImage: "gear")
             case .installed:

@@ -4,7 +4,7 @@ import CryptoKit
 
 enum RestoreModelInstallState: Equatable {
     case notInstalled
-    case downloading(Double)
+    case downloading(RestoreDownloadProgress)
     case compiling
     case installed
     case failed(String)
@@ -15,8 +15,22 @@ final class RestoreModelManager: ObservableObject {
     @Published private(set) var states: [RestoreModelID: RestoreModelInstallState] = [:]
     @Published private(set) var message: String?
 
+    private struct DownloadMetrics {
+        var attemptID: UUID
+        var phase: RestoreDownloadPhase
+        var sourceHost: String
+        var baselineBytes: Int64
+        var artifactBytes: Int64
+        var receivedBytes: Int64
+        var startedAt: Date
+        var lastBytesAt: Date
+        var lastLoggedAt: Date
+    }
+
     private let root: URL
     private var tasks: [RestoreModelID: Task<Void, Never>] = [:]
+    private var progressTimers: [RestoreModelID: Task<Void, Never>] = [:]
+    private var downloadMetrics: [RestoreModelID: DownloadMetrics] = [:]
     private var activeModelUses: [RestoreModelID: Int] = [:]
 
     init() {
@@ -42,36 +56,33 @@ final class RestoreModelManager: ObservableObject {
     func download(_ id: RestoreModelID) {
         guard !isInstalled(id), tasks[id] == nil, let spec = RestoreModelCatalog.spec(for: id), !spec.isBundled else { return }
         message = nil
-        states[id] = .downloading(0)
+        states[id] = .downloading(.waiting)
+        startProgressTimer(for: id)
         tasks[id] = Task { [weak self] in
             guard let self else { return }
             do {
                 try await self.install(spec)
                 try Task.checkCancellation()
-                try await MainActor.run {
-                    try Task.checkCancellation()
-                    self.tasks[id] = nil
-                    self.states[id] = .installed
-                    self.message = "\(spec.name) 已下载并校验，可离线使用"
-                    RestoreJournal.line("AI 模型就绪：\(spec.name) \(spec.version)")
-                }
+                self.stopDownloadTracking(for: id)
+                self.tasks[id] = nil
+                self.states[id] = .installed
+                self.message = "\(spec.name) 已下载并校验，可离线使用"
+                RestoreJournal.line("AI 模型就绪：\(spec.name) \(spec.version)")
             } catch is CancellationError {
-                await MainActor.run {
-                    self.tasks[id] = nil
+                self.stopDownloadTracking(for: id)
+                self.tasks[id] = nil
+                self.states[id] = (try? self.modelURL(for: id)) != nil ? .installed : .notInstalled
+                self.message = "已取消下载 \(spec.name)"
+            } catch {
+                self.stopDownloadTracking(for: id)
+                self.tasks[id] = nil
+                if Task.isCancelled {
                     self.states[id] = (try? self.modelURL(for: id)) != nil ? .installed : .notInstalled
                     self.message = "已取消下载 \(spec.name)"
-                }
-            } catch {
-                await MainActor.run {
-                    self.tasks[id] = nil
-                    if Task.isCancelled {
-                        self.states[id] = (try? self.modelURL(for: id)) != nil ? .installed : .notInstalled
-                        self.message = "已取消下载 \(spec.name)"
-                    } else {
-                        self.states[id] = .failed(error.localizedDescription)
-                        self.message = "\(spec.name) 安装失败：\(error.localizedDescription)"
-                        RestoreJournal.line("AI 模型安装失败：\(spec.name) \(error.localizedDescription)")
-                    }
+                } else {
+                    self.states[id] = .failed(error.localizedDescription)
+                    self.message = "\(spec.name) 安装失败：\(error.localizedDescription)"
+                    RestoreJournal.line("AI 模型安装失败：\(spec.name) \(error.localizedDescription)")
                 }
             }
         }
@@ -142,17 +153,36 @@ final class RestoreModelManager: ObservableObject {
         return url
     }
 
-    private func downloadArtifact(_ artifact: RestoreModelArtifact, from source: String, session: URLSession, staging: URL) async throws {
+    private func downloadArtifact(
+        _ artifact: RestoreModelArtifact,
+        from source: String,
+        spec: RestoreModelSpec,
+        attemptID: UUID,
+        configuration: URLSessionConfiguration,
+        staging: URL
+    ) async throws {
         guard let url = URL(string: source), url.scheme?.lowercased() == "https" else {
             throw RestoreError.modelLoadFailed("模型下载地址无效")
         }
+        let host = url.host ?? source
+        let delegate = RestoreModelDownloadDelegate { [weak self] written, expected in
+            guard let self else { return }
+            Task { @MainActor in
+                self.recordDownloadProgress(for: spec.id, attemptID: attemptID, host: host, written: written, expected: expected)
+            }
+        }
+        let session = URLSession(configuration: configuration, delegate: delegate, delegateQueue: nil)
+        defer { session.finishTasksAndInvalidate() }
         var request = URLRequest(url: url)
         request.setValue("application/vnd.github.raw+json", forHTTPHeaderField: "Accept")
-        let (temporary, response) = try await session.download(for: request)
+        let (temporary, response) = try await session.download(for: request, delegate: delegate)
         defer { try? FileManager.default.removeItem(at: temporary) }
+        try Task.checkCancellation()
         guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
             throw RestoreError.modelLoadFailed("模型服务器返回 HTTP \((response as? HTTPURLResponse)?.statusCode ?? 0)")
         }
+        markDownloadVerifying(for: spec.id)
+        RestoreJournal.line("AI 模型文件下载完成：\(spec.name) \(host)，正在校验大小和 SHA-256")
         let destination = staging.appendingPathComponent(artifact.relativePath)
         try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
         try? FileManager.default.removeItem(at: destination)
@@ -162,7 +192,7 @@ final class RestoreModelManager: ObservableObject {
             throw RestoreError.modelLoadFailed("\(artifact.relativePath) 大小校验失败")
         }
         if let expectedHash = artifact.sha256 {
-            let actualHash = try sha256(of: destination)
+            let actualHash = try await Self.sha256(of: destination)
             guard actualHash == expectedHash.lowercased() else {
                 throw RestoreError.modelLoadFailed("\(artifact.relativePath) 校验失败（实际 \(actualHash.prefix(12))）")
             }
@@ -176,14 +206,10 @@ final class RestoreModelManager: ObservableObject {
         }
         let required = Int64(spec.totalByteCount) * 3 + 128 * 1024 * 1024
         try RestorePreflight.validateSpace(required: required, available: available)
-        let session = URLSession(configuration: {
-            let configuration = URLSessionConfiguration.ephemeral
-            configuration.waitsForConnectivity = false
-            configuration.timeoutIntervalForRequest = 60
-            configuration.timeoutIntervalForResource = 1800
-            return configuration
-        }())
-        defer { session.finishTasksAndInvalidate() }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.waitsForConnectivity = false
+        configuration.timeoutIntervalForRequest = 60
+        configuration.timeoutIntervalForResource = 1800
         let staging = root.appendingPathComponent("Staging", isDirectory: true)
             .appendingPathComponent("\(spec.id.rawValue)-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
@@ -193,33 +219,49 @@ final class RestoreModelManager: ObservableObject {
         var completed: Int64 = 0
         for (index, artifact) in spec.artifacts.enumerated() {
             try Task.checkCancellation()
-            states[spec.id] = .downloading(Double(completed) / Double(max(1, total)))
             var downloadError: Error?
             var downloaded = false
             for source in artifact.downloadURLs {
                 try Task.checkCancellation()
+                let host = URL(string: source)?.host ?? source
+                let attemptID = beginDownloadSource(for: spec.id, host: host, baselineBytes: completed, artifactBytes: Int64(artifact.byteCount))
+                RestoreJournal.line("AI 模型开始下载：\(spec.name) \(index + 1)/\(spec.artifacts.count) · \(host) · \(RestoreMath.formatBytes(spec.totalByteCount))")
                 do {
-                    try await downloadArtifact(artifact, from: source, session: session, staging: staging)
-                    RestoreJournal.line("AI 模型下载源成功：\(URL(string: source)?.host ?? source)")
+                    try await downloadArtifact(
+                        artifact,
+                        from: source,
+                        spec: spec,
+                        attemptID: attemptID,
+                        configuration: configuration,
+                        staging: staging
+                    )
+                    if let progress = currentDownloadProgress(for: spec.id) {
+                        RestoreJournal.line("AI 模型下载源成功：\(host) · \(progress.summary)")
+                    }
                     downloaded = true
                     break
                 } catch {
                     if Task.isCancelled { throw error }
                     downloadError = error
-                    let host = URL(string: source)?.host ?? source
-                    RestoreJournal.line("AI 模型下载源失败：\(host) \(error.localizedDescription)")
+                    logDownloadInterruption(for: spec.id, error: error)
                 }
             }
             guard downloaded else {
                 throw downloadError ?? RestoreError.modelLoadFailed("模型没有可用下载源")
             }
             completed += Int64(artifact.byteCount)
-            states[spec.id] = .downloading(Double(completed) / Double(max(1, total)))
+            if var metrics = downloadMetrics[spec.id] {
+                metrics.receivedBytes = Int64(artifact.byteCount)
+                metrics.phase = .verifying
+                downloadMetrics[spec.id] = metrics
+                publishDownloadProgress(for: spec.id)
+            }
             RestoreJournal.line("AI 模型下载：\(spec.name) \(index + 1)/\(spec.artifacts.count)")
         }
 
         RestoreJournal.line("AI 模型文件校验通过：\(spec.name) \(spec.artifacts.count) 个文件")
         try Task.checkCancellation()
+        stopDownloadTracking(for: spec.id)
         states[spec.id] = .compiling
         let source = staging.appendingPathComponent(spec.bundleRelativePath)
         guard FileManager.default.fileExists(atPath: source.path) else {
@@ -253,6 +295,119 @@ final class RestoreModelManager: ObservableObject {
         try JSONEncoder().encode(record).write(to: marker, options: .atomic)
     }
 
+    private func startProgressTimer(for id: RestoreModelID) {
+        progressTimers[id]?.cancel()
+        progressTimers[id] = Task { [weak self] in
+            while !Task.isCancelled {
+                do {
+                    try await Task.sleep(nanoseconds: 1_000_000_000)
+                } catch {
+                    return
+                }
+                guard !Task.isCancelled, let self else { return }
+                self.tickDownloadProgress(for: id)
+            }
+        }
+    }
+
+    private func stopDownloadTracking(for id: RestoreModelID) {
+        progressTimers[id]?.cancel()
+        progressTimers[id] = nil
+        downloadMetrics[id] = nil
+    }
+
+    private func beginDownloadSource(for id: RestoreModelID, host: String, baselineBytes: Int64, artifactBytes: Int64) -> UUID {
+        let now = Date()
+        let attemptID = UUID()
+        downloadMetrics[id] = DownloadMetrics(
+            attemptID: attemptID,
+            phase: .connecting,
+            sourceHost: host,
+            baselineBytes: baselineBytes,
+            artifactBytes: artifactBytes,
+            receivedBytes: 0,
+            startedAt: now,
+            lastBytesAt: now,
+            lastLoggedAt: now
+        )
+        publishDownloadProgress(for: id)
+        return attemptID
+    }
+
+    private func recordDownloadProgress(for id: RestoreModelID, attemptID: UUID, host: String, written: Int64, expected: Int64) {
+        guard var metrics = downloadMetrics[id], metrics.attemptID == attemptID, metrics.phase != .verifying else { return }
+        let now = Date()
+        let expectedBytes = expected > 0 ? min(expected, metrics.artifactBytes) : metrics.artifactBytes
+        let received = min(max(0, written), max(0, expectedBytes))
+        if received > metrics.receivedBytes {
+            metrics.lastBytesAt = now
+        }
+        metrics.artifactBytes = expectedBytes
+        metrics.receivedBytes = received
+        metrics.phase = .downloading
+        metrics.sourceHost = host
+        downloadMetrics[id] = metrics
+        publishDownloadProgress(for: id)
+    }
+
+    private func markDownloadVerifying(for id: RestoreModelID) {
+        guard var metrics = downloadMetrics[id] else { return }
+        metrics.phase = .verifying
+        metrics.receivedBytes = metrics.artifactBytes
+        metrics.lastBytesAt = Date()
+        downloadMetrics[id] = metrics
+        publishDownloadProgress(for: id)
+    }
+
+    private func tickDownloadProgress(for id: RestoreModelID) {
+        guard var metrics = downloadMetrics[id] else { return }
+        let now = Date()
+        publishDownloadProgress(for: id)
+        if now.timeIntervalSince(metrics.lastLoggedAt) >= 10 {
+            metrics.lastLoggedAt = now
+            downloadMetrics[id] = metrics
+            if let progress = currentDownloadProgress(for: id) {
+                RestoreJournal.line("AI 模型下载进度：\(progress.summary)")
+            }
+        }
+    }
+
+    private func currentDownloadProgress(for id: RestoreModelID) -> RestoreDownloadProgress? {
+        guard let metrics = downloadMetrics[id], let spec = RestoreModelCatalog.spec(for: id) else { return nil }
+        let now = Date()
+        let elapsed = max(0, now.timeIntervalSince(metrics.startedAt))
+        let idle = max(0, now.timeIntervalSince(metrics.lastBytesAt))
+        let received = min(max(0, metrics.baselineBytes + metrics.receivedBytes), max(0, spec.totalByteCount))
+        let speed = elapsed > 0 ? Double(metrics.receivedBytes) / elapsed : 0
+        let remaining: TimeInterval?
+        if metrics.phase == .downloading, received > 0, speed > 0, idle < 5 {
+            remaining = Double(max(0, spec.totalByteCount - received)) / speed
+        } else {
+            remaining = nil
+        }
+        return RestoreDownloadProgress(
+            phase: metrics.phase,
+            receivedBytes: received,
+            totalBytes: max(0, spec.totalByteCount),
+            bytesPerSecond: speed,
+            elapsedSeconds: elapsed,
+            idleSeconds: idle,
+            remainingSeconds: remaining,
+            sourceHost: metrics.sourceHost
+        )
+    }
+
+    private func publishDownloadProgress(for id: RestoreModelID) {
+        if let progress = currentDownloadProgress(for: id) {
+            states[id] = .downloading(progress)
+        }
+    }
+
+    private func logDownloadInterruption(for id: RestoreModelID, error: Error) {
+        guard let progress = currentDownloadProgress(for: id) else { return }
+        RestoreJournal.line("AI 模型下载中断：\(progress.summary) · \(error.localizedDescription)")
+    }
+
     private func bundledModelURL(_ spec: RestoreModelSpec) -> URL? {
         let name = URL(fileURLWithPath: spec.bundleRelativePath).deletingPathExtension().lastPathComponent
         guard let url = Bundle.main.url(forResource: name, withExtension: "mlmodelc"),
@@ -279,7 +434,7 @@ final class RestoreModelManager: ObservableObject {
         try? FileManager.default.removeItem(at: staging)
     }
 
-    private func sha256(of url: URL) throws -> String {
+    private nonisolated static func sha256(of url: URL) async throws -> String {
         let handle = try FileHandle(forReadingFrom: url)
         defer { try? handle.close() }
         var hash = SHA256()
@@ -288,6 +443,25 @@ final class RestoreModelManager: ObservableObject {
             hash.update(data: chunk)
         }
         return hash.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+}
+
+private final class RestoreModelDownloadDelegate: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
+    private let onProgress: @Sendable (Int64, Int64) -> Void
+
+    init(onProgress: @escaping @Sendable (Int64, Int64) -> Void) {
+        self.onProgress = onProgress
+        super.init()
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        downloadTask: URLSessionDownloadTask,
+        didWriteData bytesWritten: Int64,
+        totalBytesWritten: Int64,
+        totalBytesExpectedToWrite: Int64
+    ) {
+        onProgress(totalBytesWritten, totalBytesExpectedToWrite)
     }
 }
 

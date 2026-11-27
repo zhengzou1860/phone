@@ -349,8 +349,11 @@ struct RestoreEditorView: View {
                         .font(.caption2)
                         .foregroundStyle(RestoreTheme.secondary)
                     switch state {
-                    case .downloading(let value):
-                        ProgressView(value: value).tint(RestoreTheme.cyan)
+                    case .downloading(let progress):
+                        ProgressView(value: progress.fraction).tint(RestoreTheme.cyan)
+                        Text(progress.summary)
+                            .font(.caption2.monospacedDigit())
+                            .foregroundStyle(RestoreTheme.secondary)
                         Button("取消下载") { models.cancelDownload(id) }.font(.caption2)
                     case .compiling:
                         ProgressView().controlSize(.small)
@@ -398,8 +401,11 @@ struct RestoreEditorView: View {
                         }
                     }
                     switch state {
-                    case .downloading(let value):
-                        ProgressView(value: value).tint(RestoreTheme.cyan)
+                    case .downloading(let progress):
+                        ProgressView(value: progress.fraction).tint(RestoreTheme.cyan)
+                        Text(progress.summary)
+                            .font(.caption2.monospacedDigit())
+                            .foregroundStyle(RestoreTheme.secondary)
                         Button("取消下载") { models.cancelDownload(.gfpgan) }.font(.caption2)
                     case .compiling:
                         ProgressView().controlSize(.small)
@@ -409,7 +415,7 @@ struct RestoreEditorView: View {
                     case .notInstalled:
                         Button("下载 \(RestoreMath.formatBytes(spec.totalByteCount)) 人脸模型") { models.download(.gfpgan) }
                             .font(.caption.weight(.semibold))
-                        Text("首次下载约 322 MiB，优先使用加速线路，失败自动回退官方源；建议连接 Wi-Fi 并保持 App 在前台。下载校验后完全离线推理。")
+                        Text("首次下载约 322 MiB，优先使用加速线路；页面会显示已收字节、速度和当前线路，中断时自动回退。建议连接 Wi-Fi 并保持 App 在前台，校验后完全离线推理。")
                             .font(.caption2)
                             .foregroundStyle(RestoreTheme.secondary)
                     case .installed:

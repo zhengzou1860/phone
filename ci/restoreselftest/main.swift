@@ -94,6 +94,44 @@ expect(timeoutMessage.contains("同一 Wi-Fi") && timeoutMessage.contains("start
 let authMessage = RestorePCTransport.userMessage(for: RestorePCError.http(401, "unauthorized"))
 expect(authMessage.contains("上传密钥不一致"), "unauthorized diagnostic explains token mismatch")
 
+let waitingDownload = RestoreDownloadProgress.waiting
+expect(waitingDownload.fraction == 0 && waitingDownload.summary.contains("正在连接"), "waiting model download is distinct from zero-byte transfer")
+let stalledDownload = RestoreDownloadProgress(
+    phase: .downloading,
+    receivedBytes: 3 * megabyte,
+    totalBytes: 100 * megabyte,
+    bytesPerSecond: 35 * 1024,
+    elapsedSeconds: 90,
+    idleSeconds: 12,
+    remainingSeconds: nil,
+    sourceHost: "gh-proxy.com"
+)
+expect(stalledDownload.summary.contains("gh-proxy.com") && stalledDownload.summary.contains("12 秒无数据"), "stalled model download reports source and idle time")
+expect(!stalledDownload.summary.contains("约剩"), "stalled model download does not show a stale completion estimate")
+let movingDownload = RestoreDownloadProgress(
+    phase: .downloading,
+    receivedBytes: 50 * megabyte,
+    totalBytes: 100 * megabyte,
+    bytesPerSecond: Double(megabyte) / 2,
+    elapsedSeconds: 100,
+    idleSeconds: 0,
+    remainingSeconds: 100,
+    sourceHost: "ghfast.top"
+)
+expect(movingDownload.fraction == 0.5 && movingDownload.summary.contains("约剩 1分40秒"), "moving model download reports progress and remaining time")
+let verifyingDownload = RestoreDownloadProgress(
+    phase: .verifying,
+    receivedBytes: 100 * megabyte,
+    totalBytes: 100 * megabyte,
+    bytesPerSecond: megabyte,
+    elapsedSeconds: 100,
+    idleSeconds: 0,
+    remainingSeconds: nil,
+    sourceHost: "github.com"
+)
+expect(verifyingDownload.fraction == 1 && verifyingDownload.summary.contains("正在校验"), "completed model transfer enters verification without claiming installation")
+expect(RestoreMath.formatSpeed(1024) == "1.0 KB/s" && RestoreMath.downloadDuration(90) == "1分30秒", "download diagnostics format speed and duration consistently")
+
 let manyLines = (0..<1005).map { "line \($0)" }
 expect(RestoreJournal.compact(manyLines).count == 1000, "runtime journal keeps only the latest 1000 lines")
 let largeLines = (0..<1000).map { _ in String(repeating: "x", count: 1000) }

@@ -34,10 +34,28 @@ struct RestoreMath {
     }
 
     static func formatBytes(_ bytes: Int) -> String {
+        formatBytes(Int64(bytes))
+    }
+
+    static func formatBytes(_ bytes: Int64) -> String {
         let formatter = ByteCountFormatter()
         formatter.countStyle = .file
         formatter.allowedUnits = [.useKB, .useMB, .useGB]
-        return formatter.string(fromByteCount: Int64(bytes))
+        return formatter.string(fromByteCount: bytes)
+    }
+
+    static func formatSpeed(_ bytesPerSecond: Double) -> String {
+        let speed = max(0, bytesPerSecond)
+        if speed < 1024 { return String(format: "%.0f B/s", speed) }
+        if speed < 1024 * 1024 { return String(format: "%.1f KB/s", speed / 1024) }
+        return String(format: "%.1f MB/s", speed / (1024 * 1024))
+    }
+
+    static func downloadDuration(_ seconds: TimeInterval) -> String {
+        let total = max(0, Int(seconds.rounded()))
+        if total < 60 { return "\(total) 秒" }
+        if total < 3600 { return "\(total / 60)分\(total % 60)秒" }
+        return "\(total / 3600)小时\(total % 3600 / 60)分"
     }
 
     static func timestampName(prefix: String, ext: String) -> String {
@@ -45,6 +63,65 @@ struct RestoreMath {
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.dateFormat = "yyyyMMdd_HHmmss"
         return "\(prefix)_\(formatter.string(from: Date())).\(ext)"
+    }
+}
+
+enum RestoreDownloadPhase: Equatable {
+    case connecting
+    case downloading
+    case verifying
+
+    var title: String {
+        switch self {
+        case .connecting: return "连接中"
+        case .downloading: return "下载中"
+        case .verifying: return "校验中"
+        }
+    }
+}
+
+struct RestoreDownloadProgress: Equatable {
+    let phase: RestoreDownloadPhase
+    let receivedBytes: Int64
+    let totalBytes: Int64
+    let bytesPerSecond: Double
+    let elapsedSeconds: TimeInterval
+    let idleSeconds: TimeInterval
+    let remainingSeconds: TimeInterval?
+    let sourceHost: String
+
+    static let waiting = RestoreDownloadProgress(
+        phase: .connecting,
+        receivedBytes: 0,
+        totalBytes: 0,
+        bytesPerSecond: 0,
+        elapsedSeconds: 0,
+        idleSeconds: 0,
+        remainingSeconds: nil,
+        sourceHost: ""
+    )
+
+    var fraction: Double {
+        guard totalBytes > 0 else { return 0 }
+        return min(1, max(0, Double(receivedBytes) / Double(totalBytes)))
+    }
+
+    var summary: String {
+        let host = sourceHost.isEmpty ? "模型服务器" : sourceHost
+        switch phase {
+        case .connecting:
+            return "正在连接 \(host) · 已等待 \(RestoreMath.downloadDuration(elapsedSeconds))"
+        case .downloading:
+            var details = "\(host) · \(RestoreMath.formatBytes(receivedBytes))/\(RestoreMath.formatBytes(totalBytes)) · 平均 \(RestoreMath.formatSpeed(bytesPerSecond)) · 已用 \(RestoreMath.downloadDuration(elapsedSeconds))"
+            if idleSeconds >= 5 {
+                details += " · \(Int(idleSeconds.rounded())) 秒无数据"
+            } else if let remainingSeconds {
+                details += " · 约剩 \(RestoreMath.downloadDuration(remainingSeconds))"
+            }
+            return details
+        case .verifying:
+            return "\(host) · 已收 \(RestoreMath.formatBytes(totalBytes))，正在校验文件"
+        }
     }
 }
 
