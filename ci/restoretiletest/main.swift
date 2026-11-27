@@ -48,6 +48,12 @@ func color(_ image: CGImage, x: Int, y: Int) -> (UInt8, UInt8, UInt8) {
     return (bytes[offset], bytes[offset + 1], bytes[offset + 2])
 }
 
+func colorsClose(_ lhs: (UInt8, UInt8, UInt8), _ rhs: (UInt8, UInt8, UInt8), tolerance: Int = 1) -> Bool {
+    abs(Int(lhs.0) - Int(rhs.0)) <= tolerance
+        && abs(Int(lhs.1) - Int(rhs.1)) <= tolerance
+        && abs(Int(lhs.2) - Int(rhs.2)) <= tolerance
+}
+
 func alpha(_ image: CGImage, x: Int, y: Int) -> UInt8 {
     let provider = image.dataProvider!
     let bytes = (provider.data! as NSData).bytes.assumingMemoryBound(to: UInt8.self)
@@ -160,9 +166,9 @@ let bottomPaddingSource = color(smallGradient, x: 100, y: 199)
 let cornerPadding = color(paddedGradient, x: 300, y: 200)
 let cornerPaddingSource = color(smallGradient, x: 299, y: 199)
 print("RESTORE-TILE DETAIL padding right=\(rightPadding)/\(rightPaddingSource) bottom=\(bottomPadding)/\(bottomPaddingSource) corner=\(cornerPadding)/\(cornerPaddingSource)")
-expect(zip(rightPadding, rightPaddingSource).allSatisfy { pair in abs(Int(pair.0) - Int(pair.1)) <= 1 }, "right padding replicates each source row edge")
-expect(zip(bottomPadding, bottomPaddingSource).allSatisfy { pair in abs(Int(pair.0) - Int(pair.1)) <= 1 }, "bottom padding replicates each source column edge")
-expect(zip(cornerPadding, cornerPaddingSource).allSatisfy { pair in abs(Int(pair.0) - Int(pair.1)) <= 1 }, "corner padding replicates the bottom-right source pixel")
+expect(colorsClose(rightPadding, rightPaddingSource), "right padding replicates each source row edge")
+expect(colorsClose(bottomPadding, bottomPaddingSource), "bottom padding replicates each source column edge")
+expect(colorsClose(cornerPadding, cornerPaddingSource), "corner padding replicates the bottom-right source pixel")
 
 let modelScale = 2
 let validPrediction = gradientImage(width: 300 * modelScale, height: 200 * modelScale)
@@ -184,9 +190,9 @@ try RestoreInferenceCore.blend(
     maskImage: nil
 )
 let smallModelImage = try smallModelCanvas.makeImage()
-expect(zip(color(smallModelImage, x: 0, y: 0), color(validPrediction, x: 0, y: 0)).allSatisfy { pair in abs(Int(pair.0) - Int(pair.1)) <= 1 }, "small 2x model output starts at the first valid source pixel")
-expect(zip(color(smallModelImage, x: 599, y: 399), color(validPrediction, x: 599, y: 399)).allSatisfy { pair in abs(Int(pair.0) - Int(pair.1)) <= 1 }, "small 2x model output excludes padding instead of squeezing it into the photo")
-expect(zip(color(smallModelImage, x: 250, y: 200), color(validPrediction, x: 250, y: 200)).allSatisfy { pair in abs(Int(pair.0) - Int(pair.1)) <= 1 }, "small 2x model output keeps valid content at native model coordinates")
+expect(colorsClose(color(smallModelImage, x: 0, y: 0), color(validPrediction, x: 0, y: 0)), "small 2x model output starts at the first valid source pixel")
+expect(colorsClose(color(smallModelImage, x: 599, y: 399), color(validPrediction, x: 599, y: 399)), "small 2x model output excludes padding instead of squeezing it into the photo")
+expect(colorsClose(color(smallModelImage, x: 250, y: 200), color(validPrediction, x: 250, y: 200)), "small 2x model output keeps valid content at native model coordinates")
 
 let edgePrediction = try RestorePixelCanvas(width: 768, height: 768)
 edgePrediction.context.setFillColor(CGColor(red: 1, green: 0, blue: 1, alpha: 1))
@@ -265,8 +271,8 @@ for tile in tiles {
 let blended = try canvas.makeImage()
 expect(color(blended, x: 0, y: 0) == color(source, x: 0, y: 0), "top-left photo edge is not blended into a black canvas")
 expect(color(blended, x: 584, y: 789) == color(source, x: 584, y: 789), "bottom-right photo edge is not blended into a black canvas")
-expect(zip(color(blended, x: 250, y: 430), color(source, x: 250, y: 430)).allSatisfy { pair in abs(Int(pair.0) - Int(pair.1)) <= 1 }, "blend writes tile rows to the same top-down destination rows")
-expect(zip(color(blended, x: 250, y: 500), color(source, x: 250, y: 500)).allSatisfy { pair in abs(Int(pair.0) - Int(pair.1)) <= 1 }, "lower photo content is not moved to the upper half")
+expect(colorsClose(color(blended, x: 250, y: 430), color(source, x: 250, y: 430)), "blend writes tile rows to the same top-down destination rows")
+expect(colorsClose(color(blended, x: 250, y: 500), color(source, x: 250, y: 500)), "lower photo content is not moved to the upper half")
 let blendedProvider = blended.dataProvider!
 let blendedBytes = (blendedProvider.data! as NSData).bytes.assumingMemoryBound(to: UInt8.self)
 let sourceBytes = pixels
