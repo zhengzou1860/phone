@@ -224,48 +224,36 @@ enum RestoreInferenceCore {
             throw RestoreError.inferenceFailed("无法复制推理小块像素")
         }
         let sourceData = rawData as NSData
-        guard sourceData.length >= bytesPerRow * size,
-              let outputData = NSMutableData(length: sourceData.length) else {
-            throw RestoreError.inferenceFailed("无法复制推理小块像素")
+        guard sourceData.length >= bytesPerRow * size else {
+            throw RestoreError.inferenceFailed("无法读取推理小块像素")
         }
-        outputData.replaceBytes(in: NSRange(location: 0, length: sourceData.length), withBytes: sourceData.bytes)
-        let bytes = outputData.mutableBytes.assumingMemoryBound(to: UInt8.self)
+        let sourceBytes = sourceData.bytes.assumingMemoryBound(to: UInt8.self)
+        func edgeColor(x: Int, y: Int) -> CGColor {
+            let offset = y * bytesPerRow + x * 4
+            return CGColor(
+                red: CGFloat(sourceBytes[offset]) / 255,
+                green: CGFloat(sourceBytes[offset + 1]) / 255,
+                blue: CGFloat(sourceBytes[offset + 2]) / 255,
+                alpha: CGFloat(sourceBytes[offset + 3]) / 255
+            )
+        }
         if validWidth < size {
             for y in 0..<validHeight {
-                let sourceOffset = y * bytesPerRow + (validWidth - 1) * 4
-                for x in validWidth..<size {
-                    let destinationOffset = y * bytesPerRow + x * 4
-                    for channel in 0..<4 {
-                        bytes[destinationOffset + channel] = bytes[sourceOffset + channel]
-                    }
-                }
+                tile.setFillColor(edgeColor(x: validWidth - 1, y: y))
+                tile.fill(CGRect(x: validWidth, y: y, width: size - validWidth, height: 1))
             }
         }
         if validHeight < size {
-            let sourceOffset = (validHeight - 1) * bytesPerRow
-            for y in validHeight..<size {
-                let destinationOffset = y * bytesPerRow
-                for offset in 0..<bytesPerRow {
-                    bytes[destinationOffset + offset] = bytes[sourceOffset + offset]
-                }
+            for x in 0..<validWidth {
+                tile.setFillColor(edgeColor(x: x, y: validHeight - 1))
+                tile.fill(CGRect(x: x, y: validHeight, width: 1, height: size - validHeight))
             }
         }
-        guard let dataProvider = CGDataProvider(data: outputData as CFData),
-              let result = CGImage(
-                width: size,
-                height: size,
-                bitsPerComponent: rendered.bitsPerComponent,
-                bitsPerPixel: rendered.bitsPerPixel,
-                bytesPerRow: bytesPerRow,
-                space: rendered.colorSpace ?? CGColorSpaceCreateDeviceRGB(),
-                bitmapInfo: rendered.bitmapInfo,
-                provider: dataProvider,
-                decode: nil,
-                shouldInterpolate: false,
-                intent: .defaultIntent
-              ) else {
-            throw RestoreError.inferenceFailed("无法生成推理小块")
+        if validWidth < size, validHeight < size {
+            tile.setFillColor(edgeColor(x: validWidth - 1, y: validHeight - 1))
+            tile.fill(CGRect(x: validWidth, y: validHeight, width: size - validWidth, height: size - validHeight))
         }
+        guard let result = tile.makeImage() else { throw RestoreError.inferenceFailed("无法生成推理小块") }
         return result
     }
 
