@@ -165,7 +165,7 @@ final class RestoreModelManager: ObservableObject {
             throw RestoreError.modelLoadFailed("模型下载地址无效")
         }
         let host = url.host ?? source
-        let delegate = RestoreModelDownloadDelegate { [weak self] written, expected in
+        let delegate = RestoreModelDownloadDelegate(expectedBytes: Int64(artifact.byteCount)) { [weak self] written, expected in
             guard let self else { return }
             Task { @MainActor in
                 self.recordDownloadProgress(for: spec.id, attemptID: attemptID, host: host, written: written, expected: expected)
@@ -341,7 +341,7 @@ final class RestoreModelManager: ObservableObject {
         }
         metrics.artifactBytes = expectedBytes
         metrics.receivedBytes = received
-        metrics.phase = .downloading
+        metrics.phase = received >= expectedBytes ? .verifying : .downloading
         metrics.sourceHost = host
         downloadMetrics[id] = metrics
         publishDownloadProgress(for: id)
@@ -443,21 +443,34 @@ final class RestoreModelManager: ObservableObject {
     }
 }
 
-private final class RestoreModelDownloadDelegate: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
+private final class RestoreModelDownloadDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+    private let expectedBytes: Int64
     private let onProgress: @Sendable (Int64, Int64) -> Void
     private let lock = NSLock()
+    private let fileURL = FileManager.default.temporaryDirectory.appendingPathComponent("HiRestore-\(UUID().uuidString)")
     private var continuation: CheckedContinuation<(URL, URLResponse), Error>?
     private var session: URLSession?
-    private var task: URLSessionDownloadTask?
-    private var downloadedURL: URL?
-    private var completionError: Error?
+    private var task: URLSessionDataTask?
+    private var fileHandle: FileHandle?
+    private var response: URLResponse?
+    private var receivedBytes: Int64 = 0
 
-    init(onProgress: @escaping @Sendable (Int64, Int64) -> Void) {
+    init(expectedBytes: Int64, onProgress: @escaping @Sendable (Int64, Int64) -> Void) {
+        self.expectedBytes = expectedBytes
         self.onProgress = onProgress
         super.init()
     }
 
     func download(_ request: URLRequest, configuration: URLSessionConfiguration) async throws -> (URL, URLResponse) {
+        guard expectedBytes > 0, FileManager.default.createFile(atPath: fileURL.path, contents: nil) else {
+            throw RestoreError.modelLoadFailed("无法创建模型下载临时文件")
+        }
+        do {
+            fileHandle = try FileHandle(forWritingTo: fileURL)
+        } catch {
+            try? FileManager.default.removeItem(at: fileURL)
+            throw error
+        }
         let session = URLSession(configuration: configuration, delegate: self, delegateQueue: nil)
         lock.lock()
         self.session = session
@@ -466,7 +479,7 @@ private final class RestoreModelDownloadDelegate: NSObject, URLSessionDownloadDe
             try await withCheckedThrowingContinuation { continuation in
                 lock.lock()
                 self.continuation = continuation
-                let task = session.downloadTask(with: request)
+                let task = session.dataTask(with: request)
                 self.task = task
                 lock.unlock()
                 task.resume()
@@ -478,45 +491,91 @@ private final class RestoreModelDownloadDelegate: NSObject, URLSessionDownloadDe
 
     func urlSession(
         _ session: URLSession,
-        downloadTask: URLSessionDownloadTask,
-        didWriteData bytesWritten: Int64,
-        totalBytesWritten: Int64,
-        totalBytesExpectedToWrite: Int64
+        dataTask: URLSessionDataTask,
+        didReceive response: URLResponse,
+        completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
     ) {
-        onProgress(totalBytesWritten, totalBytesExpectedToWrite)
+        lock.lock()
+        guard continuation != nil else {
+            lock.unlock()
+            completionHandler(.cancel)
+            return
+        }
+        self.response = response
+        lock.unlock()
+        if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+            finish(error: RestoreError.modelLoadFailed("模型服务器返回 HTTP \(http.statusCode)"))
+            completionHandler(.cancel)
+            return
+        }
+        onProgress(receivedBytes, expectedBytes)
+        completionHandler(.allow)
     }
 
-    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
-        let destination = FileManager.default.temporaryDirectory.appendingPathComponent("HiRestore-\(UUID().uuidString)")
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        lock.lock()
+        guard continuation != nil, let fileHandle else {
+            lock.unlock()
+            return
+        }
+        let remaining = expectedBytes - receivedBytes
+        let chunk = data.prefix(min(data.count, Int(remaining)))
         do {
-            try FileManager.default.moveItem(at: location, to: destination)
-            lock.lock()
-            downloadedURL = destination
-            lock.unlock()
+            try fileHandle.write(contentsOf: chunk)
+            receivedBytes += Int64(chunk.count)
         } catch {
-            lock.lock()
-            completionError = error
             lock.unlock()
+            finish(error: error)
+            return
+        }
+        let written = receivedBytes
+        let complete = written == expectedBytes
+        lock.unlock()
+        onProgress(written, expectedBytes)
+        if complete {
+            finish(error: nil)
         }
     }
 
-    func urlSession(_ session: URLSession, task: URLSessionDownloadTask, didCompleteWithError error: Error?) {
+    func urlSession(_ session: URLSession, task: URLSessionDataTask, didCompleteWithError error: Error?) {
         lock.lock()
-        let continuation = self.continuation
-        let downloadedURL = self.downloadedURL
-        let completionError = self.completionError
-        self.continuation = nil
-        self.task = nil
-        self.session = nil
+        let receivedBytes = self.receivedBytes
         lock.unlock()
-        session.finishTasksAndInvalidate()
         if let error {
-            continuation?.resume(throwing: error)
-        } else if let completionError {
-            continuation?.resume(throwing: completionError)
-        } else if let downloadedURL, let response = task.response {
-            continuation?.resume(returning: (downloadedURL, response))
+            finish(error: error)
+        } else if receivedBytes != expectedBytes {
+            finish(error: RestoreError.modelLoadFailed("模型下载未完成（已收 \(receivedBytes) / \(expectedBytes) 字节）"))
         } else {
+            finish(error: nil)
+        }
+    }
+
+    private func finish(error: Error?) {
+        lock.lock()
+        guard continuation != nil else {
+            lock.unlock()
+            return
+        }
+        let continuation = self.continuation
+        let fileHandle = self.fileHandle
+        let response = self.response
+        let session = self.session
+        let task = self.task
+        self.continuation = nil
+        self.fileHandle = nil
+        self.session = nil
+        self.task = nil
+        lock.unlock()
+        try? fileHandle?.close()
+        task?.cancel()
+        session?.invalidateAndCancel()
+        if let error {
+            try? FileManager.default.removeItem(at: fileURL)
+            continuation?.resume(throwing: error)
+        } else if let response {
+            continuation?.resume(returning: (fileURL, response))
+        } else {
+            try? FileManager.default.removeItem(at: fileURL)
             continuation?.resume(throwing: RestoreError.modelLoadFailed("模型下载未完成"))
         }
     }
