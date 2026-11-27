@@ -24,15 +24,16 @@ for y in 0..<height {
         pixels[offset + 3] = 255
     }
 }
-guard let source = CGImage(
+guard let provider = CGDataProvider(data: data as CFData),
+      let source = CGImage(
     width: width,
     height: height,
     bitsPerComponent: 8,
     bitsPerPixel: 32,
     bytesPerRow: bytesPerRow,
     space: CGColorSpaceCreateDeviceRGB(),
-    bitmapInfo: CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.premultipliedLast.rawValue,
-    provider: CGDataProvider(data: data as CFData),
+    bitmapInfo: CGBitmapInfo(rawValue: CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.premultipliedLast.rawValue),
+    provider: provider,
     decode: nil,
     shouldInterpolate: false,
     intent: .defaultIntent
@@ -73,8 +74,8 @@ func solidImage(width: Int, height: Int, red: UInt8, green: UInt8, blue: UInt8) 
         bitsPerPixel: 32,
         bytesPerRow: row,
         space: CGColorSpaceCreateDeviceRGB(),
-        bitmapInfo: CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.premultipliedLast.rawValue,
-        provider: CGDataProvider(data: data as CFData),
+        bitmapInfo: CGBitmapInfo(rawValue: CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.premultipliedLast.rawValue),
+        provider: CGDataProvider(data: data as CFData)!,
         decode: nil,
         shouldInterpolate: false,
         intent: .defaultIntent
@@ -101,8 +102,8 @@ func gradientImage(width: Int, height: Int) -> CGImage {
         bitsPerPixel: 32,
         bytesPerRow: row,
         space: CGColorSpaceCreateDeviceRGB(),
-        bitmapInfo: CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.premultipliedLast.rawValue,
-        provider: CGDataProvider(data: data as CFData),
+        bitmapInfo: CGBitmapInfo(rawValue: CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.premultipliedLast.rawValue),
+        provider: CGDataProvider(data: data as CFData)!,
         decode: nil,
         shouldInterpolate: false,
         intent: .defaultIntent
@@ -123,8 +124,8 @@ func grayImage(width: Int, height: Int, value: UInt8) -> CGImage {
         bitsPerPixel: 8,
         bytesPerRow: row,
         space: CGColorSpaceCreateDeviceGray(),
-        bitmapInfo: CGImageAlphaInfo.none.rawValue,
-        provider: CGDataProvider(data: data as CFData),
+        bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue),
+        provider: CGDataProvider(data: data as CFData)!,
         decode: nil,
         shouldInterpolate: false,
         intent: .defaultIntent
