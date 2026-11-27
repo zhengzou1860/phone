@@ -13,6 +13,7 @@ struct RestorePixelCanvas {
     let width: Int
     let height: Int
     let data: NSMutableData
+    let context: CGContext
     let bytesPerRow: Int
 
     init(width: Int, height: Int, source: CGImage? = nil) throws {
@@ -37,32 +38,17 @@ struct RestorePixelCanvas {
               ) else {
             throw RestoreError.fileOperation("无法创建照片画布")
         }
+        self.context = context
         context.setFillColor(CGColor(red: 0, green: 0, blue: 0, alpha: 1))
         context.fill(CGRect(x: 0, y: 0, width: width, height: height))
         if let source {
             context.interpolationQuality = .high
             context.draw(source, in: CGRect(x: 0, y: 0, width: width, height: height))
         }
-        _ = context.makeImage()
     }
 
     func makeImage() throws -> CGImage {
-        guard let provider = CGDataProvider(data: data as CFData),
-              let image = CGImage(
-                width: width,
-                height: height,
-                bitsPerComponent: 8,
-                bitsPerPixel: 32,
-                bytesPerRow: bytesPerRow,
-                space: CGColorSpaceCreateDeviceRGB(),
-                bitmapInfo: CGBitmapInfo(rawValue: CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.premultipliedLast.rawValue),
-                provider: provider,
-                decode: nil,
-                shouldInterpolate: false,
-                intent: .defaultIntent
-              ) else {
-            throw RestoreError.fileOperation("无法读取照片画布")
-        }
+        guard let image = context.makeImage() else { throw RestoreError.fileOperation("无法读取照片画布") }
         return image
     }
 }
@@ -132,10 +118,7 @@ final class RestoreBlendWeights {
             if let row = source.cropping(to: CGRect(x: 0, y: sourceY, width: source.width, height: sourceEndY - sourceY)) {
                 strip.draw(row, in: CGRect(x: 0, y: 0, width: width, height: 1))
             }
-            guard let renderedRow = strip.makeImage(), let rowProvider = renderedRow.dataProvider, let rowPixels = rowProvider.data else {
-                throw RestoreError.fileOperation("无法读取原图合成行")
-            }
-            let original = (rowPixels as NSData).bytes.assumingMemoryBound(to: UInt8.self)
+            let original = rowData.mutableBytes.assumingMemoryBound(to: UInt8.self)
             for x in 0..<width {
                 let index = y * width + x
                 let totalWeight = coverageWeights.map { $0[index] } ?? Self.fullWeight
@@ -340,7 +323,9 @@ enum RestoreInferenceCore {
         let outputEndY = Int((Double(originY + validHeight) * scaleY).rounded(.up))
         let outputWidth = max(1, outputEndX - outputOriginX)
         let outputHeight = max(1, outputEndY - outputOriginY)
-        let tile = try RestorePixelCanvas(width: outputWidth, height: outputHeight, source: croppedPrediction)
+        let tile = try RestorePixelCanvas(width: outputWidth, height: outputHeight)
+        tile.context.interpolationQuality = .high
+        tile.context.draw(croppedPrediction, in: CGRect(x: 0, y: 0, width: outputWidth, height: outputHeight))
         let maskCanvas = try maskImage.map { image in
             guard image.width == tileSize, image.height == tileSize,
                   let cropped = image.cropping(to: CGRect(
@@ -351,18 +336,14 @@ enum RestoreInferenceCore {
                   )) else {
                 throw RestoreError.inferenceFailed("修补蒙版与有效图像尺寸不匹配")
             }
-            return try RestorePixelCanvas(width: outputWidth, height: outputHeight, source: cropped)
+            let canvas = try RestorePixelCanvas(width: outputWidth, height: outputHeight)
+            canvas.context.interpolationQuality = .high
+            canvas.context.draw(cropped, in: CGRect(x: 0, y: 0, width: outputWidth, height: outputHeight))
+            return canvas
         }
-        let renderedTile = try tile.makeImage()
-        guard let tileProvider = renderedTile.dataProvider, let tilePixelData = tileProvider.data else {
-            throw RestoreError.inferenceFailed("无法读取模型输出小块")
-        }
-        let tileSnapshotData = tilePixelData as NSData
-        let tileBase = tileSnapshotData.bytes.assumingMemoryBound(to: UInt8.self)
-        let renderedMask = try maskCanvas?.makeImage()
-        let maskSnapshotData = renderedMask?.dataProvider?.data as NSData?
-        let maskBase = maskSnapshotData?.bytes.assumingMemoryBound(to: UInt8.self)
         let destinationBase = canvas.data.mutableBytes.assumingMemoryBound(to: UInt8.self)
+        let tileBase = tile.data.mutableBytes.assumingMemoryBound(to: UInt8.self)
+        let maskBase = maskCanvas?.data.mutableBytes.assumingMemoryBound(to: UInt8.self)
         let minX = max(0, outputOriginX)
         let maxX = min(canvas.width, outputOriginX + outputWidth)
         let minY = max(0, outputOriginY)
