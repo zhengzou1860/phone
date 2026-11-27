@@ -7,6 +7,8 @@ on:
       - 'restore/**'
       - 'ci/restoreselftest/**'
       - 'ci/restoretiletest/**'
+      - 'ci/restorearchivetest/**'
+      - 'ci/verify_gfpgan.swift'
       - 'ci/hirestorepctest.py'
       - 'tools/report_server_hirestore.py'
       - 'tools/start_hirestore.bat'
@@ -92,6 +94,43 @@ jobs:
           set -euo pipefail
           python3 ci/hirestorepctest.py 2>&1 | tee -a /tmp/selftest.log
           grep -q '^HIRESTORE-PC-VERDICT PASS$' /tmp/selftest.log
+
+      - name: model archive selftest
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/restore-archive-test
+          mkdir -p /tmp/restore-archive-test
+          python3 - <<'PY'
+          import zipfile
+          from pathlib import Path
+
+          root = Path("/tmp/restore-archive-test")
+          with zipfile.ZipFile(root / "good.zip", "w", compression=zipfile.ZIP_STORED) as handle:
+              handle.writestr("gfpgan.mlmodelc/", b"")
+              handle.writestr("gfpgan.mlmodelc/model.mil", b"model")
+              handle.writestr("gfpgan.mlmodelc/weights/", b"")
+              handle.writestr("gfpgan.mlmodelc/weights/weight.bin", bytes([0, 1, 2, 3, 255]))
+              handle.writestr("empty/", b"")
+          with zipfile.ZipFile(root / "unsafe.zip", "w", compression=zipfile.ZIP_STORED) as handle:
+              handle.writestr("../escape", b"bad")
+          with zipfile.ZipFile(root / "deflated.zip", "w", compression=zipfile.ZIP_DEFLATED) as handle:
+              handle.writestr("model.mil", b"model")
+          data = (root / "good.zip").read_bytes()
+          (root / "truncated.zip").write_bytes(data[:50])
+          PY
+          xcrun swiftc -O \
+            restore/SourcesRestore/RestoreErrors.swift \
+            restore/SourcesRestore/RestoreMath.swift \
+            restore/SourcesRestore/RestoreModelArchive.swift \
+            ci/restorearchivetest/main.swift \
+            -o /tmp/restorearchivetest 2>&1 | tee -a /tmp/selftest.log
+          /tmp/restorearchivetest \
+            /tmp/restore-archive-test \
+            /tmp/restore-archive-test/good.zip \
+            /tmp/restore-archive-test/unsafe.zip \
+            /tmp/restore-archive-test/truncated.zip \
+            /tmp/restore-archive-test/deflated.zip 2>&1 | tee -a /tmp/selftest.log
+          grep -q '^RESTORE-ARCHIVE-VERDICT PASS$' /tmp/selftest.log
 
       - name: install xcodegen
         run: |

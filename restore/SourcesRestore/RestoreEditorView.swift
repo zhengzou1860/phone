@@ -396,6 +396,7 @@ struct RestoreEditorView: View {
                         Button("取消下载") { models.cancelDownload(.gfpgan) }.font(.caption2)
                     case .compiling:
                         ProgressView().controlSize(.small)
+                        Text("正在安装模型…").font(.caption2).foregroundStyle(RestoreTheme.secondary)
                     case .failed(let message):
                         Text(message).font(.caption2).foregroundStyle(.red)
                         Button("重试下载") { models.download(.gfpgan) }.font(.caption2.weight(.semibold))

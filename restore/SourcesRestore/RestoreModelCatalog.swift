@@ -29,15 +29,17 @@ struct RestoreModelArtifact: Equatable {
     let byteCount: Int
     let sha256: String?
     let alternateDownloadURLs: [String]
+    let isArchive: Bool
 
     var downloadURLs: [String] { alternateDownloadURLs + [downloadURL] }
 
-    init(relativePath: String, downloadURL: String, byteCount: Int, sha256: String?, alternateDownloadURLs: [String] = []) {
+    init(relativePath: String, downloadURL: String, byteCount: Int, sha256: String?, alternateDownloadURLs: [String] = [], isArchive: Bool = false) {
         self.relativePath = relativePath
         self.downloadURL = downloadURL
         self.byteCount = byteCount
         self.sha256 = sha256
         self.alternateDownloadURLs = alternateDownloadURLs
+        self.isArchive = isArchive
     }
 }
 

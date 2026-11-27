@@ -32,6 +32,48 @@ jobs:
             --output /tmp/gfpgan.mlmodel \
             --manifest /tmp/gfpgan-manifest.json
 
+      - name: compile and verify GFPGAN
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/gfpgan.mlmodelc
+          xcrun coremlcompiler compile /tmp/gfpgan.mlmodel /tmp
+          test -s /tmp/gfpgan.mlmodelc/model.mil
+          test -s /tmp/gfpgan.mlmodelc/coremldata.bin
+          xcrun swiftc "$GITHUB_WORKSPACE/ci/verify_gfpgan.swift" -o /tmp/verify_gfpgan
+          /tmp/verify_gfpgan /tmp/gfpgan.mlmodelc
+
+      - name: package precompiled model
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import hashlib
+          import json
+          import zipfile
+          from pathlib import Path
+
+          source = Path("/tmp/gfpgan.mlmodelc")
+          archive = Path("/tmp/gfpgan-ios18.zip")
+          with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_STORED, allowZip64=False) as handle:
+              for path in sorted(source.rglob("*")):
+                  handle.write(path, path.relative_to(source.parent).as_posix())
+          digest = hashlib.sha256()
+          with archive.open("rb") as handle:
+              while chunk := handle.read(1024 * 1024):
+                  digest.update(chunk)
+          manifest_path = Path("/tmp/gfpgan-manifest.json")
+          manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+          manifest["compiled"] = {
+              "file": archive.name,
+              "bytes": archive.stat().st_size,
+              "sha256": digest.hexdigest(),
+              "format": "mlmodelc",
+              "archive": "zip-stored",
+              "minimumiOS": "18.0",
+          }
+          manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+          print("GFPGAN-COMPILED-PACKAGE", json.dumps(manifest["compiled"]))
+          PY
+
       - name: fetch upstream license
         run: |
           set -euo pipefail
@@ -47,6 +89,7 @@ jobs:
           name: HiRestore-GFPGAN-model
           path: |
             /tmp/gfpgan.mlmodel
+            /tmp/gfpgan-ios18.zip
             /tmp/gfpgan-manifest.json
             /tmp/GFPGAN_LICENSE.txt
           if-no-files-found: error
@@ -63,11 +106,11 @@ jobs:
               --notes 'Verified offline model assets for HiRestore.'
           fi
           gh release upload channel-hirestore-models \
-            /tmp/gfpgan.mlmodel /tmp/gfpgan-manifest.json /tmp/GFPGAN_LICENSE.txt \
+            /tmp/gfpgan.mlmodel /tmp/gfpgan-ios18.zip /tmp/gfpgan-manifest.json /tmp/GFPGAN_LICENSE.txt \
             --clobber
           gh release edit channel-hirestore-models \
             --draft=false --prerelease \
-            --notes 'GFPGAN Core ML model converted by john-rocky/CoreML-Models; upstream TencentARC/GFPGAN, Apache-2.0.'
+            --notes 'GFPGAN Core ML model converted by john-rocky/CoreML-Models; precompiled iOS package verified on macOS; upstream TencentARC/GFPGAN, Apache-2.0.'
           expected=$(python -c 'import json; print(json.load(open("/tmp/gfpgan-manifest.json"))["bytes"])')
           actual=$(gh release view channel-hirestore-models --json assets \
             --jq '.assets[] | select(.name=="gfpgan.mlmodel") | .size')
@@ -75,4 +118,11 @@ jobs:
           url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/channel-hirestore-models/gfpgan.mlmodel"
           code=$(curl -fsSIL -o /dev/null -w '%{http_code}' --max-time 90 "$url")
           test "$code" = 200
-          echo "GFPGAN-RELEASE-VERDICT PASS bytes=$actual url=$url"
+          compiled=$(python -c 'import json; print(json.load(open("/tmp/gfpgan-manifest.json"))["compiled"]["bytes"])')
+          compiled_actual=$(gh release view channel-hirestore-models --json assets \
+            --jq '.assets[] | select(.name=="gfpgan-ios18.zip") | .size')
+          test "$compiled_actual" = "$compiled"
+          compiled_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/channel-hirestore-models/gfpgan-ios18.zip"
+          compiled_code=$(curl -fsSIL -o /dev/null -w '%{http_code}' --max-time 90 "$compiled_url")
+          test "$compiled_code" = 200
+          echo "GFPGAN-RELEASE-VERDICT PASS bytes=$actual compiled_bytes=$compiled_actual url=$compiled_url"

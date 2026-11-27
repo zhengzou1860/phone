@@ -195,6 +195,12 @@ final class RestoreModelManager: ObservableObject {
                 throw RestoreError.modelLoadFailed("\(artifact.relativePath) 校验失败（实际 \(actualHash.prefix(12))）")
             }
         }
+        if artifact.isArchive {
+            let extracted = staging.appendingPathComponent(spec.bundleRelativePath)
+            try RestoreModelArchive.extractStoredZip(at: destination, to: extracted)
+            try? FileManager.default.removeItem(at: destination)
+            RestoreJournal.line("AI 模型预编译包解包完成：\(spec.name)")
+        }
     }
 
     private func install(_ spec: RestoreModelSpec) async throws {
@@ -267,15 +273,23 @@ final class RestoreModelManager: ObservableObject {
         let compiled = root.appendingPathComponent("Compiled", isDirectory: true)
             .appendingPathComponent(spec.id.rawValue, isDirectory: true)
             .appendingPathComponent(spec.version, isDirectory: true)
+        let precompiled = source.pathExtension.lowercased() == "mlmodelc"
         try FileManager.default.createDirectory(at: compiled.deletingLastPathComponent(), withIntermediateDirectories: true)
         try? FileManager.default.removeItem(at: compiled)
-        if source.pathExtension.lowercased() == "mlmodelc" {
+        if precompiled {
+            RestoreJournal.line("AI 模型开始安装预编译包：\(spec.name)")
             try FileManager.default.copyItem(at: source, to: compiled)
         } else {
+            RestoreJournal.line("AI 模型开始编译：\(spec.name)")
             let result = try await MLModel.compileModel(at: source)
             try Task.checkCancellation()
             try FileManager.default.moveItem(at: result, to: compiled)
+            _ = try RestoreInferenceCore.loadModel(compiled, spec: spec)
         }
+        guard FileManager.default.fileExists(atPath: compiled.path) else {
+            throw RestoreError.modelLoadFailed("模型编译结果不完整")
+        }
+        RestoreJournal.line("AI 模型安装完成：\(spec.name)")
         try Task.checkCancellation()
 
         let installed = root.appendingPathComponent("Models", isDirectory: true)
@@ -284,7 +298,6 @@ final class RestoreModelManager: ObservableObject {
         try FileManager.default.createDirectory(at: installed.deletingLastPathComponent(), withIntermediateDirectories: true)
         try? FileManager.default.removeItem(at: installed)
         try FileManager.default.moveItem(at: staging, to: installed)
-        _ = try RestoreInferenceCore.loadModel(compiled, spec: spec)
         try Task.checkCancellation()
         let record = ReadyRecord(version: spec.version, catalogHash: spec.catalogHash)
         let marker = readyMarker(id: spec.id)
