@@ -67,11 +67,12 @@ enum RestoreFaceRestorationRunner {
                 y: points.reduce(0) { $0 + $1.y } / CGFloat(points.count)
             )
         }
-        guard let leftEye = center(landmarks.leftEye),
-              let rightEye = center(landmarks.rightEye),
+        guard let firstEye = center(landmarks.leftEye),
+              let secondEye = center(landmarks.rightEye),
               let nose = noseTip(landmarks.nose, observation: observation, source: source),
               let mouth = mouthCorners(landmarks.outerLips, observation: observation, source: source) else { return nil }
-        let transform = RestoreFaceMath.similarityTransform(from: [leftEye, rightEye, nose, mouth.left, mouth.right])
+        let eyes = [firstEye, secondEye].sorted { $0.x < $1.x }
+        let transform = RestoreFaceMath.similarityTransform(from: [eyes[0], eyes[1], nose, mouth.left, mouth.right])
         let faceWidth = observation.boundingBox.width * CGFloat(source.width)
         let faceHeight = observation.boundingBox.height * CGFloat(source.height)
         guard let transform, min(faceWidth, faceHeight) * transform.scale >= 32 else { return nil }

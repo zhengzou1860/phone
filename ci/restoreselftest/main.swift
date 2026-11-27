@@ -159,7 +159,7 @@ let faceSpec = RestoreModelCatalog.spec(for: .gfpgan)!
 expect(faceSpec.interface == .image && faceSpec.inputName == "x_1" && faceSpec.outputName == "activation_out", "GFPGAN uses its verified image feature names")
 expect(faceSpec.tileSize == 512 && faceSpec.totalByteCount == 337392296, "GFPGAN uses a verified 512px interface and pinned model size")
 expect(faceSpec.artifacts[0].sha256 == "218a39c226adecb2ccbc1e358023b80a5cf2510be85dfc3ab0da698fad51391a", "GFPGAN verifies the downloaded model with SHA-256")
-expect(faceSpec.downloadURLs.allSatisfy { URL(string: $0)?.scheme == "https" }, "GFPGAN downloads only over HTTPS")
+expect(faceSpec.artifacts[0].downloadURLs.allSatisfy { URL(string: $0)?.scheme == "https" }, "GFPGAN downloads only over HTTPS")
 let landmarkCenter = RestoreFaceMath.imagePoint(CGPoint(x: 0.5, y: 0.5), faceBox: CGRect(x: 0.25, y: 0.25, width: 0.5, height: 0.5), imageSize: CGSize(width: 1000, height: 800))
 expect(abs(landmarkCenter.x - 500) < 0.0001 && abs(landmarkCenter.y - 400) < 0.0001, "Vision landmarks map from the face box into upper-left image coordinates")
 let identityFace = RestoreFaceMath.similarityTransform(from: RestoreFaceMath.template)!
