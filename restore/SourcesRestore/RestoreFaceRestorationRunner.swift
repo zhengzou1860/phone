@@ -148,15 +148,17 @@ enum RestoreFaceRestorationRunner {
     }
 
     private static func paste(patch: CGImage, transform: RestoreFaceTransform, source: CGImage, canvas: RestorePixelCanvas) {
-        let outputScale = CGAffineTransform(
-            scaleX: Double(canvas.width) / Double(source.width),
-            y: Double(canvas.height) / Double(source.height)
-        )
-        let inverse = RestoreFaceTransform(matrix: transform.matrix.inverted(), scale: 1 / transform.scale)
-        let faceTransform = RestoreFaceMath.coreGraphicsTransform(inverse, size: patch.width)
         canvas.context.saveGState()
         canvas.context.interpolationQuality = .high
-        canvas.context.concatenate(outputScale.concatenated(faceTransform))
+        canvas.context.translateBy(x: 0, y: CGFloat(canvas.height))
+        canvas.context.scaleBy(x: 1, y: -1)
+        canvas.context.concatenate(transform.matrix.inverted())
+        canvas.context.scaleBy(
+            x: Double(canvas.width) / Double(source.width),
+            y: Double(canvas.height) / Double(source.height)
+        )
+        canvas.context.translateBy(x: 0, y: CGFloat(canvas.height))
+        canvas.context.scaleBy(x: 1, y: -1)
         canvas.context.draw(patch, in: CGRect(x: 0, y: 0, width: patch.width, height: patch.height))
         canvas.context.restoreGState()
     }
