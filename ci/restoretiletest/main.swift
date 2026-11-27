@@ -213,11 +213,18 @@ edgePrediction.context.setFillColor(CGColor(red: 1, green: 0, blue: 1, alpha: 1)
 edgePrediction.context.fill(CGRect(x: 0, y: 0, width: 768, height: 768))
 edgePrediction.context.setFillColor(CGColor(red: 1, green: 0, blue: 0, alpha: 1))
 edgePrediction.context.fill(CGRect(x: 0, y: 0, width: 384 * modelScale, height: 384 * modelScale))
+let edgePredictionImage = try edgePrediction.makeImage()
+let edgePredictionLast = color(edgePredictionImage, x: 767, y: 767)
+let edgeCroppedPrediction = edgePredictionImage.cropping(to: CGRect(x: 0, y: 0, width: 768, height: 768))!
+let edgeCroppedLast = color(edgeCroppedPrediction, x: 767, y: 767)
+let edgeProbeCanvas = try RestorePixelCanvas(width: 768, height: 768)
+edgeProbeCanvas.context.draw(edgeCroppedPrediction, in: CGRect(x: 0, y: 0, width: 768, height: 768))
+let edgeProbeLast = color(try edgeProbeCanvas.makeImage(), x: 767, y: 767)
 let edgeModelCanvas = try RestorePixelCanvas(width: 585 * modelScale, height: 790 * modelScale)
 try RestoreInferenceCore.blend(
     canvas: edgeModelCanvas,
     weights: try RestoreBlendWeights(width: 585 * modelScale, height: 790 * modelScale),
-    tileImage: try edgePrediction.makeImage(),
+    tileImage: edgePredictionImage,
     originX: 201,
     originY: 406,
     tileSize: 384,
@@ -230,7 +237,10 @@ try RestoreInferenceCore.blend(
 )
 let edgeModelImage = try edgeModelCanvas.makeImage()
 let edgeModelLast = color(edgeModelImage, x: 585 * modelScale - 1, y: 790 * modelScale - 1)
-print("RESTORE-TILE DETAIL edge last=\(edgeModelLast) row=\(edgeModelImage.bytesPerRow) canvasRow=\(edgeModelCanvas.bytesPerRow)")
+let edgeDirectOffset = (790 * modelScale - 1) * edgeModelCanvas.bytesPerRow + (585 * modelScale - 1) * 4
+let edgeDirectBytes = edgeModelCanvas.data.mutableBytes.assumingMemoryBound(to: UInt8.self)
+let edgeDirectLast = (edgeDirectBytes[edgeDirectOffset], edgeDirectBytes[edgeDirectOffset + 1], edgeDirectBytes[edgeDirectOffset + 2])
+print("RESTORE-TILE DETAIL edge prediction=\(edgePredictionLast) cropped=\(edgeCroppedLast) probe=\(edgeProbeLast) direct=\(edgeDirectLast) image=\(edgeModelLast) row=\(edgeModelImage.bytesPerRow) canvasRow=\(edgeModelCanvas.bytesPerRow)")
 expect(edgeModelLast == (255, 0, 0), "edge-anchored 2x model output maps only valid pixels to the photo boundary")
 
 let smallMask = solidImage(width: 300, height: 200, red: 255, green: 255, blue: 255)
