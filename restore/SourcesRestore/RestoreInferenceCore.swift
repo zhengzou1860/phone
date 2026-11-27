@@ -211,47 +211,46 @@ enum RestoreInferenceCore {
            let cropped = image.cropping(to: CGRect(x: originX, y: originY, width: validWidth, height: validHeight)) {
             tile.draw(cropped, in: CGRect(x: 0, y: 0, width: validWidth, height: validHeight))
         }
-        guard let rendered = tile.makeImage() else { throw RestoreError.inferenceFailed("无法生成推理小块") }
         guard !clear, validWidth > 0, validHeight > 0,
               (validWidth < size || validHeight < size) else {
-            return rendered
+            guard let result = tile.makeImage() else { throw RestoreError.inferenceFailed("无法生成推理小块") }
+            return result
         }
-        let bytesPerRow = rendered.bytesPerRow
-        guard rendered.bitsPerComponent == 8,
-              rendered.bitsPerPixel == 32,
-              let provider = rendered.dataProvider,
-              let rawData = provider.data else {
-            throw RestoreError.inferenceFailed("无法复制推理小块像素")
-        }
-        let sourceData = rawData as NSData
-        guard sourceData.length >= bytesPerRow * size else {
-            throw RestoreError.inferenceFailed("无法读取推理小块像素")
-        }
-        let sourceBytes = sourceData.bytes.assumingMemoryBound(to: UInt8.self)
-        func edgeColor(x: Int, y: Int) -> CGColor {
-            let offset = y * bytesPerRow + x * 4
-            return CGColor(
-                red: CGFloat(sourceBytes[offset]) / 255,
-                green: CGFloat(sourceBytes[offset + 1]) / 255,
-                blue: CGFloat(sourceBytes[offset + 2]) / 255,
-                alpha: CGFloat(sourceBytes[offset + 3]) / 255
+        if validWidth < size,
+           let rightEdge = image.cropping(to: CGRect(
+            x: originX + validWidth - 1,
+            y: originY,
+            width: 1,
+            height: validHeight
+           )) {
+            tile.draw(
+                rightEdge,
+                in: CGRect(x: validWidth, y: 0, width: size - validWidth, height: validHeight)
             )
         }
-        if validWidth < size {
-            for y in 0..<validHeight {
-                tile.setFillColor(edgeColor(x: validWidth - 1, y: y))
-                tile.fill(CGRect(x: validWidth, y: y, width: size - validWidth, height: 1))
-            }
+        if validHeight < size,
+           let bottomEdge = image.cropping(to: CGRect(
+            x: originX,
+            y: originY + validHeight - 1,
+            width: validWidth,
+            height: 1
+           )) {
+            tile.draw(
+                bottomEdge,
+                in: CGRect(x: 0, y: validHeight, width: validWidth, height: size - validHeight)
+            )
         }
-        if validHeight < size {
-            for x in 0..<validWidth {
-                tile.setFillColor(edgeColor(x: x, y: validHeight - 1))
-                tile.fill(CGRect(x: x, y: validHeight, width: 1, height: size - validHeight))
-            }
-        }
-        if validWidth < size, validHeight < size {
-            tile.setFillColor(edgeColor(x: validWidth - 1, y: validHeight - 1))
-            tile.fill(CGRect(x: validWidth, y: validHeight, width: size - validWidth, height: size - validHeight))
+        if validWidth < size, validHeight < size,
+           let corner = image.cropping(to: CGRect(
+            x: originX + validWidth - 1,
+            y: originY + validHeight - 1,
+            width: 1,
+            height: 1
+           )) {
+            tile.draw(
+                corner,
+                in: CGRect(x: validWidth, y: validHeight, width: size - validWidth, height: size - validHeight)
+            )
         }
         guard let result = tile.makeImage() else { throw RestoreError.inferenceFailed("无法生成推理小块") }
         return result
