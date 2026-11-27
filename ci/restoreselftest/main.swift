@@ -123,7 +123,7 @@ let verifyingDownload = RestoreDownloadProgress(
     phase: .verifying,
     receivedBytes: 100 * megabyte,
     totalBytes: 100 * megabyte,
-    bytesPerSecond: megabyte,
+    bytesPerSecond: Double(megabyte),
     elapsedSeconds: 100,
     idleSeconds: 0,
     remainingSeconds: nil,
