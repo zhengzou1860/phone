@@ -292,13 +292,6 @@ final class RestoreModelManager: ObservableObject {
         RestoreJournal.line("AI 模型安装完成：\(spec.name)")
         try Task.checkCancellation()
 
-        let installed = root.appendingPathComponent("Models", isDirectory: true)
-            .appendingPathComponent(spec.id.rawValue, isDirectory: true)
-            .appendingPathComponent(spec.version, isDirectory: true)
-        try FileManager.default.createDirectory(at: installed.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try? FileManager.default.removeItem(at: installed)
-        try FileManager.default.moveItem(at: staging, to: installed)
-        try Task.checkCancellation()
         let record = ReadyRecord(version: spec.version, catalogHash: spec.catalogHash)
         let marker = readyMarker(id: spec.id)
         try FileManager.default.createDirectory(at: marker.deletingLastPathComponent(), withIntermediateDirectories: true)
