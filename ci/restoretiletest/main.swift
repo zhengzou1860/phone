@@ -298,15 +298,32 @@ expect(colorsClose(color(blended, x: 250, y: 500), color(source, x: 250, y: 500)
 let blendedProvider = blended.dataProvider!
 let blendedBytes = (blendedProvider.data! as NSData).bytes.assumingMemoryBound(to: UInt8.self)
 let sourceBytes = pixels
-let identical = (0..<height).allSatisfy { y in
-    (0..<width).allSatisfy { x in
+var mismatchCount = 0
+var maximumDelta = 0
+var firstMismatch: (x: Int, y: Int, actual: (UInt8, UInt8, UInt8), expected: (UInt8, UInt8, UInt8))?
+var mismatchBounds = (minX: width, minY: height, maxX: -1, maxY: -1)
+for y in 0..<height {
+    for x in 0..<width {
         let offset = y * bytesPerRow + x * 4
-        return abs(Int(blendedBytes[offset]) - Int(sourceBytes[offset])) <= 1
-            && abs(Int(blendedBytes[offset + 1]) - Int(sourceBytes[offset + 1])) <= 1
-            && abs(Int(blendedBytes[offset + 2]) - Int(sourceBytes[offset + 2])) <= 1
+        let actual = (blendedBytes[offset], blendedBytes[offset + 1], blendedBytes[offset + 2])
+        let expected = (sourceBytes[offset], sourceBytes[offset + 1], sourceBytes[offset + 2])
+        let delta = max(
+            abs(Int(actual.0) - Int(expected.0)),
+            abs(Int(actual.1) - Int(expected.1)),
+            abs(Int(actual.2) - Int(expected.2))
+        )
+        maximumDelta = max(maximumDelta, delta)
+        guard delta > 1 else { continue }
+        mismatchCount += 1
+        if firstMismatch == nil { firstMismatch = (x, y, actual, expected) }
+        mismatchBounds.minX = min(mismatchBounds.minX, x)
+        mismatchBounds.minY = min(mismatchBounds.minY, y)
+        mismatchBounds.maxX = max(mismatchBounds.maxX, x)
+        mismatchBounds.maxY = max(mismatchBounds.maxY, y)
     }
 }
-expect(identical, "all six tiles reconstruct every source pixel without gaps or dark seams")
+print("RESTORE-TILE DETAIL reconstruction mismatches=\(mismatchCount)/\(width * height) maxDelta=\(maximumDelta) first=\(String(describing: firstMismatch)) bounds=\(mismatchBounds)")
+expect(mismatchCount == 0, "all six tiles reconstruct every source pixel without gaps or dark seams")
 
 let scaledCanvas = try RestorePixelCanvas(width: width * 2, height: height * 2)
 let scaledWeights = try RestoreBlendWeights(width: width * 2, height: height * 2)
