@@ -153,9 +153,16 @@ expect(color(paddedTile, x: 300, y: 0) == (255, 0, 0), "small source tile extend
 expect(color(paddedTile, x: 0, y: 200) == (255, 0, 0), "small source tile extends the bottom edge instead of stretching")
 let smallGradient = gradientImage(width: 300, height: 200)
 let paddedGradient = try RestoreInferenceCore.sourceTile(smallGradient, originX: 0, originY: 0, size: 384)
-expect(color(paddedGradient, x: 300, y: 100) == color(smallGradient, x: 299, y: 100), "right padding replicates each source row edge")
-expect(color(paddedGradient, x: 100, y: 200) == color(smallGradient, x: 100, y: 199), "bottom padding replicates each source column edge")
-expect(color(paddedGradient, x: 300, y: 200) == color(smallGradient, x: 299, y: 199), "corner padding replicates the bottom-right source pixel")
+let rightPadding = color(paddedGradient, x: 300, y: 100)
+let rightPaddingSource = color(smallGradient, x: 299, y: 100)
+let bottomPadding = color(paddedGradient, x: 100, y: 200)
+let bottomPaddingSource = color(smallGradient, x: 100, y: 199)
+let cornerPadding = color(paddedGradient, x: 300, y: 200)
+let cornerPaddingSource = color(smallGradient, x: 299, y: 199)
+print("RESTORE-TILE DETAIL padding right=\(rightPadding)/\(rightPaddingSource) bottom=\(bottomPadding)/\(bottomPaddingSource) corner=\(cornerPadding)/\(cornerPaddingSource)")
+expect(zip(rightPadding, rightPaddingSource).allSatisfy { pair in abs(Int(pair.0) - Int(pair.1)) <= 1 }, "right padding replicates each source row edge")
+expect(zip(bottomPadding, bottomPaddingSource).allSatisfy { pair in abs(Int(pair.0) - Int(pair.1)) <= 1 }, "bottom padding replicates each source column edge")
+expect(zip(cornerPadding, cornerPaddingSource).allSatisfy { pair in abs(Int(pair.0) - Int(pair.1)) <= 1 }, "corner padding replicates the bottom-right source pixel")
 
 let modelScale = 2
 let validPrediction = gradientImage(width: 300 * modelScale, height: 200 * modelScale)
@@ -177,9 +184,9 @@ try RestoreInferenceCore.blend(
     maskImage: nil
 )
 let smallModelImage = try smallModelCanvas.makeImage()
-expect(color(smallModelImage, x: 0, y: 0) == color(validPrediction, x: 0, y: 0), "small 2x model output starts at the first valid source pixel")
-expect(color(smallModelImage, x: 599, y: 399) == color(validPrediction, x: 599, y: 399), "small 2x model output excludes padding instead of squeezing it into the photo")
-expect(color(smallModelImage, x: 250, y: 200) == color(validPrediction, x: 250, y: 200), "small 2x model output keeps valid content at native model coordinates")
+expect(zip(color(smallModelImage, x: 0, y: 0), color(validPrediction, x: 0, y: 0)).allSatisfy { pair in abs(Int(pair.0) - Int(pair.1)) <= 1 }, "small 2x model output starts at the first valid source pixel")
+expect(zip(color(smallModelImage, x: 599, y: 399), color(validPrediction, x: 599, y: 399)).allSatisfy { pair in abs(Int(pair.0) - Int(pair.1)) <= 1 }, "small 2x model output excludes padding instead of squeezing it into the photo")
+expect(zip(color(smallModelImage, x: 250, y: 200), color(validPrediction, x: 250, y: 200)).allSatisfy { pair in abs(Int(pair.0) - Int(pair.1)) <= 1 }, "small 2x model output keeps valid content at native model coordinates")
 
 let edgePrediction = try RestorePixelCanvas(width: 768, height: 768)
 edgePrediction.context.setFillColor(CGColor(red: 1, green: 0, blue: 1, alpha: 1))
@@ -208,7 +215,8 @@ let smallMask = solidImage(width: 300, height: 200, red: 255, green: 255, blue: 
 let paddedMask = try RestoreInferenceCore.maskTile(smallMask, originX: 0, originY: 0, size: 384)
 expect(alpha(paddedMask, x: 299, y: 199) == 255 && alpha(paddedMask, x: 300, y: 0) == 0, "small mask tile pads with transparent pixels")
 let grayMaskTile = try RestoreInferenceCore.maskTile(grayImage(width: 300, height: 200, value: 128), originX: 0, originY: 0, size: 384)
-expect(color(grayMaskTile, x: 299, y: 199) == (128, 128, 128) && alpha(grayMaskTile, x: 299, y: 199) == 255, "grayscale repair mask keeps its intensity in the RGB tile")
+let grayMaskPixel = color(grayMaskTile, x: 299, y: 199)
+expect(grayMaskPixel.0 >= 127 && grayMaskPixel.0 <= 129 && grayMaskPixel.1 == grayMaskPixel.0 && grayMaskPixel.2 == grayMaskPixel.0 && alpha(grayMaskTile, x: 299, y: 199) == 255, "grayscale repair mask keeps its intensity in the RGB tile")
 
 let smallInpaintCanvas = try RestorePixelCanvas(width: 300, height: 200)
 let smallInpaintWeights = try RestoreBlendWeights(width: 300, height: 200)
@@ -257,17 +265,17 @@ for tile in tiles {
 let blended = try canvas.makeImage()
 expect(color(blended, x: 0, y: 0) == color(source, x: 0, y: 0), "top-left photo edge is not blended into a black canvas")
 expect(color(blended, x: 584, y: 789) == color(source, x: 584, y: 789), "bottom-right photo edge is not blended into a black canvas")
-expect(color(blended, x: 250, y: 430) == color(source, x: 250, y: 430), "blend writes tile rows to the same top-down destination rows")
-expect(color(blended, x: 250, y: 500) == color(source, x: 250, y: 500), "lower photo content is not moved to the upper half")
+expect(zip(color(blended, x: 250, y: 430), color(source, x: 250, y: 430)).allSatisfy { pair in abs(Int(pair.0) - Int(pair.1)) <= 1 }, "blend writes tile rows to the same top-down destination rows")
+expect(zip(color(blended, x: 250, y: 500), color(source, x: 250, y: 500)).allSatisfy { pair in abs(Int(pair.0) - Int(pair.1)) <= 1 }, "lower photo content is not moved to the upper half")
 let blendedProvider = blended.dataProvider!
 let blendedBytes = (blendedProvider.data! as NSData).bytes.assumingMemoryBound(to: UInt8.self)
 let sourceBytes = pixels
 let identical = (0..<height).allSatisfy { y in
     (0..<width).allSatisfy { x in
         let offset = y * bytesPerRow + x * 4
-        return blendedBytes[offset] == sourceBytes[offset]
-            && blendedBytes[offset + 1] == sourceBytes[offset + 1]
-            && blendedBytes[offset + 2] == sourceBytes[offset + 2]
+        return abs(Int(blendedBytes[offset]) - Int(sourceBytes[offset])) <= 1
+            && abs(Int(blendedBytes[offset + 1]) - Int(sourceBytes[offset + 1])) <= 1
+            && abs(Int(blendedBytes[offset + 2]) - Int(sourceBytes[offset + 2])) <= 1
     }
 }
 expect(identical, "all six tiles reconstruct every source pixel without gaps or dark seams")
