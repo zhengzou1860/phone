@@ -13,13 +13,18 @@ concurrency:
 
 jobs:
   gfpgan:
-    runs-on: macos-latest
+    runs-on: macos-15-arm64
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
-      - name: inspect Core ML compiler
-        run: xcrun coremlcompiler compile --help
+      - name: select iOS 18 toolchain
+        run: |
+          set -euo pipefail
+          sudo xcode-select -s /Applications/Xcode_16.4.app
+          xcodebuild -version
+          xcodebuild -showsdks | grep -i ios
+          xcrun coremlcompiler compile --help
 
       - uses: actions/setup-python@v5
         with:
@@ -39,12 +44,61 @@ jobs:
         run: |
           set -euo pipefail
           rm -rf /tmp/gfpgan.mlmodelc
-          xcrun coremlcompiler compile /tmp/gfpgan.mlmodel /tmp \
-            --deployment-target 18.0 --platform ios
+          xcrun coremlcompiler compile /tmp/gfpgan.mlmodel /tmp
           test -s /tmp/gfpgan.mlmodelc/model.mil
           test -s /tmp/gfpgan.mlmodelc/coremldata.bin
           xcrun swiftc "$GITHUB_WORKSPACE/ci/verify_gfpgan.swift" -o /tmp/verify_gfpgan
           /tmp/verify_gfpgan /tmp/gfpgan.mlmodelc
+
+      - name: verify GFPGAN on iOS 18.5 simulator
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/gfpgan-verify.app /tmp/gfpgan-verify-src
+          mkdir -p /tmp/gfpgan-verify.app /tmp/gfpgan-verify-src
+          cp /tmp/gfpgan.mlmodelc /tmp/gfpgan-verify.app/gfpgan.mlmodelc
+          cp "$GITHUB_WORKSPACE/ci/verify_gfpgan.swift" /tmp/gfpgan-verify-src/main.swift
+          python3 - <<'PY'
+          import plistlib
+          info = {
+              "CFBundleIdentifier": "com.qoder.gfpganverify",
+              "CFBundleExecutable": "GFPGANVerify",
+              "CFBundleName": "GFPGANVerify",
+              "CFBundlePackageType": "APPL",
+              "CFBundleVersion": "1",
+              "MinimumOSVersion": "18.5",
+              "LSRequiresIPhoneOS": True,
+              "UIDeviceFamily": [1],
+          }
+          with open("/tmp/gfpgan-verify.app/Info.plist", "wb") as handle:
+              plistlib.dump(info, handle)
+          PY
+          xcrun swiftc \
+            -sdk "$(xcrun --sdk iphonesimulator --show-sdk-path)" \
+            -target arm64-apple-ios18.5-simulator \
+            /tmp/gfpgan-verify-src/main.swift \
+            -o /tmp/gfpgan-verify.app/GFPGANVerify
+          codesign --force --sign - /tmp/gfpgan-verify.app
+          device=$(xcrun simctl list devices available -j | python3 -c '
+          import json, sys
+          data = json.load(sys.stdin)
+          for runtime, devices in data["devices"].items():
+              if "iOS-18-5" in runtime:
+                  for device in devices:
+                      if device.get("isAvailable") and device["name"] == "iPhone 16":
+                          print(device["udid"])
+                          raise SystemExit
+          raise SystemExit("iOS 18.5 simulator unavailable")
+          ')
+          xcrun simctl boot "$device" || true
+          xcrun simctl bootstatus "$device" -b
+          xcrun simctl install "$device" /tmp/gfpgan-verify.app
+          set +e
+          output=$(xcrun simctl launch --console "$device" com.qoder.gfpganverify 2>&1)
+          status=$?
+          set -e
+          printf '%s\n' "$output"
+          test "$status" -eq 0
+          grep -q '^GFPGAN-IOS18-VERDICT PASS input=512x512 output=512x512$' <<< "$output"
 
       - name: package precompiled model
         run: |
