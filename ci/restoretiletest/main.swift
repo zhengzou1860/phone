@@ -192,11 +192,19 @@ expect(colorsClose(cornerPadding, cornerPaddingSource), "corner padding replicat
 
 let modelScale = 2
 let validPrediction = gradientImage(width: 300 * modelScale, height: 200 * modelScale)
-let modelPadding = try RestorePixelCanvas(width: 768, height: 768)
-modelPadding.context.setFillColor(CGColor(red: 1, green: 0, blue: 1, alpha: 1))
-modelPadding.context.fill(CGRect(x: 0, y: 0, width: 768, height: 768))
-modelPadding.context.draw(validPrediction, in: CGRect(x: 0, y: 768 - 400, width: 600, height: 400))
-let modelPaddingImage = try modelPadding.makeImage()
+let modelPaddingContext = CGContext(
+    data: nil,
+    width: 768,
+    height: 768,
+    bitsPerComponent: 8,
+    bytesPerRow: 768 * 4,
+    space: CGColorSpaceCreateDeviceRGB(),
+    bitmapInfo: CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.premultipliedLast.rawValue
+)!
+modelPaddingContext.setFillColor(CGColor(red: 1, green: 0, blue: 1, alpha: 1))
+modelPaddingContext.fill(CGRect(x: 0, y: 0, width: 768, height: 768))
+modelPaddingContext.draw(validPrediction, in: CGRect(x: 0, y: 768 - 400, width: 600, height: 400))
+let modelPaddingImage = modelPaddingContext.makeImage()!
 expect(colorsClose(color(modelPaddingImage, x: 0, y: 0), color(validPrediction, x: 0, y: 0)), "model padding fixture keeps valid prediction at the top-left")
 let smallModelCanvas = try RestorePixelCanvas(width: 600, height: 400)
 try RestoreInferenceCore.blend(
@@ -224,9 +232,17 @@ let edgePredictionImage = solidImage(width: 768, height: 768, red: 255, green: 0
 let edgePredictionLast = color(edgePredictionImage, x: 767, y: 767)
 let edgeCroppedPrediction = edgePredictionImage.cropping(to: CGRect(x: 0, y: 0, width: 768, height: 768))!
 let edgeCroppedLast = color(edgeCroppedPrediction, x: 767, y: 767)
-let edgeProbeCanvas = try RestorePixelCanvas(width: 768, height: 768)
-edgeProbeCanvas.context.draw(edgeCroppedPrediction, in: CGRect(x: 0, y: 0, width: 768, height: 768))
-let edgeProbeLast = color(try edgeProbeCanvas.makeImage(), x: 767, y: 767)
+let edgeProbeContext = CGContext(
+    data: nil,
+    width: 768,
+    height: 768,
+    bitsPerComponent: 8,
+    bytesPerRow: 768 * 4,
+    space: CGColorSpaceCreateDeviceRGB(),
+    bitmapInfo: CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.premultipliedLast.rawValue
+)!
+edgeProbeContext.draw(edgeCroppedPrediction, in: CGRect(x: 0, y: 0, width: 768, height: 768))
+let edgeProbeLast = color(edgeProbeContext.makeImage()!, x: 767, y: 767)
 let edgeModelCanvas = try RestorePixelCanvas(width: 585 * modelScale, height: 790 * modelScale)
 try RestoreInferenceCore.blend(
     canvas: edgeModelCanvas,
