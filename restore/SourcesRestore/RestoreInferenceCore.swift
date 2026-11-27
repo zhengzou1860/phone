@@ -187,14 +187,12 @@ enum RestoreInferenceCore {
     }
 
     private static func drawTile(_ image: CGImage, originX: Int, originY: Int, size: Int, clear: Bool) throws -> CGImage {
-        let bytesPerRow = size * 4
-        guard let data = NSMutableData(length: bytesPerRow * size),
-              let tile = CGContext(
-                data: data.mutableBytes,
+        guard let tile = CGContext(
+                data: nil,
                 width: size,
                 height: size,
                 bitsPerComponent: 8,
-                bytesPerRow: bytesPerRow,
+                bytesPerRow: size * 4,
                 space: CGColorSpaceCreateDeviceRGB(),
                 bitmapInfo: CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.premultipliedLast.rawValue
               ) else {
@@ -212,58 +210,66 @@ enum RestoreInferenceCore {
         if validWidth > 0, validHeight > 0,
            let cropped = image.cropping(to: CGRect(x: originX, y: originY, width: validWidth, height: validHeight)) {
             tile.draw(cropped, in: CGRect(x: 0, y: 0, width: validWidth, height: validHeight))
-        }
-        guard let rendered = tile.makeImage() else { throw RestoreError.inferenceFailed("无法生成推理小块") }
-        guard !clear, let provider = rendered.dataProvider, let rawData = provider.data else {
-            return rendered
-        }
-        let sourceData = rawData as NSData
-        if validWidth < size || validHeight < size {
-            let sourceBytes = sourceData.bytes.assumingMemoryBound(to: UInt8.self)
-            print("RESTORE-TILE DEBUG format bpc=\(rendered.bitsPerComponent) bpp=\(rendered.bitsPerPixel) row=\(rendered.bytesPerRow) info=\(rendered.bitmapInfo.rawValue) len=\(sourceData.length) first=\(Array(UnsafeBufferPointer(start: sourceBytes, count: 8)))")
-        }
-        let rowBytes = rendered.bytesPerRow
-        guard sourceData.length >= rowBytes * size,
-              let outputData = NSMutableData(length: sourceData.length) else {
-            throw RestoreError.inferenceFailed("无法复制推理小块像素")
-        }
-        outputData.replaceBytes(in: NSRange(location: 0, length: sourceData.length), withBytes: sourceData.bytes)
-        let bytes = outputData.mutableBytes.assumingMemoryBound(to: UInt8.self)
-        if validWidth < size {
-            for y in 0..<validHeight {
-                let sourceOffset = y * rowBytes + (validWidth - 1) * 4
-                for x in validWidth..<size {
-                    let destinationOffset = y * rowBytes + x * 4
-                    for channel in 0..<4 {
-                        bytes[destinationOffset + channel] = bytes[sourceOffset + channel]
-                    }
+            if !clear {
+                if validWidth < size {
+                    let edge = try edgeStrip(
+                        image,
+                        sourceX: originX + validWidth - 1,
+                        sourceY: originY,
+                        width: 1,
+                        height: validHeight
+                    )
+                    tile.draw(edge, in: CGRect(x: validWidth, y: 0, width: size - validWidth, height: validHeight))
+                }
+                if validHeight < size {
+                    let edge = try edgeStrip(
+                        image,
+                        sourceX: originX,
+                        sourceY: originY + validHeight - 1,
+                        width: validWidth,
+                        height: 1
+                    )
+                    tile.draw(edge, in: CGRect(x: 0, y: validHeight, width: validWidth, height: size - validHeight))
+                }
+                if validWidth < size, validHeight < size {
+                    let corner = try edgeStrip(
+                        image,
+                        sourceX: originX + validWidth - 1,
+                        sourceY: originY + validHeight - 1,
+                        width: 1,
+                        height: 1
+                    )
+                    tile.draw(corner, in: CGRect(x: validWidth, y: validHeight, width: size - validWidth, height: size - validHeight))
                 }
             }
         }
-        if validHeight < size {
-            let sourceOffset = (validHeight - 1) * rowBytes
-            for y in validHeight..<size {
-                let destinationOffset = y * rowBytes
-                for offset in 0..<rowBytes {
-                    bytes[destinationOffset + offset] = bytes[sourceOffset + offset]
-                }
-            }
+        guard let result = tile.makeImage() else { throw RestoreError.inferenceFailed("无法生成推理小块") }
+        return result
+    }
+
+    private static func edgeStrip(_ image: CGImage, sourceX: Int, sourceY: Int, width: Int, height: Int) throws -> CGImage {
+        guard let context = CGContext(
+                data: nil,
+                width: width,
+                height: height,
+                bitsPerComponent: 8,
+                bytesPerRow: width * 4,
+                space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.premultipliedLast.rawValue
+              ) else {
+            throw RestoreError.inferenceFailed("无法创建补边像素条")
         }
-        guard let result = CGImage(
-            width: size,
-            height: size,
-            bitsPerComponent: rendered.bitsPerComponent,
-            bitsPerPixel: rendered.bitsPerPixel,
-            bytesPerRow: rowBytes,
-            space: rendered.colorSpace ?? CGColorSpaceCreateDeviceRGB(),
-            bitmapInfo: rendered.bitmapInfo,
-            provider: CGDataProvider(data: outputData as CFData)!,
-            decode: nil,
-            shouldInterpolate: false,
-            intent: .defaultIntent
-        ) else {
-            throw RestoreError.inferenceFailed("无法生成推理小块")
-        }
+        context.interpolationQuality = .none
+        context.draw(
+            image,
+            in: CGRect(
+                x: CGFloat(-sourceX),
+                y: CGFloat(-sourceY),
+                width: CGFloat(image.width),
+                height: CGFloat(image.height)
+            )
+        )
+        guard let result = context.makeImage() else { throw RestoreError.inferenceFailed("无法生成补边像素条") }
         return result
     }
 
