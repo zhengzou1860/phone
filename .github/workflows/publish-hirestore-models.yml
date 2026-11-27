@@ -56,7 +56,7 @@ jobs:
           set -euo pipefail
           rm -rf /tmp/gfpgan-verify.app /tmp/gfpgan-verify-src
           mkdir -p /tmp/gfpgan-verify.app /tmp/gfpgan-verify-src
-          cp /tmp/gfpgan.mlmodelc /tmp/gfpgan-verify.app/gfpgan.mlmodelc
+          cp -R /tmp/gfpgan.mlmodelc /tmp/gfpgan-verify.app/gfpgan.mlmodelc
           cp "$GITHUB_WORKSPACE/ci/verify_gfpgan.swift" /tmp/gfpgan-verify-src/main.swift
           python3 - <<'PY'
           import plistlib
