@@ -209,35 +209,51 @@ enum RestoreInferenceCore {
         }
         let validWidth = min(size, image.width - originX)
         let validHeight = min(size, image.height - originY)
+        var replicateEdges = false
         if validWidth > 0, validHeight > 0,
            let cropped = image.cropping(to: CGRect(x: originX, y: originY, width: validWidth, height: validHeight)) {
             tile.draw(cropped, in: CGRect(x: 0, y: 0, width: validWidth, height: validHeight))
-            if !clear {
-                tile.flush()
-                let bytes = data.mutableBytes.assumingMemoryBound(to: UInt8.self)
-                if validWidth < size {
-                    for y in 0..<validHeight {
-                        let sourceOffset = y * bytesPerRow + (validWidth - 1) * 4
-                        for x in validWidth..<size {
-                            let destinationOffset = y * bytesPerRow + x * 4
-                            for channel in 0..<4 {
-                                bytes[destinationOffset + channel] = bytes[sourceOffset + channel]
-                            }
-                        }
-                    }
-                }
-                if validHeight < size {
-                    let sourceOffset = (validHeight - 1) * bytesPerRow
-                    for y in validHeight..<size {
-                        let destinationOffset = y * bytesPerRow
-                        for offset in 0..<bytesPerRow {
-                            bytes[destinationOffset + offset] = bytes[sourceOffset + offset]
+            replicateEdges = !clear
+        }
+        _ = tile.makeImage()
+        if replicateEdges {
+            let bytes = data.mutableBytes.assumingMemoryBound(to: UInt8.self)
+            if validWidth < size {
+                for y in 0..<validHeight {
+                    let sourceOffset = y * bytesPerRow + (validWidth - 1) * 4
+                    for x in validWidth..<size {
+                        let destinationOffset = y * bytesPerRow + x * 4
+                        for channel in 0..<4 {
+                            bytes[destinationOffset + channel] = bytes[sourceOffset + channel]
                         }
                     }
                 }
             }
+            if validHeight < size {
+                let sourceOffset = (validHeight - 1) * bytesPerRow
+                for y in validHeight..<size {
+                    let destinationOffset = y * bytesPerRow
+                    for offset in 0..<bytesPerRow {
+                        bytes[destinationOffset + offset] = bytes[sourceOffset + offset]
+                    }
+                }
+            }
         }
-        guard let result = tile.makeImage() else { throw RestoreError.inferenceFailed("无法生成推理小块") }
+        guard let result = CGImage(
+            width: size,
+            height: size,
+            bitsPerComponent: 8,
+            bitsPerPixel: 32,
+            bytesPerRow: bytesPerRow,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGBitmapInfo(rawValue: CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.premultipliedLast.rawValue),
+            provider: CGDataProvider(data: data as CFData)!,
+            decode: nil,
+            shouldInterpolate: false,
+            intent: .defaultIntent
+        ) else {
+            throw RestoreError.inferenceFailed("无法生成推理小块")
+        }
         return result
     }
 
