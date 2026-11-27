@@ -213,17 +213,27 @@ enum RestoreInferenceCore {
            let cropped = image.cropping(to: CGRect(x: originX, y: originY, width: validWidth, height: validHeight)) {
             tile.draw(cropped, in: CGRect(x: 0, y: 0, width: validWidth, height: validHeight))
             if !clear {
-                if validWidth < size,
-                   let edge = image.cropping(to: CGRect(x: originX + validWidth - 1, y: originY, width: 1, height: validHeight)) {
-                    tile.draw(edge, in: CGRect(x: validWidth, y: 0, width: size - validWidth, height: validHeight))
+                tile.flush()
+                let bytes = data.mutableBytes.assumingMemoryBound(to: UInt8.self)
+                if validWidth < size {
+                    for y in 0..<validHeight {
+                        let sourceOffset = y * bytesPerRow + (validWidth - 1) * 4
+                        for x in validWidth..<size {
+                            let destinationOffset = y * bytesPerRow + x * 4
+                            for channel in 0..<4 {
+                                bytes[destinationOffset + channel] = bytes[sourceOffset + channel]
+                            }
+                        }
+                    }
                 }
-                if validHeight < size,
-                   let edge = image.cropping(to: CGRect(x: originX, y: originY + validHeight - 1, width: validWidth, height: 1)) {
-                    tile.draw(edge, in: CGRect(x: 0, y: validHeight, width: validWidth, height: size - validHeight))
-                }
-                if validWidth < size, validHeight < size,
-                   let corner = image.cropping(to: CGRect(x: originX + validWidth - 1, y: originY + validHeight - 1, width: 1, height: 1)) {
-                    tile.draw(corner, in: CGRect(x: validWidth, y: validHeight, width: size - validWidth, height: size - validHeight))
+                if validHeight < size {
+                    let sourceOffset = (validHeight - 1) * bytesPerRow
+                    for y in validHeight..<size {
+                        let destinationOffset = y * bytesPerRow
+                        for offset in 0..<bytesPerRow {
+                            bytes[destinationOffset + offset] = bytes[sourceOffset + offset]
+                        }
+                    }
                 }
             }
         }
