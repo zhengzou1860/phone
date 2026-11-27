@@ -1,6 +1,7 @@
 import Foundation
 
-enum RestoreModelID: String, CaseIterable, Identifiable, Hashable {
+enum RestoreModelID: String, CaseIterable, Identifiable, Hashable, Codable {
+    case realESRGAN
     case localSRFast
     case aotGAN
 
@@ -46,6 +47,7 @@ struct RestoreModelSpec: Equatable, Identifiable {
     let bundleRelativePath: String
     let artifacts: [RestoreModelArtifact]
     let catalogHash: String
+    let packagedByteCount: Int?
     let compute: RestoreModelCompute
     let inputName: String
     let outputName: String
@@ -55,7 +57,13 @@ struct RestoreModelSpec: Equatable, Identifiable {
     let tileSize: Int
     let overlap: Int
 
-    var totalByteCount: Int { artifacts.reduce(0) { $0 + $1.byteCount } }
+    var totalByteCount: Int { packagedByteCount ?? artifacts.reduce(0) { $0 + $1.byteCount } }
+    var isBundled: Bool { packagedByteCount != nil }
+    var upscaleFactor: Int? {
+        guard inputShape.count == 4, let outputShape, outputShape.count == 4,
+              inputShape[3] > 0, outputShape[3] % inputShape[3] == 0 else { return nil }
+        return outputShape[3] / inputShape[3]
+    }
     var technicalSummary: String { "\(inputName) \(inputShape) → \(outputName) \(outputShape?.description ?? "运行时确定") · \(dataType.rawValue)" }
 }
 
@@ -63,11 +71,33 @@ enum RestoreModelCatalog {
     private static let localSRCommit = "bba30194995e2815364f111168fb15155a24920f"
     private static let aotCommit = "8b3dcd14fc9ca89c08f7485b97ade6040640d835"
 
-    static let all: [RestoreModelSpec] = [localSRFast, aotGAN]
+    static let all: [RestoreModelSpec] = [realESRGAN, localSRFast, aotGAN]
 
     static func spec(for id: RestoreModelID) -> RestoreModelSpec? {
         all.first { $0.id == id }
     }
+
+    private static let realESRGAN = RestoreModelSpec(
+        id: .realESRGAN,
+        name: "RealESRGAN 高画质",
+        version: "2.0.0",
+        summary: "2× 真实感细节生成；384px 分块、32px 重叠融合，适合优先追求修复画质。",
+        licenseLabel: "BSD-3-Clause",
+        attribution: "Xintao Wang / Real-ESRGAN",
+        sourceURL: "https://github.com/xintao/Real-ESRGAN",
+        bundleRelativePath: "RealESRGAN_x2plus_384_fp16.mlmodelc",
+        artifacts: [],
+        catalogHash: "real-esrgan-x2plus-384-fp16-folded-v1",
+        packagedByteCount: 33_580_688,
+        compute: .gpu,
+        inputName: "image",
+        outputName: "out",
+        inputShape: [1, 3, 384, 384],
+        outputShape: [1, 3, 768, 768],
+        dataType: .float32,
+        tileSize: 384,
+        overlap: 32
+    )
 
     private static let localSRFast = RestoreModelSpec(
         id: .localSRFast,
@@ -86,6 +116,7 @@ enum RestoreModelCatalog {
             artifact(localSRCommit, "mobile/Models/ios/localsr_fast.mlmodelc/weights/weight.bin", 305056, "00d5b0fd5d96cdfa5d87b466704dedbe4b51dcc291f4dd853308ac7b3378fb73")
         ],
         catalogHash: "localsr-fast-bba3019-files-v2",
+        packagedByteCount: nil,
         compute: .neuralEngine,
         inputName: "image",
         outputName: "out",
@@ -115,6 +146,7 @@ enum RestoreModelCatalog {
             ]
         )],
         catalogHash: "aot-gan-8b3dcd14-float32-v1",
+        packagedByteCount: nil,
         compute: .gpu,
         inputName: "x_1",
         outputName: "var_915",

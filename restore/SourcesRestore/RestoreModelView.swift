@@ -7,7 +7,7 @@ struct RestoreModelView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
-                Text("AI 模型不放进安装包。只有点击下载后才访问模型来源；校验通过后，照片推理完全在本机进行，原片不会上传。")
+                Text("RealESRGAN 高画质模型已内置在安装包中。LocalSR Fast 与 AOT-GAN 仅在点击下载后访问模型来源；校验通过后，照片推理完全在本机进行，原片不会上传。")
                     .font(.caption)
                     .foregroundStyle(RestoreTheme.secondary)
 
@@ -49,7 +49,7 @@ struct RestoreModelView: View {
         return RestoreCard {
             VStack(alignment: .leading, spacing: 12) {
                 HStack(spacing: 12) {
-                    Image(systemName: spec.id == .localSRFast ? "sparkles" : "bandage.fill")
+                    Image(systemName: spec.id == .aotGAN ? "bandage.fill" : "sparkles")
                         .font(.title3)
                         .foregroundStyle(RestoreTheme.cyan)
                         .frame(width: 38, height: 38)
@@ -86,9 +86,18 @@ struct RestoreModelView: View {
                     case .compiling:
                         ProgressView().controlSize(.small)
                     case .installed:
-                        Button("删除", role: .destructive) { deleteCandidate = spec.id }
+                        if spec.isBundled {
+                            Label("内置模型", systemImage: "square.stack.3d.up.fill")
+                                .font(.caption2.weight(.semibold))
+                        } else {
+                            Button("删除", role: .destructive) { deleteCandidate = spec.id }
+                        }
                     case .failed:
-                        Button("重试下载") { models.download(spec.id) }
+                        if spec.isBundled {
+                            Text("请重新安装 App 以恢复内置模型").font(.caption2.weight(.semibold))
+                        } else {
+                            Button("重试下载") { models.download(spec.id) }
+                        }
                     }
                 }
                 .buttonStyle(.bordered)
@@ -110,8 +119,7 @@ struct RestoreModelView: View {
             case .compiling:
                 Label("准备中", systemImage: "gear")
             case .installed:
-                Label("已就绪", systemImage: "checkmark.circle.fill")
-            case .failed:
+                Label("已就绪", systemImage: "checkmark.circle.fill")            case .failed:
                 Label("失败", systemImage: "exclamationmark.triangle.fill")
             }
         }

@@ -26,7 +26,7 @@ final class RestoreProcessor: ObservableObject {
         do {
             try RestorePreflight.validate(width: media.width, height: media.height, duration: media.duration, isVideo: media.kind == .video)
             if settings.mode.isAI {
-                guard media.kind == .image, settings.mode.model != nil else {
+                guard media.kind == .image, settings.model != nil else {
                     throw RestoreError.fileOperation("当前 AI 模型仅支持照片")
                 }
                 try RestoreAIMath.validateSource(width: media.width, height: media.height)
@@ -54,7 +54,7 @@ final class RestoreProcessor: ObservableObject {
                 outputHeight: output.height
             )
             try RestorePreflight.validateSpace(required: required, available: available)
-            if settings.mode.isAI, let modelID = settings.mode.model {
+            if settings.mode.isAI, let modelID = settings.model {
                 modelURL = try models.beginProcessing(modelID)
             }
             RestoreJournal.line("处理预检通过：预计需要 \(RestoreMath.formatBytes(Int(required))) 可用空间，当前 \(RestoreMath.formatBytes(Int(available)))")
@@ -74,7 +74,7 @@ final class RestoreProcessor: ObservableObject {
 
         workTask = Task.detached(priority: .userInitiated) { [weak self, modelURL, models] in
             guard let self else {
-                if settings.mode.isAI, let modelID = settings.mode.model {
+                if settings.mode.isAI, let modelID = settings.model {
                     await models.endProcessing(modelID)
                 }
                 return
@@ -148,13 +148,13 @@ final class RestoreProcessor: ObservableObject {
                     duration: media.duration,
                     resultBytes: bytes
                 )
-                if settings.mode.isAI, let modelID = settings.mode.model {
+                if settings.mode.isAI, let modelID = settings.model {
                     await models.endProcessing(modelID)
                 }
                 await self.finish(record: record)
             } catch {
                 if let temporaryOutput { try? FileManager.default.removeItem(at: temporaryOutput) }
-                if settings.mode.isAI, let modelID = settings.mode.model {
+                if settings.mode.isAI, let modelID = settings.model {
                     await models.endProcessing(modelID)
                 }
                 await self.finish(error: error)

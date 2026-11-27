@@ -45,7 +45,7 @@ struct RestoreEditorView: View {
     private var canStart: Bool {
         guard !processor.isProcessing, !isCheckingSpace, !hasInsufficientSpace, !spaceCheckFailed else { return false }
         guard !settings.mode.isAI else {
-            guard let id = settings.mode.model, models.isInstalled(id),
+            guard let id = settings.model, models.isInstalled(id),
                   media.width <= RestoreAIMath.maximumSourceLongEdge,
                   Double(media.width) * Double(media.height) <= Double(RestoreAIMath.maximumSourcePixels) else { return false }
             return settings.mode != .inpainting || !(settings.mask?.isEmpty ?? true)
@@ -60,6 +60,7 @@ struct RestoreEditorView: View {
                     sourceSection
                     if media.kind == .image { modeSection }
                     if media.kind == .image && settings.mode == .native { presetSection }
+                    if media.kind == .image && settings.mode == .superResolution { superResolutionModelSection }
                     if media.kind == .video || settings.mode == .native || settings.mode == .superResolution { scaleSection }
                     if media.kind == .image && settings.mode.isAI { aiModelSection }
                     if media.kind == .image && settings.mode == .inpainting { maskSection }
@@ -198,7 +199,13 @@ struct RestoreEditorView: View {
             HStack(spacing: 9) {
                 ForEach(RestorePreset.allCases) { preset in
                     Button {
-                        settings = preset.settings(scale: settings.scale)
+                        var updated = preset.settings(
+                            scale: settings.scale,
+                            superResolutionModel: settings.superResolutionModel
+                        )
+                        updated.mode = settings.mode
+                        updated.mask = settings.mask
+                        settings = updated
                     } label: {
                         VStack(alignment: .leading, spacing: 7) {
                             HStack {
@@ -237,6 +244,48 @@ struct RestoreEditorView: View {
         }
     }
 
+    private var superResolutionModelSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("超分模型").font(.headline)
+            HStack(spacing: 9) {
+                ForEach([RestoreModelID.realESRGAN, .localSRFast], id: \.self) { id in
+                    if let spec = RestoreModelCatalog.spec(for: id) {
+                        Button {
+                            settings.superResolutionModel = id
+                            if settings.scale > 2 { settings.scale = 2 }
+                        } label: {
+                            VStack(alignment: .leading, spacing: 6) {
+                                HStack {
+                                    Text(spec.name).font(.caption.weight(.bold)).lineLimit(1)
+                                    Spacer()
+                                    if settings.superResolutionModel == id {
+                                        Image(systemName: "checkmark.circle.fill").foregroundStyle(RestoreTheme.cyan)
+                                    }
+                                }
+                                Text(id == .realESRGAN ? "2× 高画质 · 内置 \(RestoreMath.formatBytes(spec.totalByteCount)) · 较慢" : "4× 快速 · 需下载 · 更快")
+                                    .font(.caption2)
+                                    .foregroundStyle(RestoreTheme.secondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                            .foregroundStyle(.white)
+                            .padding(12)
+                            .frame(maxWidth: .infinity, minHeight: 86, alignment: .topLeading)
+                            .background(
+                                settings.superResolutionModel == id ? RestoreTheme.cyan.opacity(0.12) : RestoreTheme.card,
+                                in: RoundedRectangle(cornerRadius: 16)
+                            )
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 16)
+                                    .stroke(settings.superResolutionModel == id ? RestoreTheme.cyan.opacity(0.52) : RestoreTheme.stroke)
+                            )
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+        }
+    }
+
     private var scaleSection: some View {
         RestoreCard {
             VStack(alignment: .leading, spacing: 12) {
@@ -252,7 +301,9 @@ struct RestoreEditorView: View {
                         Text("1×").tag(1.0)
                         Text("1.5×").tag(1.5)
                         Text("2×").tag(2.0)
-                        Text("4×").tag(4.0)
+                        if RestoreModelCatalog.spec(for: settings.superResolutionModel)?.upscaleFactor == 4 {
+                            Text("4×").tag(4.0)
+                        }
                     }
                     .pickerStyle(.segmented)
                 } else {
@@ -266,8 +317,9 @@ struct RestoreEditorView: View {
                 Text("\(media.width) × \(media.height)  →  \(output.width) × \(output.height)")
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(RestoreTheme.secondary)
-                if settings.mode == .superResolution {
-                    Text("模型先生成 4 倍细节，再缩放到所选输出尺寸；长边 6144 px、最多 32MP。")
+                if settings.mode == .superResolution, let spec = RestoreModelCatalog.spec(for: settings.superResolutionModel) {
+                    let factor = spec.upscaleFactor.map { "\($0)" } ?? "多"
+                    Text("模型先生成 \(factor) 倍细节，再缩放到所选输出尺寸；长边 6144 px、最多 32MP。")
                         .font(.caption2)
                         .foregroundStyle(RestoreTheme.secondary)
                 }
@@ -276,7 +328,7 @@ struct RestoreEditorView: View {
     }
 
     @ViewBuilder private var aiModelSection: some View {
-        if let id = settings.mode.model, let spec = RestoreModelCatalog.spec(for: id) {
+        if let id = settings.model, let spec = RestoreModelCatalog.spec(for: id) {
             let state = models.state(for: id)
             RestoreCard {
                 VStack(alignment: .leading, spacing: 10) {
@@ -290,7 +342,7 @@ struct RestoreEditorView: View {
                         }
                     }
                     .font(.caption.weight(.semibold))
-                    Text("模型单独下载并校验；照片推理不联网，不上传原片。")
+                    Text(spec.isBundled ? "模型已内置并校验；照片推理不联网，不上传原片。" : "模型单独下载并校验；照片推理不联网，不上传原片。")
                         .font(.caption2)
                         .foregroundStyle(RestoreTheme.secondary)
                     switch state {
@@ -301,7 +353,11 @@ struct RestoreEditorView: View {
                         ProgressView().controlSize(.small)
                     case .failed(let message):
                         Text(message).font(.caption2).foregroundStyle(.red)
-                        Button("重试下载") { models.download(id) }.font(.caption2.weight(.semibold))
+                        if spec.isBundled {
+                            Text("请重新安装 App 以恢复内置模型").font(.caption2.weight(.semibold))
+                        } else {
+                            Button("重试下载") { models.download(id) }.font(.caption2.weight(.semibold))
+                        }
                     case .notInstalled:
                         Button("下载 \(RestoreMath.formatBytes(spec.totalByteCount)) 模型") { models.download(id) }
                             .font(.caption.weight(.semibold))
@@ -436,7 +492,11 @@ struct RestoreEditorView: View {
         case .native:
             return "原生增强使用系统降噪、色彩、锐化和边缘保留放大。它不生成新细节；视频处理速度取决于时长和分辨率。"
         case .superResolution:
-            return "AI 超分按 384px 小块生成 4 倍细节并融合重叠区。生成内容不一定等于真实原貌，处理时间取决于照片尺寸。"
+            if let spec = RestoreModelCatalog.spec(for: settings.superResolutionModel) {
+                let factor = spec.upscaleFactor.map { "\($0) 倍" } ?? "多倍"
+                return "AI 超分按 \(spec.tileSize)px 小块生成\(factor)细节并融合重叠区。高画质模型计算量更大，生成内容不一定等于真实原貌。"
+            }
+            return "AI 超分按小块生成细节并融合重叠区。生成内容不一定等于真实原貌，处理时间取决于照片尺寸。"
         case .inpainting:
             return "AI 修补按 512px 上下文块补全蒙版区域。大面积缺失可能没有唯一正确答案，请对比原片并保留重要照片的原件。"
         }

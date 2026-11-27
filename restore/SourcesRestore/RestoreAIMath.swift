@@ -4,6 +4,10 @@ struct RestoreAITile: Equatable {
     let originX: Int
     let originY: Int
     let outputScale: Double
+    let overlapLeft: Int
+    let overlapRight: Int
+    let overlapTop: Int
+    let overlapBottom: Int
 
     var sourceMinX: Int { originX }
     var sourceMinY: Int { originY }
@@ -21,21 +25,31 @@ enum RestoreAIMath {
             return []
         }
         let step = tileSize - overlap * 2
-        var tiles: [RestoreAITile] = []
-        var y = 0
-        while y < height {
-            var x = 0
-            while x < width {
-                tiles.append(RestoreAITile(originX: x - overlap, originY: y - overlap, outputScale: outputScale))
-                x += step
+        func origins(for length: Int) -> [Int] {
+            guard length > tileSize else { return [0] }
+            var result = [0]
+            var origin = 0
+            while origin + tileSize < length {
+                origin = min(origin + step, length - tileSize)
+                result.append(origin)
             }
-            y += step
+            return result
         }
-        return tiles
-    }
-
-    static func sourceTileVerticalOffset(sourceHeight: Double, originY: Int, size: Int) -> Double {
-        sourceHeight - Double(originY) - Double(size)
+        let horizontalOrigins = origins(for: width)
+        let verticalOrigins = origins(for: height)
+        return verticalOrigins.enumerated().flatMap { verticalIndex, y in
+            horizontalOrigins.enumerated().map { horizontalIndex, x in
+                RestoreAITile(
+                    originX: x,
+                    originY: y,
+                    outputScale: outputScale,
+                    overlapLeft: horizontalIndex > 0 ? tileSize - (x - horizontalOrigins[horizontalIndex - 1]) : 0,
+                    overlapRight: horizontalIndex + 1 < horizontalOrigins.count ? tileSize - (horizontalOrigins[horizontalIndex + 1] - x) : 0,
+                    overlapTop: verticalIndex > 0 ? tileSize - (y - verticalOrigins[verticalIndex - 1]) : 0,
+                    overlapBottom: verticalIndex + 1 < verticalOrigins.count ? tileSize - (verticalOrigins[verticalIndex + 1] - y) : 0
+                )
+            }
+        }
     }
 
     static func featherWeight(
@@ -45,11 +59,15 @@ enum RestoreAIMath {
         sourceOrigin: Int,
         sourceSize: Int,
         sourceImageSize: Int,
-        halo: Double
+        halo: Double,
+        haloLeft: Double? = nil,
+        haloRight: Double? = nil
     ) -> Double {
         guard halo > 0, halo.isFinite else { return 1 }
-        let left = sourceOrigin < 0 ? 1 : min(1, max(0, (Double(pixel) - Double(origin)) / halo))
-        let right = sourceOrigin + sourceSize > sourceImageSize ? 1 : min(1, max(0, (Double(origin + size) - Double(pixel)) / halo))
+        let leftHalo = max(1, haloLeft ?? halo)
+        let rightHalo = max(1, haloRight ?? halo)
+        let left = sourceOrigin <= 0 ? 1 : min(1, max(0, (Double(pixel) - Double(origin)) / leftHalo))
+        let right = sourceOrigin + sourceSize >= sourceImageSize ? 1 : min(1, max(0, (Double(origin + size) - Double(pixel)) / rightHalo))
         return min(left, right)
     }
 

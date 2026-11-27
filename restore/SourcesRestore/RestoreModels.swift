@@ -34,11 +34,11 @@ enum RestorePreset: String, Codable, CaseIterable, Identifiable {
         }
     }
 
-    func settings(scale: Double) -> RestorationSettings {
+    func settings(scale: Double, superResolutionModel: RestoreModelID = .realESRGAN) -> RestorationSettings {
         switch self {
-        case .smart: return RestorationSettings(preset: self, scale: scale, denoise: 0.28, sharpen: 0.52, color: 0.12)
-        case .portrait: return RestorationSettings(preset: self, scale: scale, denoise: 0.18, sharpen: 0.30, color: 0.08)
-        case .archive: return RestorationSettings(preset: self, scale: scale, denoise: 0.55, sharpen: 0.42, color: 0.34)
+        case .smart: return RestorationSettings(preset: self, superResolutionModel: superResolutionModel, scale: scale, denoise: 0.28, sharpen: 0.52, color: 0.12)
+        case .portrait: return RestorationSettings(preset: self, superResolutionModel: superResolutionModel, scale: scale, denoise: 0.18, sharpen: 0.30, color: 0.08)
+        case .archive: return RestorationSettings(preset: self, superResolutionModel: superResolutionModel, scale: scale, denoise: 0.55, sharpen: 0.42, color: 0.34)
         }
     }
 }
@@ -59,7 +59,7 @@ enum RestoreProcessingMode: String, Codable, CaseIterable, Identifiable {
     var subtitle: String {
         switch self {
         case .native: return "无需模型，改善噪点和色彩"
-        case .superResolution: return "生成 4 倍细节，再按输出上限缩放"
+        case .superResolution: return "按所选模型生成细节，再按输出上限缩放"
         case .inpainting: return "涂抹破损区域，按周围内容补全"
         }
     }
@@ -70,13 +70,6 @@ enum RestoreProcessingMode: String, Codable, CaseIterable, Identifiable {
         case .inpainting: return "bandage.fill"
         }
     }
-    var model: RestoreModelID? {
-        switch self {
-        case .native: return nil
-        case .superResolution: return .localSRFast
-        case .inpainting: return .aotGAN
-        }
-    }
     var maximumOutputLongEdge: Int { self == .superResolution ? 6144 : 4096 }
     var isAI: Bool { self != .native }
 }
@@ -84,11 +77,20 @@ enum RestoreProcessingMode: String, Codable, CaseIterable, Identifiable {
 struct RestorationSettings: Equatable, Codable {
     var preset: RestorePreset = .smart
     var mode: RestoreProcessingMode = .native
+    var superResolutionModel: RestoreModelID = .realESRGAN
     var scale: Double = 2
     var denoise: Double = 0.28
     var sharpen: Double = 0.52
     var color: Double = 0.12
     var mask: RestoreMask?
+
+    var model: RestoreModelID? {
+        switch mode {
+        case .native: return nil
+        case .superResolution: return superResolutionModel
+        case .inpainting: return .aotGAN
+        }
+    }
 
     var summary: String {
         switch mode {
@@ -97,7 +99,9 @@ struct RestorationSettings: Equatable, Codable {
             return "\(preset.title) · \(scaleText)× · 降噪 \(Int(denoise * 100))% · 锐化 \(Int(sharpen * 100))%"
         case .superResolution:
             let scaleText = scale == scale.rounded() ? String(Int(scale)) : String(format: "%.1f", scale)
-            return "AI 超分 · 模型 4× · 输出 \(scaleText)×"
+            let spec = RestoreModelCatalog.spec(for: superResolutionModel)
+            let factor = spec?.upscaleFactor.map { "\($0)×" } ?? "多倍"
+            return "AI 超分 · \(spec?.name ?? "本地模型") \(factor) · 输出 \(scaleText)×"
         case .inpainting:
             return "AI 缺损修补 · 原尺寸输出"
         }

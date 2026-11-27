@@ -1,6 +1,6 @@
 import Foundation
 import CoreML
-import CoreImage
+import CoreGraphics
 
 enum RestoreInpaintingRunner {
     static func run(
@@ -19,7 +19,6 @@ enum RestoreInpaintingRunner {
         let target = RestoreMath.fittedSize(width: decoded.width, height: decoded.height, scale: scale, maxLongEdge: max(outputWidth, outputHeight))
         try RestoreAIMath.validateOutput(width: target.width, height: target.height, isSuperResolution: false)
         let maskImage = try mask.rasterized(width: decoded.width, height: decoded.height)
-        let maskSource = CIImage(cgImage: maskImage)
         let model = try RestoreInferenceCore.loadModel(modelURL, spec: spec)
         let tileSize = spec.tileSize
         let overlap = spec.overlap
@@ -32,26 +31,30 @@ enum RestoreInpaintingRunner {
         )
         let tiles = allTiles.filter { intersectsMask($0, mask: maskImage, imageWidth: decoded.width, imageHeight: decoded.height, tileSize: tileSize) }
         guard !tiles.isEmpty else { throw RestoreError.emptyMask }
-        let context = CIContext(options: [.cacheIntermediates: false, .useSoftwareRenderer: true])
-        let canvas = try RestorePixelCanvas(width: target.width, height: target.height, source: decoded.image)
+        let canvas = try RestorePixelCanvas(width: target.width, height: target.height)
+        let weights = try RestoreBlendWeights(width: target.width, height: target.height)
         let input = try MLMultiArray(shape: spec.inputShape.map { NSNumber(value: $0) }, dataType: .float32)
         RestoreJournal.line("AI 修补：\(decoded.width)×\(decoded.height)，蒙版命中 \(tiles.count) 个 \(tileSize)px 小块")
 
         for (index, tile) in tiles.enumerated() {
             try Task.checkCancellation()
-            let sourceTile = try RestoreInferenceCore.sourceTile(decoded.source, originX: tile.originX, originY: tile.originY, size: tileSize, context: context)
-            let maskTile = try RestoreInferenceCore.maskTile(maskSource, originX: tile.originX, originY: tile.originY, size: tileSize, context: context)
+            let sourceTile = try RestoreInferenceCore.sourceTile(decoded.image, originX: tile.originX, originY: tile.originY, size: tileSize)
+            let maskTile = try RestoreInferenceCore.maskTile(maskImage, originX: tile.originX, originY: tile.originY, size: tileSize)
             try fillInput(input, source: sourceTile, mask: maskTile)
             let prediction = try RestoreInferenceCore.predict(model, input: input, spec: spec)
             let tileImage = try makeOutputImage(prediction)
             try RestoreInferenceCore.blend(
                 canvas: canvas,
+                weights: weights,
                 tileImage: tileImage,
                 originX: tile.originX,
                 originY: tile.originY,
                 tileSize: tileSize,
                 overlap: overlap,
-                scale: scale,
+                overlapLeft: tile.overlapLeft,
+                overlapRight: tile.overlapRight,
+                overlapTop: tile.overlapTop,
+                overlapBottom: tile.overlapBottom,
                 sourceImageWidth: decoded.width,
                 sourceImageHeight: decoded.height,
                 maskImage: maskTile
@@ -59,6 +62,7 @@ enum RestoreInpaintingRunner {
             await progress(0.1 + Double(index + 1) / Double(tiles.count) * 0.84, "AI 修补 \(index + 1)/\(tiles.count) 块")
         }
         try Task.checkCancellation()
+        try weights.composite(canvas, over: decoded.image)
         await progress(0.96, "编码 AI 修补结果")
         RestoreJournal.line("AI 修补：\(tiles.count) 个分块全部完成")
         return try await RestoreInferenceCore.writeJPEG(canvas.makeImage())

@@ -64,7 +64,7 @@ struct RestoreSettingsView: View {
                     Image(systemName: "square.stack.3d.down.forward.line.vertical").foregroundStyle(RestoreTheme.cyan)
                     VStack(alignment: .leading, spacing: 4) {
                         Text("AI 模型").font(.subheadline.weight(.bold))
-                        Text("下载、校验和管理照片超分与修补模型").font(.caption2).foregroundStyle(RestoreTheme.secondary)
+                        Text("查看内置高画质模型，下载、校验和管理其他修复模型").font(.caption2).foregroundStyle(RestoreTheme.secondary)
                     }
                     Spacer()
                     Image(systemName: "chevron.right").font(.caption).foregroundStyle(RestoreTheme.secondary)

@@ -28,7 +28,10 @@ final class RestoreModelManager: ObservableObject {
     }
 
     func state(for id: RestoreModelID) -> RestoreModelInstallState {
-        states[id] ?? .notInstalled
+        if let spec = RestoreModelCatalog.spec(for: id), spec.isBundled {
+            return bundledModelURL(spec) != nil ? .installed : .failed("安装包中缺少模型资源")
+        }
+        return states[id] ?? .notInstalled
     }
 
     func isInstalled(_ id: RestoreModelID) -> Bool {
@@ -37,7 +40,7 @@ final class RestoreModelManager: ObservableObject {
     }
 
     func download(_ id: RestoreModelID) {
-        guard !isInstalled(id), tasks[id] == nil, let spec = RestoreModelCatalog.spec(for: id) else { return }
+        guard !isInstalled(id), tasks[id] == nil, let spec = RestoreModelCatalog.spec(for: id), !spec.isBundled else { return }
         message = nil
         states[id] = .downloading(0)
         tasks[id] = Task { [weak self] in
@@ -85,6 +88,10 @@ final class RestoreModelManager: ObservableObject {
             await task.value
         }
         let name = RestoreModelCatalog.spec(for: id)?.name ?? "AI 模型"
+        if RestoreModelCatalog.spec(for: id)?.isBundled == true {
+            message = "\(name) 已内置在安装包中，无需下载，也不能删除"
+            return
+        }
         guard activeModelUses[id, default: 0] == 0 else {
             message = "\(name) 正在用于照片修复，请完成或停止后再删除"
             return
@@ -118,6 +125,10 @@ final class RestoreModelManager: ObservableObject {
 
     func modelURL(for id: RestoreModelID) throws -> URL {
         guard let spec = RestoreModelCatalog.spec(for: id) else { throw RestoreError.modelNotInstalled }
+        if spec.isBundled {
+            guard let url = bundledModelURL(spec) else { throw RestoreError.modelNotInstalled }
+            return url
+        }
         let marker = readyMarker(id: id)
         guard let record = try? JSONDecoder().decode(ReadyRecord.self, from: Data(contentsOf: marker)),
               record.version == spec.version,
@@ -239,6 +250,13 @@ final class RestoreModelManager: ObservableObject {
         let marker = readyMarker(id: spec.id)
         try FileManager.default.createDirectory(at: marker.deletingLastPathComponent(), withIntermediateDirectories: true)
         try JSONEncoder().encode(record).write(to: marker, options: .atomic)
+    }
+
+    private func bundledModelURL(_ spec: RestoreModelSpec) -> URL? {
+        let name = URL(fileURLWithPath: spec.bundleRelativePath).deletingPathExtension().lastPathComponent
+        guard let url = Bundle.main.url(forResource: name, withExtension: "mlmodelc"),
+              FileManager.default.fileExists(atPath: url.path) else { return nil }
+        return url
     }
 
     private func readyMarker(id: RestoreModelID) -> URL {

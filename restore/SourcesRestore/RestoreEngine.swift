@@ -94,10 +94,10 @@ enum RestoreEngine {
         try RestoreAIMath.validateOutput(width: target.width, height: target.height, isSuperResolution: settings.mode == .superResolution)
         try Task.checkCancellation()
         await progress(0.06, "加载本地 AI 模型")
-        RestoreJournal.line("照片 AI 处理：\(settings.mode.rawValue)，模型 \(modelURL.lastPathComponent)")
+        guard let spec = settings.model.flatMap({ RestoreModelCatalog.spec(for: $0) }) else { throw RestoreError.modelNotInstalled }
+        RestoreJournal.line("照片 AI 处理：\(settings.mode.rawValue)，模型 \(spec.name) \(spec.technicalSummary)")
         switch settings.mode {
         case .superResolution:
-            guard let spec = settings.mode.model.flatMap({ RestoreModelCatalog.spec(for: $0) }) else { throw RestoreError.modelNotInstalled }
             return try await RestoreSuperResolutionRunner.run(
                 from: url,
                 modelURL: modelURL,
@@ -108,7 +108,6 @@ enum RestoreEngine {
             )
         case .inpainting:
             guard let mask = settings.mask, !mask.isEmpty else { throw RestoreError.emptyMask }
-            guard let spec = settings.mode.model.flatMap({ RestoreModelCatalog.spec(for: $0) }) else { throw RestoreError.modelNotInstalled }
             return try await RestoreInpaintingRunner.run(
                 from: url,
                 modelURL: modelURL,

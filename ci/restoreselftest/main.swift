@@ -101,16 +101,36 @@ let compacted = RestoreJournal.compact(largeLines)
 expect(compacted.joined(separator: "\n").utf8.count <= 512 * 1024, "runtime journal respects its byte cap")
 
 let singleAITile = RestoreAIMath.tilePlan(width: 300, height: 200, tileSize: 384, overlap: 8, outputScale: 1)
-expect(singleAITile.count == 1 && singleAITile[0].originX == -8 && singleAITile[0].originY == -8, "small AI image uses one padded tile")
+expect(singleAITile.count == 1 && singleAITile[0].originX == 0 && singleAITile[0].originY == 0, "small AI image uses one padded tile")
 let edgeAITiles = RestoreAIMath.tilePlan(width: 384, height: 384, tileSize: 384, overlap: 8, outputScale: 1)
-expect(edgeAITiles.count == 4 && edgeAITiles.contains { $0.originX == 360 }, "AI tile grid covers both edges with overlap")
-let upperTileOffset = RestoreAIMath.sourceTileVerticalOffset(sourceHeight: 790, originY: 360, size: 384)
-expect(upperTileOffset == 46 && 790 - (upperTileOffset + 384) == 360, "AI tiles select the correct photo rows from Core Image bottom-left coordinates")
-let paddedTileOffset = RestoreAIMath.sourceTileVerticalOffset(sourceHeight: 790, originY: -8, size: 384)
-expect(paddedTileOffset == 414 && 790 - paddedTileOffset == 376, "AI padded tiles select the top edge without shifting content")
-let overlapWeightsSum = (360..<376).allSatisfy { pixel in
-    let first = RestoreAIMath.featherWeight(pixel: pixel, origin: -8, size: 384, sourceOrigin: -8, sourceSize: 384, sourceImageSize: 800, halo: 16)
-    let second = RestoreAIMath.featherWeight(pixel: pixel, origin: 360, size: 384, sourceOrigin: 360, sourceSize: 384, sourceImageSize: 800, halo: 16)
+expect(edgeAITiles.count == 1 && edgeAITiles[0].originX == 0, "exact-size AI image does not create empty edge tiles")
+let phoneAITiles = RestoreAIMath.tilePlan(width: 585, height: 790, tileSize: 384, overlap: 8, outputScale: 2)
+expect(phoneAITiles.count == 6, "585x790 AI image uses a complete 2x3 tile grid")
+expect(Set(phoneAITiles.map { $0.originX }) == Set([0, 201]), "AI columns do not add a redundant overlapping tile")
+expect(Set(phoneAITiles.map { $0.originY }) == Set([0, 368, 406]), "AI rows cover the full photo height")
+expect(phoneAITiles.contains { $0.originX == 0 && $0.originY == 0 }, "AI tile grid starts at the top-left photo boundary")
+expect(phoneAITiles.contains { $0.originX == 201 && $0.originY == 406 }, "AI edge tiles stay anchored to the right and bottom photo boundaries")
+expect(phoneAITiles.allSatisfy { $0.originX >= 0 && $0.originX + 384 <= 585 && $0.originY >= 0 && $0.originY + 384 <= 790 }, "AI tiles never extend beyond the source photo")
+let firstPhoneTile = phoneAITiles.first { $0.originX == 0 && $0.originY == 0 }!
+let rightPhoneTile = phoneAITiles.first { $0.originX == 201 && $0.originY == 0 }!
+let lowerPhoneTile = phoneAITiles.first { $0.originX == 0 && $0.originY == 368 }!
+let bottomPhoneTile = phoneAITiles.first { $0.originX == 0 && $0.originY == 406 }!
+expect(firstPhoneTile.overlapRight == 183 && rightPhoneTile.overlapLeft == 183, "edge anchoring records the actual 183px horizontal overlap")
+expect(lowerPhoneTile.overlapBottom == 346 && bottomPhoneTile.overlapTop == 346, "edge anchoring records the actual 346px vertical overlap")
+let largeOverlapWeightsSum = (201..<384).allSatisfy { pixel in
+    let first = RestoreAIMath.featherWeight(pixel: pixel, origin: 0, size: 384, sourceOrigin: 0, sourceSize: 384, sourceImageSize: 585, halo: firstPhoneTile.overlapRight)
+    let second = RestoreAIMath.featherWeight(pixel: pixel, origin: 201, size: 384, sourceOrigin: 201, sourceSize: 384, sourceImageSize: 585, halo: rightPhoneTile.overlapLeft)
+    return abs(first + second - 1) < 0.00001
+}
+expect(largeOverlapWeightsSum, "actual large-overlap feather weights remain complementary without darkening")
+expect(RestoreAIMath.featherWeight(pixel: 184, origin: 0, size: 384, sourceOrigin: 0, sourceSize: 384, sourceImageSize: 585, halo: firstPhoneTile.overlapRight) == 1, "large-overlap feathering does not dim pixels before the overlap begins")
+let wideAITiles = RestoreAIMath.tilePlan(width: 800, height: 100, tileSize: 384, overlap: 8, outputScale: 1)
+expect(wideAITiles.map { $0.originX } == [0, 368, 416], "wide AI images anchor the final column after regular overlap")
+expect(RestoreAIMath.featherWeight(pixel: 0, origin: 0, size: 384, sourceOrigin: 0, sourceSize: 384, sourceImageSize: 585, halo: 8) == 1, "AI source left edge keeps full tile weight")
+expect(RestoreAIMath.featherWeight(pixel: 383, origin: 201, size: 384, sourceOrigin: 201, sourceSize: 384, sourceImageSize: 585, halo: 8) == 1, "AI source right edge keeps full tile weight")
+let overlapWeightsSum = (368..<384).allSatisfy { pixel in
+    let first = RestoreAIMath.featherWeight(pixel: pixel, origin: 0, size: 384, sourceOrigin: 0, sourceSize: 384, sourceImageSize: 800, halo: 16)
+    let second = RestoreAIMath.featherWeight(pixel: pixel, origin: 368, size: 384, sourceOrigin: 368, sourceSize: 384, sourceImageSize: 800, halo: 16)
     return abs(first + second - 1) < 0.00001
 }
 expect(overlapWeightsSum, "AI feather weights span the full overlap and sum to one")
@@ -128,6 +148,17 @@ try RestoreAIMath.validateOutput(width: 4096, height: 3072, isSuperResolution: f
 expect(true, "AI inpainting accepts a 12MP output")
 
 let srSpec = RestoreModelCatalog.spec(for: .localSRFast)!
+let realSpec = RestoreModelCatalog.spec(for: .realESRGAN)!
+expect(realSpec.isBundled && realSpec.totalByteCount == 33580688 && realSpec.artifacts.isEmpty, "RealESRGAN is packaged offline at its verified size")
+expect(realSpec.inputName == "image" && realSpec.outputName == "out", "RealESRGAN tensor names match the verified model")
+expect(realSpec.inputShape == [1, 3, 384, 384] && realSpec.outputShape == [1, 3, 768, 768], "RealESRGAN tensor shapes match the verified model")
+expect(realSpec.dataType == .float32 && realSpec.compute == .gpu && realSpec.overlap == 32, "RealESRGAN uses its verified FP32 tensor interface with GPU tiling")
+expect(realSpec.upscaleFactor == 2 && srSpec.upscaleFactor == 4, "super-resolution summaries distinguish 2x and 4x models")
+expect(RestoreModelCatalog.all.count == 3, "model catalog includes RealESRGAN, LocalSR Fast, and AOT-GAN")
+let encodedModelID = try JSONEncoder().encode(RestoreModelID.realESRGAN)
+let decodedModelID = try JSONDecoder().decode(RestoreModelID.self, from: encodedModelID)
+expect(decodedModelID == .realESRGAN, "selected super-resolution model survives Codable settings round trips")
+
 expect(srSpec.inputName == "image" && srSpec.outputName == "out", "LocalSR tensor names match the verified model")
 expect(srSpec.inputShape == [1, 3, 384, 384] && srSpec.outputShape == [1, 3, 1536, 1536], "LocalSR tensor shapes match the verified model")
 let localSRHashes = [

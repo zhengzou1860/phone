@@ -16,6 +16,8 @@ targets:
     sources:
       - SourcesRestore
       - Assets.xcassets
+      - Resources/RealESRGAN_x2plus_384_fp16.mlmodel
+      - Resources/RealESRGAN_LICENSE.txt
     info:
       path: Info-HiRestore.plist
       properties:
@@ -24,8 +26,8 @@ targets:
         CFBundleExecutable: HiRestore
         CFBundleIdentifier: com.qoder.hirestore
         CFBundlePackageType: APPL
-        CFBundleShortVersionString: "0.3.6"
-        CFBundleVersion: "11"
+        CFBundleShortVersionString: "0.3.7"
+        CFBundleVersion: "12"
         CFBundleInfoDictionaryVersion: "6.0"
         NSPhotoLibraryAddUsageDescription: 修复完成后，需要你的允许才能把照片或视频保存到系统相册。
         NSLocalNetworkUsageDescription: 在你点击上传时，连接同一 Wi-Fi 中自己的电脑，发送运行日志或修复结果用于调试。
