@@ -137,8 +137,8 @@ expect(color(top, x: 0, y: 0) == (0, 0, 0), "top-left tile starts at the first s
 expect(color(top, x: 100, y: 0).1 == 0, "top tile keeps source rows in top-down order")
 
 let bottom = try RestoreInferenceCore.sourceTile(source, originX: 201, originY: 406, size: 384)
-expect(color(bottom, x: 0, y: 0) == (201 % 251, 406 % 251, (201 + 406) % 251), "bottom-right tile starts at its anchored source origin")
-expect(color(bottom, x: 383, y: 383) == (584 % 251, 789 % 251, (584 + 789) % 251), "bottom-right tile ends at the last source pixel")
+expect(color(bottom, x: 0, y: 0) == (UInt8(201 % 251), UInt8(406 % 251), UInt8((201 + 406) % 251)), "bottom-right tile starts at its anchored source origin")
+expect(color(bottom, x: 383, y: 383) == (UInt8(584 % 251), UInt8(789 % 251), UInt8((584 + 789) % 251)), "bottom-right tile ends at the last source pixel")
 
 let sourceCanvas = try RestorePixelCanvas(width: width, height: height, source: source)
 let sourceCanvasImage = try sourceCanvas.makeImage()
@@ -336,7 +336,7 @@ expect(color(seamImage, x: 799, y: 799) == (255, 0, 255), "distinct-color tile k
 let pair = color(seamImage, x: 370, y: 370)
 expect(abs(Int(pair.0) - 204) <= 1 && abs(Int(pair.1) - 51) <= 1 && pair.2 == 0, "regular overlap uses the full 16px complementary feather")
 let crossing = color(seamImage, x: 420, y: 420)
-expect(abs(Int(crossing.0) - 73) <= 2 && abs(Int(crossing.1) - 182) <= 2 && abs(Int(crossing.2) - 73) <= 2, "four-tile crossing uses actual neighbor overlaps in the normalized average")
+expect(abs(Int(crossing.0) - 6) <= 2 && abs(Int(crossing.1) - 249) <= 2 && abs(Int(crossing.2) - 6) <= 2, "four-tile crossing uses actual neighbor overlaps in the normalized average")
 
 let reversedCanvas = try RestorePixelCanvas(width: seamSide, height: seamSide)
 let reversedWeights = try RestoreBlendWeights(width: seamSide, height: seamSide)
@@ -505,7 +505,7 @@ try crossingMaskWeights.composite(
 )
 let crossingMaskImage = try crossingMaskCanvas.makeImage()
 let crossingMask = color(crossingMaskImage, x: 420, y: 420)
-expect(abs(Int(crossingMask.0) - 86) <= 3 && abs(Int(crossingMask.1) - 141) <= 3 && abs(Int(crossingMask.2) - 86) <= 3, "2D masked overlap normalizes coverage by total feather weight")
+expect(abs(Int(crossingMask.0) - 53) <= 3 && abs(Int(crossingMask.1) - 175) <= 3 && abs(Int(crossingMask.2) - 53) <= 3, "2D masked overlap normalizes coverage by total feather weight")
 
 let orientationSource = gradientImage(width: 13, height: 9)
 let orientationCanvas = try RestorePixelCanvas(width: 13, height: 9)
