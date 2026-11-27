@@ -208,12 +208,7 @@ expect(colorsClose(smallModelFirst, color(validPrediction, x: 0, y: 0)), "small 
 expect(colorsClose(smallModelLast, color(validPrediction, x: 599, y: 399)), "small 2x model output excludes padding instead of squeezing it into the photo")
 expect(colorsClose(smallModelMiddle, color(validPrediction, x: 250, y: 200)), "small 2x model output keeps valid content at native model coordinates")
 
-let edgePrediction = try RestorePixelCanvas(width: 768, height: 768)
-edgePrediction.context.setFillColor(CGColor(red: 1, green: 0, blue: 1, alpha: 1))
-edgePrediction.context.fill(CGRect(x: 0, y: 0, width: 768, height: 768))
-edgePrediction.context.setFillColor(CGColor(red: 1, green: 0, blue: 0, alpha: 1))
-edgePrediction.context.fill(CGRect(x: 0, y: 0, width: 384 * modelScale, height: 384 * modelScale))
-let edgePredictionImage = try edgePrediction.makeImage()
+let edgePredictionImage = solidImage(width: 768, height: 768, red: 255, green: 0, blue: 0)
 let edgePredictionLast = color(edgePredictionImage, x: 767, y: 767)
 let edgeCroppedPrediction = edgePredictionImage.cropping(to: CGRect(x: 0, y: 0, width: 768, height: 768))!
 let edgeCroppedLast = color(edgeCroppedPrediction, x: 767, y: 767)
