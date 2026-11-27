@@ -161,6 +161,8 @@ expect(color(paddedTile, x: 300, y: 0) == (255, 0, 0), "small source tile extend
 expect(color(paddedTile, x: 0, y: 200) == (255, 0, 0), "small source tile extends the bottom edge instead of stretching")
 let smallGradient = gradientImage(width: 300, height: 200)
 let paddedGradient = try RestoreInferenceCore.sourceTile(smallGradient, originX: 0, originY: 0, size: 384)
+expect(colorsClose(color(paddedGradient, x: 0, y: 0), color(smallGradient, x: 0, y: 0)), "small source tile keeps its top-left pixel at the tile origin")
+expect(colorsClose(color(paddedGradient, x: 299, y: 199), color(smallGradient, x: 299, y: 199)), "small source tile keeps its bottom-right pixel at native coordinates")
 let rightPadding = color(paddedGradient, x: 300, y: 100)
 let rightPaddingSource = color(smallGradient, x: 299, y: 100)
 let bottomPadding = color(paddedGradient, x: 100, y: 200)
@@ -221,6 +223,7 @@ expect(color(edgeModelImage, x: 585 * modelScale - 1, y: 790 * modelScale - 1) =
 
 let smallMask = solidImage(width: 300, height: 200, red: 255, green: 255, blue: 255)
 let paddedMask = try RestoreInferenceCore.maskTile(smallMask, originX: 0, originY: 0, size: 384)
+expect(alpha(paddedMask, x: 0, y: 0) == 255 && alpha(paddedMask, x: 0, y: 383) == 0, "small mask tile keeps valid pixels at the top and pads the bottom")
 expect(alpha(paddedMask, x: 299, y: 199) == 255 && alpha(paddedMask, x: 300, y: 0) == 0, "small mask tile pads with transparent pixels")
 let grayMaskTile = try RestoreInferenceCore.maskTile(grayImage(width: 300, height: 200, value: 128), originX: 0, originY: 0, size: 384)
 let grayMaskPixel = color(grayMaskTile, x: 299, y: 199)

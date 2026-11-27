@@ -209,7 +209,10 @@ enum RestoreInferenceCore {
         let validHeight = min(size, image.height - originY)
         if validWidth > 0, validHeight > 0,
            let cropped = image.cropping(to: CGRect(x: originX, y: originY, width: validWidth, height: validHeight)) {
-            tile.draw(cropped, in: CGRect(x: 0, y: 0, width: validWidth, height: validHeight))
+            tile.draw(
+                cropped,
+                in: CGRect(x: 0, y: size - validHeight, width: validWidth, height: validHeight)
+            )
         }
         guard let rendered = tile.makeImage() else { throw RestoreError.inferenceFailed("无法生成推理小块") }
         guard !clear, validWidth > 0, validHeight > 0,
@@ -240,18 +243,18 @@ enum RestoreInferenceCore {
         if validWidth < size {
             for y in 0..<validHeight {
                 tile.setFillColor(edgeColor(x: validWidth - 1, y: y))
-                tile.fill(CGRect(x: validWidth, y: y, width: size - validWidth, height: 1))
+                tile.fill(CGRect(x: validWidth, y: size - 1 - y, width: size - validWidth, height: 1))
             }
         }
         if validHeight < size {
             for x in 0..<validWidth {
                 tile.setFillColor(edgeColor(x: x, y: validHeight - 1))
-                tile.fill(CGRect(x: x, y: validHeight, width: 1, height: size - validHeight))
+                tile.fill(CGRect(x: x, y: 0, width: 1, height: size - validHeight))
             }
         }
         if validWidth < size, validHeight < size {
             tile.setFillColor(edgeColor(x: validWidth - 1, y: validHeight - 1))
-            tile.fill(CGRect(x: validWidth, y: validHeight, width: size - validWidth, height: size - validHeight))
+            tile.fill(CGRect(x: validWidth, y: 0, width: size - validWidth, height: size - validHeight))
         }
         guard let result = tile.makeImage() else { throw RestoreError.inferenceFailed("无法生成推理小块") }
         return result
