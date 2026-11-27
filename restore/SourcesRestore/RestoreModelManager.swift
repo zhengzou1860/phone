@@ -200,6 +200,7 @@ final class RestoreModelManager: ObservableObject {
                 try Task.checkCancellation()
                 do {
                     try await downloadArtifact(artifact, from: source, session: session, staging: staging)
+                    RestoreJournal.line("AI 模型下载源成功：\(URL(string: source)?.host ?? source)")
                     downloaded = true
                     break
                 } catch {

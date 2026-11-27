@@ -128,6 +128,7 @@ struct RestoreModelSpec: Equatable, Identifiable {
 enum RestoreModelCatalog {
     private static let localSRCommit = "bba30194995e2815364f111168fb15155a24920f"
     private static let aotCommit = "8b3dcd14fc9ca89c08f7485b97ade6040640d835"
+    private static let gfpganURL = "https://github.com/zhengzou1860/phone/releases/download/channel-hirestore-models/gfpgan.mlmodel"
 
     static let all: [RestoreModelSpec] = [realESRGAN, localSRFast, gfpgan, aotGAN]
 
@@ -196,9 +197,13 @@ enum RestoreModelCatalog {
         bundleRelativePath: "gfpgan.mlmodel",
         artifacts: [RestoreModelArtifact(
             relativePath: "gfpgan.mlmodel",
-            downloadURL: "https://github.com/zhengzou1860/phone/releases/download/channel-hirestore-models/gfpgan.mlmodel",
+            downloadURL: gfpganURL,
             byteCount: 337_392_296,
-            sha256: "218a39c226adecb2ccbc1e358023b80a5cf2510be85dfc3ab0da698fad51391a"
+            sha256: "218a39c226adecb2ccbc1e358023b80a5cf2510be85dfc3ab0da698fad51391a",
+            alternateDownloadURLs: [
+                "https://gh-proxy.com/\(gfpganURL)",
+                "https://ghfast.top/\(gfpganURL)"
+            ]
         )],
         catalogHash: "gfpgan-coreml-512-image-v1",
         packagedByteCount: nil,

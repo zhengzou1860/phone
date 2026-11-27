@@ -409,7 +409,7 @@ struct RestoreEditorView: View {
                     case .notInstalled:
                         Button("下载 \(RestoreMath.formatBytes(spec.totalByteCount)) 人脸模型") { models.download(.gfpgan) }
                             .font(.caption.weight(.semibold))
-                        Text("首次下载约 322 MiB，建议连接 Wi-Fi 并保持 App 在前台；下载校验后完全离线推理。")
+                        Text("首次下载约 322 MiB，优先使用加速线路，失败自动回退官方源；建议连接 Wi-Fi 并保持 App 在前台。下载校验后完全离线推理。")
                             .font(.caption2)
                             .foregroundStyle(RestoreTheme.secondary)
                     case .installed:
