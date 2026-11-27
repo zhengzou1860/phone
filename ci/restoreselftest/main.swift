@@ -118,12 +118,12 @@ let bottomPhoneTile = phoneAITiles.first { $0.originX == 0 && $0.originY == 406 
 expect(firstPhoneTile.overlapRight == 183 && rightPhoneTile.overlapLeft == 183, "edge anchoring records the actual 183px horizontal overlap")
 expect(lowerPhoneTile.overlapBottom == 346 && bottomPhoneTile.overlapTop == 346, "edge anchoring records the actual 346px vertical overlap")
 let largeOverlapWeightsSum = (201..<384).allSatisfy { pixel in
-    let first = RestoreAIMath.featherWeight(pixel: pixel, origin: 0, size: 384, sourceOrigin: 0, sourceSize: 384, sourceImageSize: 585, halo: firstPhoneTile.overlapRight)
-    let second = RestoreAIMath.featherWeight(pixel: pixel, origin: 201, size: 384, sourceOrigin: 201, sourceSize: 384, sourceImageSize: 585, halo: rightPhoneTile.overlapLeft)
+    let first = RestoreAIMath.featherWeight(pixel: pixel, origin: 0, size: 384, sourceOrigin: 0, sourceSize: 384, sourceImageSize: 585, halo: Double(firstPhoneTile.overlapRight))
+    let second = RestoreAIMath.featherWeight(pixel: pixel, origin: 201, size: 384, sourceOrigin: 201, sourceSize: 384, sourceImageSize: 585, halo: Double(rightPhoneTile.overlapLeft))
     return abs(first + second - 1) < 0.00001
 }
 expect(largeOverlapWeightsSum, "actual large-overlap feather weights remain complementary without darkening")
-expect(RestoreAIMath.featherWeight(pixel: 184, origin: 0, size: 384, sourceOrigin: 0, sourceSize: 384, sourceImageSize: 585, halo: firstPhoneTile.overlapRight) == 1, "large-overlap feathering does not dim pixels before the overlap begins")
+expect(RestoreAIMath.featherWeight(pixel: 184, origin: 0, size: 384, sourceOrigin: 0, sourceSize: 384, sourceImageSize: 585, halo: Double(firstPhoneTile.overlapRight)) == 1, "large-overlap feathering does not dim pixels before the overlap begins")
 let wideAITiles = RestoreAIMath.tilePlan(width: 800, height: 100, tileSize: 384, overlap: 8, outputScale: 1)
 expect(wideAITiles.map { $0.originX } == [0, 368, 416], "wide AI images anchor the final column after regular overlap")
 expect(RestoreAIMath.featherWeight(pixel: 0, origin: 0, size: 384, sourceOrigin: 0, sourceSize: 384, sourceImageSize: 585, halo: 8) == 1, "AI source left edge keeps full tile weight")
