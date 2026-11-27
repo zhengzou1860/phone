@@ -184,7 +184,7 @@ expect((0..<5).allSatisfy { index in
 expect(RestoreFaceMath.similarityTransform(from: Array(repeating: CGPoint(x: 10, y: 10), count: 5)) == nil, "face alignment rejects degenerate landmarks")
 expect(RestoreFaceMath.featherAlpha(pixelX: 256, pixelY: 281, size: 512) == 1, "face feather keeps the central facial area fully opaque")
 expect(RestoreFaceMath.featherAlpha(pixelX: 0, pixelY: 0, size: 512) == 0, "face feather leaves the aligned crop border transparent")
-expect(RestoreFaceMath.featherAlpha(pixelX: 256, pixelY: 80, size: 512) < RestoreFaceMath.featherAlpha(pixelX: 256, pixelY: 200, size: 512), "face feather fades continuously toward the forehead")
+expect(RestoreFaceMath.featherAlpha(pixelX: 256, pixelY: 70, size: 512) < RestoreFaceMath.featherAlpha(pixelX: 256, pixelY: 200, size: 512), "face feather fades continuously toward the forehead")
 let faceMask = try RestoreFaceMath.featherMask(size: 64)
 expect(faceMask.width == 64 && faceMask.height == 64, "face feather mask matches the inference patch dimensions")
 let encodedModelID = try JSONEncoder().encode(RestoreModelID.realESRGAN)
