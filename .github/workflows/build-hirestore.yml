@@ -12,6 +12,11 @@ on:
       - 'tools/start_hirestore.bat'
       - '.github/workflows/build-hirestore.yml'
   workflow_dispatch:
+    inputs:
+      publish_models:
+        description: Publish verified offline face models
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -22,6 +27,7 @@ concurrency:
 
 jobs:
   hirestore:
+    if: ${{ github.event.inputs.publish_models != 'true' }}
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
@@ -217,3 +223,9 @@ jobs:
           gh release delete channel-hirestore-fail --cleanup-tag -y >/dev/null 2>&1 || true
           gh release create channel-hirestore-fail build.log \
             --title "HiRestore CI failed log" --prerelease --notes "no IPA this round" 2>&1 | ann "GH-FAIL "
+
+  gfpgan:
+    if: ${{ github.event.inputs.publish_models == 'true' }}
+    uses: ./.github/workflows/publish-hirestore-models.yml
+    permissions:
+      contents: write
