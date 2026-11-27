@@ -20,12 +20,12 @@ enum RestoreModelArchive {
                 throw invalidArchive("文件头无效")
             }
             let header = try read(reader, count: 26)
-            let flags = integer(header, offset: 6, width: 2)
-            let method = integer(header, offset: 8, width: 2)
-            let compressedSize = integer(header, offset: 18, width: 4)
-            let size = integer(header, offset: 22, width: 4)
-            let nameLength = integer(header, offset: 26, width: 2)
-            let extraLength = integer(header, offset: 28, width: 2)
+            let flags = integer(header, offset: 2, width: 2)
+            let method = integer(header, offset: 4, width: 2)
+            let compressedSize = integer(header, offset: 14, width: 4)
+            let size = integer(header, offset: 18, width: 4)
+            let nameLength = integer(header, offset: 22, width: 2)
+            let extraLength = integer(header, offset: 24, width: 2)
             guard flags & 0x0009 == 0, method == 0, compressedSize == size,
                   nameLength > 0, nameLength <= 4096, extraLength <= 65_535,
                   size <= 2 * 1024 * 1024 * 1024 else {
