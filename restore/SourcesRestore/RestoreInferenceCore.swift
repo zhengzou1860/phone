@@ -341,9 +341,16 @@ enum RestoreInferenceCore {
             canvas.context.draw(cropped, in: CGRect(x: 0, y: 0, width: outputWidth, height: outputHeight))
             return canvas
         }
+        let renderedTile = try tile.makeImage()
+        guard let tileProvider = renderedTile.dataProvider, let tilePixelData = tileProvider.data else {
+            throw RestoreError.inferenceFailed("无法读取模型输出小块")
+        }
+        let tileSnapshotData = tilePixelData as NSData
+        let tileBase = tileSnapshotData.bytes.assumingMemoryBound(to: UInt8.self)
+        let renderedMask = try maskCanvas?.makeImage()
+        let maskSnapshotData = renderedMask?.dataProvider?.data as NSData?
+        let maskBase = maskSnapshotData?.bytes.assumingMemoryBound(to: UInt8.self)
         let destinationBase = canvas.data.mutableBytes.assumingMemoryBound(to: UInt8.self)
-        let tileBase = tile.data.mutableBytes.assumingMemoryBound(to: UInt8.self)
-        let maskBase = maskCanvas?.data.mutableBytes.assumingMemoryBound(to: UInt8.self)
         let minX = max(0, outputOriginX)
         let maxX = min(canvas.width, outputOriginX + outputWidth)
         let minY = max(0, outputOriginY)

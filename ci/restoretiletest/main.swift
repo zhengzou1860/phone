@@ -141,6 +141,18 @@ func grayImage(width: Int, height: Int, value: UInt8) -> CGImage {
 let top = try RestoreInferenceCore.sourceTile(source, originX: 0, originY: 0, size: 384)
 expect(color(top, x: 0, y: 0) == (0, 0, 0), "top-left tile starts at the first source pixel")
 expect(color(top, x: 100, y: 0).1 == 0, "top tile keeps source rows in top-down order")
+let topBytes = (top.dataProvider!.data! as NSData).bytes.assumingMemoryBound(to: UInt8.self)
+let topMismatchCount = (0..<384).reduce(0) { count, y in
+    count + (0..<384).filter { x in
+        let tileOffset = y * top.bytesPerRow + x * 4
+        let sourceOffset = y * bytesPerRow + x * 4
+        return topBytes[tileOffset] != pixels[sourceOffset]
+            || topBytes[tileOffset + 1] != pixels[sourceOffset + 1]
+            || topBytes[tileOffset + 2] != pixels[sourceOffset + 2]
+    }.count
+}
+print("RESTORE-TILE DETAIL source-tile mismatches=\(topMismatchCount)/147456")
+expect(topMismatchCount == 0, "source tile preserves every valid pixel before inference")
 
 let bottom = try RestoreInferenceCore.sourceTile(source, originX: 201, originY: 406, size: 384)
 expect(color(bottom, x: 0, y: 0) == (UInt8(201 % 251), UInt8(406 % 251), UInt8((201 + 406) % 251)), "bottom-right tile starts at its anchored source origin")
