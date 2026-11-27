@@ -212,7 +212,7 @@ let edgePrediction = try RestorePixelCanvas(width: 768, height: 768)
 edgePrediction.context.setFillColor(CGColor(red: 1, green: 0, blue: 1, alpha: 1))
 edgePrediction.context.fill(CGRect(x: 0, y: 0, width: 768, height: 768))
 edgePrediction.context.setFillColor(CGColor(red: 1, green: 0, blue: 0, alpha: 1))
-edgePrediction.context.fill(CGRect(x: 0, y: 0, width: 183 * modelScale, height: 384 * modelScale))
+edgePrediction.context.fill(CGRect(x: 0, y: 0, width: 384 * modelScale, height: 384 * modelScale))
 let edgeModelCanvas = try RestorePixelCanvas(width: 585 * modelScale, height: 790 * modelScale)
 try RestoreInferenceCore.blend(
     canvas: edgeModelCanvas,
@@ -229,7 +229,9 @@ try RestoreInferenceCore.blend(
     maskImage: nil
 )
 let edgeModelImage = try edgeModelCanvas.makeImage()
-expect(color(edgeModelImage, x: 585 * modelScale - 1, y: 790 * modelScale - 1) == (255, 0, 0), "edge-anchored 2x model output maps only valid pixels to the photo boundary")
+let edgeModelLast = color(edgeModelImage, x: 585 * modelScale - 1, y: 790 * modelScale - 1)
+print("RESTORE-TILE DETAIL edge last=\(edgeModelLast)")
+expect(edgeModelLast == (255, 0, 0), "edge-anchored 2x model output maps only valid pixels to the photo boundary")
 
 let smallMask = solidImage(width: 300, height: 200, red: 255, green: 255, blue: 255)
 let paddedMask = try RestoreInferenceCore.maskTile(smallMask, originX: 0, originY: 0, size: 384)
