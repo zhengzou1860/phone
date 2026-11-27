@@ -20,7 +20,7 @@ struct RestorePixelCanvas {
         guard width > 0, height > 0, width <= 8192, height <= 8192 else { throw RestoreError.invalidDimensions }
         self.width = width
         self.height = height
-        bytesPerRow = width * 4
+        bytesPerRow = ((width * 4 + 15) / 16) * 16
         guard let data = NSMutableData(length: bytesPerRow * height) else {
             throw RestoreError.fileOperation("无法分配照片画布内存")
         }
@@ -93,7 +93,7 @@ final class RestoreBlendWeights {
     }
 
     func composite(_ canvas: RestorePixelCanvas, over source: CGImage) throws {
-        let bytesPerRow = width * 4
+        let bytesPerRow = canvas.bytesPerRow
         guard let rowData = NSMutableData(length: bytesPerRow),
               let strip = CGContext(
                 data: rowData.mutableBytes,
@@ -123,7 +123,7 @@ final class RestoreBlendWeights {
                 let index = y * width + x
                 let totalWeight = coverageWeights.map { $0[index] } ?? Self.fullWeight
                 let coverage = totalWeight > 0 ? min(1, Double(weights[index]) / Double(totalWeight)) : 0
-                let offset = index * 4
+                let offset = y * bytesPerRow + x * 4
                 for channel in 0..<3 {
                     let value = Double(prediction[offset + channel]) * coverage
                         + Double(original[x * 4 + channel]) * (1 - coverage)
@@ -393,7 +393,7 @@ enum RestoreInferenceCore {
                     coverageWeight: maskBase == nil ? nil : baseWeight
                 )
                 guard alpha > 0 else { continue }
-                let destinationIndex = (y * canvas.width + x) * 4
+                let destinationIndex = y * canvas.bytesPerRow + x * 4
                 let inverse = 1 - alpha
                 for channel in 0..<3 {
                     let value = Double(tileBase[sourceIndex + channel]) * alpha + Double(destinationBase[destinationIndex + channel]) * inverse

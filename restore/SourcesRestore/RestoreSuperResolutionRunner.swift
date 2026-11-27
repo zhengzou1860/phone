@@ -99,7 +99,7 @@ enum RestoreSuperResolutionRunner {
 
     private static func makeOutputImage(_ array: MLMultiArray, width: Int, height: Int, minimum: Float, maximum: Float, dataType: RestoreModelDataType) throws -> CGImage {
         let count = 3 * width * height
-        let bytesPerRow = width * 4
+        let bytesPerRow = ((width * 4 + 15) / 16) * 16
         guard let data = NSMutableData(length: bytesPerRow * height) else {
             throw RestoreError.inferenceFailed("无法转换超分输出")
         }

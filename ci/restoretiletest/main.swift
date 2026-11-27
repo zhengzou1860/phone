@@ -230,7 +230,7 @@ try RestoreInferenceCore.blend(
 )
 let edgeModelImage = try edgeModelCanvas.makeImage()
 let edgeModelLast = color(edgeModelImage, x: 585 * modelScale - 1, y: 790 * modelScale - 1)
-print("RESTORE-TILE DETAIL edge last=\(edgeModelLast)")
+print("RESTORE-TILE DETAIL edge last=\(edgeModelLast) row=\(edgeModelImage.bytesPerRow) canvasRow=\(edgeModelCanvas.bytesPerRow)")
 expect(edgeModelLast == (255, 0, 0), "edge-anchored 2x model output maps only valid pixels to the photo boundary")
 
 let smallMask = solidImage(width: 300, height: 200, red: 255, green: 255, blue: 255)
