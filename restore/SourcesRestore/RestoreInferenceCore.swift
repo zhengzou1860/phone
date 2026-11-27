@@ -216,6 +216,7 @@ enum RestoreInferenceCore {
         }
         if !clear, validWidth > 0, validHeight > 0,
            validWidth < size || validHeight < size {
+            _ = tile.makeImage()
             let bytes = data.mutableBytes.assumingMemoryBound(to: UInt8.self)
             func offset(x: Int, y: Int) -> Int {
                 (size - 1 - y) * bytesPerRow + x * 4
