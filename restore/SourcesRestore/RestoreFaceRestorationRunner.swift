@@ -14,7 +14,6 @@ enum RestoreFaceRestorationRunner {
         progress: @escaping @Sendable (Double, String) async -> Void
     ) async throws -> Int {
         try Task.checkCancellation()
-        let model = try RestoreInferenceCore.loadModel(modelURL, spec: spec)
         let request = VNDetectFaceLandmarksRequest()
         request.revision = VNDetectFaceLandmarksRequestRevision3
         let handler = VNImageRequestHandler(cgImage: source, orientation: .up)
@@ -28,6 +27,7 @@ enum RestoreFaceRestorationRunner {
             return 0
         }
         let selected = Array(observations.prefix(maximumFaces))
+        let model = try RestoreInferenceCore.loadModel(modelURL, spec: spec)
         if observations.count > selected.count {
             RestoreJournal.line("人脸补全：检测到 \(observations.count) 张脸，本轮处理前 \(selected.count) 张")
         }
