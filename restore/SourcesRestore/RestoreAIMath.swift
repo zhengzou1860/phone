@@ -34,6 +34,10 @@ enum RestoreAIMath {
         return tiles
     }
 
+    static func sourceTileVerticalOffset(sourceHeight: Double, originY: Int, size: Int) -> Double {
+        sourceHeight - Double(originY) - Double(size)
+    }
+
     static func featherWeight(
         pixel: Int,
         origin: Int,

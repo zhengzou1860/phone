@@ -111,14 +111,17 @@ enum RestoreInferenceCore {
     }
 
     static func sourceTile(_ source: CIImage, originX: Int, originY: Int, size: Int, context: CIContext) throws -> CGImage {
+        // CIImage 的原点在左下，照片行号需要先转换。
+        let offsetY = RestoreAIMath.sourceTileVerticalOffset(sourceHeight: source.extent.height, originY: originY, size: size)
         let shifted = source
             .clampedToExtent()
-            .transformed(by: CGAffineTransform(translationX: -Double(originX), y: -Double(originY)))
+            .transformed(by: CGAffineTransform(translationX: -Double(originX), y: offsetY))
         return try render(shifted, extent: CGRect(x: 0, y: 0, width: size, height: size), context: context)
     }
 
     static func maskTile(_ mask: CIImage, originX: Int, originY: Int, size: Int, context: CIContext) throws -> CGImage {
-        let shifted = mask.transformed(by: CGAffineTransform(translationX: -Double(originX), y: -Double(originY)))
+        let offsetY = RestoreAIMath.sourceTileVerticalOffset(sourceHeight: mask.extent.height, originY: originY, size: size)
+        let shifted = mask.transformed(by: CGAffineTransform(translationX: -Double(originX), y: offsetY))
         return try render(shifted, extent: CGRect(x: 0, y: 0, width: size, height: size), context: context)
     }
 

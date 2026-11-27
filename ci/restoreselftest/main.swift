@@ -104,6 +104,10 @@ let singleAITile = RestoreAIMath.tilePlan(width: 300, height: 200, tileSize: 384
 expect(singleAITile.count == 1 && singleAITile[0].originX == -8 && singleAITile[0].originY == -8, "small AI image uses one padded tile")
 let edgeAITiles = RestoreAIMath.tilePlan(width: 384, height: 384, tileSize: 384, overlap: 8, outputScale: 1)
 expect(edgeAITiles.count == 4 && edgeAITiles.contains { $0.originX == 360 }, "AI tile grid covers both edges with overlap")
+let upperTileOffset = RestoreAIMath.sourceTileVerticalOffset(sourceHeight: 790, originY: 360, size: 384)
+expect(upperTileOffset == 46 && 790 - (upperTileOffset + 384) == 360, "AI tiles select the correct photo rows from Core Image bottom-left coordinates")
+let paddedTileOffset = RestoreAIMath.sourceTileVerticalOffset(sourceHeight: 790, originY: -8, size: 384)
+expect(paddedTileOffset == 414 && 790 - paddedTileOffset == 376, "AI padded tiles select the top edge without shifting content")
 let overlapWeightsSum = (360..<376).allSatisfy { pixel in
     let first = RestoreAIMath.featherWeight(pixel: pixel, origin: -8, size: 384, sourceOrigin: -8, sourceSize: 384, sourceImageSize: 800, halo: 16)
     let second = RestoreAIMath.featherWeight(pixel: pixel, origin: 360, size: 384, sourceOrigin: 360, sourceSize: 384, sourceImageSize: 800, halo: 16)
