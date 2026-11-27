@@ -290,6 +290,7 @@ enum RestoreInferenceCore {
                 spec.inputName: try MLFeatureValue(cgImage: image, constraint: constraint, options: nil)
             ])
             let result = try model.prediction(from: provider)
+            #if os(iOS)
             guard let output = result.featureValue(for: spec.outputName)?.imageValue else {
                 throw RestoreError.inferenceFailed("模型没有返回 \(spec.outputName) 图像")
             }
@@ -297,6 +298,9 @@ enum RestoreInferenceCore {
                 throw RestoreError.inferenceFailed("人脸模型输出尺寸无效")
             }
             return output
+            #else
+            throw RestoreError.inferenceFailed("当前平台无法读取图片模型输出")
+            #endif
         } catch let error as RestoreError {
             throw error
         } catch {
