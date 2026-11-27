@@ -170,8 +170,8 @@ jobs:
           build_number=$(awk -F' => ' '/"CFBundleVersion"/{gsub(/"/,"",$2); print $2; exit}' /tmp/hirestore-info.txt)
           echo "I-VERDICT bundle=$bundle_id version=$version build=$build_number" | tee -a /tmp/selftest.log
           test "$bundle_id" = "com.qoder.hirestore"
-          test "$version" = "0.3.12"
-          test "$build_number" = "17"
+          test "$version" = "0.3.13"
+          test "$build_number" = "18"
           grep -q NSPhotoLibraryAddUsageDescription /tmp/hirestore-info.txt
           grep -q NSLocalNetworkUsageDescription /tmp/hirestore-info.txt
           grep -q NSAllowsLocalNetworking /tmp/hirestore-info.txt

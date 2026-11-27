@@ -128,7 +128,7 @@ struct RestoreModelSpec: Equatable, Identifiable {
 
 enum RestoreModelCatalog {
     private static let localSRCommit = "bba30194995e2815364f111168fb15155a24920f"
-    private static let gfpganURL = "https://github.com/zhengzou1860/phone/releases/download/channel-hirestore-models/gfpgan.mlmodel"
+    private static let gfpganArchiveURL = "https://github.com/zhengzou1860/phone/releases/download/channel-hirestore-models/gfpgan-ios18.zip"
 
     static let all: [RestoreModelSpec] = [realESRGAN, localSRFast, gfpgan]
 
@@ -189,23 +189,24 @@ enum RestoreModelCatalog {
     private static let gfpgan = RestoreModelSpec(
         id: .gfpgan,
         name: "GFPGAN 人脸细节",
-        version: "1.0.0",
+        version: "1.1.0",
         summary: "512px 对齐人脸细节补全；只贴回脸部区域，背景继续使用超分模型，首次需下载约 322 MiB。",
         licenseLabel: "Apache-2.0",
         attribution: "TencentARC/GFPGAN · john-rocky/Core ML conversion",
         sourceURL: "https://github.com/john-rocky/CoreML-Models",
-        bundleRelativePath: "gfpgan.mlmodel",
+        bundleRelativePath: "gfpgan.mlmodelc",
         artifacts: [RestoreModelArtifact(
-            relativePath: "gfpgan.mlmodel",
-            downloadURL: gfpganURL,
-            byteCount: 337_392_296,
-            sha256: "218a39c226adecb2ccbc1e358023b80a5cf2510be85dfc3ab0da698fad51391a",
+            relativePath: "gfpgan-ios18.zip",
+            downloadURL: gfpganArchiveURL,
+            byteCount: 337_900_799,
+            sha256: "c657ae0d9c2d10e03ee6f11f2c521a9b65011f5e1fb2c5b83ee964905ca25ec3",
             alternateDownloadURLs: [
-                "https://gh-proxy.com/\(gfpganURL)",
-                "https://ghfast.top/\(gfpganURL)"
-            ]
+                "https://gh-proxy.com/\(gfpganArchiveURL)",
+                "https://ghfast.top/\(gfpganArchiveURL)"
+            ],
+            isArchive: true
         )],
-        catalogHash: "gfpgan-coreml-512-image-v1",
+        catalogHash: "gfpgan-coreml-512-image-ios18-precompiled-v1",
         packagedByteCount: nil,
         compute: .gpu,
         inputName: "x_1",
