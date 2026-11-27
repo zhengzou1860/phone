@@ -208,8 +208,7 @@ try RestoreInferenceCore.blend(
     tileSize: 384,
     overlap: 32,
     sourceImageWidth: 300,
-    sourceImageHeight: 200,
-    maskImage: nil
+    sourceImageHeight: 200
 )
 let smallModelImage = try smallModelCanvas.makeImage()
 let smallModelFirst = color(smallModelImage, x: 0, y: 0)
@@ -239,8 +238,7 @@ try RestoreInferenceCore.blend(
     overlapLeft: 183,
     overlapTop: 346,
     sourceImageWidth: 585,
-    sourceImageHeight: 790,
-    maskImage: nil
+    sourceImageHeight: 790
 )
 let edgeModelImage = try edgeModelCanvas.makeImage()
 let edgeModelLast = color(edgeModelImage, x: 585 * modelScale - 1, y: 790 * modelScale - 1)
@@ -249,35 +247,6 @@ let edgeDirectBytes = edgeModelCanvas.data.mutableBytes.assumingMemoryBound(to: 
 let edgeDirectLast = (edgeDirectBytes[edgeDirectOffset], edgeDirectBytes[edgeDirectOffset + 1], edgeDirectBytes[edgeDirectOffset + 2])
 print("RESTORE-TILE DETAIL edge prediction=\(edgePredictionLast) cropped=\(edgeCroppedLast) probe=\(edgeProbeLast) direct=\(edgeDirectLast) image=\(edgeModelLast) row=\(edgeModelImage.bytesPerRow) canvasRow=\(edgeModelCanvas.bytesPerRow)")
 expect(edgeModelLast == (255, 0, 0), "edge-anchored 2x model output maps only valid pixels to the photo boundary")
-
-let smallMask = solidImage(width: 300, height: 200, red: 255, green: 255, blue: 255)
-let paddedMask = try RestoreInferenceCore.maskTile(smallMask, originX: 0, originY: 0, size: 384)
-expect(alpha(paddedMask, x: 0, y: 0) == 255 && alpha(paddedMask, x: 0, y: 383) == 0, "small mask tile keeps valid pixels at the top and pads the bottom")
-expect(alpha(paddedMask, x: 299, y: 199) == 255 && alpha(paddedMask, x: 300, y: 0) == 0, "small mask tile pads with transparent pixels")
-let grayMaskTile = try RestoreInferenceCore.maskTile(grayImage(width: 300, height: 200, value: 128), originX: 0, originY: 0, size: 384)
-let grayMaskPixel = color(grayMaskTile, x: 299, y: 199)
-expect(grayMaskPixel.0 >= 127 && grayMaskPixel.0 <= 129 && grayMaskPixel.1 == grayMaskPixel.0 && grayMaskPixel.2 == grayMaskPixel.0 && alpha(grayMaskTile, x: 299, y: 199) == 255, "grayscale repair mask keeps its intensity in the RGB tile")
-
-let smallInpaintCanvas = try RestorePixelCanvas(width: 300, height: 200)
-let smallInpaintWeights = try RestoreBlendWeights(width: 300, height: 200)
-try RestoreInferenceCore.blend(
-    canvas: smallInpaintCanvas,
-    weights: smallInpaintWeights,
-    tileImage: solidImage(width: 512, height: 512, red: 255, green: 0, blue: 0),
-    originX: 0,
-    originY: 0,
-    tileSize: 512,
-    overlap: 32,
-    sourceImageWidth: 300,
-    sourceImageHeight: 200,
-    maskImage: solidImage(width: 512, height: 512, red: 255, green: 255, blue: 255)
-)
-try smallInpaintWeights.composite(
-    smallInpaintCanvas,
-    over: solidImage(width: 300, height: 200, red: 100, green: 100, blue: 100)
-)
-let smallInpaintImage = try smallInpaintCanvas.makeImage()
-expect(color(smallInpaintImage, x: 299, y: 199) == (255, 0, 0), "small inpaint output and mask crop their padded regions together")
 
 let canvas = try RestorePixelCanvas(width: width, height: height)
 let tiles = RestoreAIMath.tilePlan(width: width, height: height, tileSize: 384, overlap: 8, outputScale: 1)
@@ -298,8 +267,7 @@ for tile in tiles {
         overlapTop: tile.overlapTop,
         overlapBottom: tile.overlapBottom,
         sourceImageWidth: width,
-        sourceImageHeight: height,
-        maskImage: nil
+        sourceImageHeight: height
     )
 }
 let blended = try canvas.makeImage()
@@ -355,8 +323,7 @@ for tile in tiles {
         overlapTop: tile.overlapTop,
         overlapBottom: tile.overlapBottom,
         sourceImageWidth: width,
-        sourceImageHeight: height,
-        maskImage: nil
+        sourceImageHeight: height
     )
 }
 let scaled = try scaledCanvas.makeImage()
@@ -392,8 +359,7 @@ for tile in seamTiles {
         overlapTop: tile.overlapTop,
         overlapBottom: tile.overlapBottom,
         sourceImageWidth: seamSide,
-        sourceImageHeight: seamSide,
-        maskImage: nil
+        sourceImageHeight: seamSide
     )
 }
 let seamImage = try seamCanvas.makeImage()
@@ -421,8 +387,7 @@ for tile in seamTiles.reversed() {
         overlapTop: tile.overlapTop,
         overlapBottom: tile.overlapBottom,
         sourceImageWidth: seamSide,
-        sourceImageHeight: seamSide,
-        maskImage: nil
+        sourceImageHeight: seamSide
     )
 }
 let reversedImage = try reversedCanvas.makeImage()
@@ -463,8 +428,7 @@ func nineImage(order: [RestoreAITile]) throws -> CGImage {
             overlapTop: tile.overlapTop,
             overlapBottom: tile.overlapBottom,
             sourceImageWidth: nineSide,
-            sourceImageHeight: nineSide,
-            maskImage: nil
+            sourceImageHeight: nineSide
         )
     }
     return try canvas.makeImage()
@@ -502,76 +466,12 @@ for tile in largeOverlapTiles {
         overlapTop: tile.overlapTop,
         overlapBottom: tile.overlapBottom,
         sourceImageWidth: largeOverlapWidth,
-        sourceImageHeight: 100,
-        maskImage: nil
+        sourceImageHeight: 100
     )
 }
 let largeOverlapImage = try largeOverlapCanvas.makeImage()
 let largeOverlap = color(largeOverlapImage, x: 220, y: 50)
 expect(abs(Int(largeOverlap.0) - 229) <= 2 && abs(Int(largeOverlap.1) - 26) <= 2, "edge-anchored 183px overlap is feathered across its actual width")
-
-let maskWidth = 800
-let maskHeight = 100
-let maskTiles = RestoreAIMath.tilePlan(width: maskWidth, height: maskHeight, tileSize: 384, overlap: 8, outputScale: 1)
-let maskedCanvas = try RestorePixelCanvas(width: maskWidth, height: maskHeight)
-let maskedWeights = try RestoreBlendWeights(width: maskWidth, height: maskHeight)
-for tile in maskTiles {
-    let first = tile.originX == 0
-    try RestoreInferenceCore.blend(
-        canvas: maskedCanvas,
-        weights: maskedWeights,
-        tileImage: solidImage(width: 384, height: 384, red: first ? 255 : 0, green: first ? 0 : 255, blue: 0),
-        originX: tile.originX,
-        originY: tile.originY,
-        tileSize: 384,
-        overlap: 8,
-        overlapLeft: tile.overlapLeft,
-        overlapRight: tile.overlapRight,
-        overlapTop: tile.overlapTop,
-        overlapBottom: tile.overlapBottom,
-        sourceImageWidth: maskWidth,
-        sourceImageHeight: maskHeight,
-        maskImage: solidImage(width: 384, height: 384, red: first ? 128 : 255, green: 0, blue: 0)
-    )
-}
-try maskedWeights.composite(
-    maskedCanvas,
-    over: solidImage(width: maskWidth, height: maskHeight, red: 100, green: 100, blue: 100)
-)
-let maskedImage = try maskedCanvas.makeImage()
-let partialEdge = color(maskedImage, x: 10, y: 50)
-expect(abs(Int(partialEdge.0) - 178) <= 2 && abs(Int(partialEdge.1) - 50) <= 2 && abs(Int(partialEdge.2) - 50) <= 2, "partial inpaint mask keeps the unmatched source weight")
-let partialOverlap = color(maskedImage, x: 370, y: 50)
-expect(abs(Int(partialOverlap.0) - 156) <= 2 && abs(Int(partialOverlap.1) - 76) <= 2 && abs(Int(partialOverlap.2) - 44) <= 2, "partial inpaint weights include the original image in the normalized average")
-
-let crossingMaskCanvas = try RestorePixelCanvas(width: seamSide, height: seamSide)
-let crossingMaskWeights = try RestoreBlendWeights(width: seamSide, height: seamSide)
-for tile in seamTiles {
-    let value = seamColor(tile)
-    try RestoreInferenceCore.blend(
-        canvas: crossingMaskCanvas,
-        weights: crossingMaskWeights,
-        tileImage: solidImage(width: 384, height: 384, red: value.0, green: value.1, blue: value.2),
-        originX: tile.originX,
-        originY: tile.originY,
-        tileSize: 384,
-        overlap: 8,
-        overlapLeft: tile.overlapLeft,
-        overlapRight: tile.overlapRight,
-        overlapTop: tile.overlapTop,
-        overlapBottom: tile.overlapBottom,
-        sourceImageWidth: seamSide,
-        sourceImageHeight: seamSide,
-        maskImage: solidImage(width: 384, height: 384, red: 128, green: 0, blue: 0)
-    )
-}
-try crossingMaskWeights.composite(
-    crossingMaskCanvas,
-    over: solidImage(width: seamSide, height: seamSide, red: 100, green: 100, blue: 100)
-)
-let crossingMaskImage = try crossingMaskCanvas.makeImage()
-let crossingMask = color(crossingMaskImage, x: 420, y: 420)
-expect(abs(Int(crossingMask.0) - 53) <= 3 && abs(Int(crossingMask.1) - 175) <= 3 && abs(Int(crossingMask.2) - 53) <= 3, "2D masked overlap normalizes coverage by total feather weight")
 
 let orientationSource = gradientImage(width: 13, height: 9)
 let orientationCanvas = try RestorePixelCanvas(width: 13, height: 9)
@@ -589,7 +489,7 @@ let orientationPreserved = (0..<9).allSatisfy { y in
         }
     }
 }
-expect(orientationPreserved, "masked compositor scales the original top-down without vertical flipping")
+expect(orientationPreserved, "compositor scales the original top-down without vertical flipping")
 
 let fractionalSource = solidImage(width: 7, height: 5, red: 255, green: 32, blue: 16)
 let fractionalTiles = RestoreAIMath.tilePlan(width: 7, height: 5, tileSize: 4, overlap: 1, outputScale: 1)
@@ -609,8 +509,7 @@ for tile in fractionalTiles {
         overlapTop: tile.overlapTop,
         overlapBottom: tile.overlapBottom,
         sourceImageWidth: 7,
-        sourceImageHeight: 5,
-        maskImage: nil
+        sourceImageHeight: 5
     )
 }
 let fractionalImage = try fractionalCanvas.makeImage()

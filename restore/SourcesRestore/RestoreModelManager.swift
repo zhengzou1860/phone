@@ -171,11 +171,9 @@ final class RestoreModelManager: ObservableObject {
                 self.recordDownloadProgress(for: spec.id, attemptID: attemptID, host: host, written: written, expected: expected)
             }
         }
-        let session = URLSession(configuration: configuration, delegate: delegate, delegateQueue: nil)
-        defer { session.finishTasksAndInvalidate() }
         var request = URLRequest(url: url)
         request.setValue("application/vnd.github.raw+json", forHTTPHeaderField: "Accept")
-        let (temporary, response) = try await session.download(for: request, delegate: delegate)
+        let (temporary, response) = try await delegate.download(request, configuration: configuration)
         defer { try? FileManager.default.removeItem(at: temporary) }
         try Task.checkCancellation()
         guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
@@ -215,7 +213,6 @@ final class RestoreModelManager: ObservableObject {
         try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: staging) }
 
-        let total = spec.artifacts.reduce(Int64(0)) { $0 + Int64($1.byteCount) }
         var completed: Int64 = 0
         for (index, artifact) in spec.artifacts.enumerated() {
             try Task.checkCancellation()
@@ -377,18 +374,18 @@ final class RestoreModelManager: ObservableObject {
         let now = Date()
         let elapsed = max(0, now.timeIntervalSince(metrics.startedAt))
         let idle = max(0, now.timeIntervalSince(metrics.lastBytesAt))
-        let received = min(max(0, metrics.baselineBytes + metrics.receivedBytes), max(0, spec.totalByteCount))
+        let received = min(max(0, metrics.baselineBytes + metrics.receivedBytes), Int64(max(0, spec.totalByteCount)))
         let speed = elapsed > 0 ? Double(metrics.receivedBytes) / elapsed : 0
         let remaining: TimeInterval?
         if metrics.phase == .downloading, received > 0, speed > 0, idle < 5 {
-            remaining = Double(max(0, spec.totalByteCount - received)) / speed
+            remaining = Double(max(0, Int64(max(0, spec.totalByteCount)) - received)) / speed
         } else {
             remaining = nil
         }
         return RestoreDownloadProgress(
             phase: metrics.phase,
             receivedBytes: received,
-            totalBytes: max(0, spec.totalByteCount),
+            totalBytes: Int64(max(0, spec.totalByteCount)),
             bytesPerSecond: speed,
             elapsedSeconds: elapsed,
             idleSeconds: idle,
@@ -448,10 +445,35 @@ final class RestoreModelManager: ObservableObject {
 
 private final class RestoreModelDownloadDelegate: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
     private let onProgress: @Sendable (Int64, Int64) -> Void
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<(URL, URLResponse), Error>?
+    private var session: URLSession?
+    private var task: URLSessionDownloadTask?
+    private var downloadedURL: URL?
+    private var completionError: Error?
 
     init(onProgress: @escaping @Sendable (Int64, Int64) -> Void) {
         self.onProgress = onProgress
         super.init()
+    }
+
+    func download(_ request: URLRequest, configuration: URLSessionConfiguration) async throws -> (URL, URLResponse) {
+        let session = URLSession(configuration: configuration, delegate: self, delegateQueue: nil)
+        lock.lock()
+        self.session = session
+        lock.unlock()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                lock.lock()
+                self.continuation = continuation
+                let task = session.downloadTask(with: request)
+                self.task = task
+                lock.unlock()
+                task.resume()
+            }
+        } onCancel: { [weak self] in
+            self?.cancel()
+        }
     }
 
     func urlSession(
@@ -462,6 +484,48 @@ private final class RestoreModelDownloadDelegate: NSObject, URLSessionDownloadDe
         totalBytesExpectedToWrite: Int64
     ) {
         onProgress(totalBytesWritten, totalBytesExpectedToWrite)
+    }
+
+    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
+        let destination = FileManager.default.temporaryDirectory.appendingPathComponent("HiRestore-\(UUID().uuidString)")
+        do {
+            try FileManager.default.moveItem(at: location, to: destination)
+            lock.lock()
+            downloadedURL = destination
+            lock.unlock()
+        } catch {
+            lock.lock()
+            completionError = error
+            lock.unlock()
+        }
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionDownloadTask, didCompleteWithError error: Error?) {
+        lock.lock()
+        let continuation = self.continuation
+        let downloadedURL = self.downloadedURL
+        let completionError = self.completionError
+        self.continuation = nil
+        self.task = nil
+        self.session = nil
+        lock.unlock()
+        session.finishTasksAndInvalidate()
+        if let error {
+            continuation?.resume(throwing: error)
+        } else if let completionError {
+            continuation?.resume(throwing: completionError)
+        } else if let downloadedURL, let response = task.response {
+            continuation?.resume(returning: (downloadedURL, response))
+        } else {
+            continuation?.resume(throwing: RestoreError.modelLoadFailed("模型下载未完成"))
+        }
+    }
+
+    private func cancel() {
+        lock.lock()
+        let task = self.task
+        lock.unlock()
+        task?.cancel()
     }
 }
 

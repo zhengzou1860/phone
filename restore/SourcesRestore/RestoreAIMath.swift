@@ -74,7 +74,6 @@ enum RestoreAIMath {
     static let maximumSourceLongEdge = 8192
     static let maximumSourcePixels = 40_000_000
     static let maximumSuperResolutionOutputPixels = 32_000_000
-    static let maximumInpaintingOutputPixels = 16_000_000
 
     static func validateSource(width: Int, height: Int) throws {
         guard width > 0, height > 0,
@@ -84,11 +83,10 @@ enum RestoreAIMath {
         }
     }
 
-    static func validateOutput(width: Int, height: Int, isSuperResolution: Bool) throws {
+    static func validateOutput(width: Int, height: Int) throws {
         guard width > 0, height > 0 else { throw RestoreError.invalidDimensions }
-        let limit = isSuperResolution ? maximumSuperResolutionOutputPixels : maximumInpaintingOutputPixels
-        guard Double(width) * Double(height) <= Double(limit) else {
-            throw RestorePreflightError.aiOutputTooLarge(isSuperResolution: isSuperResolution)
+        guard Double(width) * Double(height) <= Double(maximumSuperResolutionOutputPixels) else {
+            throw RestorePreflightError.aiOutputTooLarge
         }
     }
 }

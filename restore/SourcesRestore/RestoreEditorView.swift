@@ -12,7 +12,6 @@ struct RestoreEditorView: View {
     @State private var availableBytes: Int64?
     @State private var isCheckingSpace = false
     @State private var spaceCheckFailed = false
-    @State private var showMaskEditor = false
 
     private var maxEdge: Int { media.kind == .image ? settings.mode.maximumOutputLongEdge : 3840 }
     private var output: (width: Int, height: Int) {
@@ -49,7 +48,7 @@ struct RestoreEditorView: View {
                   media.width <= RestoreAIMath.maximumSourceLongEdge,
                   Double(media.width) * Double(media.height) <= Double(RestoreAIMath.maximumSourcePixels) else { return false }
             if settings.mode == .superResolution, settings.restoreFaces, !models.isInstalled(.gfpgan) { return false }
-            return settings.mode != .inpainting || !(settings.mask?.isEmpty ?? true)
+            return true
         }
         return true
     }
@@ -62,10 +61,9 @@ struct RestoreEditorView: View {
                     if media.kind == .image { modeSection }
                     if media.kind == .image && settings.mode == .native { presetSection }
                     if media.kind == .image && settings.mode == .superResolution { superResolutionModelSection }
-                    if media.kind == .video || settings.mode == .native || settings.mode == .superResolution { scaleSection }
+                    scaleSection
                     if media.kind == .image && settings.mode.isAI { aiModelSection }
                     if media.kind == .image && settings.mode == .superResolution { faceRestorationSection }
-                    if media.kind == .image && settings.mode == .inpainting { maskSection }
                     outputSection
                     if settings.mode == .native { advancedSection }
                     disclosure
@@ -87,15 +85,6 @@ struct RestoreEditorView: View {
                 }
             }
             .interactiveDismissDisabled(processor.isProcessing)
-            .sheet(isPresented: $showMaskEditor) {
-                RestoreMaskEditor(
-                    mask: Binding(
-                        get: { settings.mask ?? RestoreMask() },
-                        set: { settings.mask = $0 }
-                    ),
-                    imageURL: media.url
-                )
-            }
             .overlay {
                 if processor.isProcessing {
                     ProcessingOverlay(
@@ -167,7 +156,6 @@ struct RestoreEditorView: View {
             ForEach(RestoreProcessingMode.allCases) { mode in
                 Button {
                     settings.mode = mode
-                    if mode == .inpainting { settings.scale = 1 }
                     if mode == .native && settings.scale > 2 { settings.scale = 2 }
                 } label: {
                     HStack(spacing: 12) {
@@ -206,7 +194,6 @@ struct RestoreEditorView: View {
                             superResolutionModel: settings.superResolutionModel
                         )
                         updated.mode = settings.mode
-                        updated.mask = settings.mask
                         updated.restoreFaces = settings.restoreFaces
                         settings = updated
                     } label: {
@@ -429,31 +416,6 @@ struct RestoreEditorView: View {
         }
     }
 
-    private var maskSection: some View {
-        RestoreCard {
-            VStack(alignment: .leading, spacing: 10) {
-                HStack {
-                    Label("缺损区域", systemImage: "bandage.fill")
-                    Spacer()
-                    if !(settings.mask?.isEmpty ?? true) {
-                        Text("\(settings.mask?.strokes.count ?? 0) 笔").font(.caption2.monospacedDigit()).foregroundStyle(RestoreTheme.green)
-                    }
-                }
-                Text("涂抹划痕、破损或缺失位置。模型只修改蒙版区域，周围画面保持原样。")
-                    .font(.caption2)
-                    .foregroundStyle(RestoreTheme.secondary)
-                Button {
-                    showMaskEditor = true
-                } label: {
-                    Label(settings.mask?.isEmpty == false ? "修改蒙版" : "涂抹缺损区域", systemImage: "paintbrush.fill")
-                        .font(.caption.weight(.semibold))
-                }
-                .buttonStyle(.bordered)
-                .tint(RestoreTheme.cyan)
-            }
-        }
-    }
-
     private var outputSection: some View {
         RestoreCard {
             VStack(alignment: .leading, spacing: 9) {
@@ -557,8 +519,6 @@ struct RestoreEditorView: View {
                 return "AI 超分按 \(spec.tileSize)px 小块生成\(factor)细节并融合重叠区。\(faceText)高画质模型计算量更大，生成内容不一定等于真实原貌。"
             }
             return "AI 超分按小块生成细节并融合重叠区。生成内容不一定等于真实原貌，处理时间取决于照片尺寸。"
-        case .inpainting:
-            return "AI 修补按 512px 上下文块补全蒙版区域。大面积缺失可能没有唯一正确答案，请对比原片并保留重要照片的原件。"
         }
     }
 

@@ -181,9 +181,9 @@ expect(RestoreAIMath.tilePlan(width: 100, height: 100, tileSize: 384, overlap: 8
 try RestoreAIMath.validateSource(width: 8192, height: 4882)
 expect(true, "AI source accepts the documented geometry boundary")
 expectPreflightError({ try RestoreAIMath.validateSource(width: 8193, height: 100) }, "8192")
-expectPreflightError({ try RestoreAIMath.validateOutput(width: 8000, height: 4001, isSuperResolution: true) }, "32MP")
-try RestoreAIMath.validateOutput(width: 4096, height: 3072, isSuperResolution: false)
-expect(true, "AI inpainting accepts a 12MP output")
+expectPreflightError({ try RestoreAIMath.validateOutput(width: 8000, height: 4001) }, "32MP")
+try RestoreAIMath.validateOutput(width: 8000, height: 4000)
+expect(true, "AI super-resolution accepts a 32MP output")
 
 let srSpec = RestoreModelCatalog.spec(for: .localSRFast)!
 let realSpec = RestoreModelCatalog.spec(for: .realESRGAN)!
@@ -192,7 +192,7 @@ expect(realSpec.inputName == "image" && realSpec.outputName == "out", "RealESRGA
 expect(realSpec.inputShape == [1, 3, 384, 384] && realSpec.outputShape == [1, 3, 768, 768], "RealESRGAN tensor shapes match the verified model")
 expect(realSpec.dataType == .float32 && realSpec.compute == .gpu && realSpec.overlap == 32, "RealESRGAN uses its verified FP32 tensor interface with GPU tiling")
 expect(realSpec.upscaleFactor == 2 && srSpec.upscaleFactor == 4, "super-resolution summaries distinguish 2x and 4x models")
-expect(RestoreModelCatalog.all.count == 4, "model catalog includes RealESRGAN, LocalSR Fast, GFPGAN, and AOT-GAN")
+expect(RestoreModelCatalog.all.count == 3, "model catalog includes RealESRGAN, LocalSR Fast, and GFPGAN")
 let faceSpec = RestoreModelCatalog.spec(for: .gfpgan)!
 expect(faceSpec.interface == .image && faceSpec.inputName == "x_1" && faceSpec.outputName == "activation_out", "GFPGAN uses its verified image feature names")
 expect(faceSpec.tileSize == 512 && faceSpec.totalByteCount == 337392296, "GFPGAN uses a verified 512px interface and pinned model size")
@@ -256,29 +256,4 @@ expect(srSpec.artifacts.allSatisfy { $0.relativePath.hasPrefix(srSpec.bundleRela
 expect(srSpec.artifacts.allSatisfy { $0.downloadURLs.count == 4 && $0.downloadURLs.allSatisfy { URL(string: $0)?.scheme == "https" } }, "LocalSR artifacts include HTTPS mirror and API fallbacks")
 expect(srSpec.artifacts.allSatisfy { $0.downloadURLs.contains { $0.contains("fastly.jsdelivr.net") } && $0.downloadURLs.contains { $0.contains("api.github.com") } }, "LocalSR bypasses an unavailable raw GitHub route")
 expect(srSpec.artifacts.allSatisfy { $0.downloadURLs.first?.contains("jsdelivr.net") == true }, "LocalSR tries working mirrors before the raw GitHub route")
-let inpaintSpec = RestoreModelCatalog.spec(for: .aotGAN)!
-expect(inpaintSpec.inputName == "x_1" && inpaintSpec.outputName == "var_915", "AOT-GAN tensor names match the verified model")
-expect(inpaintSpec.dataType == .float32 && inpaintSpec.outputShape == nil, "AOT-GAN Float32 flexible output is validated at runtime")
-expect(inpaintSpec.totalByteCount == 60818996 && inpaintSpec.artifacts[0].sha256 == "6090945f20e4971113457fa0bb90bca42e4569dcaf9ab7c183d2749ee4718b68", "AOT-GAN artifact size and SHA are pinned")
-expect(inpaintSpec.artifacts[0].downloadURLs.contains("https://api.github.com/repos/john-rocky/AOT-GAN-for-Inpainting-CoreML/git/blobs/0e916772d239c30ce1dc72b5ec2af5df67d5e5a4"), "AOT-GAN has a pinned GitHub API raw-file fallback")
-
-let emptyMask = RestoreMask()
-expect(emptyMask.isEmpty, "empty repair mask is detected")
-let erase = RestoreMaskStroke(points: [RestoreMaskPoint(x: 0.5, y: 0.5)], brushSize: 0.04, erasing: true)
-let eraseOnlyMask = RestoreMask(strokes: [erase])
-expect(eraseOnlyMask.isEmpty, "erase-only mask does not request repair")
-var mask = RestoreMask()
-mask.append(RestoreMaskStroke(points: [RestoreMaskPoint(x: -1, y: 2)], brushSize: 0.04))
-mask.append(RestoreMaskStroke(points: [RestoreMaskPoint(x: 0.5, y: 0.5)], brushSize: -0.1))
-expect(mask.strokes[0].points[0] == RestoreMaskPoint(x: 0, y: 1) && mask.strokes[0].brushSize == 0.04, "mask input is normalized and clamped")
-expect(mask.strokes[1].brushSize == 0.002, "mask brush has a safe minimum")
-let maskImage = try mask.rasterized(width: 64, height: 64)
-let maskProvider = maskImage.dataProvider!
-let maskData = maskProvider.data! as Data
-let maskBytes = (maskData as NSData).bytes.assumingMemoryBound(to: UInt8.self)
-let firstColumnHasPaint = (0..<64).contains { maskBytes[$0 * maskImage.bytesPerRow] > 0 }
-expect(firstColumnHasPaint, "normalized mask coordinates rasterize at the expected edge")
-let decodedMask = try JSONDecoder().decode(RestoreMask.self, from: JSONEncoder().encode(mask))
-expect(decodedMask == mask, "repair mask survives codable round trip")
-
 print("RESTORE-VERDICT PASS")

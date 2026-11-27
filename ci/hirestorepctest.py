@@ -42,7 +42,7 @@ with tempfile.TemporaryDirectory() as directory:
         code, payload = request("/ping", headers={"X-HiRestore-Token": "wrong"})
         assert code == 401 and payload["status"] == "error"
 
-        code, payload = request("/report", data=b"log", headers={"X-HiRestore-Protocol": "2"})
+        code, payload = request("/report", data=b"", headers={"X-HiRestore-Protocol": "2"})
         assert code == 400 and "Protocol" in payload["message"]
 
         code, payload = request("/report", data="HiRestore 自测日志".encode(), headers={"Content-Type": "text/plain"})

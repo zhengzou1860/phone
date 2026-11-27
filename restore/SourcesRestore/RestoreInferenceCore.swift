@@ -60,7 +60,6 @@ final class RestoreBlendWeights {
     private let width: Int
     private let height: Int
     private let data: NSMutableData
-    private var coverageData: NSMutableData?
 
     init(width: Int, height: Int) throws {
         guard width > 0, height > 0, width <= 8192, height <= 8192 else { throw RestoreError.invalidDimensions }
@@ -72,20 +71,8 @@ final class RestoreBlendWeights {
         self.data = data
     }
 
-    func prepareCoverage() throws {
-        guard coverageData == nil else { return }
-        guard let data = NSMutableData(length: width * height * MemoryLayout<UInt16>.size) else {
-            throw RestoreError.fileOperation("无法分配照片蒙版权重")
-        }
-        coverageData = data
-    }
-
-    func blendWeight(pixelX: Int, pixelY: Int, weight: UInt16, coverageWeight: UInt16? = nil) -> Double {
+    func blendWeight(pixelX: Int, pixelY: Int, weight: UInt16) -> Double {
         let index = pixelY * width + pixelX
-        if let coverageWeight, let coverageData {
-            let coverage = coverageData.mutableBytes.assumingMemoryBound(to: UInt16.self)
-            coverage[index] = min(UInt16.max, coverage[index] &+ coverageWeight)
-        }
         guard weight > 0 else { return 0 }
         let values = data.mutableBytes.assumingMemoryBound(to: UInt16.self)
         let total = min(UInt16.max, values[index] &+ weight)
@@ -109,7 +96,6 @@ final class RestoreBlendWeights {
         }
         strip.interpolationQuality = .high
         let weights = data.bytes.assumingMemoryBound(to: UInt16.self)
-        let coverageWeights = coverageData?.bytes.assumingMemoryBound(to: UInt16.self)
         let prediction = canvas.data.mutableBytes.assumingMemoryBound(to: UInt8.self)
         for y in 0..<height {
             if (y & 255) == 0 { try Task.checkCancellation() }
@@ -122,7 +108,7 @@ final class RestoreBlendWeights {
             let original = rowData.mutableBytes.assumingMemoryBound(to: UInt8.self)
             for x in 0..<width {
                 let index = y * width + x
-                let totalWeight = coverageWeights.map { $0[index] } ?? Self.fullWeight
+                let totalWeight = Self.fullWeight
                 let coverage = totalWeight > 0 ? min(1, Double(weights[index]) / Double(totalWeight)) : 0
                 let offset = y * bytesPerRow + x * 4
                 for channel in 0..<3 {
@@ -180,14 +166,10 @@ enum RestoreInferenceCore {
     }
 
     static func sourceTile(_ image: CGImage, originX: Int, originY: Int, size: Int) throws -> CGImage {
-        try drawTile(image, originX: originX, originY: originY, size: size, clear: false)
+        try drawTile(image, originX: originX, originY: originY, size: size)
     }
 
-    static func maskTile(_ image: CGImage, originX: Int, originY: Int, size: Int) throws -> CGImage {
-        try drawTile(image, originX: originX, originY: originY, size: size, clear: true)
-    }
-
-    private static func drawTile(_ image: CGImage, originX: Int, originY: Int, size: Int, clear: Bool) throws -> CGImage {
+    private static func drawTile(_ image: CGImage, originX: Int, originY: Int, size: Int) throws -> CGImage {
         guard let tile = CGContext(
                 data: nil,
                 width: size,
@@ -200,12 +182,8 @@ enum RestoreInferenceCore {
             throw RestoreError.inferenceFailed("无法创建推理小块")
         }
         tile.interpolationQuality = .none
-        if clear {
-            tile.clear(CGRect(x: 0, y: 0, width: size, height: size))
-        } else {
-            tile.setFillColor(CGColor(red: 0, green: 0, blue: 0, alpha: 1))
-            tile.fill(CGRect(x: 0, y: 0, width: size, height: size))
-        }
+        tile.setFillColor(CGColor(red: 0, green: 0, blue: 0, alpha: 1))
+        tile.fill(CGRect(x: 0, y: 0, width: size, height: size))
         let validWidth = min(size, image.width - originX)
         let validHeight = min(size, image.height - originY)
         let cropped = validWidth > 0 && validHeight > 0
@@ -217,7 +195,7 @@ enum RestoreInferenceCore {
                 in: CGRect(x: 0, y: size - validHeight, width: validWidth, height: validHeight)
             )
         }
-        if !clear, let cropped, validWidth > 0, validHeight > 0 {
+        if let cropped, validWidth > 0, validHeight > 0 {
             let paddingWidth = size - validWidth
             let paddingHeight = size - validHeight
             if paddingWidth > 0 {
@@ -323,8 +301,7 @@ enum RestoreInferenceCore {
         overlapTop: Int? = nil,
         overlapBottom: Int? = nil,
         sourceImageWidth: Int,
-        sourceImageHeight: Int,
-        maskImage: CGImage?
+        sourceImageHeight: Int
     ) throws {
         let validWidth = min(tileSize, sourceImageWidth - originX)
         let validHeight = min(tileSize, sourceImageHeight - originY)
@@ -355,30 +332,13 @@ enum RestoreInferenceCore {
         let tile = try RestorePixelCanvas(width: outputWidth, height: outputHeight)
         tile.context.interpolationQuality = .high
         tile.context.draw(croppedPrediction, in: CGRect(x: 0, y: 0, width: outputWidth, height: outputHeight))
-        let maskCanvas = try maskImage.map { image in
-            guard image.width == tileSize, image.height == tileSize,
-                  let cropped = image.cropping(to: CGRect(
-                    x: 0,
-                    y: 0,
-                    width: validWidth,
-                    height: validHeight
-                  )) else {
-                throw RestoreError.inferenceFailed("修补蒙版与有效图像尺寸不匹配")
-            }
-            let canvas = try RestorePixelCanvas(width: outputWidth, height: outputHeight)
-            canvas.context.interpolationQuality = .high
-            canvas.context.draw(cropped, in: CGRect(x: 0, y: 0, width: outputWidth, height: outputHeight))
-            return canvas
-        }
         let destinationBase = canvas.data.mutableBytes.assumingMemoryBound(to: UInt8.self)
         let tileBase = tile.data.mutableBytes.assumingMemoryBound(to: UInt8.self)
-        let maskBase = maskCanvas?.data.mutableBytes.assumingMemoryBound(to: UInt8.self)
         let minX = max(0, outputOriginX)
         let maxX = min(canvas.width, outputOriginX + outputWidth)
         let minY = max(0, outputOriginY)
         let maxY = min(canvas.height, outputOriginY + outputHeight)
         guard minX < maxX, minY < maxY else { return }
-        if maskImage != nil { try weights.prepareCoverage() }
 
         let haloLeft = max(1, Double(overlapLeft ?? overlap) * scaleX)
         let haloRight = max(1, Double(overlapRight ?? overlap) * scaleX)
@@ -410,16 +370,10 @@ enum RestoreInferenceCore {
                     quantum: Double(RestoreBlendWeights.fullWeight)
                 )
                 let sourceIndex = localY * tile.bytesPerRow + (x - outputOriginX) * 4
-                let baseWeight = min(horizontal, vertical)
-                var weight = baseWeight
-                if let maskBase {
-                    weight = UInt16((Double(weight) * Double(maskBase[sourceIndex]) / 255).rounded())
-                }
                 let alpha = weights.blendWeight(
                     pixelX: x,
                     pixelY: y,
-                    weight: weight,
-                    coverageWeight: maskBase == nil ? nil : baseWeight
+                    weight: min(horizontal, vertical)
                 )
                 guard alpha > 0 else { continue }
                 let destinationIndex = y * canvas.bytesPerRow + x * 4

@@ -17,7 +17,7 @@ enum RestoreSuperResolutionRunner {
         let decoded = try RestoreInferenceCore.decode(url)
         let scale = min(Double(outputWidth) / Double(decoded.width), Double(outputHeight) / Double(decoded.height))
         let target = RestoreMath.fittedSize(width: decoded.width, height: decoded.height, scale: scale, maxLongEdge: max(outputWidth, outputHeight))
-        try RestoreAIMath.validateOutput(width: target.width, height: target.height, isSuperResolution: true)
+        try RestoreAIMath.validateOutput(width: target.width, height: target.height)
         let tileSize = spec.tileSize
         let overlap = spec.overlap
         let tiles = RestoreAIMath.tilePlan(
@@ -58,8 +58,7 @@ enum RestoreSuperResolutionRunner {
                     overlapTop: tile.overlapTop,
                     overlapBottom: tile.overlapBottom,
                     sourceImageWidth: decoded.width,
-                    sourceImageHeight: decoded.height,
-                    maskImage: nil
+                    sourceImageHeight: decoded.height
                 )
                 let value = 0.1 + Double(index + 1) / Double(tiles.count) * (tileProgressEnd - 0.1)
                 await progress(value, "AI 超分 \(index + 1)/\(tiles.count) 块")

@@ -4,7 +4,6 @@ enum RestoreModelID: String, CaseIterable, Identifiable, Hashable, Codable {
     case realESRGAN
     case localSRFast
     case gfpgan
-    case aotGAN
 
     var id: String { rawValue }
 }
@@ -127,10 +126,9 @@ struct RestoreModelSpec: Equatable, Identifiable {
 
 enum RestoreModelCatalog {
     private static let localSRCommit = "bba30194995e2815364f111168fb15155a24920f"
-    private static let aotCommit = "8b3dcd14fc9ca89c08f7485b97ade6040640d835"
     private static let gfpganURL = "https://github.com/zhengzou1860/phone/releases/download/channel-hirestore-models/gfpgan.mlmodel"
 
-    static let all: [RestoreModelSpec] = [realESRGAN, localSRFast, gfpgan, aotGAN]
+    static let all: [RestoreModelSpec] = [realESRGAN, localSRFast, gfpgan]
 
     static func spec(for id: RestoreModelID) -> RestoreModelSpec? {
         all.first { $0.id == id }
@@ -216,36 +214,6 @@ enum RestoreModelCatalog {
         tileSize: 512,
         overlap: 0,
         interface: .image
-    )
-
-    private static let aotGAN = RestoreModelSpec(
-        id: .aotGAN,
-        name: "AOT-GAN Places2",
-        version: "1.0.0",
-        summary: "512px 上下文缺损修补；只处理蒙版命中的小块，未选中画面保留原样。",
-        licenseLabel: "上游 Apache-2.0；转换仓库许可未声明",
-        attribution: "researchmm/AOT-GAN · john-rocky/Core ML conversion",
-        sourceURL: "https://github.com/john-rocky/AOT-GAN-for-Inpainting-CoreML",
-        bundleRelativePath: "aotgan.mlmodel",
-        artifacts: [RestoreModelArtifact(
-            relativePath: "aotgan.mlmodel",
-            downloadURL: "https://raw.githubusercontent.com/john-rocky/AOT-GAN-for-Inpainting-CoreML/\(aotCommit)/AOT-GAN-for-Inpainting-CoreML/aotgan.mlmodel",
-            byteCount: 60_818_996,
-            sha256: "6090945f20e4971113457fa0bb90bca42e4569dcaf9ab7c183d2749ee4718b68",
-            alternateDownloadURLs: [
-                "https://api.github.com/repos/john-rocky/AOT-GAN-for-Inpainting-CoreML/git/blobs/0e916772d239c30ce1dc72b5ec2af5df67d5e5a4"
-            ]
-        )],
-        catalogHash: "aot-gan-8b3dcd14-float32-v1",
-        packagedByteCount: nil,
-        compute: .gpu,
-        inputName: "x_1",
-        outputName: "var_915",
-        inputShape: [1, 4, 512, 512],
-        outputShape: nil,
-        dataType: .float32,
-        tileSize: 512,
-        overlap: 32
     )
 
     private static func artifact(_ commit: String, _ path: String, _ byteCount: Int, _ sha256: String) -> RestoreModelArtifact {

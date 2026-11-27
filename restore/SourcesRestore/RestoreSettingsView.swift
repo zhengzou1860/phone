@@ -28,7 +28,7 @@ struct RestoreSettingsView: View {
                     modelCard
                     privacyCard
                     fileCard
-                    Text("AI 超分和缺损修补会生成合理细节，但不保证还原真实原貌；原生增强仍可作为无需模型的备用方式。")
+                    Text("AI 超分会生成合理细节，但不保证还原真实原貌；原生增强仍可作为无需模型的备用方式。")
                         .font(.caption)
                         .foregroundStyle(RestoreTheme.secondary)
                         .padding(.horizontal, 4)

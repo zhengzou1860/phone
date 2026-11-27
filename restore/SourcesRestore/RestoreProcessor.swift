@@ -31,13 +31,10 @@ final class RestoreProcessor: ObservableObject {
                     throw RestoreError.fileOperation("当前 AI 模型仅支持照片")
                 }
                 try RestoreAIMath.validateSource(width: media.width, height: media.height)
-                if settings.mode == .inpainting {
-                    guard let mask = settings.mask, !mask.isEmpty else { throw RestoreError.emptyMask }
-                }
             }
             let preliminaryOutput = outputSize(for: media, settings: settings)
             if settings.mode.isAI {
-                try RestoreAIMath.validateOutput(width: preliminaryOutput.width, height: preliminaryOutput.height, isSuperResolution: settings.mode == .superResolution)
+                try RestoreAIMath.validateOutput(width: preliminaryOutput.width, height: preliminaryOutput.height)
             }
             guard FileManager.default.fileExists(atPath: media.url.path) else {
                 throw RestoreError.fileOperation("要处理的原片已不存在")

@@ -8,7 +8,6 @@ enum RestoreError: LocalizedError {
     case filterFailed(String)
     case exportFailed(String)
     case photoPermissionDenied
-    case emptyMask
     case modelNotInstalled
     case modelLoadFailed(String)
     case inferenceFailed(String)
@@ -23,7 +22,6 @@ enum RestoreError: LocalizedError {
         case .filterFailed(let message): return "画面处理失败：\(message)"
         case .exportFailed(let message): return "视频导出失败：\(message)"
         case .photoPermissionDenied: return "没有相册写入权限，请在系统设置中允许"
-        case .emptyMask: return "请先在照片上涂抹要修补的缺损区域"
         case .modelNotInstalled: return "AI 模型尚未下载，请先在「设置 → AI 模型」中下载"
         case .modelLoadFailed(let message): return "AI 模型加载失败：\(message)"
         case .inferenceFailed(let message): return "AI 推理失败：\(message)"
@@ -39,7 +37,7 @@ enum RestorePreflightError: LocalizedError {
     case resolutionTooLarge(isVideo: Bool)
     case insufficientSpace(required: Int64, available: Int64)
     case aiSourceTooLarge
-    case aiOutputTooLarge(isSuperResolution: Bool)
+    case aiOutputTooLarge
 
     var errorDescription: String? {
         switch self {
@@ -55,10 +53,8 @@ enum RestorePreflightError: LocalizedError {
             return "可用空间不足：预计需要 \(RestoreMath.formatBytes(Int(required)))，当前只有 \(RestoreMath.formatBytes(Int(available)))"
         case .aiSourceTooLarge:
             return "AI 修复支持最长边 8192 px、最多 40MP 的原片；当前照片请先缩小"
-        case .aiOutputTooLarge(let isSuperResolution):
-            return isSuperResolution
-                ? "AI 超分输出超过 32MP，请降低放大倍数"
-                : "AI 修补输出超过 16MP，请先缩小原片"
+        case .aiOutputTooLarge:
+            return "AI 超分输出超过 32MP，请降低放大倍数"
         }
     }
 }

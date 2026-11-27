@@ -46,28 +46,24 @@ enum RestorePreset: String, Codable, CaseIterable, Identifiable {
 enum RestoreProcessingMode: String, Codable, CaseIterable, Identifiable {
     case native
     case superResolution
-    case inpainting
 
     var id: String { rawValue }
     var title: String {
         switch self {
         case .native: return "原生增强"
         case .superResolution: return "AI 智能超分"
-        case .inpainting: return "AI 缺损修补"
         }
     }
     var subtitle: String {
         switch self {
         case .native: return "无需模型，改善噪点和色彩"
         case .superResolution: return "按所选模型生成细节，再按输出上限缩放"
-        case .inpainting: return "涂抹破损区域，按周围内容补全"
         }
     }
     var systemImage: String {
         switch self {
         case .native: return "slider.horizontal.3"
         case .superResolution: return "sparkles"
-        case .inpainting: return "bandage.fill"
         }
     }
     var maximumOutputLongEdge: Int { self == .superResolution ? 6144 : 4096 }
@@ -83,13 +79,11 @@ struct RestorationSettings: Equatable, Codable {
     var sharpen: Double = 0.52
     var color: Double = 0.12
     var restoreFaces: Bool = true
-    var mask: RestoreMask?
 
     var model: RestoreModelID? {
         switch mode {
         case .native: return nil
         case .superResolution: return superResolutionModel
-        case .inpainting: return .aotGAN
         }
     }
 
@@ -103,8 +97,6 @@ struct RestorationSettings: Equatable, Codable {
             let spec = RestoreModelCatalog.spec(for: superResolutionModel)
             let factor = spec?.upscaleFactor.map { "\($0)×" } ?? "多倍"
             return "AI 超分 · \(spec?.name ?? "本地模型") \(factor) · 输出 \(scaleText)×\(restoreFaces ? " · 人脸补全" : "")"
-        case .inpainting:
-            return "AI 缺损修补 · 原尺寸输出"
         }
     }
 }

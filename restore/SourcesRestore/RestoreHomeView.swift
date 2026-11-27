@@ -129,7 +129,7 @@ struct RestoreHomeView: View {
                 .foregroundStyle(
                     LinearGradient(colors: [.white, RestoreTheme.cyan], startPoint: .top, endPoint: .bottom)
                 )
-            Text("照片支持本地 AI 超分与缺损补全，视频使用原生能力修复噪点、色彩和边缘。")
+            Text("照片支持本地 AI 超分与人脸细节修复，视频使用原生能力修复噪点、色彩和边缘。")
                 .font(.subheadline)
                 .foregroundStyle(RestoreTheme.secondary)
             PrivacyPill()

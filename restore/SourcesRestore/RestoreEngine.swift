@@ -93,7 +93,7 @@ enum RestoreEngine {
             scale: settings.scale,
             maxLongEdge: maxLongEdge
         )
-        try RestoreAIMath.validateOutput(width: target.width, height: target.height, isSuperResolution: settings.mode == .superResolution)
+        try RestoreAIMath.validateOutput(width: target.width, height: target.height)
         try Task.checkCancellation()
         await progress(0.06, "加载本地 AI 模型")
         guard let spec = settings.model.flatMap({ RestoreModelCatalog.spec(for: $0) }) else { throw RestoreError.modelNotInstalled }
@@ -107,17 +107,6 @@ enum RestoreEngine {
                 spec: spec,
                 faceModelURL: settings.restoreFaces ? faceModelURL : nil,
                 restoreFaces: settings.restoreFaces,
-                outputWidth: target.width,
-                outputHeight: target.height,
-                progress: progress
-            )
-        case .inpainting:
-            guard let mask = settings.mask, !mask.isEmpty else { throw RestoreError.emptyMask }
-            return try await RestoreInpaintingRunner.run(
-                from: url,
-                modelURL: modelURL,
-                spec: spec,
-                mask: mask,
                 outputWidth: target.width,
                 outputHeight: target.height,
                 progress: progress
