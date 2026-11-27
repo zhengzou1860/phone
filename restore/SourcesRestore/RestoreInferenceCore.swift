@@ -220,8 +220,11 @@ enum RestoreInferenceCore {
         guard rendered.bitsPerComponent == 8,
               rendered.bitsPerPixel == 32,
               let provider = rendered.dataProvider,
-              let sourceData = provider.data,
-              sourceData.length >= bytesPerRow * size,
+              let rawData = provider.data else {
+            throw RestoreError.inferenceFailed("无法复制推理小块像素")
+        }
+        let sourceData = rawData as NSData
+        guard sourceData.length >= bytesPerRow * size,
               let outputData = NSMutableData(length: sourceData.length) else {
             throw RestoreError.inferenceFailed("无法复制推理小块像素")
         }
