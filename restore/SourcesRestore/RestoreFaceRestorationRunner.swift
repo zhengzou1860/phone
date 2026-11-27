@@ -19,7 +19,7 @@ enum RestoreFaceRestorationRunner {
         request.revision = VNDetectFaceLandmarksRequestRevision3
         let handler = VNImageRequestHandler(cgImage: source, orientation: .up)
         try handler.perform([request])
-        let observations = (request.results ?? [])
+        let observations = (request.results as? [VNFaceObservation] ?? [])
             .filter { $0.boundingBox.width * CGFloat(source.width) >= 24 && $0.boundingBox.height * CGFloat(source.height) >= 24 }
             .sorted { $0.boundingBox.width * $0.boundingBox.height > $1.boundingBox.width * $1.boundingBox.height }
         guard !observations.isEmpty else {
