@@ -44,7 +44,9 @@ jobs:
         run: |
           set -euo pipefail
           rm -rf /tmp/gfpgan.mlmodelc
-          xcrun coremlcompiler compile /tmp/gfpgan.mlmodel /tmp
+          xcrun coremlcompiler compile /tmp/gfpgan.mlmodel /tmp \
+            --platform iOS --deployment-target 18.0 \
+            --add-mlprogram-if-eligible force
           test -s /tmp/gfpgan.mlmodelc/model.mil
           test -s /tmp/gfpgan.mlmodelc/coremldata.bin
           xcrun swiftc "$GITHUB_WORKSPACE/ci/verify_gfpgan.swift" -o /tmp/verify_gfpgan
