@@ -187,68 +187,79 @@ enum RestoreInferenceCore {
     }
 
     private static func drawTile(_ image: CGImage, originX: Int, originY: Int, size: Int, clear: Bool) throws -> CGImage {
-        let bytesPerRow = size * 4
-        guard let data = NSMutableData(length: bytesPerRow * size),
-              let tile = CGContext(
-                data: data.mutableBytes,
+        guard let tile = CGContext(
+                data: nil,
                 width: size,
                 height: size,
                 bitsPerComponent: 8,
-                bytesPerRow: bytesPerRow,
+                bytesPerRow: size * 4,
                 space: CGColorSpaceCreateDeviceRGB(),
                 bitmapInfo: CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.premultipliedLast.rawValue
               ) else {
             throw RestoreError.inferenceFailed("无法创建推理小块")
         }
         tile.interpolationQuality = .none
-        if !clear {
+        if clear {
+            tile.clear(CGRect(x: 0, y: 0, width: size, height: size))
+        } else {
             tile.setFillColor(CGColor(red: 0, green: 0, blue: 0, alpha: 1))
             tile.fill(CGRect(x: 0, y: 0, width: size, height: size))
         }
         let validWidth = min(size, image.width - originX)
         let validHeight = min(size, image.height - originY)
-        if validWidth > 0, validHeight > 0,
-           let cropped = image.cropping(to: CGRect(x: originX, y: originY, width: validWidth, height: validHeight)) {
+        let cropped = validWidth > 0 && validHeight > 0
+            ? image.cropping(to: CGRect(x: originX, y: originY, width: validWidth, height: validHeight))
+            : nil
+        if let cropped {
             tile.draw(
                 cropped,
                 in: CGRect(x: 0, y: size - validHeight, width: validWidth, height: validHeight)
             )
         }
-        if !clear, validWidth > 0, validHeight > 0,
-           validWidth < size || validHeight < size {
-            _ = tile.makeImage()
-            let bytes = data.mutableBytes.assumingMemoryBound(to: UInt8.self)
-            func offset(x: Int, y: Int) -> Int {
-                (size - 1 - y) * bytesPerRow + x * 4
+        if !clear, let cropped, validWidth > 0, validHeight > 0 {
+            let paddingWidth = size - validWidth
+            let paddingHeight = size - validHeight
+            if paddingWidth > 0 {
+                tile.saveGState()
+                tile.clip(to: CGRect(x: validWidth, y: size - validHeight, width: paddingWidth, height: validHeight))
+                tile.draw(
+                    cropped,
+                    in: CGRect(
+                        x: CGFloat(validWidth - (validWidth - 1) * paddingWidth),
+                        y: CGFloat(size - validHeight),
+                        width: CGFloat(validWidth * paddingWidth),
+                        height: CGFloat(validHeight)
+                    )
+                )
+                tile.restoreGState()
             }
-            func copyPixel(from source: Int, to destination: Int) {
-                bytes[destination] = bytes[source]
-                bytes[destination + 1] = bytes[source + 1]
-                bytes[destination + 2] = bytes[source + 2]
-                bytes[destination + 3] = bytes[source + 3]
+            if paddingHeight > 0 {
+                tile.saveGState()
+                tile.clip(to: CGRect(x: 0, y: 0, width: validWidth, height: paddingHeight))
+                tile.draw(
+                    cropped,
+                    in: CGRect(
+                        x: 0,
+                        y: 0,
+                        width: CGFloat(validWidth),
+                        height: CGFloat(validHeight * paddingHeight)
+                    )
+                )
+                tile.restoreGState()
             }
-            if validWidth < size {
-                for y in 0..<validHeight {
-                    let source = offset(x: validWidth - 1, y: y)
-                    for x in validWidth..<size {
-                        copyPixel(from: source, to: offset(x: x, y: y))
-                    }
-                }
-            }
-            if validHeight < size {
-                for y in validHeight..<size {
-                    for x in 0..<validWidth {
-                        copyPixel(from: offset(x: x, y: validHeight - 1), to: offset(x: x, y: y))
-                    }
-                }
-            }
-            if validWidth < size, validHeight < size {
-                let source = offset(x: validWidth - 1, y: validHeight - 1)
-                for y in validHeight..<size {
-                    for x in validWidth..<size {
-                        copyPixel(from: source, to: offset(x: x, y: y))
-                    }
-                }
+            if paddingWidth > 0, paddingHeight > 0 {
+                tile.saveGState()
+                tile.clip(to: CGRect(x: validWidth, y: 0, width: paddingWidth, height: paddingHeight))
+                tile.draw(
+                    cropped,
+                    in: CGRect(
+                        x: CGFloat(validWidth - (validWidth - 1) * paddingWidth),
+                        y: 0,
+                        width: CGFloat(validWidth * paddingWidth),
+                        height: CGFloat(validHeight * paddingHeight)
+                    )
+                )
+                tile.restoreGState()
             }
         }
         guard let result = tile.makeImage() else { throw RestoreError.inferenceFailed("无法生成推理小块") }
