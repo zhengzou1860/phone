@@ -1,6 +1,7 @@
 tools/*
 !tools/report_server_hirestore.py
 !tools/start_hirestore.bat
+!tools/prepare_gfpgan.py
 *.ipa
 *.msi
 *.zip

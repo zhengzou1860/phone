@@ -1,0 +1,77 @@
+name: publish-hirestore-models
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: hirestore-models
+  cancel-in-progress: false
+
+jobs:
+  gfpgan:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: install model tools
+        run: python -m pip install --disable-pip-version-check 'gdown==5.2.0' 'coremltools==9.0'
+
+      - name: download and inspect GFPGAN
+        run: |
+          set -euo pipefail
+          python tools/prepare_gfpgan.py \
+            --output /tmp/gfpgan.mlmodel \
+            --manifest /tmp/gfpgan-manifest.json
+
+      - name: fetch upstream license
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 \
+            https://raw.githubusercontent.com/TencentARC/GFPGAN/master/LICENSE \
+            -o /tmp/GFPGAN_LICENSE.txt
+          test -s /tmp/GFPGAN_LICENSE.txt
+          grep -q 'Apache License' /tmp/GFPGAN_LICENSE.txt
+
+      - name: upload model artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: HiRestore-GFPGAN-model
+          path: |
+            /tmp/gfpgan.mlmodel
+            /tmp/gfpgan-manifest.json
+            /tmp/GFPGAN_LICENSE.txt
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: publish model release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if ! gh release view channel-hirestore-models >/dev/null 2>&1; then
+            gh release create channel-hirestore-models \
+              --title 'HiRestore offline models' --prerelease \
+              --notes 'Verified offline model assets for HiRestore.'
+          fi
+          gh release upload channel-hirestore-models \
+            /tmp/gfpgan.mlmodel /tmp/gfpgan-manifest.json /tmp/GFPGAN_LICENSE.txt \
+            --clobber
+          gh release edit channel-hirestore-models \
+            --draft=false --prerelease \
+            --notes 'GFPGAN Core ML model converted by john-rocky/CoreML-Models; upstream TencentARC/GFPGAN, Apache-2.0.'
+          expected=$(python -c 'import json; print(json.load(open("/tmp/gfpgan-manifest.json"))["bytes"])')
+          actual=$(gh release view channel-hirestore-models --json assets \
+            --jq '.assets[] | select(.name=="gfpgan.mlmodel") | .size')
+          test "$actual" = "$expected"
+          url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/channel-hirestore-models/gfpgan.mlmodel"
+          code=$(curl -fsSIL -o /dev/null -w '%{http_code}' --max-time 90 "$url")
+          test "$code" = 200
+          echo "GFPGAN-RELEASE-VERDICT PASS bytes=$actual url=$url"
