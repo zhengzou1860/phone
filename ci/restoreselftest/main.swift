@@ -154,7 +154,39 @@ expect(realSpec.inputName == "image" && realSpec.outputName == "out", "RealESRGA
 expect(realSpec.inputShape == [1, 3, 384, 384] && realSpec.outputShape == [1, 3, 768, 768], "RealESRGAN tensor shapes match the verified model")
 expect(realSpec.dataType == .float32 && realSpec.compute == .gpu && realSpec.overlap == 32, "RealESRGAN uses its verified FP32 tensor interface with GPU tiling")
 expect(realSpec.upscaleFactor == 2 && srSpec.upscaleFactor == 4, "super-resolution summaries distinguish 2x and 4x models")
-expect(RestoreModelCatalog.all.count == 3, "model catalog includes RealESRGAN, LocalSR Fast, and AOT-GAN")
+expect(RestoreModelCatalog.all.count == 4, "model catalog includes RealESRGAN, LocalSR Fast, GFPGAN, and AOT-GAN")
+let faceSpec = RestoreModelCatalog.spec(for: .gfpgan)!
+expect(faceSpec.interface == .image && faceSpec.inputName == "x_1" && faceSpec.outputName == "activation_out", "GFPGAN uses its verified image feature names")
+expect(faceSpec.tileSize == 512 && faceSpec.totalByteCount == 337392296, "GFPGAN uses a verified 512px interface and pinned model size")
+expect(faceSpec.artifacts[0].sha256 == "218a39c226adecb2ccbc1e358023b80a5cf2510be85dfc3ab0da698fad51391a", "GFPGAN verifies the downloaded model with SHA-256")
+expect(faceSpec.downloadURLs.allSatisfy { URL(string: $0)?.scheme == "https" }, "GFPGAN downloads only over HTTPS")
+let landmarkCenter = RestoreFaceMath.imagePoint(CGPoint(x: 0.5, y: 0.5), faceBox: CGRect(x: 0.25, y: 0.25, width: 0.5, height: 0.5), imageSize: CGSize(width: 1000, height: 800))
+expect(abs(landmarkCenter.x - 500) < 0.0001 && abs(landmarkCenter.y - 400) < 0.0001, "Vision landmarks map from the face box into upper-left image coordinates")
+let identityFace = RestoreFaceMath.similarityTransform(from: RestoreFaceMath.template)!
+expect(abs(identityFace.matrix.a - 1) < 0.000001 && abs(identityFace.matrix.d - 1) < 0.000001 && abs(identityFace.matrix.tx) < 0.000001 && abs(identityFace.matrix.ty) < 0.000001, "face alignment identity transform preserves the 512px template")
+let scaledFaceSource = RestoreFaceMath.template.map { CGPoint(x: $0.x * 0.4 + 300, y: $0.y * 0.4 - 80) }
+let scaledFace = RestoreFaceMath.similarityTransform(from: scaledFaceSource)!
+expect((0..<5).allSatisfy { index in
+    let point = scaledFace.apply(scaledFaceSource[index])
+    let expected = RestoreFaceMath.template[index]
+    return abs(point.x - expected.x) < 0.0001 && abs(point.y - expected.y) < 0.0001
+}, "face alignment recovers scale and translation without drift")
+let angle = 0.3
+let rotatedFaceSource = RestoreFaceMath.template.map { point in
+    CGPoint(x: cos(angle) * point.x - sin(angle) * point.y, y: sin(angle) * point.x + cos(angle) * point.y)
+}
+let rotatedFace = RestoreFaceMath.similarityTransform(from: rotatedFaceSource)!
+expect((0..<5).allSatisfy { index in
+    let point = rotatedFace.apply(rotatedFaceSource[index])
+    let expected = RestoreFaceMath.template[index]
+    return abs(point.x - expected.x) < 0.0001 && abs(point.y - expected.y) < 0.0001
+}, "face alignment removes in-plane face rotation")
+expect(RestoreFaceMath.similarityTransform(from: Array(repeating: CGPoint(x: 10, y: 10), count: 5)) == nil, "face alignment rejects degenerate landmarks")
+expect(RestoreFaceMath.featherAlpha(pixelX: 256, pixelY: 281, size: 512) == 1, "face feather keeps the central facial area fully opaque")
+expect(RestoreFaceMath.featherAlpha(pixelX: 0, pixelY: 0, size: 512) == 0, "face feather leaves the aligned crop border transparent")
+expect(RestoreFaceMath.featherAlpha(pixelX: 256, pixelY: 80, size: 512) < RestoreFaceMath.featherAlpha(pixelX: 256, pixelY: 200, size: 512), "face feather fades continuously toward the forehead")
+let faceMask = try RestoreFaceMath.featherMask(size: 64)
+expect(faceMask.width == 64 && faceMask.height == 64, "face feather mask matches the inference patch dimensions")
 let encodedModelID = try JSONEncoder().encode(RestoreModelID.realESRGAN)
 let decodedModelID = try JSONDecoder().decode(RestoreModelID.self, from: encodedModelID)
 expect(decodedModelID == .realESRGAN, "selected super-resolution model survives Codable settings round trips")

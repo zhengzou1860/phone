@@ -281,6 +281,26 @@ enum RestoreInferenceCore {
         }
     }
 
+    static func predictImage(_ model: MLModel, image: CGImage, spec: RestoreModelSpec) throws -> CGImage {
+        do {
+            let provider = try MLDictionaryFeatureProvider(dictionary: [
+                spec.inputName: try MLFeatureValue(cgImage: image)
+            ])
+            let result = try model.prediction(from: provider)
+            guard let output = result.featureValue(for: spec.outputName)?.imageValue else {
+                throw RestoreError.inferenceFailed("模型没有返回 \(spec.outputName) 图像")
+            }
+            guard output.width == spec.tileSize, output.height == spec.tileSize else {
+                throw RestoreError.inferenceFailed("人脸模型输出尺寸无效")
+            }
+            return output
+        } catch let error as RestoreError {
+            throw error
+        } catch {
+            throw RestoreError.inferenceFailed(error.localizedDescription)
+        }
+    }
+
     static func blend(
         canvas: RestorePixelCanvas,
         weights: RestoreBlendWeights,
@@ -450,13 +470,21 @@ enum RestoreInferenceCore {
     }
 
     private static func validate(_ model: MLModel, spec: RestoreModelSpec) throws {
-        guard let input = model.modelDescription.inputDescriptionsByName[spec.inputName]?.multiArrayConstraint,
-              let output = model.modelDescription.outputDescriptionsByName[spec.outputName]?.multiArrayConstraint,
-              input.shape.map({ $0.intValue }) == spec.inputShape,
-              input.dataType == spec.dataType.coreMLType,
-              output.dataType == spec.dataType.coreMLType,
-              spec.outputShape == nil || output.shape.map({ $0.intValue }) == spec.outputShape else {
-            throw RestoreError.modelLoadFailed("模型接口与当前版本不匹配")
+        switch spec.interface {
+        case .multiArray:
+            guard let input = model.modelDescription.inputDescriptionsByName[spec.inputName]?.multiArrayConstraint,
+                  let output = model.modelDescription.outputDescriptionsByName[spec.outputName]?.multiArrayConstraint,
+                  input.shape.map({ $0.intValue }) == spec.inputShape,
+                  input.dataType == spec.dataType.coreMLType,
+                  output.dataType == spec.dataType.coreMLType,
+                  spec.outputShape == nil || output.shape.map({ $0.intValue }) == spec.outputShape else {
+                throw RestoreError.modelLoadFailed("模型接口与当前版本不匹配")
+            }
+        case .image:
+            guard model.modelDescription.inputDescriptionsByName[spec.inputName]?.type == .image,
+                  model.modelDescription.outputDescriptionsByName[spec.outputName]?.type == .image else {
+                throw RestoreError.modelLoadFailed("模型接口与当前版本不匹配")
+            }
         }
     }
 

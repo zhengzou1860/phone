@@ -3,6 +3,7 @@ import Foundation
 enum RestoreModelID: String, CaseIterable, Identifiable, Hashable, Codable {
     case realESRGAN
     case localSRFast
+    case gfpgan
     case aotGAN
 
     var id: String { rawValue }
@@ -11,6 +12,11 @@ enum RestoreModelID: String, CaseIterable, Identifiable, Hashable, Codable {
 enum RestoreModelCompute: Equatable {
     case neuralEngine
     case gpu
+}
+
+enum RestoreModelInterface: Equatable {
+    case multiArray
+    case image
 }
 
 enum RestoreModelDataType: String, Equatable {
@@ -49,6 +55,7 @@ struct RestoreModelSpec: Equatable, Identifiable {
     let catalogHash: String
     let packagedByteCount: Int?
     let compute: RestoreModelCompute
+    let interface: RestoreModelInterface
     let inputName: String
     let outputName: String
     let inputShape: [Int]
@@ -57,6 +64,50 @@ struct RestoreModelSpec: Equatable, Identifiable {
     let tileSize: Int
     let overlap: Int
 
+    init(
+        id: RestoreModelID,
+        name: String,
+        version: String,
+        summary: String,
+        licenseLabel: String,
+        attribution: String,
+        sourceURL: String,
+        bundleRelativePath: String,
+        artifacts: [RestoreModelArtifact],
+        catalogHash: String,
+        packagedByteCount: Int?,
+        compute: RestoreModelCompute,
+        inputName: String,
+        outputName: String,
+        inputShape: [Int],
+        outputShape: [Int]?,
+        dataType: RestoreModelDataType,
+        tileSize: Int,
+        overlap: Int,
+        interface: RestoreModelInterface = .multiArray
+    ) {
+        self.id = id
+        self.name = name
+        self.version = version
+        self.summary = summary
+        self.licenseLabel = licenseLabel
+        self.attribution = attribution
+        self.sourceURL = sourceURL
+        self.bundleRelativePath = bundleRelativePath
+        self.artifacts = artifacts
+        self.catalogHash = catalogHash
+        self.packagedByteCount = packagedByteCount
+        self.compute = compute
+        self.inputName = inputName
+        self.outputName = outputName
+        self.inputShape = inputShape
+        self.outputShape = outputShape
+        self.dataType = dataType
+        self.tileSize = tileSize
+        self.overlap = overlap
+        self.interface = interface
+    }
+
     var totalByteCount: Int { packagedByteCount ?? artifacts.reduce(0) { $0 + $1.byteCount } }
     var isBundled: Bool { packagedByteCount != nil }
     var upscaleFactor: Int? {
@@ -64,14 +115,21 @@ struct RestoreModelSpec: Equatable, Identifiable {
               inputShape[3] > 0, outputShape[3] % inputShape[3] == 0 else { return nil }
         return outputShape[3] / inputShape[3]
     }
-    var technicalSummary: String { "\(inputName) \(inputShape) → \(outputName) \(outputShape?.description ?? "运行时确定") · \(dataType.rawValue)" }
+    var technicalSummary: String {
+        switch interface {
+        case .multiArray:
+            return "\(inputName) \(inputShape) → \(outputName) \(outputShape?.description ?? "运行时确定") · \(dataType.rawValue)"
+        case .image:
+            return "\(inputName) RGB \(tileSize)×\(tileSize) → \(outputName) RGB \(tileSize)×\(tileSize)"
+        }
+    }
 }
 
 enum RestoreModelCatalog {
     private static let localSRCommit = "bba30194995e2815364f111168fb15155a24920f"
     private static let aotCommit = "8b3dcd14fc9ca89c08f7485b97ade6040640d835"
 
-    static let all: [RestoreModelSpec] = [realESRGAN, localSRFast, aotGAN]
+    static let all: [RestoreModelSpec] = [realESRGAN, localSRFast, gfpgan, aotGAN]
 
     static func spec(for id: RestoreModelID) -> RestoreModelSpec? {
         all.first { $0.id == id }
@@ -125,6 +183,34 @@ enum RestoreModelCatalog {
         dataType: .float16,
         tileSize: 384,
         overlap: 8
+    )
+
+    private static let gfpgan = RestoreModelSpec(
+        id: .gfpgan,
+        name: "GFPGAN 人脸细节",
+        version: "1.0.0",
+        summary: "512px 对齐人脸细节补全；只贴回脸部区域，背景继续使用超分模型，首次需下载约 322 MiB。",
+        licenseLabel: "Apache-2.0",
+        attribution: "TencentARC/GFPGAN · john-rocky/Core ML conversion",
+        sourceURL: "https://github.com/john-rocky/CoreML-Models",
+        bundleRelativePath: "gfpgan.mlmodel",
+        artifacts: [RestoreModelArtifact(
+            relativePath: "gfpgan.mlmodel",
+            downloadURL: "https://github.com/zhengzou1860/phone/releases/download/channel-hirestore-models/gfpgan.mlmodel",
+            byteCount: 337_392_296,
+            sha256: "218a39c226adecb2ccbc1e358023b80a5cf2510be85dfc3ab0da698fad51391a"
+        )],
+        catalogHash: "gfpgan-coreml-512-image-v1",
+        packagedByteCount: nil,
+        compute: .gpu,
+        inputName: "x_1",
+        outputName: "activation_out",
+        inputShape: [],
+        outputShape: [],
+        dataType: .float16,
+        tileSize: 512,
+        overlap: 0,
+        interface: .image
     )
 
     private static let aotGAN = RestoreModelSpec(

@@ -7,7 +7,7 @@ struct RestoreModelView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
-                Text("RealESRGAN 高画质模型已内置在安装包中。LocalSR Fast 与 AOT-GAN 仅在点击下载后访问模型来源；校验通过后，照片推理完全在本机进行，原片不会上传。")
+                Text("RealESRGAN 高画质模型已内置在安装包中。GFPGAN 人脸细节补全、LocalSR Fast 与 AOT-GAN 仅在点击下载后访问模型来源；校验通过后，照片推理完全在本机进行，原片不会上传。")
                     .font(.caption)
                     .foregroundStyle(RestoreTheme.secondary)
 

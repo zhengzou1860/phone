@@ -45,6 +45,7 @@ jobs:
             restore/SourcesRestore/RestoreMath.swift \
             restore/SourcesRestore/RestoreErrors.swift \
             restore/SourcesRestore/RestoreAIMath.swift \
+            restore/SourcesRestore/RestoreFaceMath.swift \
             restore/SourcesRestore/RestoreModelCatalog.swift \
             restore/SourcesRestore/RestoreMask.swift \
             restore/SourcesRestore/RestorePCTransport.swift \
@@ -69,6 +70,7 @@ jobs:
             restore/SourcesRestore/RestoreMath.swift \
             restore/SourcesRestore/RestoreErrors.swift \
             restore/SourcesRestore/RestoreAIMath.swift \
+            restore/SourcesRestore/RestoreFaceMath.swift \
             restore/SourcesRestore/RestoreModelCatalog.swift \
             restore/SourcesRestore/RestoreInferenceCore.swift \
             ci/restoretiletest/main.swift \
@@ -130,8 +132,8 @@ jobs:
           build_number=$(awk -F' => ' '/"CFBundleVersion"/{gsub(/"/,"",$2); print $2; exit}' /tmp/hirestore-info.txt)
           echo "I-VERDICT bundle=$bundle_id version=$version build=$build_number" | tee -a /tmp/selftest.log
           test "$bundle_id" = "com.qoder.hirestore"
-          test "$version" = "0.3.7"
-          test "$build_number" = "12"
+          test "$version" = "0.3.8"
+          test "$build_number" = "13"
           grep -q NSPhotoLibraryAddUsageDescription /tmp/hirestore-info.txt
           grep -q NSLocalNetworkUsageDescription /tmp/hirestore-info.txt
           grep -q NSAllowsLocalNetworking /tmp/hirestore-info.txt
@@ -144,6 +146,7 @@ jobs:
           test -s "$APP/Assets.car"
           test -d "$APP/RealESRGAN_x2plus_384_fp16.mlmodelc"
           test -s "$APP/RealESRGAN_LICENSE.txt"
+          test -s "$APP/GFPGAN_LICENSE.txt"
           echo "I-VERDICT icon=$icon_name assets=$(wc -c < "$APP/Assets.car" | tr -d ' ')B realesrgan=packaged" | tee -a /tmp/selftest.log
           rm -rf Payload hirestore.ipa
           mkdir Payload

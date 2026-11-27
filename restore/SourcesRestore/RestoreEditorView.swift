@@ -48,6 +48,7 @@ struct RestoreEditorView: View {
             guard let id = settings.model, models.isInstalled(id),
                   media.width <= RestoreAIMath.maximumSourceLongEdge,
                   Double(media.width) * Double(media.height) <= Double(RestoreAIMath.maximumSourcePixels) else { return false }
+            if settings.mode == .superResolution, settings.restoreFaces, !models.isInstalled(.gfpgan) { return false }
             return settings.mode != .inpainting || !(settings.mask?.isEmpty ?? true)
         }
         return true
@@ -63,6 +64,7 @@ struct RestoreEditorView: View {
                     if media.kind == .image && settings.mode == .superResolution { superResolutionModelSection }
                     if media.kind == .video || settings.mode == .native || settings.mode == .superResolution { scaleSection }
                     if media.kind == .image && settings.mode.isAI { aiModelSection }
+                    if media.kind == .image && settings.mode == .superResolution { faceRestorationSection }
                     if media.kind == .image && settings.mode == .inpainting { maskSection }
                     outputSection
                     if settings.mode == .native { advancedSection }
@@ -99,7 +101,7 @@ struct RestoreEditorView: View {
                     ProcessingOverlay(
                         progress: processor.progress,
                         phase: processor.phase,
-                        detail: media.kind == .video ? "视频会逐帧处理，请保持 App 在前台" : (settings.mode.isAI ? "照片按小块推理，请保持 App 在前台" : "正在本机生成高清照片")
+                        detail: media.kind == .video ? "视频会逐帧处理，请保持 App 在前台" : (settings.mode.isAI ? "照片按小块和人脸模型推理，请保持 App 在前台" : "正在本机生成高清照片")
                     ) {
                         processor.cancel()
                     }
@@ -205,6 +207,7 @@ struct RestoreEditorView: View {
                         )
                         updated.mode = settings.mode
                         updated.mask = settings.mask
+                        updated.restoreFaces = settings.restoreFaces
                         settings = updated
                     } label: {
                         VStack(alignment: .leading, spacing: 7) {
@@ -370,6 +373,56 @@ struct RestoreEditorView: View {
         }
     }
 
+    private var faceRestorationSection: some View {
+        RestoreCard {
+            VStack(alignment: .leading, spacing: 10) {
+                Toggle(isOn: $settings.restoreFaces) {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Label("人脸细节补全", systemImage: "face.smiling")
+                        Text("识别人脸并对齐，补全眼睛、皮肤和五官颗粒；羽化贴回，不改动背景。")
+                            .font(.caption2)
+                            .foregroundStyle(RestoreTheme.secondary)
+                    }
+                }
+                .font(.subheadline.weight(.semibold))
+                .tint(RestoreTheme.cyan)
+                if settings.restoreFaces, let spec = RestoreModelCatalog.spec(for: .gfpgan) {
+                    let state = models.state(for: .gfpgan)
+                    HStack {
+                        Text(spec.name).font(.caption.weight(.semibold))
+                        Spacer()
+                        if models.isInstalled(.gfpgan) {
+                            Label("已就绪", systemImage: "checkmark.circle.fill").foregroundStyle(RestoreTheme.green)
+                        } else {
+                            Label("需要模型", systemImage: "arrow.down.circle").foregroundStyle(.orange)
+                        }
+                    }
+                    switch state {
+                    case .downloading(let value):
+                        ProgressView(value: value).tint(RestoreTheme.cyan)
+                        Button("取消下载") { models.cancelDownload(.gfpgan) }.font(.caption2)
+                    case .compiling:
+                        ProgressView().controlSize(.small)
+                    case .failed(let message):
+                        Text(message).font(.caption2).foregroundStyle(.red)
+                        Button("重试下载") { models.download(.gfpgan) }.font(.caption2.weight(.semibold))
+                    case .notInstalled:
+                        Button("下载 \(RestoreMath.formatBytes(spec.totalByteCount)) 人脸模型") { models.download(.gfpgan) }
+                            .font(.caption.weight(.semibold))
+                        Text("首次下载约 322 MiB，建议连接 Wi-Fi 并保持 App 在前台；下载校验后完全离线推理。")
+                            .font(.caption2)
+                            .foregroundStyle(RestoreTheme.secondary)
+                    case .installed:
+                        Text("人脸模型已校验，可在飞行模式下处理。")
+                            .font(.caption2)
+                            .foregroundStyle(RestoreTheme.secondary)
+                    }
+                }
+            }
+            .font(.caption)
+        }
+    }
+
     private var maskSection: some View {
         RestoreCard {
             VStack(alignment: .leading, spacing: 10) {
@@ -494,7 +547,8 @@ struct RestoreEditorView: View {
         case .superResolution:
             if let spec = RestoreModelCatalog.spec(for: settings.superResolutionModel) {
                 let factor = spec.upscaleFactor.map { "\($0) 倍" } ?? "多倍"
-                return "AI 超分按 \(spec.tileSize)px 小块生成\(factor)细节并融合重叠区。高画质模型计算量更大，生成内容不一定等于真实原貌。"
+                let faceText = settings.restoreFaces ? " 人脸使用 GFPGAN 512px 对齐补全并羽化贴回。" : ""
+                return "AI 超分按 \(spec.tileSize)px 小块生成\(factor)细节并融合重叠区。\(faceText)高画质模型计算量更大，生成内容不一定等于真实原貌。"
             }
             return "AI 超分按小块生成细节并融合重叠区。生成内容不一定等于真实原貌，处理时间取决于照片尺寸。"
         case .inpainting:

@@ -9,11 +9,12 @@ enum RestoreEngine {
         from url: URL,
         settings: RestorationSettings,
         modelURL: URL? = nil,
+        faceModelURL: URL? = nil,
         maxLongEdge: Int = 4096,
         progress: @escaping @Sendable (Double, String) async -> Void
     ) async throws -> URL {
         if settings.mode.isAI {
-            return try await restoreAIImage(from: url, settings: settings, modelURL: modelURL, maxLongEdge: maxLongEdge, progress: progress)
+            return try await restoreAIImage(from: url, settings: settings, modelURL: modelURL, faceModelURL: faceModelURL, maxLongEdge: maxLongEdge, progress: progress)
         }
         RestoreJournal.line("照片处理：读取原片")
         try Task.checkCancellation()
@@ -78,6 +79,7 @@ enum RestoreEngine {
         from url: URL,
         settings: RestorationSettings,
         modelURL: URL?,
+        faceModelURL: URL?,
         maxLongEdge: Int,
         progress: @escaping @Sendable (Double, String) async -> Void
     ) async throws -> URL {
@@ -98,10 +100,13 @@ enum RestoreEngine {
         RestoreJournal.line("照片 AI 处理：\(settings.mode.rawValue)，模型 \(spec.name) \(spec.technicalSummary)")
         switch settings.mode {
         case .superResolution:
+            if settings.restoreFaces && faceModelURL == nil { throw RestoreError.modelNotInstalled }
             return try await RestoreSuperResolutionRunner.run(
                 from: url,
                 modelURL: modelURL,
                 spec: spec,
+                faceModelURL: settings.restoreFaces ? faceModelURL : nil,
+                restoreFaces: settings.restoreFaces,
                 outputWidth: target.width,
                 outputHeight: target.height,
                 progress: progress

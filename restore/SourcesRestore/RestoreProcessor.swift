@@ -23,6 +23,7 @@ final class RestoreProcessor: ObservableObject {
     func start(media: ImportedMedia, settings: RestorationSettings) {
         guard !isProcessing else { return }
         var modelURL: URL?
+        var faceModelURL: URL?
         do {
             try RestorePreflight.validate(width: media.width, height: media.height, duration: media.duration, isVideo: media.kind == .video)
             if settings.mode.isAI {
@@ -57,8 +58,15 @@ final class RestoreProcessor: ObservableObject {
             if settings.mode.isAI, let modelID = settings.model {
                 modelURL = try models.beginProcessing(modelID)
             }
+            if settings.mode == .superResolution, settings.restoreFaces {
+                faceModelURL = try models.beginProcessing(.gfpgan)
+            }
             RestoreJournal.line("处理预检通过：预计需要 \(RestoreMath.formatBytes(Int(required))) 可用空间，当前 \(RestoreMath.formatBytes(Int(available)))")
         } catch {
+            if settings.mode.isAI, let modelID = settings.model {
+                models.endProcessing(modelID)
+            }
+            if faceModelURL != nil { models.endProcessing(.gfpgan) }
             errorMessage = error.localizedDescription
             phase = "预检未通过"
             RestoreJournal.line("处理预检失败：\(error.localizedDescription)")
@@ -72,11 +80,12 @@ final class RestoreProcessor: ObservableObject {
         UIApplication.shared.isIdleTimerDisabled = true
         RestoreJournal.line("开始处理：\(media.kind.rawValue) \(media.width)×\(media.height) \(settings.summary)")
 
-        workTask = Task.detached(priority: .userInitiated) { [weak self, modelURL, models] in
+        workTask = Task.detached(priority: .userInitiated) { [weak self, modelURL, faceModelURL, models] in
             guard let self else {
                 if settings.mode.isAI, let modelID = settings.model {
                     await models.endProcessing(modelID)
                 }
+                if faceModelURL != nil { await models.endProcessing(.gfpgan) }
                 return
             }
             var temporaryOutput: URL?
@@ -86,6 +95,7 @@ final class RestoreProcessor: ObservableObject {
                         from: media.url,
                         settings: settings,
                         modelURL: modelURL,
+                        faceModelURL: faceModelURL,
                         maxLongEdge: settings.mode.maximumOutputLongEdge,
                         progress: { [weak self] value, text in
                             await MainActor.run {
@@ -151,12 +161,14 @@ final class RestoreProcessor: ObservableObject {
                 if settings.mode.isAI, let modelID = settings.model {
                     await models.endProcessing(modelID)
                 }
+                if faceModelURL != nil { await models.endProcessing(.gfpgan) }
                 await self.finish(record: record)
             } catch {
                 if let temporaryOutput { try? FileManager.default.removeItem(at: temporaryOutput) }
                 if settings.mode.isAI, let modelID = settings.model {
                     await models.endProcessing(modelID)
                 }
+                if faceModelURL != nil { await models.endProcessing(.gfpgan) }
                 await self.finish(error: error)
             }
         }

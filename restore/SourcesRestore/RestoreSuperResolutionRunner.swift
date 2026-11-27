@@ -7,6 +7,8 @@ enum RestoreSuperResolutionRunner {
         from url: URL,
         modelURL: URL,
         spec: RestoreModelSpec,
+        faceModelURL: URL? = nil,
+        restoreFaces: Bool = false,
         outputWidth: Int,
         outputHeight: Int,
         progress: @escaping @Sendable (Double, String) async -> Void
@@ -16,7 +18,6 @@ enum RestoreSuperResolutionRunner {
         let scale = min(Double(outputWidth) / Double(decoded.width), Double(outputHeight) / Double(decoded.height))
         let target = RestoreMath.fittedSize(width: decoded.width, height: decoded.height, scale: scale, maxLongEdge: max(outputWidth, outputHeight))
         try RestoreAIMath.validateOutput(width: target.width, height: target.height, isSuperResolution: true)
-        let model = try RestoreInferenceCore.loadModel(modelURL, spec: spec)
         let tileSize = spec.tileSize
         let overlap = spec.overlap
         let tiles = RestoreAIMath.tilePlan(
@@ -28,39 +29,55 @@ enum RestoreSuperResolutionRunner {
         )
         guard !tiles.isEmpty else { throw RestoreError.invalidDimensions }
         let canvas = try RestorePixelCanvas(width: target.width, height: target.height)
-        let weights = try RestoreBlendWeights(width: target.width, height: target.height)
-        let inputDataType: MLMultiArrayDataType = spec.dataType == .float16 ? .float16 : .float32
-        let input = try MLMultiArray(shape: spec.inputShape.map { NSNumber(value: $0) }, dataType: inputDataType)
-        RestoreJournal.line("AI 超分：\(decoded.width)×\(decoded.height)，\(tiles.count) 个 \(tileSize)px 小块，输出 \(target.width)×\(target.height)")
+        let useFaceRestoration = restoreFaces && faceModelURL != nil
+        let tileProgressEnd = useFaceRestoration ? 0.78 : 0.94
+        do {
+            let model = try RestoreInferenceCore.loadModel(modelURL, spec: spec)
+            let weights = try RestoreBlendWeights(width: target.width, height: target.height)
+            let inputDataType: MLMultiArrayDataType = spec.dataType == .float16 ? .float16 : .float32
+            let input = try MLMultiArray(shape: spec.inputShape.map { NSNumber(value: $0) }, dataType: inputDataType)
+            RestoreJournal.line("AI 超分：\(decoded.width)×\(decoded.height)，\(tiles.count) 个 \(tileSize)px 小块，输出 \(target.width)×\(target.height)")
 
-        for (index, tile) in tiles.enumerated() {
-            try Task.checkCancellation()
-            let sourceTile = try RestoreInferenceCore.sourceTile(decoded.image, originX: tile.originX, originY: tile.originY, size: tileSize)
-            try fillRGB(input, from: sourceTile, channels: 3, minimum: 0, maximum: 1, dataType: spec.dataType)
-            let prediction = try RestoreInferenceCore.predict(model, input: input, spec: spec)
-            let outputSize = try RestoreInferenceCore.imageShape(prediction)
-            let tileImage = try makeOutputImage(prediction, width: outputSize.width, height: outputSize.height, minimum: 0, maximum: 1, dataType: spec.dataType)
-            try RestoreInferenceCore.blend(
+            for (index, tile) in tiles.enumerated() {
+                try Task.checkCancellation()
+                let sourceTile = try RestoreInferenceCore.sourceTile(decoded.image, originX: tile.originX, originY: tile.originY, size: tileSize)
+                try fillRGB(input, from: sourceTile, channels: 3, minimum: 0, maximum: 1, dataType: spec.dataType)
+                let prediction = try RestoreInferenceCore.predict(model, input: input, spec: spec)
+                let outputSize = try RestoreInferenceCore.imageShape(prediction)
+                let tileImage = try makeOutputImage(prediction, width: outputSize.width, height: outputSize.height, minimum: 0, maximum: 1, dataType: spec.dataType)
+                try RestoreInferenceCore.blend(
+                    canvas: canvas,
+                    weights: weights,
+                    tileImage: tileImage,
+                    originX: tile.originX,
+                    originY: tile.originY,
+                    tileSize: tileSize,
+                    overlap: overlap,
+                    overlapLeft: tile.overlapLeft,
+                    overlapRight: tile.overlapRight,
+                    overlapTop: tile.overlapTop,
+                    overlapBottom: tile.overlapBottom,
+                    sourceImageWidth: decoded.width,
+                    sourceImageHeight: decoded.height,
+                    maskImage: nil
+                )
+                let value = 0.1 + Double(index + 1) / Double(tiles.count) * (tileProgressEnd - 0.1)
+                await progress(value, "AI 超分 \(index + 1)/\(tiles.count) 块")
+            }
+            RestoreJournal.line("AI 超分：\(tiles.count) 个分块全部完成")
+        }
+        if useFaceRestoration, let faceModelURL, let faceSpec = RestoreModelCatalog.spec(for: .gfpgan) {
+            await progress(0.79, "检测并对齐人脸")
+            _ = try await RestoreFaceRestorationRunner.restore(
                 canvas: canvas,
-                weights: weights,
-                tileImage: tileImage,
-                originX: tile.originX,
-                originY: tile.originY,
-                tileSize: tileSize,
-                overlap: overlap,
-                overlapLeft: tile.overlapLeft,
-                overlapRight: tile.overlapRight,
-                overlapTop: tile.overlapTop,
-                overlapBottom: tile.overlapBottom,
-                sourceImageWidth: decoded.width,
-                sourceImageHeight: decoded.height,
-                maskImage: nil
+                source: decoded.image,
+                modelURL: faceModelURL,
+                spec: faceSpec,
+                progress: progress
             )
-            await progress(0.1 + Double(index + 1) / Double(tiles.count) * 0.84, "AI 超分 \(index + 1)/\(tiles.count) 块")
         }
         try Task.checkCancellation()
-        await progress(0.96, "编码 AI 超分结果")
-        RestoreJournal.line("AI 超分：\(tiles.count) 个分块全部完成")
+        await progress(0.98, "编码高清修复结果")
         return try await RestoreInferenceCore.writeJPEG(canvas.makeImage())
     }
 

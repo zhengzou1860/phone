@@ -82,6 +82,7 @@ struct RestorationSettings: Equatable, Codable {
     var denoise: Double = 0.28
     var sharpen: Double = 0.52
     var color: Double = 0.12
+    var restoreFaces: Bool = true
     var mask: RestoreMask?
 
     var model: RestoreModelID? {
@@ -101,7 +102,7 @@ struct RestorationSettings: Equatable, Codable {
             let scaleText = scale == scale.rounded() ? String(Int(scale)) : String(format: "%.1f", scale)
             let spec = RestoreModelCatalog.spec(for: superResolutionModel)
             let factor = spec?.upscaleFactor.map { "\($0)×" } ?? "多倍"
-            return "AI 超分 · \(spec?.name ?? "本地模型") \(factor) · 输出 \(scaleText)×"
+            return "AI 超分 · \(spec?.name ?? "本地模型") \(factor) · 输出 \(scaleText)×\(restoreFaces ? " · 人脸补全" : "")"
         case .inpainting:
             return "AI 缺损修补 · 原尺寸输出"
         }
