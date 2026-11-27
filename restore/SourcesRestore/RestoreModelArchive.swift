@@ -44,7 +44,7 @@ enum RestoreModelArchive {
                 throw invalidArchive("路径不安全或重复")
             }
             if extraLength > 0 {
-                try reader.seekToCurrentOffset(relativeOffset: UInt64(extraLength))
+                try reader.seek(toOffset: try reader.offset() + UInt64(extraLength))
             }
             let output = destination.appendingPathComponent(name)
             if directory {
