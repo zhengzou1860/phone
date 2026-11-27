@@ -187,21 +187,21 @@ enum RestoreInferenceCore {
     }
 
     private static func drawTile(_ image: CGImage, originX: Int, originY: Int, size: Int, clear: Bool) throws -> CGImage {
-        guard let tile = CGContext(
-                data: nil,
+        let bytesPerRow = size * 4
+        guard let data = NSMutableData(length: bytesPerRow * size),
+              let tile = CGContext(
+                data: data.mutableBytes,
                 width: size,
                 height: size,
                 bitsPerComponent: 8,
-                bytesPerRow: size * 4,
+                bytesPerRow: bytesPerRow,
                 space: CGColorSpaceCreateDeviceRGB(),
                 bitmapInfo: CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.premultipliedLast.rawValue
               ) else {
             throw RestoreError.inferenceFailed("无法创建推理小块")
         }
         tile.interpolationQuality = .none
-        if clear {
-            tile.clear(CGRect(x: 0, y: 0, width: size, height: size))
-        } else {
+        if !clear {
             tile.setFillColor(CGColor(red: 0, green: 0, blue: 0, alpha: 1))
             tile.fill(CGRect(x: 0, y: 0, width: size, height: size))
         }
@@ -214,47 +214,41 @@ enum RestoreInferenceCore {
                 in: CGRect(x: 0, y: size - validHeight, width: validWidth, height: validHeight)
             )
         }
-        guard let rendered = tile.makeImage() else { throw RestoreError.inferenceFailed("无法生成推理小块") }
-        guard !clear, validWidth > 0, validHeight > 0,
-              (validWidth < size || validHeight < size) else {
-            return rendered
-        }
-        let bytesPerRow = rendered.bytesPerRow
-        guard rendered.bitsPerComponent == 8,
-              rendered.bitsPerPixel == 32,
-              let provider = rendered.dataProvider,
-              let rawData = provider.data else {
-            throw RestoreError.inferenceFailed("无法复制推理小块像素")
-        }
-        let sourceData = rawData as NSData
-        guard sourceData.length >= bytesPerRow * size else {
-            throw RestoreError.inferenceFailed("无法读取推理小块像素")
-        }
-        let sourceBytes = Array(sourceData as Data)
-        func edgeColor(x: Int, y: Int) -> CGColor {
-            let offset = y * bytesPerRow + x * 4
-            return CGColor(
-                red: CGFloat(sourceBytes[offset]) / 255,
-                green: CGFloat(sourceBytes[offset + 1]) / 255,
-                blue: CGFloat(sourceBytes[offset + 2]) / 255,
-                alpha: CGFloat(sourceBytes[offset + 3]) / 255
-            )
-        }
-        if validWidth < size {
-            for y in 0..<validHeight {
-                tile.setFillColor(edgeColor(x: validWidth - 1, y: y))
-                tile.fill(CGRect(x: validWidth, y: size - 1 - y, width: size - validWidth, height: 1))
+        if !clear, validWidth > 0, validHeight > 0,
+           validWidth < size || validHeight < size {
+            let bytes = data.mutableBytes.assumingMemoryBound(to: UInt8.self)
+            func offset(x: Int, y: Int) -> Int {
+                (size - 1 - y) * bytesPerRow + x * 4
             }
-        }
-        if validHeight < size {
-            for x in 0..<validWidth {
-                tile.setFillColor(edgeColor(x: x, y: validHeight - 1))
-                tile.fill(CGRect(x: x, y: 0, width: 1, height: size - validHeight))
+            func copyPixel(from source: Int, to destination: Int) {
+                bytes[destination] = bytes[source]
+                bytes[destination + 1] = bytes[source + 1]
+                bytes[destination + 2] = bytes[source + 2]
+                bytes[destination + 3] = bytes[source + 3]
             }
-        }
-        if validWidth < size, validHeight < size {
-            tile.setFillColor(edgeColor(x: validWidth - 1, y: validHeight - 1))
-            tile.fill(CGRect(x: validWidth, y: 0, width: size - validWidth, height: size - validHeight))
+            if validWidth < size {
+                for y in 0..<validHeight {
+                    let source = offset(x: validWidth - 1, y: y)
+                    for x in validWidth..<size {
+                        copyPixel(from: source, to: offset(x: x, y: y))
+                    }
+                }
+            }
+            if validHeight < size {
+                for y in validHeight..<size {
+                    for x in 0..<validWidth {
+                        copyPixel(from: offset(x: x, y: validHeight - 1), to: offset(x: x, y: y))
+                    }
+                }
+            }
+            if validWidth < size, validHeight < size {
+                let source = offset(x: validWidth - 1, y: validHeight - 1)
+                for y in validHeight..<size {
+                    for x in validWidth..<size {
+                        copyPixel(from: source, to: offset(x: x, y: y))
+                    }
+                }
+            }
         }
         guard let result = tile.makeImage() else { throw RestoreError.inferenceFailed("无法生成推理小块") }
         return result
