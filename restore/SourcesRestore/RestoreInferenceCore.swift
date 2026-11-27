@@ -218,6 +218,10 @@ enum RestoreInferenceCore {
             return rendered
         }
         let sourceData = rawData as NSData
+        if validWidth < size || validHeight < size {
+            let sourceBytes = sourceData.bytes.assumingMemoryBound(to: UInt8.self)
+            print("RESTORE-TILE DEBUG format bpc=\(rendered.bitsPerComponent) bpp=\(rendered.bitsPerPixel) row=\(rendered.bytesPerRow) info=\(rendered.bitmapInfo.rawValue) len=\(sourceData.length) first=\(Array(UnsafeBufferPointer(start: sourceBytes, count: 8)))")
+        }
         let rowBytes = rendered.bytesPerRow
         guard sourceData.length >= rowBytes * size,
               let outputData = NSMutableData(length: sourceData.length) else {
