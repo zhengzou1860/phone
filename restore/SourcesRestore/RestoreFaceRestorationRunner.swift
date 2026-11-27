@@ -126,7 +126,7 @@ enum RestoreFaceRestorationRunner {
         context.fill(CGRect(x: 0, y: 0, width: size, height: size))
         context.interpolationQuality = .high
         context.concatenate(RestoreFaceMath.coreGraphicsTransform(transform, size: size))
-        context.draw(source, at: .zero)
+        context.draw(source, in: CGRect(x: 0, y: 0, width: source.width, height: source.height))
         return context.makeImage()
     }
 

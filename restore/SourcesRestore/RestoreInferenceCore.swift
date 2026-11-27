@@ -1,6 +1,7 @@
 import Foundation
 import CoreML
 import CoreGraphics
+import VideoToolbox
 import ImageIO
 
 struct RestoreDecodedImage {
@@ -290,17 +291,18 @@ enum RestoreInferenceCore {
                 spec.inputName: try MLFeatureValue(cgImage: image, constraint: constraint, options: nil)
             ])
             let result = try model.prediction(from: provider)
-            #if os(iOS)
-            guard let output = result.featureValue(for: spec.outputName)?.imageValue else {
+            guard let output = result.featureValue(for: spec.outputName)?.imageBufferValue else {
                 throw RestoreError.inferenceFailed("模型没有返回 \(spec.outputName) 图像")
             }
-            guard output.width == spec.tileSize, output.height == spec.tileSize else {
+            var image: CGImage?
+            let status = VTCreateCGImageFromCVPixelBuffer(output, options: nil, imageOut: &image)
+            guard status == noErr, let image else {
+                throw RestoreError.inferenceFailed("无法转换人脸模型输出")
+            }
+            guard image.width == spec.tileSize, image.height == spec.tileSize else {
                 throw RestoreError.inferenceFailed("人脸模型输出尺寸无效")
             }
-            return output
-            #else
-            throw RestoreError.inferenceFailed("当前平台无法读取图片模型输出")
-            #endif
+            return image
         } catch let error as RestoreError {
             throw error
         } catch {
