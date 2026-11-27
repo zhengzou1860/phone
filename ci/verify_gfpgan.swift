@@ -2,9 +2,6 @@ import CoreML
 import CoreGraphics
 import CoreVideo
 import Foundation
-#if os(iOS)
-import UIKit
-#endif
 
 func verifyGFPGAN(at path: String) throws {
     let configuration = MLModelConfiguration()
@@ -42,29 +39,27 @@ func verifyGFPGAN(at path: String) throws {
 }
 
 #if os(iOS)
-final class AppDelegate: NSObject, UIApplicationDelegate {
-    func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
-        do {
-            guard let path = Bundle.main.url(forResource: "gfpgan", withExtension: "mlmodelc")?.path else {
-                throw NSError(domain: "GFPGANVerify", code: 5, userInfo: [NSLocalizedDescriptionKey: "compiled model missing"])
-            }
-            try verifyGFPGAN(at: path)
-            print("GFPGAN-IOS18-VERDICT PASS input=512x512 output=512x512")
-            exit(0)
-        } catch {
-            print("GFPGAN-IOS18-VERDICT FAIL \(error.localizedDescription)")
-            exit(1)
-        }
-    }
+guard let modelURL = Bundle.main.url(forResource: "gfpgan", withExtension: "mlmodelc") else {
+    FileHandle.standardError.write(Data("GFPGAN-IOS18-VERDICT FAIL compiled model missing\n".utf8))
+    exit(1)
 }
-
-UIApplicationMain(CommandLine.argc, CommandLine.unsafeArgv, nil, NSStringFromClass(AppDelegate.self))
+let path = modelURL.path
 #else
 let path = CommandLine.arguments.dropFirst().first ?? "/tmp/gfpgan.mlmodelc"
+#endif
+
 do {
     try verifyGFPGAN(at: path)
+    #if os(iOS)
+    print("GFPGAN-IOS18-VERDICT PASS input=512x512 output=512x512")
+    #else
     print("GFPGAN-COMPILED-VERDICT PASS input=512x512 output=512x512")
+    #endif
 } catch {
-    fatalError("GFPGAN compiled verification failed: \(error.localizedDescription)")
+    #if os(iOS)
+    FileHandle.standardError.write(Data("GFPGAN-IOS18-VERDICT FAIL \(error.localizedDescription)\n".utf8))
+    #else
+    FileHandle.standardError.write(Data("GFPGAN-COMPILED-VERDICT FAIL \(error.localizedDescription)\n".utf8))
+    #endif
+    exit(1)
 }
-#endif

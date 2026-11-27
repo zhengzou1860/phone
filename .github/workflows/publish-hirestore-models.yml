@@ -65,6 +65,7 @@ jobs:
               "CFBundleExecutable": "GFPGANVerify",
               "CFBundleName": "GFPGANVerify",
               "CFBundlePackageType": "APPL",
+              "CFBundleSupportedPlatforms": ["iPhoneSimulator"],
               "CFBundleVersion": "1",
               "MinimumOSVersion": "18.5",
               "LSRequiresIPhoneOS": True,
@@ -93,11 +94,15 @@ jobs:
           xcrun simctl boot "$device" || true
           xcrun simctl bootstatus "$device" -b
           xcrun simctl install "$device" /tmp/gfpgan-verify.app
+          container=$(xcrun simctl get_app_container "$device" com.qoder.gfpganverify app)
           set +e
-          output=$(xcrun simctl launch --console "$device" com.qoder.gfpganverify 2>&1)
+          output=$(xcrun simctl spawn "$device" "$container/GFPGANVerify" 2>&1)
           status=$?
           set -e
           printf '%s\n' "$output"
+          if [ "$status" -ne 0 ]; then
+            xcrun simctl spawn "$device" log show --last 3m --style compact --predicate 'process == "GFPGANVerify"' || true
+          fi
           test "$status" -eq 0
           grep -q '^GFPGAN-IOS18-VERDICT PASS input=512x512 output=512x512$' <<< "$output"
 
