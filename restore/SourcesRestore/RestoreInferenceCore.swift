@@ -283,8 +283,11 @@ enum RestoreInferenceCore {
 
     static func predictImage(_ model: MLModel, image: CGImage, spec: RestoreModelSpec) throws -> CGImage {
         do {
+            guard let constraint = model.modelDescription.inputDescriptionsByName[spec.inputName]?.imageConstraint else {
+                throw RestoreError.modelLoadFailed("人脸模型缺少图片输入约束")
+            }
             let provider = try MLDictionaryFeatureProvider(dictionary: [
-                spec.inputName: try MLFeatureValue(cgImage: image)
+                spec.inputName: try MLFeatureValue(cgImage: image, constraint: constraint, options: nil)
             ])
             let result = try model.prediction(from: provider)
             guard let output = result.featureValue(for: spec.outputName)?.imageValue else {

@@ -125,10 +125,8 @@ enum RestoreFaceRestorationRunner {
         context.setFillColor(CGColor(red: 0, green: 0, blue: 0, alpha: 1))
         context.fill(CGRect(x: 0, y: 0, width: size, height: size))
         context.interpolationQuality = .high
-        context.saveGState()
-        context.concatenate(transform.matrix)
+        context.concatenate(RestoreFaceMath.coreGraphicsTransform(transform, size: size))
         context.draw(source, at: .zero)
-        context.restoreGState()
         return context.makeImage()
     }
 
@@ -154,9 +152,11 @@ enum RestoreFaceRestorationRunner {
             scaleX: Double(canvas.width) / Double(source.width),
             y: Double(canvas.height) / Double(source.height)
         )
+        let inverse = RestoreFaceTransform(matrix: transform.matrix.inverted(), scale: 1 / transform.scale)
+        let faceTransform = RestoreFaceMath.coreGraphicsTransform(inverse, size: patch.width)
         canvas.context.saveGState()
         canvas.context.interpolationQuality = .high
-        canvas.context.concatenate(outputScale.concatenated(transform.matrix.inverted()))
+        canvas.context.concatenate(outputScale.concatenated(faceTransform))
         canvas.context.draw(patch, in: CGRect(x: 0, y: 0, width: patch.width, height: patch.height))
         canvas.context.restoreGState()
     }

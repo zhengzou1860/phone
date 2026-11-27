@@ -68,6 +68,19 @@ enum RestoreFaceMath {
         )
     }
 
+    static func coreGraphicsTransform(_ transform: RestoreFaceTransform, size: Int) -> CGAffineTransform {
+        let matrix = transform.matrix
+        let height = Double(size)
+        return CGAffineTransform(
+            a: matrix.a,
+            b: -matrix.b,
+            c: -matrix.c,
+            d: matrix.d,
+            tx: matrix.c * height + matrix.tx,
+            ty: height - matrix.d * height - matrix.ty
+        )
+    }
+
     static func featherAlpha(pixelX: Int, pixelY: Int, size: Int) -> Double {
         guard size > 0 else { return 0 }
         let centerX = Double(size - 1) / 2

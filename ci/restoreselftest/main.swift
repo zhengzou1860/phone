@@ -182,6 +182,11 @@ expect((0..<5).allSatisfy { index in
     return abs(point.x - expected.x) < 0.0001 && abs(point.y - expected.y) < 0.0001
 }, "face alignment removes in-plane face rotation")
 expect(RestoreFaceMath.similarityTransform(from: Array(repeating: CGPoint(x: 10, y: 10), count: 5)) == nil, "face alignment rejects degenerate landmarks")
+let contextFaceSource = CGPoint(x: 140, y: 90)
+let contextAligned = rotatedFace.apply(contextFaceSource)
+let contextInput = CGPoint(x: contextFaceSource.x, y: 512 - contextFaceSource.y)
+let contextPoint = contextInput.applying(RestoreFaceMath.coreGraphicsTransform(rotatedFace, size: 512))
+expect(abs(contextPoint.x - contextAligned.x) < 0.0001 && abs(contextPoint.y - (512 - contextAligned.y)) < 0.0001, "face alignment converts upper-left landmarks into Core Graphics coordinates")
 expect(RestoreFaceMath.featherAlpha(pixelX: 256, pixelY: 281, size: 512) == 1, "face feather keeps the central facial area fully opaque")
 expect(RestoreFaceMath.featherAlpha(pixelX: 0, pixelY: 0, size: 512) == 0, "face feather leaves the aligned crop border transparent")
 expect(RestoreFaceMath.featherAlpha(pixelX: 256, pixelY: 70, size: 512) < RestoreFaceMath.featherAlpha(pixelX: 256, pixelY: 200, size: 512), "face feather fades continuously toward the forehead")
