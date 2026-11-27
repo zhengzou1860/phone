@@ -51,6 +51,14 @@ jobs:
       - name: tile pixel selftest
         run: |
           set -euo pipefail
+          annotate() {
+            grep -E 'RESTORE-TILE (DETAIL|FAIL)|error:' /tmp/selftest.log | while IFS= read -r line; do
+              line=${line//'%'/'%25'}
+              line=${line//$'\r'/'%0D'}
+              echo "::error::TILE $line"
+            done || true
+          }
+          set +e
           xcrun swiftc -O \
             restore/SourcesRestore/RestoreMath.swift \
             restore/SourcesRestore/RestoreErrors.swift \
@@ -59,8 +67,18 @@ jobs:
             restore/SourcesRestore/RestoreInferenceCore.swift \
             ci/restoretiletest/main.swift \
             -o /tmp/restoretiletest 2>&1 | tee -a /tmp/selftest.log
+          status=${PIPESTATUS[0]}
+          set -e
+          if [ "$status" -ne 0 ]; then annotate; exit "$status"; fi
+          set +e
           /tmp/restoretiletest 2>&1 | tee -a /tmp/selftest.log
-          grep -q '^RESTORE-TILE-VERDICT PASS$' /tmp/selftest.log
+          status=${PIPESTATUS[0]}
+          set -e
+          if [ "$status" -ne 0 ]; then annotate; exit "$status"; fi
+          if ! grep -q '^RESTORE-TILE-VERDICT PASS$' /tmp/selftest.log; then
+            echo "::error::TILE missing RESTORE-TILE-VERDICT PASS"
+            exit 1
+          fi
 
       - name: PC receiver selftest
         run: |
