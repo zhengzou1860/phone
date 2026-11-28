@@ -45,7 +45,7 @@ def validate_prediction(model, example, reference, label):
         if float(array.max()) <= 1.0:
             array = array * 255.0
         array = np.ascontiguousarray(np.rint(array), dtype=np.uint8)
-    reference_array = np.moveaxis(reference[0].numpy(), 0, -1)
+    reference_array = np.moveaxis(reference[0].numpy(), 0, -1) / 255.0
     mean_error = float(np.abs(array.astype(np.float32) / 255.0 - reference_array).mean())
     output_std = float(array.astype(np.float32).std() / 255.0)
     print(
