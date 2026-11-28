@@ -56,7 +56,7 @@ jobs:
           set -euo pipefail
           rm -rf /tmp/gfpgan-verify.app /tmp/gfpgan-verify-src
           mkdir -p /tmp/gfpgan-verify.app /tmp/gfpgan-verify-src
-          cp -R /tmp/gfpgan.mlmodelc /tmp/gfpgan-verify.app/1.1.0-gfpgan.mlmodelc
+          cp -R /tmp/gfpgan.mlmodelc /tmp/gfpgan-verify.app/1.1.1-gfpgan.mlmodelc
           cp "$GITHUB_WORKSPACE/ci/verify_gfpgan.swift" /tmp/gfpgan-verify-src/main.swift
           simulator=$(xcrun simctl list devices available -j | python3 -c '
           import json, sys
@@ -188,7 +188,7 @@ jobs:
             --clobber
           gh release edit channel-hirestore-models \
             --draft=false --prerelease \
-            --notes 'GFPGAN Core ML model converted by john-rocky/CoreML-Models; precompiled iOS package verified on macOS; upstream TencentARC/GFPGAN, Apache-2.0.'
+            --notes 'GFPGAN Core ML model converted by john-rocky/CoreML-Models; precompiled with Xcode 26.6 and verified on macOS plus the current iOS simulator; upstream TencentARC/GFPGAN, Apache-2.0.'
           expected=$(python -c 'import json; print(json.load(open("/tmp/gfpgan-manifest.json"))["bytes"])')
           actual=$(gh release view channel-hirestore-models --json assets \
             --jq '.assets[] | select(.name=="gfpgan.mlmodel") | .size')

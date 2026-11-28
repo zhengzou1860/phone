@@ -157,7 +157,7 @@ enum RestoreModelStorage {
 
 enum RestoreModelCatalog {
     private static let localSRCommit = "bba30194995e2815364f111168fb15155a24920f"
-    private static let gfpganArchiveURL = "https://github.com/zhengzou1860/phone/releases/download/channel-hirestore-models/gfpgan-ios18.zip"
+    private static let gfpganArchiveURL = "https://github.com/zhengzou1860/phone/releases/download/channel-hirestore-models/gfpgan-ios26.zip"
 
     static let all: [RestoreModelSpec] = [realESRGAN, localSRFast, gfpgan]
 
@@ -218,24 +218,24 @@ enum RestoreModelCatalog {
     private static let gfpgan = RestoreModelSpec(
         id: .gfpgan,
         name: "GFPGAN 人脸细节",
-        version: "1.1.0",
+        version: "1.1.1",
         summary: "512px 对齐人脸细节补全；只贴回脸部区域，背景继续使用超分模型，首次需下载约 322 MiB。",
         licenseLabel: "Apache-2.0",
         attribution: "TencentARC/GFPGAN · john-rocky/Core ML conversion",
         sourceURL: "https://github.com/john-rocky/CoreML-Models",
         bundleRelativePath: "gfpgan.mlmodelc",
         artifacts: [RestoreModelArtifact(
-            relativePath: "gfpgan-ios18.zip",
+            relativePath: "gfpgan-ios26.zip",
             downloadURL: gfpganArchiveURL,
             byteCount: 337_900_799,
-            sha256: "c657ae0d9c2d10e03ee6f11f2c521a9b65011f5e1fb2c5b83ee964905ca25ec3",
+            sha256: "36c1da280f6d4e680e3638f926cc166d09f54c44c5fdbad8fa5b967189de6688",
             alternateDownloadURLs: [
                 "https://gh-proxy.com/\(gfpganArchiveURL)",
                 "https://ghfast.top/\(gfpganArchiveURL)"
             ],
             isArchive: true
         )],
-        catalogHash: "gfpgan-coreml-512-image-ios18-precompiled-v1",
+        catalogHash: "gfpgan-coreml-512-image-ios26-xcode26.6-v2",
         packagedByteCount: nil,
         compute: .gpu,
         inputName: "x_1",
