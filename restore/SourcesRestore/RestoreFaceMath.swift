@@ -70,15 +70,32 @@ enum RestoreFaceMath {
 
     static func coreGraphicsTransform(_ transform: RestoreFaceTransform, size: Int) -> CGAffineTransform {
         let matrix = transform.matrix
-        let height = Double(size)
         return CGAffineTransform(
             a: matrix.a,
             b: -matrix.b,
             c: -matrix.c,
             d: matrix.d,
-            tx: matrix.c * height + matrix.tx,
-            ty: height - matrix.d * height - matrix.ty
+            tx: matrix.tx,
+            ty: Double(size) - matrix.ty
         )
+    }
+
+    static func paste(patch: CGImage, transform: RestoreFaceTransform, source: CGImage, canvas: RestorePixelCanvas) {
+        let patchFlip = CGAffineTransform(translationX: 0, y: Double(patch.height)).scaledBy(x: 1, y: -1)
+        let resize = CGAffineTransform(
+            scaleX: Double(canvas.width) / Double(source.width),
+            y: Double(canvas.height) / Double(source.height)
+        )
+        let canvasFlip = CGAffineTransform(translationX: 0, y: Double(canvas.height)).scaledBy(x: 1, y: -1)
+        canvas.context.saveGState()
+        canvas.context.interpolationQuality = .high
+        canvas.context.concatenate(
+            canvasFlip.concatenated(with: resize)
+                .concatenated(with: patchFlip)
+                .concatenated(with: transform.matrix.inverted())
+        )
+        canvas.context.draw(patch, in: CGRect(x: 0, y: 0, width: patch.width, height: patch.height))
+        canvas.context.restoreGState()
     }
 
     static func featherAlpha(pixelX: Int, pixelY: Int, size: Int) -> Double {

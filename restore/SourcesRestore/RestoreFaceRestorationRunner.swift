@@ -61,10 +61,26 @@ enum RestoreFaceRestorationRunner {
                 RestoreJournal.line("人脸补全推理失败：第 \(index + 1) 张脸 · \(RestoreInferenceCore.diagnostic(for: error))")
                 throw error
             }
+            let modelDifference = try imageDifference(aligned, restored)
+            RestoreJournal.line(String(
+                format: "GFPGAN 输出变化：平均 RGB 差 %.2f/255，变化 %d 个像素",
+                modelDifference.mean, modelDifference.changedPixels
+            ))
             guard let patch = maskedPatch(image: restored, mask: mask) else {
                 throw RestoreError.inferenceFailed("无法生成人脸融合图像")
             }
-            paste(patch: patch, transform: transform, source: source, canvas: canvas)
+            guard let before = canvas.data.mutableCopy() as? NSMutableData else {
+                throw RestoreError.inferenceFailed("无法比对人脸补全结果")
+            }
+            RestoreFaceMath.paste(patch: patch, transform: transform, source: source, canvas: canvas)
+            let canvasDifference = difference(before: before, after: canvas.data, width: canvas.width, height: canvas.height, bytesPerRow: canvas.bytesPerRow)
+            guard canvasDifference.changedPixels > 0 else {
+                throw RestoreError.inferenceFailed("人脸补全结果没有写入图像")
+            }
+            RestoreJournal.line(String(
+                format: "人脸贴回：变化 %d 个像素，平均 RGB 差 %.2f/255，最大差 %d",
+                canvasDifference.changedPixels, canvasDifference.mean, canvasDifference.maximum
+            ))
             completed += 1
             let value = 0.80 + Double(index + 1) / Double(selected.count) * 0.16
             await progress(value, "人脸细节补全 \(index + 1)/\(selected.count)")
@@ -177,19 +193,46 @@ enum RestoreFaceRestorationRunner {
         return context.makeImage()
     }
 
-    private static func paste(patch: CGImage, transform: RestoreFaceTransform, source: CGImage, canvas: RestorePixelCanvas) {
-        canvas.context.saveGState()
-        canvas.context.interpolationQuality = .high
-        canvas.context.translateBy(x: 0, y: CGFloat(patch.height))
-        canvas.context.scaleBy(x: 1, y: -1)
-        canvas.context.concatenate(transform.matrix.inverted())
-        canvas.context.scaleBy(
-            x: Double(canvas.width) / Double(source.width),
-            y: Double(canvas.height) / Double(source.height)
+    private static func imageDifference(_ first: CGImage, _ second: CGImage) throws -> (mean: Double, changedPixels: Int, maximum: Int) {
+        guard first.width == second.width, first.height == second.height else {
+            throw RestoreError.inferenceFailed("人脸模型输入输出尺寸不一致")
+        }
+        let firstCanvas = try RestorePixelCanvas(width: first.width, height: first.height, source: first)
+        let secondCanvas = try RestorePixelCanvas(width: second.width, height: second.height, source: second)
+        return difference(
+            before: firstCanvas.data,
+            after: secondCanvas.data,
+            width: first.width,
+            height: first.height,
+            bytesPerRow: firstCanvas.bytesPerRow
         )
-        canvas.context.translateBy(x: 0, y: CGFloat(canvas.height))
-        canvas.context.scaleBy(x: 1, y: -1)
-        canvas.context.draw(patch, in: CGRect(x: 0, y: 0, width: patch.width, height: patch.height))
-        canvas.context.restoreGState()
+    }
+
+    private static func difference(
+        before: NSMutableData,
+        after: NSMutableData,
+        width: Int,
+        height: Int,
+        bytesPerRow: Int
+    ) -> (mean: Double, changedPixels: Int, maximum: Int) {
+        let first = before.mutableBytes.assumingMemoryBound(to: UInt8.self)
+        let second = after.mutableBytes.assumingMemoryBound(to: UInt8.self)
+        var total = 0
+        var maximum = 0
+        var changedPixels = 0
+        for y in 0..<height {
+            for x in 0..<width {
+                let offset = y * bytesPerRow + x * 4
+                var changed = false
+                for channel in 0..<3 {
+                    let delta = abs(Int(first[offset + channel]) - Int(second[offset + channel]))
+                    total += delta
+                    maximum = max(maximum, delta)
+                    if delta > 0 { changed = true }
+                }
+                if changed { changedPixels += 1 }
+            }
+        }
+        return (Double(total) / Double(width * height * 3), changedPixels, maximum)
     }
 }

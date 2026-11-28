@@ -8,6 +8,19 @@ func expect(_ condition: Bool, _ message: String) {
     print("RESTORE-CASE PASS \(message)")
 }
 
+func solidImage(width: Int, height: Int, red: Double, green: Double, blue: Double) throws -> CGImage {
+    let canvas = try RestorePixelCanvas(width: width, height: height)
+    canvas.context.setFillColor(CGColor(red: red, green: green, blue: blue, alpha: 1))
+    canvas.context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+    return try canvas.makeImage()
+}
+
+func canvasPixel(_ canvas: RestorePixelCanvas, x: Int, y: Int) -> (UInt8, UInt8, UInt8, UInt8) {
+    let bytes = canvas.data.mutableBytes.assumingMemoryBound(to: UInt8.self)
+    let offset = y * canvas.bytesPerRow + x * 4
+    return (bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3])
+}
+
 let capped = RestoreMath.fittedSize(width: 4032, height: 3024, scale: 2, maxLongEdge: 4096)
 expect(capped.width == 4096 && capped.height == 3072, "12MP landscape capped at 4096 with aspect ratio")
 
@@ -245,10 +258,30 @@ let contextAligned = rotatedFace.apply(contextFaceSource)
 let contextInput = CGPoint(x: contextFaceSource.x, y: 512 - contextFaceSource.y)
 let contextPoint = contextInput.applying(RestoreFaceMath.coreGraphicsTransform(rotatedFace, size: 512))
 expect(abs(contextPoint.x - contextAligned.x) < 0.0001 && abs(contextPoint.y - (512 - contextAligned.y)) < 0.0001, "face alignment converts upper-left landmarks into Core Graphics coordinates")
+expect((0..<5).allSatisfy { index in
+    let sourcePoint = rotatedFaceSource[index]
+    let mapped = CGPoint(x: sourcePoint.x, y: 512 - sourcePoint.y)
+        .applying(RestoreFaceMath.coreGraphicsTransform(rotatedFace, size: 512))
+    return abs(mapped.x - RestoreFaceMath.template[index].x) < 0.0001
+        && abs(mapped.y - (512 - RestoreFaceMath.template[index].y)) < 0.0001
+}, "rotated face alignment maps every landmark into the GFPGAN template")
 let inverseFace = RestoreFaceTransform(matrix: rotatedFace.matrix.inverted(), scale: 1 / rotatedFace.scale)
 let patchPoint = CGPoint(x: contextAligned.x, y: 512 - contextAligned.y)
 let pastedPoint = patchPoint.applying(RestoreFaceMath.coreGraphicsTransform(inverseFace, size: 512))
 expect(abs(pastedPoint.x - contextFaceSource.x) < 0.0001 && abs(pastedPoint.y - (512 - contextFaceSource.y)) < 0.0001, "face patch inverse transform returns to the source location")
+let pasteSource = try solidImage(width: 128, height: 128, red: 1, green: 0, blue: 0)
+let pastePatch = try solidImage(width: 64, height: 64, red: 0, green: 1, blue: 0)
+let pasteCanvas = try RestorePixelCanvas(width: 256, height: 256, source: pasteSource)
+let pasteTemplate = RestoreFaceMath.template.map { CGPoint(x: $0.x / 8, y: $0.y / 8) }
+let pasteTransform = RestoreFaceMath.similarityTransform(
+    from: pasteTemplate,
+    to: pasteTemplate.map { CGPoint(x: $0.x * 0.5 + 20, y: $0.y * 0.5 + 20) }
+)!
+RestoreFaceMath.paste(patch: pastePatch, transform: pasteTransform, source: pasteSource, canvas: pasteCanvas)
+let pastedPixel = canvasPixel(pasteCanvas, x: 48, y: 144)
+let untouchedPixel = canvasPixel(pasteCanvas, x: 48, y: 200)
+expect(pastedPixel.0 == 0 && pastedPixel.1 > 240 && pastedPixel.2 == 0, "face patch is drawn at the transformed image location without vertical mirroring")
+expect(untouchedPixel.0 > 240 && untouchedPixel.1 == 0 && untouchedPixel.2 == 0, "face patch leaves pixels outside its transformed bounds unchanged")
 expect(RestoreFaceMath.featherAlpha(pixelX: 256, pixelY: 281, size: 512) == 1, "face feather keeps the central facial area fully opaque")
 expect(RestoreFaceMath.featherAlpha(pixelX: 0, pixelY: 0, size: 512) == 0, "face feather leaves the aligned crop border transparent")
 expect(RestoreFaceMath.featherAlpha(pixelX: 256, pixelY: 70, size: 512) < RestoreFaceMath.featherAlpha(pixelX: 256, pixelY: 200, size: 512), "face feather fades continuously toward the forehead")
