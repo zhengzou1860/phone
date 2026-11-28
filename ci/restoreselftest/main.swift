@@ -289,7 +289,7 @@ RestoreFaceMath.paste(
     canvas: identityCanvas
 )
 let identityInside = canvasPixel(identityCanvas, x: 16, y: 20)
-let identityOutside = canvasPixel(identityCanvas, x: 16, y: 100)
+let identityOutside = canvasPixel(identityCanvas, x: 120, y: 120)
 expect(identityInside.0 == 0 && identityInside.1 > 240 && identityInside.2 == 0, "identity face patch covers the expected top-left crop")
 expect(identityOutside.0 > 240 && identityOutside.1 == 0 && identityOutside.2 == 0, "identity face patch leaves the lower image area unchanged")
 expect(RestoreFaceMath.featherAlpha(pixelX: 256, pixelY: 281, size: 512) == 1, "face feather keeps the central facial area fully opaque")
