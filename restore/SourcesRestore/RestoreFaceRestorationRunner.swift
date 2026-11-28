@@ -2,9 +2,11 @@ import Foundation
 import CoreGraphics
 import CoreML
 import Vision
+import os
 
 enum RestoreFaceRestorationRunner {
     static let maximumFaces = 8
+    private static let minimumAvailableMemory: UInt64 = 896 * 1024 * 1024
 
     static func restore(
         canvas: RestorePixelCanvas,
@@ -27,6 +29,7 @@ enum RestoreFaceRestorationRunner {
             return 0
         }
         let selected = Array(observations.prefix(maximumFaces))
+        try requireMemory("模型加载前")
         let loadedModel: RestoreLoadedModel
         do {
             loadedModel = try RestoreInferenceCore.loadModel(modelURL, spec: spec)
@@ -34,6 +37,7 @@ enum RestoreFaceRestorationRunner {
             RestoreJournal.line("人脸补全模型不可用：\(RestoreInferenceCore.diagnostic(for: error))")
             throw error
         }
+        logMemory("模型加载后")
         if observations.count > selected.count {
             RestoreJournal.line("人脸补全：检测到 \(observations.count) 张脸，本轮处理前 \(selected.count) 张")
         }
@@ -50,7 +54,9 @@ enum RestoreFaceRestorationRunner {
             }
             let restored: CGImage
             do {
+                try requireMemory("第 \(index + 1) 张脸推理前")
                 restored = try RestoreInferenceCore.predictImage(loadedModel, image: aligned, spec: spec)
+                logMemory("第 \(index + 1) 张脸推理后")
             } catch {
                 RestoreJournal.line("人脸补全推理失败：第 \(index + 1) 张脸 · \(RestoreInferenceCore.diagnostic(for: error))")
                 throw error
@@ -68,6 +74,18 @@ enum RestoreFaceRestorationRunner {
             await progress(0.94, "人脸特征不足，保留超分结果")
         }
         return completed
+    }
+
+    private static func requireMemory(_ stage: String) throws {
+        let available = UInt64(os_proc_available_memory())
+        RestoreJournal.line("人脸补全内存：\(stage) · 可用 \(RestoreMath.formatBytes(Int(available)))")
+        guard available >= minimumAvailableMemory else {
+            throw RestoreError.inferenceFailed("可用内存不足，已保留超分结果；请关闭其他应用后重试人脸补全")
+        }
+    }
+
+    private static func logMemory(_ stage: String) {
+        RestoreJournal.line("人脸补全内存：\(stage) · 可用 \(RestoreMath.formatBytes(Int(os_proc_available_memory())))")
     }
 
     private static func alignment(for observation: VNFaceObservation, source: CGImage) -> RestoreFaceTransform? {

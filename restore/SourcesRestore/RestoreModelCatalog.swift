@@ -11,6 +11,7 @@ enum RestoreModelID: String, CaseIterable, Identifiable, Hashable, Codable {
 enum RestoreModelCompute: Equatable {
     case neuralEngine
     case gpu
+    case cpu
 }
 
 enum RestoreModelInterface: Equatable {
@@ -237,7 +238,7 @@ enum RestoreModelCatalog {
         )],
         catalogHash: "gfpgan-v1.4-mlprogram-fp32-pal6-precompiled-v1",
         packagedByteCount: nil,
-        compute: .gpu,
+        compute: .cpu,
         inputName: "x_1",
         outputName: "activation_out",
         inputShape: [],

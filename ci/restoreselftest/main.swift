@@ -199,6 +199,7 @@ expect(realSpec.upscaleFactor == 2 && srSpec.upscaleFactor == 4, "super-resoluti
 expect(RestoreModelCatalog.all.count == 3, "model catalog includes RealESRGAN, LocalSR Fast, and GFPGAN")
 let faceSpec = RestoreModelCatalog.spec(for: .gfpgan)!
 expect(faceSpec.version == "1.3.0" && faceSpec.dataType == .float32 && faceSpec.interface == .image && faceSpec.inputName == "x_1" && faceSpec.outputName == "activation_out", "GFPGAN uses its verified FP32 image feature names")
+expect(faceSpec.compute == .cpu, "GFPGAN avoids GPU weight expansion on 4 GB iPhones")
 expect(faceSpec.tileSize == 512 && faceSpec.totalByteCount == 64270667, "GFPGAN uses a verified 512px interface and pinned precompiled package size")
 expect(faceSpec.bundleRelativePath == "gfpgan.mlmodelc" && faceSpec.artifacts[0].isArchive, "GFPGAN installs the precompiled ML Program without device compilation")
 expect(RestoreModelCatalog.all.allSatisfy({ RestoreModelStorage.compiledURL(root: URL(fileURLWithPath: "/models"), spec: $0).pathExtension.lowercased() == "mlmodelc" }), "every installed model path preserves the Core ML bundle extension")

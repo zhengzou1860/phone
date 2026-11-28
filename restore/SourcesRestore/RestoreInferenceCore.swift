@@ -165,9 +165,11 @@ enum RestoreInferenceCore {
         switch spec.compute {
         case .neuralEngine: preferred = .cpuAndNeuralEngine
         case .gpu: preferred = .cpuAndGPU
+        case .cpu: preferred = .cpuOnly
         }
         var failures: [String] = []
-        for computeUnits in [preferred, .cpuOnly] {
+        let candidates: [MLComputeUnits] = preferred == .cpuOnly ? [preferred] : [preferred, .cpuOnly]
+        for computeUnits in candidates {
             do {
                 return try loadModel(at: url, spec: spec, computeUnits: computeUnits)
             } catch {
@@ -349,30 +351,32 @@ enum RestoreInferenceCore {
     }
 
     private static func predictImage(_ model: MLModel, image: CGImage, spec: RestoreModelSpec) throws -> CGImage {
-        do {
-            guard let constraint = model.modelDescription.inputDescriptionsByName[spec.inputName]?.imageConstraint else {
-                throw RestoreError.modelLoadFailed("人脸模型缺少图片输入约束")
+        try autoreleasepool {
+            do {
+                guard let constraint = model.modelDescription.inputDescriptionsByName[spec.inputName]?.imageConstraint else {
+                    throw RestoreError.modelLoadFailed("人脸模型缺少图片输入约束")
+                }
+                let provider = try MLDictionaryFeatureProvider(dictionary: [
+                    spec.inputName: try MLFeatureValue(cgImage: image, constraint: constraint, options: nil)
+                ])
+                let result = try model.prediction(from: provider)
+                guard let output = result.featureValue(for: spec.outputName)?.imageBufferValue else {
+                    throw RestoreError.inferenceFailed("模型没有返回 \(spec.outputName) 图像")
+                }
+                var image: CGImage?
+                let status = VTCreateCGImageFromCVPixelBuffer(output, options: nil, imageOut: &image)
+                guard status == noErr, let image else {
+                    throw RestoreError.inferenceFailed("无法转换人脸模型输出（VideoToolbox \(status)）")
+                }
+                guard image.width == spec.tileSize, image.height == spec.tileSize else {
+                    throw RestoreError.inferenceFailed("人脸模型输出尺寸无效（\(image.width)×\(image.height)）")
+                }
+                return image
+            } catch let error as RestoreError {
+                throw error
+            } catch {
+                throw RestoreError.inferenceFailed("\(error.localizedDescription)（\(diagnostic(for: error))）")
             }
-            let provider = try MLDictionaryFeatureProvider(dictionary: [
-                spec.inputName: try MLFeatureValue(cgImage: image, constraint: constraint, options: nil)
-            ])
-            let result = try model.prediction(from: provider)
-            guard let output = result.featureValue(for: spec.outputName)?.imageBufferValue else {
-                throw RestoreError.inferenceFailed("模型没有返回 \(spec.outputName) 图像")
-            }
-            var image: CGImage?
-            let status = VTCreateCGImageFromCVPixelBuffer(output, options: nil, imageOut: &image)
-            guard status == noErr, let image else {
-                throw RestoreError.inferenceFailed("无法转换人脸模型输出（VideoToolbox \(status)）")
-            }
-            guard image.width == spec.tileSize, image.height == spec.tileSize else {
-                throw RestoreError.inferenceFailed("人脸模型输出尺寸无效（\(image.width)×\(image.height)）")
-            }
-            return image
-        } catch let error as RestoreError {
-            throw error
-        } catch {
-            throw RestoreError.inferenceFailed("\(error.localizedDescription)（\(diagnostic(for: error))）")
         }
     }
 
