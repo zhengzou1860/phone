@@ -82,21 +82,98 @@ enum RestoreFaceMath {
     }
 
     static func paste(patch: CGImage, transform: RestoreFaceTransform, source: CGImage, canvas: RestorePixelCanvas) {
-        let patchFlip = CGAffineTransform(a: 1, b: 0, c: 0, d: -1, tx: 0, ty: Double(patch.height))
-        let resize = CGAffineTransform(
-            scaleX: Double(canvas.width) / Double(source.width),
-            y: Double(canvas.height) / Double(source.height)
+        guard patch.bitsPerComponent == 8, patch.bitsPerPixel == 32,
+              patch.bytesPerRow >= patch.width * 4,
+              let provider = patch.dataProvider,
+              let providerData = CGDataProviderCopyData(provider) as Data?,
+              providerData.count >= patch.bytesPerRow * patch.height else { return }
+        let patchBytes = (providerData as NSData).bytes.assumingMemoryBound(to: UInt8.self)
+        let canvasBytes = canvas.data.mutableBytes.assumingMemoryBound(to: UInt8.self)
+        let inverse = transform.matrix.inverted()
+        let scaleX = Double(canvas.width) / Double(source.width)
+        let scaleY = Double(canvas.height) / Double(source.height)
+        let corners = [
+            CGPoint(x: 0, y: 0),
+            CGPoint(x: patch.width, y: 0),
+            CGPoint(x: 0, y: patch.height),
+            CGPoint(x: patch.width, y: patch.height)
+        ].map { $0.applying(transform.matrix) }
+        guard corners.allSatisfy({ $0.x.isFinite && $0.y.isFinite }) else { return }
+        let minimumX = corners.map { $0.x * scaleX }.min() ?? 0
+        let maximumX = corners.map { $0.x * scaleX }.max() ?? 0
+        let minimumY = corners.map { $0.y * scaleY }.min() ?? 0
+        let maximumY = corners.map { $0.y * scaleY }.max() ?? 0
+        let startX = max(0, Int(minimumX.rounded(.down)))
+        let endX = min(canvas.width, Int(maximumX.rounded(.up)))
+        let startY = max(0, Int(minimumY.rounded(.down)))
+        let endY = min(canvas.height, Int(maximumY.rounded(.up)))
+        guard startX < endX, startY < endY else { return }
+        for y in startY..<endY {
+            let sourceY = (Double(y) + 0.5) / scaleY
+            for x in startX..<endX {
+                let sourceX = (Double(x) + 0.5) / scaleX
+                let point = CGPoint(x: sourceX, y: sourceY).applying(inverse)
+                let sample = bilinearSample(
+                    patchBytes,
+                    bytesPerRow: patch.bytesPerRow,
+                    width: patch.width,
+                    height: patch.height,
+                    x: point.x - 0.5,
+                    y: point.y - 0.5
+                )
+                guard sample.alpha > 0 else { continue }
+                let remainingAlpha = 255 - sample.alpha
+                let offset = y * canvas.bytesPerRow + x * 4
+                canvasBytes[offset] = UInt8(max(0, min(255, sample.red + Int(canvasBytes[offset]) * remainingAlpha / 255)))
+                canvasBytes[offset + 1] = UInt8(max(0, min(255, sample.green + Int(canvasBytes[offset + 1]) * remainingAlpha / 255)))
+                canvasBytes[offset + 2] = UInt8(max(0, min(255, sample.blue + Int(canvasBytes[offset + 2]) * remainingAlpha / 255)))
+                canvasBytes[offset + 3] = 255
+            }
+        }
+    }
+
+    private static func bilinearSample(
+        _ bytes: UnsafePointer<UInt8>,
+        bytesPerRow: Int,
+        width: Int,
+        height: Int,
+        x: Double,
+        y: Double
+    ) -> (red: Int, green: Int, blue: Int, alpha: Int) {
+        guard x >= 0, y >= 0, x < Double(width - 1), y < Double(height - 1) else {
+            return (0, 0, 0, 0)
+        }
+        let x0 = Int(x.rounded(.down))
+        let y0 = Int(y.rounded(.down))
+        let x1 = min(width - 1, x0 + 1)
+        let y1 = min(height - 1, y0 + 1)
+        let fractionX = x - Double(x0)
+        let fractionY = y - Double(y0)
+        let topWeight = 1 - fractionY
+        let bottomWeight = fractionY
+        let leftWeight = 1 - fractionX
+        let rightWeight = fractionX
+        func pixel(_ pixelX: Int, _ pixelY: Int) -> (Int, Int, Int, Int) {
+            let offset = pixelY * bytesPerRow + pixelX * 4
+            return (Int(bytes[offset]), Int(bytes[offset + 1]), Int(bytes[offset + 2]), Int(bytes[offset + 3]))
+        }
+        let topLeft = pixel(x0, y0)
+        let topRight = pixel(x1, y0)
+        let bottomLeft = pixel(x0, y1)
+        let bottomRight = pixel(x1, y1)
+        func channel(_ topLeftValue: Int, _ topRightValue: Int, _ bottomLeftValue: Int, _ bottomRightValue: Int) -> Int {
+            let value = Double(topLeftValue) * topWeight * leftWeight
+                + Double(topRightValue) * topWeight * rightWeight
+                + Double(bottomLeftValue) * bottomWeight * leftWeight
+                + Double(bottomRightValue) * bottomWeight * rightWeight
+            return Int(value.rounded())
+        }
+        return (
+            channel(topLeft.0, topRight.0, bottomLeft.0, bottomRight.0),
+            channel(topLeft.1, topRight.1, bottomLeft.1, bottomRight.1),
+            channel(topLeft.2, topRight.2, bottomLeft.2, bottomRight.2),
+            channel(topLeft.3, topRight.3, bottomLeft.3, bottomRight.3)
         )
-        let canvasFlip = CGAffineTransform(a: 1, b: 0, c: 0, d: -1, tx: 0, ty: Double(canvas.height))
-        canvas.context.saveGState()
-        canvas.context.interpolationQuality = .high
-        canvas.context.concatenate(
-            patchFlip.concatenating(transform.matrix.inverted())
-                .concatenating(resize)
-                .concatenating(canvasFlip)
-        )
-        canvas.context.draw(patch, in: CGRect(x: 0, y: 0, width: patch.width, height: patch.height))
-        canvas.context.restoreGState()
     }
 
     static func featherAlpha(pixelX: Int, pixelY: Int, size: Int) -> Double {

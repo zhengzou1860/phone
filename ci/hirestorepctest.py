@@ -69,20 +69,33 @@ with tempfile.TemporaryDirectory() as directory:
 
         code, payload = request("/upload", data=content, headers=headers)
         assert code == 200 and payload["bytes"] == len(content)
+        assert payload["kind"] == "result"
         saved = module.UPLOAD_DIR / payload["filename"]
+        assert saved.name.endswith("_result_restore_test.mov")
         assert saved.read_bytes() == content
         assert saved.parent == module.UPLOAD_DIR
+
+        source_headers = dict(headers, **{"X-HiRestore-Kind": "source"})
+        code, payload = request("/upload", data=content, headers=source_headers)
+        assert code == 200 and payload["kind"] == "source"
+        source_saved = module.UPLOAD_DIR / payload["filename"]
+        assert source_saved.name.endswith("_source_restore_test.mov")
+        assert source_saved.read_bytes() == content
+
+        code, payload = request("/upload", data=content, headers=dict(headers, **{"X-HiRestore-Kind": "other"}))
+        assert code == 400 and "Kind" in payload["message"]
+        assert len(list(module.UPLOAD_DIR.iterdir())) == 2
 
         headers["X-HiRestore-SHA256"] = "0" * 64
         code, payload = request("/upload", data=content, headers=headers)
         assert code == 400 and "checksum" in payload["message"]
-        assert len(list(module.UPLOAD_DIR.iterdir())) == 1
+        assert len(list(module.UPLOAD_DIR.iterdir())) == 2
 
-        module.MAX_RETAINED_UPLOAD_BYTES = len(content)
+        module.MAX_RETAINED_UPLOAD_BYTES = len(content) * 2
         headers["X-HiRestore-SHA256"] = digest
         code, payload = request("/upload", data=content, headers=headers)
         assert code == 507 and "storage limit" in payload["message"]
-        assert len(list(module.UPLOAD_DIR.iterdir())) == 1
+        assert len(list(module.UPLOAD_DIR.iterdir())) == 2
 
         code, payload = request("/missing")
         assert code == 404

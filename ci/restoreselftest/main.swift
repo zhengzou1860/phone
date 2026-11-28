@@ -16,6 +16,46 @@ func solidImage(width: Int, height: Int, red: Double, green: Double, blue: Doubl
     return try canvas.makeImage()
 }
 
+func quadrantImage(width: Int, height: Int) throws -> CGImage {
+    let bytesPerRow = ((width * 4 + 15) / 16) * 16
+    guard let data = NSMutableData(length: bytesPerRow * height) else {
+        throw RestoreError.fileOperation("无法分配方向测试图")
+    }
+    let bytes = data.mutableBytes.assumingMemoryBound(to: UInt8.self)
+    for y in 0..<height {
+        for x in 0..<width {
+            let color: (UInt8, UInt8, UInt8)
+            if x < width / 2 {
+                color = y < height / 2 ? (255, 0, 0) : (0, 0, 255)
+            } else {
+                color = y < height / 2 ? (0, 255, 0) : (255, 255, 0)
+            }
+            let offset = y * bytesPerRow + x * 4
+            bytes[offset] = color.0
+            bytes[offset + 1] = color.1
+            bytes[offset + 2] = color.2
+            bytes[offset + 3] = 255
+        }
+    }
+    guard let provider = CGDataProvider(data: data as CFData),
+          let image = CGImage(
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bitsPerPixel: 32,
+            bytesPerRow: bytesPerRow,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGBitmapInfo(rawValue: CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.premultipliedLast.rawValue),
+            provider: provider,
+            decode: nil,
+            shouldInterpolate: true,
+            intent: .defaultIntent
+          ) else {
+        throw RestoreError.fileOperation("无法创建方向测试图")
+    }
+    return image
+}
+
 func canvasPixel(_ canvas: RestorePixelCanvas, x: Int, y: Int) -> (UInt8, UInt8, UInt8, UInt8) {
     let bytes = canvas.data.mutableBytes.assumingMemoryBound(to: UInt8.self)
     let offset = y * canvas.bytesPerRow + x * 4
@@ -279,19 +319,33 @@ let pasteTransform = RestoreFaceMath.similarityTransform(
     to: pasteTemplate.map { CGPoint(x: $0.x * 0.5 + 20, y: $0.y * 0.5 + 20) }
 )!
 RestoreFaceMath.paste(patch: pastePatch, transform: pasteTransform, source: pasteSource, canvas: pasteCanvas)
-let pastedPixel = canvasPixel(pasteCanvas, x: 48, y: 144)
+let transformedPatchPoint = CGPoint(x: 32, y: 32)
+let transformedSourcePoint = transformedPatchPoint.applying(pasteTransform.matrix)
+let transformedCanvasPoint = CGPoint(
+    x: transformedSourcePoint.x * Double(pasteCanvas.width) / Double(pasteSource.width),
+    y: transformedSourcePoint.y * Double(pasteCanvas.height) / Double(pasteSource.height)
+)
+let pastedPixel = canvasPixel(pasteCanvas, x: Int(transformedCanvasPoint.x), y: Int(transformedCanvasPoint.y))
 expect(pastedPixel.0 == 0 && pastedPixel.1 > 240 && pastedPixel.2 == 0, "face patch is drawn at the transformed image location without vertical mirroring")
 let identityCanvas = try RestorePixelCanvas(width: 128, height: 128, source: pasteSource)
+let orientationSource = try quadrantImage(width: 64, height: 64)
+let orientationPatch = try RestorePixelCanvas(width: 64, height: 64, source: orientationSource).makeImage()
 let identityOutsideBefore = canvasPixel(identityCanvas, x: 120, y: 120)
 RestoreFaceMath.paste(
-    patch: pastePatch,
+    patch: orientationPatch,
     transform: RestoreFaceMath.similarityTransform(from: RestoreFaceMath.template)!,
     source: pasteSource,
     canvas: identityCanvas
 )
-let identityInside = canvasPixel(identityCanvas, x: 16, y: 20)
+let identityTopLeft = canvasPixel(identityCanvas, x: 16, y: 20)
+let identityTopRight = canvasPixel(identityCanvas, x: 48, y: 20)
+let identityBottomLeft = canvasPixel(identityCanvas, x: 16, y: 48)
+let identityBottomRight = canvasPixel(identityCanvas, x: 48, y: 48)
 let identityOutside = canvasPixel(identityCanvas, x: 120, y: 120)
-expect(identityInside.0 == 0 && identityInside.1 > 240 && identityInside.2 == 0, "identity face patch covers the expected top-left crop")
+expect(identityTopLeft.0 > 240 && identityTopLeft.1 == 0 && identityTopLeft.2 == 0, "identity face patch preserves the top-left quadrant (\(identityTopLeft))")
+expect(identityTopRight.0 == 0 && identityTopRight.1 > 240 && identityTopRight.2 == 0, "identity face patch preserves the top-right quadrant (\(identityTopRight))")
+expect(identityBottomLeft.0 == 0 && identityBottomLeft.1 == 0 && identityBottomLeft.2 > 240, "identity face patch preserves the bottom-left quadrant (\(identityBottomLeft))")
+expect(identityBottomRight.0 > 240 && identityBottomRight.1 > 240 && identityBottomRight.2 == 0, "identity face patch preserves the bottom-right quadrant (\(identityBottomRight))")
 expect(identityOutside == identityOutsideBefore, "identity face patch leaves the lower image area unchanged (before=\(identityOutsideBefore), after=\(identityOutside))")
 expect(RestoreFaceMath.featherAlpha(pixelX: 256, pixelY: 281, size: 512) == 1, "face feather keeps the central facial area fully opaque")
 expect(RestoreFaceMath.featherAlpha(pixelX: 0, pixelY: 0, size: 512) == 0, "face feather leaves the aligned crop border transparent")

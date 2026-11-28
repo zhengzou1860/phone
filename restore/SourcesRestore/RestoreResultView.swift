@@ -9,6 +9,7 @@ struct RestoreResultView: View {
     @State private var isSaving = false
     @State private var isUploading = false
     @State private var uploadProgress: Double?
+    @State private var uploadStage = "上传中"
     @State private var uploadTask: Task<Void, Never>?
     @State private var showUploadConfirmation = false
     @State private var message: String?
@@ -72,10 +73,10 @@ struct RestoreResultView: View {
                         HStack {
                             if isUploading {
                                 ProgressView().tint(RestoreTheme.cyan)
-                                Text("上传中 \(Int((uploadProgress ?? 0) * 100))%")
+                                Text(isUploading ? "\(uploadStage) \(Int((uploadProgress ?? 0) * 100))%" : "发给电脑 · 上传原片和修复结果")
                             } else {
                                 Image(systemName: "computer")
-                                Text("发给电脑 · 上传修复结果")
+                                Text("发给电脑 · 上传原片和修复结果")
                             }
                             Spacer()
                         }
@@ -84,7 +85,7 @@ struct RestoreResultView: View {
                         .background(RestoreTheme.card, in: RoundedRectangle(cornerRadius: 17))
                     }
                     .disabled(isSaving || isUploading)
-                    .confirmationDialog("只发送这条修复结果（\(RestoreMath.formatBytes(asset.resultBytes))），不发送 App 内保留的原片。继续上传吗？", isPresented: $showUploadConfirmation) {
+                    .confirmationDialog("发送 App 内保留的原片和这条修复结果到电脑，用于对照。原片较大时上传会花更久。继续上传吗？", isPresented: $showUploadConfirmation) {
                         Button("上传到电脑") { uploadResult() }
                         Button("取消", role: .cancel) {}
                     } message: {
@@ -149,7 +150,7 @@ struct RestoreResultView: View {
         uploadProgress = 0
         let target = RestorePCTransport.savedEndpoint
         let key = RestorePCTransport.savedToken
-        RestoreJournal.line("准备上传修复结果：\(asset.kind.rawValue) \(asset.outputWidth)×\(asset.outputHeight) \(asset.resultBytes) 字节")
+        RestoreJournal.line("准备上传原片和修复结果：\(asset.kind.rawValue) \(asset.outputWidth)×\(asset.outputHeight) \(asset.resultBytes) 字节")
         uploadTask = Task {
             defer {
                 isUploading = false
@@ -157,20 +158,32 @@ struct RestoreResultView: View {
                 uploadTask = nil
             }
             do {
-                let reply = try await RestorePCTransport.upload(
-                    file: resultURL,
+                uploadStage = "正在上传原片"
+                let sourceReply = try await RestorePCTransport.upload(
+                    file: sourceURL,
+                    kind: .source,
                     endpoint: target,
                     token: key
                 ) { value in
-                    await MainActor.run { uploadProgress = value }
+                    await MainActor.run { uploadProgress = value * 0.5 }
                 }
-                message = reply
-                RestoreJournal.line("修复结果上传成功：\(reply)")
+                RestoreJournal.line("原片上传成功：\(sourceReply)")
+                uploadStage = "正在上传修复结果"
+                let resultReply = try await RestorePCTransport.upload(
+                    file: resultURL,
+                    kind: .result,
+                    endpoint: target,
+                    token: key
+                ) { value in
+                    await MainActor.run { uploadProgress = 0.5 + value * 0.5 }
+                }
+                message = "原片和修复结果均已上传：\(resultReply)"
+                RestoreJournal.line("修复结果上传成功：\(resultReply)")
             } catch is CancellationError {
-                RestoreJournal.line("修复结果上传已取消")
+                RestoreJournal.line("原片和修复结果上传已取消")
             } catch {
                 message = RestorePCTransport.userMessage(for: error)
-                RestoreJournal.line("修复结果上传失败：\(RestorePCTransport.userMessage(for: error))")
+                RestoreJournal.line("原片和修复结果上传失败：\(RestorePCTransport.userMessage(for: error))")
             }
         }
     }

@@ -109,8 +109,14 @@ enum RestorePCTransport {
         return "日志已发送（\(request.httpBody?.count ?? 0) 字节）：\(reply)"
     }
 
+    enum UploadKind: String {
+        case source
+        case result
+    }
+
     static func upload(
         file: URL,
+        kind: UploadKind = .result,
         endpoint: String,
         token: String,
         progress: @escaping @Sendable (Double) async -> Void
@@ -126,6 +132,7 @@ enum RestorePCTransport {
         request.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
         request.setValue(token, forHTTPHeaderField: "X-HiRestore-Token")
         request.setValue(encodedFilename(file.lastPathComponent), forHTTPHeaderField: "X-HiRestore-Filename")
+        request.setValue(kind.rawValue, forHTTPHeaderField: "X-HiRestore-Kind")
         request.setValue(String(size), forHTTPHeaderField: "X-HiRestore-Size")
         request.setValue(checksum, forHTTPHeaderField: "X-HiRestore-SHA256")
         request.setValue("1", forHTTPHeaderField: "X-HiRestore-Protocol")

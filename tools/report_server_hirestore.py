@@ -1,9 +1,9 @@
-"""接收 HiRestore 的运行日志和用户主动上传的修复结果。
+"""接收 HiRestore 的运行日志、用户主动上传的原片和修复结果。
 
 python tools/report_server_hirestore.py
 GET /ping -> 连接测试
 POST /report -> tools/phone-reports-hirestore.txt
-POST /upload -> tools/hirestore-uploads/（只接收修复结果，不接收原片）
+POST /upload -> tools/hirestore-uploads/（source_ 原片，result_ 修复结果）
 """
 import hashlib
 import hmac
@@ -171,6 +171,10 @@ class Handler(BaseHTTPRequestHandler):
         if not re.fullmatch(r"[0-9a-f]{64}", expected_hash):
             self._reply({"status": "error", "message": "valid X-HiRestore-SHA256 required"}, 400)
             return
+        kind = (self.headers.get("X-HiRestore-Kind") or "result").strip().lower()
+        if kind not in {"source", "result"}:
+            self._reply({"status": "error", "message": "X-HiRestore-Kind must be source or result"}, 400)
+            return
         raw_name = unquote(self.headers.get("X-HiRestore-Filename", "restore.bin"))
         name = os.path.basename(raw_name.replace("\\", "/"))
         name = re.sub(r"[^A-Za-z0-9._-]", "_", name)[:180]
@@ -187,7 +191,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._reply({"status": "error", "message": "upload storage limit reached"}, 507)
                 return
             reserved = True
-            final_name = f"{time.strftime('%Y%m%d_%H%M%S')}_{time.time_ns()}_{name}"
+            final_name = f"{time.strftime('%Y%m%d_%H%M%S')}_{time.time_ns()}_{kind}_{name}"
             destination = UPLOAD_DIR / final_name
             partial = destination.with_suffix(destination.suffix + ".part")
             received = 0
@@ -208,8 +212,8 @@ class Handler(BaseHTTPRequestHandler):
             if actual_hash != expected_hash:
                 raise ValueError("upload checksum does not match X-HiRestore-SHA256")
             os.replace(partial, destination)
-            self._reply({"status": "ok", "filename": final_name, "bytes": received, "sha256": actual_hash})
-            print(f"HiRestore upload: {final_name} ({received} bytes)", flush=True)
+            self._reply({"status": "ok", "kind": kind, "filename": final_name, "bytes": received, "sha256": actual_hash})
+            print(f"HiRestore {kind} upload: {final_name} ({received} bytes)", flush=True)
         except (ConnectionError, OSError, ValueError) as exc:
             if partial is not None:
                 try:
@@ -244,4 +248,5 @@ if __name__ == "__main__":
     print("If Windows Firewall asks, allow Python on private networks.", flush=True)
     print(f"logs -> {OUT}", flush=True)
     print(f"uploads -> {UPLOAD_DIR}", flush=True)
+    print("Upload names are prefixed source_ (original) or result_ (restored).", flush=True)
     server.serve_forever()
