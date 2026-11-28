@@ -91,9 +91,9 @@ enum RestoreFaceMath {
         canvas.context.saveGState()
         canvas.context.interpolationQuality = .high
         canvas.context.concatenate(
-            canvasFlip.concatenating(resize)
-                .concatenating(patchFlip)
-                .concatenating(transform.matrix.inverted())
+            patchFlip.concatenating(transform.matrix.inverted())
+                .concatenating(resize)
+                .concatenating(canvasFlip)
         )
         canvas.context.draw(patch, in: CGRect(x: 0, y: 0, width: patch.width, height: patch.height))
         canvas.context.restoreGState()
