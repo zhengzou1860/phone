@@ -49,10 +49,8 @@ enum RestoreNativeImageRunner {
                 configuration = created
                 try await prepare(configuration, progress: progress)
             }
-            let processor: VTFrameProcessor
-            if let existing = processors[size] {
-                processor = existing
-            } else {
+            var processor = processors[size]
+            if processor == nil {
                 let created = VTFrameProcessor()
                 await progress(0.16, "加载苹果图像超分模型")
                 do {
@@ -61,7 +59,11 @@ enum RestoreNativeImageRunner {
                     throw RestoreError.inferenceFailed("苹果图像超分启动失败：\(error.localizedDescription)")
                 }
                 processors[size] = created
+                processor = created
                 RestoreJournal.line("系统 AI 超分会话已启动：\(tile.width)×\(tile.height) · \(configuration.configurationModelStatus)")
+            }
+            guard let processor else {
+                throw RestoreError.inferenceFailed("无法创建苹果图像超分会话")
             }
             let input = try sourceTile(source, tile: tile)
             let output = try await process(processor: processor, configuration: configuration, input: input, context: context)
