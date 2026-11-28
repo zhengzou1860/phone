@@ -193,8 +193,7 @@ final class RestoreModelManager: ObservableObject {
             }
         }
         if artifact.isArchive {
-            let extracted = staging.appendingPathComponent(spec.bundleRelativePath)
-            try RestoreModelArchive.extractStoredZip(at: destination, to: extracted)
+            try RestoreModelArchive.extractStoredZip(at: destination, into: staging, bundleRelativePath: spec.bundleRelativePath)
             try? FileManager.default.removeItem(at: destination)
             RestoreJournal.line("AI 模型预编译包解包完成：\(spec.name)")
         }
@@ -269,19 +268,37 @@ final class RestoreModelManager: ObservableObject {
         }
         let compiled = RestoreModelStorage.compiledURL(root: root, spec: spec)
         let precompiled = source.pathExtension.lowercased() == "mlmodelc"
+        let installing = compiled.deletingLastPathComponent()
+            .appendingPathComponent(".\(compiled.lastPathComponent)-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: installing) }
         try FileManager.default.createDirectory(at: compiled.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try? FileManager.default.removeItem(at: compiled)
         if precompiled {
+            try validatePrecompiledBundle(at: source)
             RestoreJournal.line("AI 模型开始安装预编译包：\(spec.name)")
-            try FileManager.default.copyItem(at: source, to: compiled)
-            _ = try RestoreInferenceCore.loadModel(compiled, spec: spec)
+            try FileManager.default.moveItem(at: source, to: installing)
         } else {
             RestoreJournal.line("AI 模型开始编译：\(spec.name)")
             let result = try await MLModel.compileModel(at: source)
             try Task.checkCancellation()
-            try FileManager.default.moveItem(at: result, to: compiled)
-            _ = try RestoreInferenceCore.loadModel(compiled, spec: spec)
+            try FileManager.default.moveItem(at: result, to: installing)
         }
+        _ = try RestoreInferenceCore.loadModel(installing, spec: spec)
+        try Task.checkCancellation()
+        let backup = compiled.deletingLastPathComponent()
+            .appendingPathComponent(".\(compiled.lastPathComponent)-backup-\(UUID().uuidString)", isDirectory: true)
+        let hadPrevious = FileManager.default.fileExists(atPath: compiled.path)
+        if hadPrevious {
+            try FileManager.default.moveItem(at: compiled, to: backup)
+        }
+        do {
+            try FileManager.default.moveItem(at: installing, to: compiled)
+        } catch {
+            if hadPrevious {
+                try? FileManager.default.moveItem(at: backup, to: compiled)
+            }
+            throw error
+        }
+        try? FileManager.default.removeItem(at: backup)
         guard FileManager.default.fileExists(atPath: compiled.path) else {
             throw RestoreError.modelLoadFailed("模型编译结果不完整")
         }
@@ -293,6 +310,44 @@ final class RestoreModelManager: ObservableObject {
         let marker = readyMarker(id: spec.id)
         try FileManager.default.createDirectory(at: marker.deletingLastPathComponent(), withIntermediateDirectories: true)
         try JSONEncoder().encode(record).write(to: marker, options: .atomic)
+    }
+
+    private func validatePrecompiledBundle(at url: URL) throws {
+        let fileManager = FileManager.default
+        var isDirectory: ObjCBool = false
+        guard fileManager.fileExists(atPath: url.path, isDirectory: &isDirectory), isDirectory.boolValue else {
+            throw RestoreError.modelLoadFailed("预编译模型目录缺失")
+        }
+        for name in ["coremldata.bin", "metadata.json", "model.mil", "weights/weight.bin"] {
+            let file = url.appendingPathComponent(name)
+            let values = try file.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey])
+            guard values.isRegularFile == true, (values.fileSize ?? 0) > 0 else {
+                throw RestoreError.modelLoadFailed("预编译模型缺少 \(name)")
+            }
+        }
+        guard let metadataData = try? Data(contentsOf: url.appendingPathComponent("metadata.json")),
+              let records = try? JSONSerialization.jsonObject(with: metadataData) as? [[String: Any]],
+              let record = records.first else {
+            throw RestoreError.modelLoadFailed("预编译模型元数据无效")
+        }
+        let histogram = record["mlProgramOperationTypeHistogram"] as? [String: Int] ?? [:]
+        guard let enumerator = fileManager.enumerator(
+            at: url,
+            includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            throw RestoreError.modelLoadFailed("无法检查预编译模型文件")
+        }
+        var fileCount = 0
+        var totalBytes: Int64 = 0
+        for case let file as URL in enumerator {
+            let values = try file.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
+            guard values.isRegularFile == true else { continue }
+            fileCount += 1
+            totalBytes += Int64(values.fileSize ?? 0)
+        }
+        let operationSummary = histogram.keys.sorted().joined(separator: ", ")
+        RestoreJournal.line("AI 模型包检查：\(fileCount) 个文件 · \(RestoreMath.formatBytes(Int(totalBytes))) · 算子 \(operationSummary.isEmpty ? "未报告" : operationSummary)")
     }
 
     private func startProgressTimer(for id: RestoreModelID) {

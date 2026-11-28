@@ -1,7 +1,7 @@
 import Foundation
 import CoreGraphics
 import AVFoundation
-import UIKit
+import ImageIO
 
 enum MediaKind: String, Codable, CaseIterable, Identifiable {
     case image
@@ -36,53 +36,74 @@ enum RestorePreset: String, Codable, CaseIterable, Identifiable {
 
     func settings(scale: Double, superResolutionModel: RestoreModelID = .realESRGAN) -> RestorationSettings {
         switch self {
-        case .smart: return RestorationSettings(preset: self, superResolutionModel: superResolutionModel, scale: scale, denoise: 0.28, sharpen: 0.52, color: 0.12)
-        case .portrait: return RestorationSettings(preset: self, superResolutionModel: superResolutionModel, scale: scale, denoise: 0.18, sharpen: 0.30, color: 0.08)
-        case .archive: return RestorationSettings(preset: self, superResolutionModel: superResolutionModel, scale: scale, denoise: 0.55, sharpen: 0.42, color: 0.34)
+        case .smart: return RestorationSettings(preset: self, mode: .preferred, superResolutionModel: superResolutionModel, scale: scale, denoise: 0.28, sharpen: 0.52, color: 0.12, restoreFaces: false)
+        case .portrait: return RestorationSettings(preset: self, mode: .preferred, superResolutionModel: superResolutionModel, scale: scale, denoise: 0.18, sharpen: 0.30, color: 0.08, restoreFaces: false)
+        case .archive: return RestorationSettings(preset: self, mode: .preferred, superResolutionModel: superResolutionModel, scale: scale, denoise: 0.55, sharpen: 0.42, color: 0.34, restoreFaces: false)
         }
     }
 }
 
 enum RestoreProcessingMode: String, Codable, CaseIterable, Identifiable {
     case native
+    case systemSuperResolution
     case superResolution
+
+    static var preferred: RestoreProcessingMode {
+        if #available(iOS 26.0, macOS 26.0, *), RestoreNativeSuperResolution.isSupported {
+            return .systemSuperResolution
+        }
+        return .native
+    }
+
+    static func available(_ mode: RestoreProcessingMode, for kind: MediaKind) -> Bool {
+        if mode == .systemSuperResolution {
+            guard #available(iOS 26.0, macOS 26.0, *) else { return false }
+            return RestoreNativeSuperResolution.isSupported
+        }
+        if mode == .superResolution { return kind == .image }
+        return true
+    }
 
     var id: String { rawValue }
     var title: String {
         switch self {
         case .native: return "原生增强"
-        case .superResolution: return "AI 智能超分"
+        case .systemSuperResolution: return "苹果 AI 超分"
+        case .superResolution: return "本地 AI 智能超分"
         }
     }
     var subtitle: String {
         switch self {
         case .native: return "无需模型，改善噪点和色彩"
+        case .systemSuperResolution: return "系统图像/视频模型恢复细节，不支持时回退内置模型"
         case .superResolution: return "按所选模型生成细节，再按输出上限缩放"
         }
     }
     var systemImage: String {
         switch self {
         case .native: return "slider.horizontal.3"
+        case .systemSuperResolution: return "wand.and.sparkles"
         case .superResolution: return "sparkles"
         }
     }
     var maximumOutputLongEdge: Int { self == .superResolution ? 6144 : 4096 }
-    var isAI: Bool { self != .native }
+    var isAI: Bool { self == .superResolution }
+    var usesCoreMLFallback: Bool { self == .systemSuperResolution }
 }
 
 struct RestorationSettings: Equatable, Codable {
     var preset: RestorePreset = .smart
-    var mode: RestoreProcessingMode = .native
+    var mode: RestoreProcessingMode = .preferred
     var superResolutionModel: RestoreModelID = .realESRGAN
     var scale: Double = 2
     var denoise: Double = 0.28
     var sharpen: Double = 0.52
     var color: Double = 0.12
-    var restoreFaces: Bool = true
+    var restoreFaces: Bool = false
 
     var model: RestoreModelID? {
         switch mode {
-        case .native: return nil
+        case .native, .systemSuperResolution: return nil
         case .superResolution: return superResolutionModel
         }
     }
@@ -92,6 +113,9 @@ struct RestorationSettings: Equatable, Codable {
         case .native:
             let scaleText = scale == scale.rounded() ? String(Int(scale)) : String(format: "%.1f", scale)
             return "\(preset.title) · \(scaleText)× · 降噪 \(Int(denoise * 100))% · 锐化 \(Int(sharpen * 100))%"
+        case .systemSuperResolution:
+            let scaleText = scale == scale.rounded() ? String(Int(scale)) : String(format: "%.1f", scale)
+            return "苹果 AI 超分 · 输出 \(scaleText)×\(restoreFaces ? " · 人脸补全" : "")"
         case .superResolution:
             let scaleText = scale == scale.rounded() ? String(Int(scale)) : String(format: "%.1f", scale)
             let spec = RestoreModelCatalog.spec(for: superResolutionModel)
@@ -175,14 +199,17 @@ struct ImageGeometry {
     let height: Int
 
     static func load(_ url: URL) throws -> ImageGeometry {
-        guard let image = UIImage(contentsOfFile: url.path), let cgImage = image.cgImage else {
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [String: Any] else {
             throw RestoreError.unreadableImage
         }
-        switch image.imageOrientation {
-        case .left, .right, .leftMirrored, .rightMirrored:
-            return ImageGeometry(width: cgImage.height, height: cgImage.width)
-        default:
-            return ImageGeometry(width: cgImage.width, height: cgImage.height)
-        }
+        let width = (properties[kCGImagePropertyPixelWidth as String] as? NSNumber)?.intValue ?? 0
+        let height = (properties[kCGImagePropertyPixelHeight as String] as? NSNumber)?.intValue ?? 0
+        let orientation = (properties[kCGImagePropertyOrientation as String] as? NSNumber)?.intValue ?? 1
+        let swapsDimensions = [3, 4, 7, 8].contains(orientation)
+        return ImageGeometry(
+            width: swapsDimensions ? height : width,
+            height: swapsDimensions ? width : height
+        )
     }
 }

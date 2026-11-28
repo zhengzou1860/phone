@@ -12,6 +12,11 @@ struct HiRestoreApp: App {
         let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "-"
         RestoreJournal.line("App 启动：HiRestore \(version) (\(build))")
         RestoreJournal.line("设备：\(UIDevice.current.model) · \(UIDevice.current.systemName) \(UIDevice.current.systemVersion) · 内存 \(RestoreMath.formatBytes(Int(ProcessInfo.processInfo.physicalMemory)))")
+        if #available(iOS 26.0, *) {
+            RestoreJournal.line("苹果 AI 超分：\(RestoreNativeSuperResolution.statusSummary)")
+        } else {
+            RestoreJournal.line("苹果 AI 超分：系统版本低于 iOS 26")
+        }
         let store = RestoreStore()
         let models = RestoreModelManager()
         _store = StateObject(wrappedValue: store)

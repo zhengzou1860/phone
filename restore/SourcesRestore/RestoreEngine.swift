@@ -13,6 +13,9 @@ enum RestoreEngine {
         maxLongEdge: Int = 4096,
         progress: @escaping @Sendable (Double, String) async -> Void
     ) async throws -> URL {
+        if settings.mode == .systemSuperResolution {
+            return try await restoreSystemImage(from: url, settings: settings, modelURL: modelURL, faceModelURL: faceModelURL, maxLongEdge: maxLongEdge, progress: progress)
+        }
         if settings.mode.isAI {
             return try await restoreAIImage(from: url, settings: settings, modelURL: modelURL, faceModelURL: faceModelURL, maxLongEdge: maxLongEdge, progress: progress)
         }
@@ -75,6 +78,70 @@ enum RestoreEngine {
         return outputURL
     }
 
+    private static func restoreSystemImage(
+        from url: URL,
+        settings: RestorationSettings,
+        modelURL: URL?,
+        faceModelURL: URL?,
+        maxLongEdge: Int,
+        progress: @escaping @Sendable (Double, String) async -> Void
+    ) async throws -> URL {
+        guard #available(iOS 26.0, *), RestoreNativeSuperResolution.isSupported else {
+            return try await restoreFallbackImage(from: url, settings: settings, modelURL: modelURL, faceModelURL: faceModelURL, maxLongEdge: maxLongEdge, progress: progress, reason: "当前设备不支持苹果 AI 超分")
+        }
+        let decoded = try RestoreInferenceCore.decode(url)
+        let target = RestoreMath.fittedSize(width: decoded.width, height: decoded.height, scale: settings.scale, maxLongEdge: maxLongEdge)
+        do {
+            let canvas = try await RestoreNativeImageRunner.restore(
+                source: decoded.image,
+                outputWidth: target.width,
+                outputHeight: target.height,
+                progressEnd: settings.restoreFaces ? 0.78 : 0.92,
+                progress: progress
+            )
+            if settings.restoreFaces, let faceModelURL, let faceSpec = RestoreModelCatalog.spec(for: .gfpgan) {
+                do {
+                    await progress(0.79, "检测并对齐人脸")
+                    _ = try await RestoreFaceRestorationRunner.restore(canvas: canvas, source: decoded.image, modelURL: faceModelURL, spec: faceSpec, progress: progress)
+                } catch {
+                    try Task.checkCancellation()
+                    RestoreJournal.line("人脸补全不可用，保留系统超分结果：\(RestoreInferenceCore.diagnostic(for: error))")
+                    await progress(0.94, "人脸补全不可用，已保留系统超分结果")
+                }
+            }
+            await progress(0.98, "编码高清修复结果")
+            return try await RestoreInferenceCore.writeJPEG(canvas.makeImage())
+        } catch {
+            try Task.checkCancellation()
+            return try await restoreFallbackImage(
+                from: url,
+                settings: settings,
+                modelURL: modelURL,
+                faceModelURL: faceModelURL,
+                maxLongEdge: maxLongEdge,
+                progress: progress,
+                reason: RestoreInferenceCore.diagnostic(for: error)
+            )
+        }
+    }
+
+    private static func restoreFallbackImage(
+        from url: URL,
+        settings: RestorationSettings,
+        modelURL: URL?,
+        faceModelURL: URL?,
+        maxLongEdge: Int,
+        progress: @escaping @Sendable (Double, String) async -> Void,
+        reason: String
+    ) async throws -> URL {
+        RestoreJournal.line("系统 AI 超分不可用，改用内置 RealESRGAN：\(reason)")
+        await progress(0.05, "系统超分不可用，改用内置模型")
+        var fallback = settings
+        fallback.mode = .superResolution
+        fallback.superResolutionModel = .realESRGAN
+        return try await restoreAIImage(from: url, settings: fallback, modelURL: modelURL, faceModelURL: faceModelURL, maxLongEdge: maxLongEdge, progress: progress)
+    }
+
     private static func restoreAIImage(
         from url: URL,
         settings: RestorationSettings,
@@ -111,7 +178,7 @@ enum RestoreEngine {
                 outputHeight: target.height,
                 progress: progress
             )
-        case .native:
+        case .native, .systemSuperResolution:
             throw RestoreError.fileOperation("修复模式无效")
         }
     }
@@ -121,7 +188,8 @@ enum RestoreEngine {
         settings: RestorationSettings,
         maxLongEdge: Int = 3840,
         progress: @escaping @Sendable (Double, String) async -> Void,
-        sessionHandler: @escaping @Sendable (AVAssetExportSession) async -> Void
+        sessionHandler: @escaping @Sendable (AVAssetExportSession) async -> Void,
+        cancelHandler: @escaping @Sendable (@escaping @Sendable () -> Void) async -> Void
     ) async throws -> URL {
         try Task.checkCancellation()
         await progress(0.02, "读取视频轨道")
@@ -134,6 +202,26 @@ enum RestoreEngine {
             maxLongEdge: maxLongEdge
         )
         guard target.width >= 2, target.height >= 2 else { throw RestoreError.invalidDimensions }
+
+        if settings.mode == .systemSuperResolution {
+            if #available(iOS 26.0, *), RestoreNativeSuperResolution.isSupported {
+                do {
+                    return try await RestoreNativeVideoRunner.restore(
+                        from: url,
+                        outputWidth: target.width,
+                        outputHeight: target.height,
+                        progress: progress,
+                        onStarted: cancelHandler
+                    )
+                } catch {
+                    try Task.checkCancellation()
+                    RestoreJournal.line("系统 AI 视频超分不可用，改用原生逐帧增强：\(RestoreInferenceCore.diagnostic(for: error))")
+                    await progress(0.03, "系统超分不可用，改用原生增强")
+                }
+            } else {
+                RestoreJournal.line("当前设备不支持系统 AI 视频超分，改用原生逐帧增强")
+            }
+        }
 
         let composition = AVMutableVideoComposition(asset: asset, applyingCIFiltersWithHandler: { request in
             let source = request.sourceImage.transformed(by: CGAffineTransform(

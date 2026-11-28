@@ -43,14 +43,19 @@ struct RestoreEditorView: View {
     }
     private var canStart: Bool {
         guard !processor.isProcessing, !isCheckingSpace, !hasInsufficientSpace, !spaceCheckFailed else { return false }
-        guard !settings.mode.isAI else {
-            guard let id = settings.model, models.isInstalled(id),
+        switch settings.mode {
+        case .native:
+            return true
+        case .systemSuperResolution:
+            return RestoreProcessingMode.available(.systemSuperResolution, for: media.kind)
+                && (media.kind == .video || !settings.restoreFaces || models.isInstalled(.gfpgan))
+        case .superResolution:
+            guard media.kind == .image, let id = settings.model, models.isInstalled(id),
                   media.width <= RestoreAIMath.maximumSourceLongEdge,
                   Double(media.width) * Double(media.height) <= Double(RestoreAIMath.maximumSourcePixels) else { return false }
-            if settings.mode == .superResolution, settings.restoreFaces, !models.isInstalled(.gfpgan) { return false }
+            if settings.restoreFaces, !models.isInstalled(.gfpgan) { return false }
             return true
         }
-        return true
     }
 
     var body: some View {
@@ -58,12 +63,12 @@ struct RestoreEditorView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
                     sourceSection
-                    if media.kind == .image { modeSection }
+                    modeSection
                     if media.kind == .image && settings.mode == .native { presetSection }
                     if media.kind == .image && settings.mode == .superResolution { superResolutionModelSection }
                     scaleSection
                     if media.kind == .image && settings.mode.isAI { aiModelSection }
-                    if media.kind == .image && settings.mode == .superResolution { faceRestorationSection }
+                    if media.kind == .image && (settings.mode == .superResolution || settings.mode == .systemSuperResolution) { faceRestorationSection }
                     outputSection
                     if settings.mode == .native { advancedSection }
                     disclosure
@@ -90,7 +95,7 @@ struct RestoreEditorView: View {
                     ProcessingOverlay(
                         progress: processor.progress,
                         phase: processor.phase,
-                        detail: media.kind == .video ? "视频会逐帧处理，请保持 App 在前台" : (settings.mode.isAI ? "照片按小块和人脸模型推理，请保持 App 在前台" : "正在本机生成高清照片")
+                        detail: media.kind == .video ? "视频会逐帧处理，请保持 App 在前台" : (settings.mode == .systemSuperResolution ? "正在调用苹果系统超分模型，请保持 App 在前台" : (settings.mode.isAI ? "照片按小块和人脸模型推理，请保持 App 在前台" : "正在本机生成高清照片"))
                     ) {
                         processor.cancel()
                     }
@@ -142,7 +147,7 @@ struct RestoreEditorView: View {
                 Text("限长 15 分钟 · 最高 4K / 12MP · 流式逐帧处理")
                     .font(.caption2)
                     .foregroundStyle(RestoreTheme.secondary)
-            } else if settings.mode.isAI {
+            } else if settings.mode.isAI || settings.mode == .systemSuperResolution {
                 Text("AI 原片限制：最长边 8192 px · 最多 40MP · 分块本机推理")
                     .font(.caption2)
                     .foregroundStyle(RestoreTheme.secondary)
@@ -153,10 +158,10 @@ struct RestoreEditorView: View {
     private var modeSection: some View {
         VStack(alignment: .leading, spacing: 10) {
             Text("修复方式").font(.headline)
-            ForEach(RestoreProcessingMode.allCases) { mode in
+            ForEach(RestoreProcessingMode.allCases.filter { RestoreProcessingMode.available($0, for: media.kind) }, id: \.self) { mode in
                 Button {
                     settings.mode = mode
-                    if mode == .native && settings.scale > 2 { settings.scale = 2 }
+                    if mode != .superResolution && settings.scale > 2 { settings.scale = 2 }
                 } label: {
                     HStack(spacing: 12) {
                         Image(systemName: mode.systemImage)
@@ -403,7 +408,7 @@ struct RestoreEditorView: View {
                     case .notInstalled:
                         Button("下载 \(RestoreMath.formatBytes(spec.totalByteCount)) 人脸模型") { models.download(.gfpgan) }
                             .font(.caption.weight(.semibold))
-                        Text("首次下载约 322 MiB，优先使用加速线路；页面会显示已收字节、速度和当前线路，中断时自动回退。建议连接 Wi-Fi 并保持 App 在前台，校验后完全离线推理。")
+                        Text("首次下载约 61 MiB，使用电脑预编译模型；页面会显示已收字节、速度和当前线路，校验后完全离线推理。")
                             .font(.caption2)
                             .foregroundStyle(RestoreTheme.secondary)
                     case .installed:
@@ -513,6 +518,8 @@ struct RestoreEditorView: View {
         switch settings.mode {
         case .native:
             return "原生增强使用系统降噪、色彩、锐化和边缘保留放大。它不生成新细节；视频处理速度取决于时长和分辨率。"
+        case .systemSuperResolution:
+            return "优先使用苹果系统 AI 超分，照片按块处理并羽化拼接，视频逐帧保留前后关联；不可用时自动回退。首次使用可能需要下载系统模型。"
         case .superResolution:
             if let spec = RestoreModelCatalog.spec(for: settings.superResolutionModel) {
                 let factor = spec.upscaleFactor.map { "\($0) 倍" } ?? "多倍"

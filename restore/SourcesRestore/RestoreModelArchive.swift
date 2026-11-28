@@ -1,7 +1,16 @@
 import Foundation
 
 enum RestoreModelArchive {
-    static func extractStoredZip(at archive: URL, to destination: URL) throws {
+    static func extractStoredZip(at archive: URL, into destination: URL, bundleRelativePath: String) throws {
+        try extractStoredZip(at: archive, to: destination)
+        let bundle = destination.appendingPathComponent(bundleRelativePath)
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: bundle.path, isDirectory: &isDirectory), isDirectory.boolValue else {
+            throw invalidArchive("缺少模型目录 \(bundleRelativePath)")
+        }
+    }
+
+    private static func extractStoredZip(at archive: URL, to destination: URL) throws {
         let reader = try FileHandle(forReadingFrom: archive)
         defer { try? reader.close() }
         try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)

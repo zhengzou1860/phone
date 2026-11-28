@@ -13,7 +13,16 @@ struct RestoreSettingsView: View {
                     appIdentity
                     RestoreCard {
                         VStack(alignment: .leading, spacing: 14) {
-                            infoRow("处理方式", "原生增强 + 本地 Core ML")
+                            infoRow("处理方式", "苹果 AI 超分 + 本地 Core ML")
+                            if #available(iOS 26.0, *) {
+                                infoRow("系统超分能力", RestoreNativeSuperResolution.isSupported ? "高质量可用" : "高质量不可用")
+                                Text(RestoreNativeSuperResolution.statusSummary)
+                                    .font(.caption2)
+                                    .foregroundStyle(RestoreTheme.secondary)
+                                    .multilineTextAlignment(.trailing)
+                            } else {
+                                infoRow("系统超分能力", "需要 iOS 26 或更高版本")
+                            }
                             Divider().overlay(RestoreTheme.stroke)
                             infoRow("视频导出", "AVFoundation · 保留原声音")
                             Divider().overlay(RestoreTheme.stroke)

@@ -14,6 +14,7 @@ final class RestoreProcessor: ObservableObject {
     private let models: RestoreModelManager
     private var workTask: Task<Void, Never>?
     private var exportSession: AVAssetExportSession?
+    private var cancelNativeVideo: (@Sendable () -> Void)?
 
     init(store: RestoreStore, models: RestoreModelManager) {
         self.store = store
@@ -30,10 +31,12 @@ final class RestoreProcessor: ObservableObject {
                 guard media.kind == .image, settings.model != nil else {
                     throw RestoreError.fileOperation("当前 AI 模型仅支持照片")
                 }
+            }
+            if settings.mode.isAI || (settings.mode.usesCoreMLFallback && media.kind == .image) {
                 try RestoreAIMath.validateSource(width: media.width, height: media.height)
             }
             let preliminaryOutput = outputSize(for: media, settings: settings)
-            if settings.mode.isAI {
+            if settings.mode.isAI || (settings.mode.usesCoreMLFallback && media.kind == .image) {
                 try RestoreAIMath.validateOutput(width: preliminaryOutput.width, height: preliminaryOutput.height)
             }
             guard FileManager.default.fileExists(atPath: media.url.path) else {
@@ -55,12 +58,18 @@ final class RestoreProcessor: ObservableObject {
             if settings.mode.isAI, let modelID = settings.model {
                 modelURL = try models.beginProcessing(modelID)
             }
-            if settings.mode == .superResolution, settings.restoreFaces {
+            if settings.mode.usesCoreMLFallback, media.kind == .image {
+                modelURL = try models.beginProcessing(.realESRGAN)
+            }
+            if media.kind == .image,
+               (settings.mode == .superResolution || settings.mode == .systemSuperResolution),
+               settings.restoreFaces {
                 faceModelURL = try models.beginProcessing(.gfpgan)
             }
             RestoreJournal.line("处理预检通过：预计需要 \(RestoreMath.formatBytes(Int(required))) 可用空间，当前 \(RestoreMath.formatBytes(Int(available)))")
         } catch {
-            if settings.mode.isAI, let modelID = settings.model {
+            if settings.mode.isAI || (settings.mode.usesCoreMLFallback && media.kind == .image),
+               let modelID = settings.model ?? (settings.mode.usesCoreMLFallback ? .realESRGAN : nil) {
                 models.endProcessing(modelID)
             }
             if faceModelURL != nil { models.endProcessing(.gfpgan) }
@@ -74,12 +83,15 @@ final class RestoreProcessor: ObservableObject {
         phase = "准备处理"
         errorMessage = nil
         completedAsset = nil
+        exportSession = nil
+        cancelNativeVideo = nil
         UIApplication.shared.isIdleTimerDisabled = true
         RestoreJournal.line("开始处理：\(media.kind.rawValue) \(media.width)×\(media.height) \(settings.summary)")
 
         workTask = Task.detached(priority: .userInitiated) { [weak self, modelURL, faceModelURL, models] in
             guard let self else {
-                if settings.mode.isAI, let modelID = settings.model {
+                if settings.mode.isAI || (settings.mode.usesCoreMLFallback && media.kind == .image),
+                   let modelID = settings.model ?? (settings.mode.usesCoreMLFallback ? .realESRGAN : nil) {
                     await models.endProcessing(modelID)
                 }
                 if faceModelURL != nil { await models.endProcessing(.gfpgan) }
@@ -114,6 +126,9 @@ final class RestoreProcessor: ObservableObject {
                         },
                         sessionHandler: { [weak self] session in
                             await MainActor.run { self?.exportSession = session }
+                        },
+                        cancelHandler: { [weak self] cancel in
+                            await MainActor.run { self?.cancelNativeVideo = cancel }
                         }
                     )
                 }
@@ -155,14 +170,16 @@ final class RestoreProcessor: ObservableObject {
                     duration: media.duration,
                     resultBytes: bytes
                 )
-                if settings.mode.isAI, let modelID = settings.model {
+                if settings.mode.isAI || (settings.mode.usesCoreMLFallback && media.kind == .image),
+                   let modelID = settings.model ?? (settings.mode.usesCoreMLFallback ? .realESRGAN : nil) {
                     await models.endProcessing(modelID)
                 }
                 if faceModelURL != nil { await models.endProcessing(.gfpgan) }
                 await self.finish(record: record)
             } catch {
                 if let temporaryOutput { try? FileManager.default.removeItem(at: temporaryOutput) }
-                if settings.mode.isAI, let modelID = settings.model {
+                if settings.mode.isAI || (settings.mode.usesCoreMLFallback && media.kind == .image),
+                   let modelID = settings.model ?? (settings.mode.usesCoreMLFallback ? .realESRGAN : nil) {
                     await models.endProcessing(modelID)
                 }
                 if faceModelURL != nil { await models.endProcessing(.gfpgan) }
@@ -183,6 +200,7 @@ final class RestoreProcessor: ObservableObject {
     func cancel() {
         workTask?.cancel()
         exportSession?.cancelExport()
+        cancelNativeVideo?()
         phase = "正在停止"
         RestoreJournal.line("用户停止处理")
     }
@@ -201,6 +219,7 @@ final class RestoreProcessor: ObservableObject {
         progress = 1
         phase = "修复完成"
         exportSession = nil
+        cancelNativeVideo = nil
         UIApplication.shared.isIdleTimerDisabled = false
         if store.register(record) {
             completedAsset = record
@@ -215,6 +234,7 @@ final class RestoreProcessor: ObservableObject {
     private func finish(error: Error) {
         isProcessing = false
         exportSession = nil
+        cancelNativeVideo = nil
         UIApplication.shared.isIdleTimerDisabled = false
         if Task.isCancelled || error is CancellationError {
             phase = "已停止"

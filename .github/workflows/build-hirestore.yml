@@ -46,6 +46,9 @@ jobs:
             restore/SourcesRestore/RestoreMath.swift \
             restore/SourcesRestore/RestoreErrors.swift \
             restore/SourcesRestore/RestoreAIMath.swift \
+            restore/SourcesRestore/RestoreNativeMath.swift \
+            restore/SourcesRestore/RestoreModels.swift \
+            restore/SourcesRestore/RestoreNativeSuperResolution.swift \
             restore/SourcesRestore/RestoreFaceMath.swift \
             restore/SourcesRestore/RestoreModelCatalog.swift \
             restore/SourcesRestore/RestorePCTransport.swift \
@@ -115,6 +118,8 @@ jobs:
               handle.writestr("../escape", b"bad")
           with zipfile.ZipFile(root / "deflated.zip", "w", compression=zipfile.ZIP_DEFLATED) as handle:
               handle.writestr("model.mil", b"model")
+          with zipfile.ZipFile(root / "missing-root.zip", "w", compression=zipfile.ZIP_STORED) as handle:
+              handle.writestr("other/model.mil", b"model")
           data = (root / "good.zip").read_bytes()
           (root / "truncated.zip").write_bytes(data[:50])
           PY
@@ -129,7 +134,8 @@ jobs:
             /tmp/restore-archive-test/good.zip \
             /tmp/restore-archive-test/unsafe.zip \
             /tmp/restore-archive-test/truncated.zip \
-            /tmp/restore-archive-test/deflated.zip 2>&1 | tee -a /tmp/selftest.log
+            /tmp/restore-archive-test/deflated.zip \
+            /tmp/restore-archive-test/missing-root.zip 2>&1 | tee -a /tmp/selftest.log
           grep -q '^RESTORE-ARCHIVE-VERDICT PASS$' /tmp/selftest.log
 
       - name: install xcodegen
@@ -170,8 +176,8 @@ jobs:
           build_number=$(awk -F' => ' '/"CFBundleVersion"/{gsub(/"/,"",$2); print $2; exit}' /tmp/hirestore-info.txt)
           echo "I-VERDICT bundle=$bundle_id version=$version build=$build_number" | tee -a /tmp/selftest.log
           test "$bundle_id" = "com.qoder.hirestore"
-          test "$version" = "0.3.17"
-          test "$build_number" = "22"
+          test "$version" = "0.3.18"
+          test "$build_number" = "23"
           grep -q NSPhotoLibraryAddUsageDescription /tmp/hirestore-info.txt
           grep -q NSLocalNetworkUsageDescription /tmp/hirestore-info.txt
           grep -q NSAllowsLocalNetworking /tmp/hirestore-info.txt
