@@ -82,12 +82,12 @@ enum RestoreFaceMath {
     }
 
     static func paste(patch: CGImage, transform: RestoreFaceTransform, source: CGImage, canvas: RestorePixelCanvas) {
-        let patchFlip = CGAffineTransform(translationX: 0, y: Double(patch.height)).scaledBy(x: 1, y: -1)
+        let patchFlip = CGAffineTransform(a: 1, b: 0, c: 0, d: -1, tx: 0, ty: Double(patch.height))
         let resize = CGAffineTransform(
             scaleX: Double(canvas.width) / Double(source.width),
             y: Double(canvas.height) / Double(source.height)
         )
-        let canvasFlip = CGAffineTransform(translationX: 0, y: Double(canvas.height)).scaledBy(x: 1, y: -1)
+        let canvasFlip = CGAffineTransform(a: 1, b: 0, c: 0, d: -1, tx: 0, ty: Double(canvas.height))
         canvas.context.saveGState()
         canvas.context.interpolationQuality = .high
         canvas.context.concatenate(

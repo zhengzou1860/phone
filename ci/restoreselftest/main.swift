@@ -280,9 +280,18 @@ let pasteTransform = RestoreFaceMath.similarityTransform(
 )!
 RestoreFaceMath.paste(patch: pastePatch, transform: pasteTransform, source: pasteSource, canvas: pasteCanvas)
 let pastedPixel = canvasPixel(pasteCanvas, x: 48, y: 112)
-let untouchedPixel = canvasPixel(pasteCanvas, x: 48, y: 20)
 expect(pastedPixel.0 == 0 && pastedPixel.1 > 240 && pastedPixel.2 == 0, "face patch is drawn at the transformed image location without vertical mirroring")
-expect(untouchedPixel.0 > 240 && untouchedPixel.1 == 0 && untouchedPixel.2 == 0, "face patch leaves pixels outside its transformed bounds unchanged")
+let identityCanvas = try RestorePixelCanvas(width: 128, height: 128, source: pasteSource)
+RestoreFaceMath.paste(
+    patch: pastePatch,
+    transform: RestoreFaceMath.similarityTransform(from: RestoreFaceMath.template)!,
+    source: pasteSource,
+    canvas: identityCanvas
+)
+let identityInside = canvasPixel(identityCanvas, x: 16, y: 100)
+let identityOutside = canvasPixel(identityCanvas, x: 16, y: 20)
+expect(identityInside.0 == 0 && identityInside.1 > 240 && identityInside.2 == 0, "identity face patch covers the expected top-left crop")
+expect(identityOutside.0 > 240 && identityOutside.1 == 0 && identityOutside.2 == 0, "identity face patch leaves the lower image area unchanged")
 expect(RestoreFaceMath.featherAlpha(pixelX: 256, pixelY: 281, size: 512) == 1, "face feather keeps the central facial area fully opaque")
 expect(RestoreFaceMath.featherAlpha(pixelX: 0, pixelY: 0, size: 512) == 0, "face feather leaves the aligned crop border transparent")
 expect(RestoreFaceMath.featherAlpha(pixelX: 256, pixelY: 70, size: 512) < RestoreFaceMath.featherAlpha(pixelX: 256, pixelY: 200, size: 512), "face feather fades continuously toward the forehead")
