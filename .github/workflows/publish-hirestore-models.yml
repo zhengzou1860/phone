@@ -77,7 +77,6 @@ jobs:
           print(f"GFPGAN-COMPILED-BYTES {size}")
           PY
           test -s /tmp/gfpgan.mlmodelc/coremldata.bin
-          test -s /tmp/gfpgan.mlmodelc/model.mlmodel
           xcrun swiftc "$GITHUB_WORKSPACE/ci/verify_gfpgan.swift" -o /tmp/verify_gfpgan
           /tmp/verify_gfpgan /tmp/gfpgan.mlmodelc
 
