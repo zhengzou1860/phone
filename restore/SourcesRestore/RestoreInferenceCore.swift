@@ -122,6 +122,18 @@ final class RestoreBlendWeights {
     }
 }
 
+final class RestoreLoadedModel {
+    let url: URL
+    var model: MLModel?
+    var computeUnits: MLComputeUnits
+
+    init(url: URL, model: MLModel?, computeUnits: MLComputeUnits) {
+        self.url = url
+        self.model = model
+        self.computeUnits = computeUnits
+    }
+}
+
 enum RestoreInferenceCore {
     static func decode(_ url: URL) throws -> RestoreDecodedImage {
         guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
@@ -148,20 +160,58 @@ enum RestoreInferenceCore {
             : (width.intValue, height.intValue)
     }
 
-    static func loadModel(_ url: URL, spec: RestoreModelSpec) throws -> MLModel {
-        let configuration = MLModelConfiguration()
+    static func loadModel(_ url: URL, spec: RestoreModelSpec) throws -> RestoreLoadedModel {
+        let preferred: MLComputeUnits
         switch spec.compute {
-        case .neuralEngine: configuration.computeUnits = .cpuAndNeuralEngine
-        case .gpu: configuration.computeUnits = .cpuAndGPU
+        case .neuralEngine: preferred = .cpuAndNeuralEngine
+        case .gpu: preferred = .cpuAndGPU
         }
-        do {
-            let model = try MLModel(contentsOf: url, configuration: configuration)
-            try validate(model, spec: spec)
-            return model
-        } catch let error as RestoreError {
-            throw error
-        } catch {
-            throw RestoreError.modelLoadFailed(error.localizedDescription)
+        var failures: [String] = []
+        for computeUnits in [preferred, .cpuOnly] {
+            do {
+                return try loadModel(at: url, spec: spec, computeUnits: computeUnits)
+            } catch {
+                let diagnostic = diagnostic(for: error)
+                failures.append(diagnostic)
+                RestoreJournal.line("AI 模型加载失败：\(spec.name) · \(computeName(computeUnits)) · \(diagnostic)")
+            }
+        }
+        throw RestoreError.modelLoadFailed(failures.joined(separator: "；"))
+    }
+
+    static func loadCPUModel(at url: URL, spec: RestoreModelSpec) throws -> RestoreLoadedModel {
+        try loadModel(at: url, spec: spec, computeUnits: .cpuOnly)
+    }
+
+    private static func loadModel(at url: URL, spec: RestoreModelSpec, computeUnits: MLComputeUnits) throws -> RestoreLoadedModel {
+        let configuration = MLModelConfiguration()
+        configuration.computeUnits = computeUnits
+        let model = try MLModel(contentsOf: url, configuration: configuration)
+        try validate(model, spec: spec)
+        let bytes = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int) ?? 0
+        RestoreJournal.line("AI 模型加载成功：\(spec.name) · \(computeName(computeUnits)) · \(bytes) 字节")
+        return RestoreLoadedModel(url: url, model: model, computeUnits: computeUnits)
+    }
+
+    static func diagnostic(for error: Error) -> String {
+        let nsError = error as NSError
+        var result = "\(nsError.domain) / \(nsError.code)"
+        if !nsError.localizedDescription.isEmpty {
+            result += " · \(nsError.localizedDescription)"
+        }
+        if let underlying = nsError.userInfo[NSUnderlyingErrorKey] as? Error {
+            result += " · 原因：\(diagnostic(for: underlying))"
+        }
+        return result
+    }
+
+    private static func computeName(_ computeUnits: MLComputeUnits) -> String {
+        switch computeUnits {
+        case .all: return "全部"
+        case .cpuOnly: return "CPU"
+        case .cpuAndGPU: return "CPU+GPU"
+        case .cpuAndNeuralEngine: return "CPU+ANE"
+        @unknown default: return "未知"
         }
     }
 
@@ -245,7 +295,25 @@ enum RestoreInferenceCore {
         return result
     }
 
-    static func predict(_ model: MLModel, input: MLMultiArray, spec: RestoreModelSpec) throws -> MLMultiArray {
+    static func predict(_ loaded: RestoreLoadedModel, input: MLMultiArray, spec: RestoreModelSpec) throws -> MLMultiArray {
+        guard var model = loaded.model else { throw RestoreError.modelLoadFailed("模型已卸载") }
+        do {
+            return try predict(model, input: input, spec: spec)
+        } catch {
+            guard loaded.computeUnits != .cpuOnly else { throw error }
+            let diagnostic = diagnostic(for: error)
+            RestoreJournal.line("AI 加速推理失败，改用 CPU 重试：\(spec.name) · \(diagnostic)")
+            model = nil
+            loaded.model = nil
+            let cpuModel = try loadCPUModel(at: loaded.url, spec: spec)
+            loaded.model = cpuModel.model
+            loaded.computeUnits = .cpuOnly
+            guard let model = loaded.model else { throw RestoreError.modelLoadFailed("CPU 模型加载失败") }
+            return try predict(model, input: input, spec: spec)
+        }
+    }
+
+    private static func predict(_ model: MLModel, input: MLMultiArray, spec: RestoreModelSpec) throws -> MLMultiArray {
         do {
             let provider = try MLDictionaryFeatureProvider(dictionary: [spec.inputName: MLFeatureValue(multiArray: input)])
             let result = try model.prediction(from: provider)
@@ -256,11 +324,29 @@ enum RestoreInferenceCore {
         } catch let error as RestoreError {
             throw error
         } catch {
-            throw RestoreError.inferenceFailed(error.localizedDescription)
+            throw RestoreError.inferenceFailed("\(error.localizedDescription)（\(diagnostic(for: error))）")
         }
     }
 
-    static func predictImage(_ model: MLModel, image: CGImage, spec: RestoreModelSpec) throws -> CGImage {
+    static func predictImage(_ loaded: RestoreLoadedModel, image: CGImage, spec: RestoreModelSpec) throws -> CGImage {
+        guard var model = loaded.model else { throw RestoreError.modelLoadFailed("模型已卸载") }
+        do {
+            return try predictImage(model, image: image, spec: spec)
+        } catch {
+            guard loaded.computeUnits != .cpuOnly else { throw error }
+            let diagnostic = diagnostic(for: error)
+            RestoreJournal.line("人脸加速推理失败，改用 CPU 重试：\(diagnostic)")
+            model = nil
+            loaded.model = nil
+            let cpuModel = try loadCPUModel(at: loaded.url, spec: spec)
+            loaded.model = cpuModel.model
+            loaded.computeUnits = .cpuOnly
+            guard let model = loaded.model else { throw RestoreError.modelLoadFailed("CPU 模型加载失败") }
+            return try predictImage(model, image: image, spec: spec)
+        }
+    }
+
+    private static func predictImage(_ model: MLModel, image: CGImage, spec: RestoreModelSpec) throws -> CGImage {
         do {
             guard let constraint = model.modelDescription.inputDescriptionsByName[spec.inputName]?.imageConstraint else {
                 throw RestoreError.modelLoadFailed("人脸模型缺少图片输入约束")
@@ -275,16 +361,16 @@ enum RestoreInferenceCore {
             var image: CGImage?
             let status = VTCreateCGImageFromCVPixelBuffer(output, options: nil, imageOut: &image)
             guard status == noErr, let image else {
-                throw RestoreError.inferenceFailed("无法转换人脸模型输出")
+                throw RestoreError.inferenceFailed("无法转换人脸模型输出（VideoToolbox \(status)）")
             }
             guard image.width == spec.tileSize, image.height == spec.tileSize else {
-                throw RestoreError.inferenceFailed("人脸模型输出尺寸无效")
+                throw RestoreError.inferenceFailed("人脸模型输出尺寸无效（\(image.width)×\(image.height)）")
             }
             return image
         } catch let error as RestoreError {
             throw error
         } catch {
-            throw RestoreError.inferenceFailed(error.localizedDescription)
+            throw RestoreError.inferenceFailed("\(error.localizedDescription)（\(diagnostic(for: error))）")
         }
     }
 

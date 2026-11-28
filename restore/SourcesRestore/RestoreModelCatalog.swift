@@ -126,6 +126,35 @@ struct RestoreModelSpec: Equatable, Identifiable {
     }
 }
 
+enum RestoreModelStorage {
+    static func compiledURL(root: URL, spec: RestoreModelSpec) -> URL {
+        let bundleName = URL(fileURLWithPath: spec.bundleRelativePath).lastPathComponent
+        return root.appendingPathComponent("Compiled", isDirectory: true)
+            .appendingPathComponent(spec.id.rawValue, isDirectory: true)
+            .appendingPathComponent("\(spec.version)-\(bundleName)", isDirectory: true)
+    }
+
+    static func legacyCompiledURL(root: URL, spec: RestoreModelSpec) -> URL {
+        root.appendingPathComponent("Compiled", isDirectory: true)
+            .appendingPathComponent(spec.id.rawValue, isDirectory: true)
+            .appendingPathComponent(spec.version, isDirectory: true)
+    }
+
+    static func resolveCompiledModel(root: URL, spec: RestoreModelSpec) throws -> URL {
+        let compiled = compiledURL(root: root, spec: spec)
+        if FileManager.default.fileExists(atPath: compiled.path) {
+            return compiled
+        }
+        let legacy = legacyCompiledURL(root: root, spec: spec)
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: legacy.path, isDirectory: &isDirectory), isDirectory.boolValue else {
+            throw RestoreError.modelNotInstalled
+        }
+        try FileManager.default.moveItem(at: legacy, to: compiled)
+        return compiled
+    }
+}
+
 enum RestoreModelCatalog {
     private static let localSRCommit = "bba30194995e2815364f111168fb15155a24920f"
     private static let gfpganArchiveURL = "https://github.com/zhengzou1860/phone/releases/download/channel-hirestore-models/gfpgan-ios18.zip"

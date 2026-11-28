@@ -32,7 +32,7 @@ enum RestoreSuperResolutionRunner {
         let useFaceRestoration = restoreFaces && faceModelURL != nil
         let tileProgressEnd = useFaceRestoration ? 0.78 : 0.94
         do {
-            let model = try RestoreInferenceCore.loadModel(modelURL, spec: spec)
+            let loadedModel = try RestoreInferenceCore.loadModel(modelURL, spec: spec)
             let weights = try RestoreBlendWeights(width: target.width, height: target.height)
             let inputDataType: MLMultiArrayDataType = spec.dataType == .float16 ? .float16 : .float32
             let input = try MLMultiArray(shape: spec.inputShape.map { NSNumber(value: $0) }, dataType: inputDataType)
@@ -42,7 +42,7 @@ enum RestoreSuperResolutionRunner {
                 try Task.checkCancellation()
                 let sourceTile = try RestoreInferenceCore.sourceTile(decoded.image, originX: tile.originX, originY: tile.originY, size: tileSize)
                 try fillRGB(input, from: sourceTile, channels: 3, minimum: 0, maximum: 1, dataType: spec.dataType)
-                let prediction = try RestoreInferenceCore.predict(model, input: input, spec: spec)
+                let prediction = try RestoreInferenceCore.predict(loadedModel, input: input, spec: spec)
                 let outputSize = try RestoreInferenceCore.imageShape(prediction)
                 let tileImage = try makeOutputImage(prediction, width: outputSize.width, height: outputSize.height, minimum: 0, maximum: 1, dataType: spec.dataType)
                 try RestoreInferenceCore.blend(
@@ -66,14 +66,20 @@ enum RestoreSuperResolutionRunner {
             RestoreJournal.line("AI 超分：\(tiles.count) 个分块全部完成")
         }
         if useFaceRestoration, let faceModelURL, let faceSpec = RestoreModelCatalog.spec(for: .gfpgan) {
-            await progress(0.79, "检测并对齐人脸")
-            _ = try await RestoreFaceRestorationRunner.restore(
-                canvas: canvas,
-                source: decoded.image,
-                modelURL: faceModelURL,
-                spec: faceSpec,
-                progress: progress
-            )
+            do {
+                await progress(0.79, "检测并对齐人脸")
+                _ = try await RestoreFaceRestorationRunner.restore(
+                    canvas: canvas,
+                    source: decoded.image,
+                    modelURL: faceModelURL,
+                    spec: faceSpec,
+                    progress: progress
+                )
+            } catch {
+                try Task.checkCancellation()
+                RestoreJournal.line("人脸补全不可用，保留超分结果：\(RestoreInferenceCore.diagnostic(for: error))")
+                await progress(0.94, "人脸补全不可用，已保留超分结果")
+            }
         }
         try Task.checkCancellation()
         await progress(0.98, "编码高清修复结果")

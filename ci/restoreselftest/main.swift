@@ -137,6 +137,10 @@ expect(RestoreJournal.compact(manyLines).count == 1000, "runtime journal keeps o
 let largeLines = (0..<1000).map { _ in String(repeating: "x", count: 1000) }
 let compacted = RestoreJournal.compact(largeLines)
 expect(compacted.joined(separator: "\n").utf8.count <= 512 * 1024, "runtime journal respects its byte cap")
+let exportedLog = try RestoreJournal.exportSnapshot(details: "selftest device")
+expect(exportedLog.lastPathComponent.hasPrefix("HiRestore-runtime-") && exportedLog.pathExtension == "log", "runtime journal exports a recognizable local log file")
+expect(try String(contentsOf: exportedLog, encoding: .utf8).contains("selftest device"), "exported log includes device diagnostics")
+try? FileManager.default.removeItem(at: exportedLog)
 
 let singleAITile = RestoreAIMath.tilePlan(width: 300, height: 200, tileSize: 384, overlap: 8, outputScale: 1)
 expect(singleAITile.count == 1 && singleAITile[0].originX == 0 && singleAITile[0].originY == 0, "small AI image uses one padded tile")
@@ -197,6 +201,17 @@ let faceSpec = RestoreModelCatalog.spec(for: .gfpgan)!
 expect(faceSpec.interface == .image && faceSpec.inputName == "x_1" && faceSpec.outputName == "activation_out", "GFPGAN uses its verified image feature names")
 expect(faceSpec.tileSize == 512 && faceSpec.totalByteCount == 337900799, "GFPGAN uses a verified 512px interface and pinned precompiled package size")
 expect(faceSpec.bundleRelativePath == "gfpgan.mlmodelc" && faceSpec.artifacts[0].isArchive, "GFPGAN installs an extracted precompiled model bundle")
+expect(RestoreModelCatalog.all.allSatisfy({ RestoreModelStorage.compiledURL(root: URL(fileURLWithPath: "/models"), spec: $0).pathExtension.lowercased() == "mlmodelc" }), "every installed model path preserves the Core ML bundle extension")
+let modelStorageRoot = FileManager.default.temporaryDirectory.appendingPathComponent("HiRestore-model-storage-\(UUID().uuidString)", isDirectory: true)
+defer { try? FileManager.default.removeItem(at: modelStorageRoot) }
+let legacyFaceURL = RestoreModelStorage.legacyCompiledURL(root: modelStorageRoot, spec: faceSpec)
+try FileManager.default.createDirectory(at: legacyFaceURL, withIntermediateDirectories: true)
+try Data("compiled-model".utf8).write(to: legacyFaceURL.appendingPathComponent("model.espresso.net"))
+let migratedFaceURL = try RestoreModelStorage.resolveCompiledModel(root: modelStorageRoot, spec: faceSpec)
+expect(migratedFaceURL == RestoreModelStorage.compiledURL(root: modelStorageRoot, spec: faceSpec) && migratedFaceURL.pathExtension == "mlmodelc", "legacy GFPGAN migrates to a versioned mlmodelc bundle")
+let migratedContents = try Data(contentsOf: migratedFaceURL.appendingPathComponent("model.espresso.net"))
+expect(!FileManager.default.fileExists(atPath: legacyFaceURL.path) && migratedContents == Data("compiled-model".utf8), "legacy model migration preserves compiled files without copying or downloading")
+expect(try RestoreModelStorage.resolveCompiledModel(root: modelStorageRoot, spec: faceSpec) == migratedFaceURL, "model path resolution is stable after migration")
 expect(faceSpec.artifacts[0].sha256 == "c657ae0d9c2d10e03ee6f11f2c521a9b65011f5e1fb2c5b83ee964905ca25ec3", "GFPGAN verifies the downloaded archive with SHA-256")
 expect(faceSpec.artifacts[0].downloadURLs.allSatisfy { URL(string: $0)?.scheme == "https" }, "GFPGAN downloads only over HTTPS")
 let faceSources = faceSpec.artifacts[0].downloadURLs

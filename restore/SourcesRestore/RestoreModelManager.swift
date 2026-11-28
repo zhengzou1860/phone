@@ -146,10 +146,7 @@ final class RestoreModelManager: ObservableObject {
               record.catalogHash == spec.catalogHash else {
             throw RestoreError.modelNotInstalled
         }
-        let url = root.appendingPathComponent("Compiled", isDirectory: true)
-            .appendingPathComponent(id.rawValue, isDirectory: true)
-            .appendingPathComponent(spec.version, isDirectory: true)
-        guard FileManager.default.fileExists(atPath: url.path) else { throw RestoreError.modelNotInstalled }
+        let url = try RestoreModelStorage.resolveCompiledModel(root: root, spec: spec)
         return url
     }
 
@@ -270,9 +267,7 @@ final class RestoreModelManager: ObservableObject {
         guard FileManager.default.fileExists(atPath: source.path) else {
             throw RestoreError.modelLoadFailed("模型包不完整")
         }
-        let compiled = root.appendingPathComponent("Compiled", isDirectory: true)
-            .appendingPathComponent(spec.id.rawValue, isDirectory: true)
-            .appendingPathComponent(spec.version, isDirectory: true)
+        let compiled = RestoreModelStorage.compiledURL(root: root, spec: spec)
         let precompiled = source.pathExtension.lowercased() == "mlmodelc"
         try FileManager.default.createDirectory(at: compiled.deletingLastPathComponent(), withIntermediateDirectories: true)
         try? FileManager.default.removeItem(at: compiled)
@@ -289,6 +284,7 @@ final class RestoreModelManager: ObservableObject {
         guard FileManager.default.fileExists(atPath: compiled.path) else {
             throw RestoreError.modelLoadFailed("模型编译结果不完整")
         }
+        try? FileManager.default.removeItem(at: RestoreModelStorage.legacyCompiledURL(root: root, spec: spec))
         RestoreJournal.line("AI 模型安装完成：\(spec.name)")
         try Task.checkCancellation()
 

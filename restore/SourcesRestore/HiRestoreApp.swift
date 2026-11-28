@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 @main
 struct HiRestoreApp: App {
@@ -10,6 +11,7 @@ struct HiRestoreApp: App {
         let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "-"
         let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "-"
         RestoreJournal.line("App 启动：HiRestore \(version) (\(build))")
+        RestoreJournal.line("设备：\(UIDevice.current.model) · \(UIDevice.current.systemName) \(UIDevice.current.systemVersion) · 内存 \(RestoreMath.formatBytes(Int(ProcessInfo.processInfo.physicalMemory)))")
         let store = RestoreStore()
         let models = RestoreModelManager()
         _store = StateObject(wrappedValue: store)

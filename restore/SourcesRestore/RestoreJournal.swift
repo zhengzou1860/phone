@@ -30,6 +30,15 @@ enum RestoreJournal {
         try? data.write(to: url, options: .atomic)
     }
 
+    static func exportSnapshot(details: String) throws -> URL {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withYearMonthDay, .withDashSeparator, .withColonSeparator, .withTime]
+        let name = "HiRestore-runtime-\(formatter.string(from: Date()).replacingOccurrences(of: ":", with: "-")).log"
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(name)
+        try snapshot(details: details).write(to: url, atomically: true, encoding: .utf8)
+        return url
+    }
+
     static func snapshot(details: String) -> String {
         lock.lock()
         let lines = readLinesLocked()

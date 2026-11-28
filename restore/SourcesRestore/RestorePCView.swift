@@ -8,6 +8,7 @@ struct RestorePCView: View {
     @State private var message = "还没有连接或发送"
     @State private var isBusy = false
     @State private var progress: Double?
+    @State private var sharedLogURL: URL?
 
     var body: some View {
         RestoreCard {
@@ -45,6 +46,11 @@ struct RestorePCView: View {
                 .tint(RestoreTheme.cyan)
                 .disabled(isBusy)
 
+                Button("导出日志（无需连接电脑）") { exportLog() }
+                    .buttonStyle(.bordered)
+                    .frame(maxWidth: .infinity)
+                    .disabled(isBusy)
+
                 if isBusy {
                     HStack(spacing: 10) {
                         ProgressView().tint(RestoreTheme.cyan)
@@ -60,9 +66,23 @@ struct RestorePCView: View {
                     .foregroundStyle(RestoreTheme.secondary)
                     .textSelection(.enabled)
 
-                Text("日志只包含 App 版本、设备型号、存储状态和操作记录，不包含照片或视频内容。媒体结果只能在「修复完成」页由你主动上传。")
+                Text("日志只包含 App 版本、设备型号、存储状态和操作记录，不包含照片或视频内容。无法连接电脑时，可点「导出日志」后存储到文件或发给他人。媒体结果只能在「修复完成」页由你主动上传。")
                     .font(.caption2)
                     .foregroundStyle(RestoreTheme.secondary)
+            }
+        }
+        .sheet(isPresented: Binding(
+            get: { sharedLogURL != nil },
+            set: { if !$0 { sharedLogURL = nil } }
+        )) {
+            if let sharedLogURL {
+                ShareLink(item: sharedLogURL) {
+                    Label("导出运行日志", systemImage: "square.and.arrow.up")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .padding(24)
+                .presentationDetents([.medium])
             }
         }
     }
@@ -113,6 +133,18 @@ struct RestorePCView: View {
         }
     }
 
+    private func exportLog() {
+        RestoreJournal.line("导出运行日志到文件")
+        do {
+            let url = try RestoreJournal.exportSnapshot(details: deviceDetails(target: endpoint))
+            sharedLogURL = url
+            message = "日志已生成，可存储到「文件」或分享给他人"
+        } catch {
+            message = "日志导出失败：\(error.localizedDescription)"
+            RestoreJournal.line("运行日志导出失败：\(error.localizedDescription)")
+        }
+    }
+
     private func deviceDetails(target: String) -> String {
         let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "-"
         let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "-"
@@ -123,6 +155,7 @@ struct RestorePCView: View {
         版本：\(version) (\(build))
         系统：\(device.systemName) \(device.systemVersion)
         设备：\(device.model)
+        内存：\(RestoreMath.formatBytes(Int(ProcessInfo.processInfo.physicalMemory)))
         电脑地址：\(RestorePCTransport.normalizedEndpoint(target) ?? target)
         可用空间：\(RestoreMath.formatBytes(Int(available)))
         """

@@ -27,7 +27,13 @@ enum RestoreFaceRestorationRunner {
             return 0
         }
         let selected = Array(observations.prefix(maximumFaces))
-        let model = try RestoreInferenceCore.loadModel(modelURL, spec: spec)
+        let loadedModel: RestoreLoadedModel
+        do {
+            loadedModel = try RestoreInferenceCore.loadModel(modelURL, spec: spec)
+        } catch {
+            RestoreJournal.line("人脸补全模型不可用：\(RestoreInferenceCore.diagnostic(for: error))")
+            throw error
+        }
         if observations.count > selected.count {
             RestoreJournal.line("人脸补全：检测到 \(observations.count) 张脸，本轮处理前 \(selected.count) 张")
         }
@@ -42,7 +48,13 @@ enum RestoreFaceRestorationRunner {
             guard let aligned = alignedFace(source: source, transform: transform, size: spec.tileSize) else {
                 throw RestoreError.inferenceFailed("无法对齐人脸")
             }
-            let restored = try RestoreInferenceCore.predictImage(model, image: aligned, spec: spec)
+            let restored: CGImage
+            do {
+                restored = try RestoreInferenceCore.predictImage(loadedModel, image: aligned, spec: spec)
+            } catch {
+                RestoreJournal.line("人脸补全推理失败：第 \(index + 1) 张脸 · \(RestoreInferenceCore.diagnostic(for: error))")
+                throw error
+            }
             guard let patch = maskedPatch(image: restored, mask: mask) else {
                 throw RestoreError.inferenceFailed("无法生成人脸融合图像")
             }
