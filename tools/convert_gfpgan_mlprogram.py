@@ -104,7 +104,7 @@ class Restore(nn.Module):
     def forward(self, x):
         x = x * 2.0 - 1.0
         out = self.net(x, return_rgb=False, randomize_noise=False)[0]
-        return (out.clamp(-1.0, 1.0) + 1.0) / 2.0
+        return (out.clamp(-1.0, 1.0) + 1.0) * 127.5
 
 
 def main():
@@ -162,8 +162,7 @@ def main():
         traced,
         inputs=[ct.ImageType(name="x_1", shape=(1, 3, 512, 512), scale=1.0 / 255.0,
                              bias=[0, 0, 0], color_layout=ct.colorlayout.RGB)],
-        outputs=[ct.ImageType(name="activation_out", scale=1.0 / 255.0,
-                              bias=[0, 0, 0], color_layout=ct.colorlayout.RGB)],
+        outputs=[ct.ImageType(name="activation_out")],
         minimum_deployment_target=ct.target.iOS18,
         convert_to="mlprogram",
         compute_units=ct.ComputeUnit.CPU_AND_GPU,
