@@ -85,7 +85,7 @@ enum RestoreFaceMath {
         guard patch.bitsPerComponent == 8, patch.bitsPerPixel == 32,
               patch.bytesPerRow >= patch.width * 4,
               let provider = patch.dataProvider,
-              let providerData = CGDataProviderCopyData(provider) as Data?,
+              let providerData = provider.data as Data?,
               providerData.count >= patch.bytesPerRow * patch.height else { return }
         let patchBytes = (providerData as NSData).bytes.assumingMemoryBound(to: UInt8.self)
         let canvasBytes = canvas.data.mutableBytes.assumingMemoryBound(to: UInt8.self)
