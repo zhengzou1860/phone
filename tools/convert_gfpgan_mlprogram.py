@@ -30,6 +30,36 @@ def package_bytes(path):
     return sum(item.stat().st_size for item in path.rglob("*") if item.is_file())
 
 
+def validate_prediction(model, example, reference, label):
+    pixels = np.moveaxis(example[0].numpy(), 0, -1)
+    pixels = np.ascontiguousarray(np.rint(pixels * 255.0), dtype=np.uint8)
+    prediction = model.predict({"x_1": Image.fromarray(pixels)})["activation_out"]
+    array = np.asarray(prediction)
+    if array.shape == (1, 3, 512, 512):
+        array = array[0]
+    if array.shape == (3, 512, 512):
+        array = np.moveaxis(array, 0, -1)
+    if array.shape == (512, 512, 4):
+        array = array[..., :3]
+    if array.dtype != np.uint8:
+        if float(array.max()) <= 1.0:
+            array = array * 255.0
+        array = np.ascontiguousarray(np.rint(array), dtype=np.uint8)
+    reference_array = np.moveaxis(reference[0].numpy(), 0, -1)
+    mean_error = float(np.abs(array.astype(np.float32) / 255.0 - reference_array).mean())
+    output_std = float(array.astype(np.float32).std() / 255.0)
+    print(
+        f"GFPGAN-{label} shape={array.shape} mean_error={mean_error:.6f} "
+        f"std={output_std:.6f} range=[{array.min()},{array.max()}]"
+    )
+    if array.shape != (512, 512, 3) or mean_error > 0.08 or output_std < 0.03:
+        raise RuntimeError(
+            f"Core ML {label} output validation failed: shape={array.shape} "
+            f"mean_error={mean_error} std={output_std}"
+        )
+    return {"meanAbsoluteError": mean_error, "outputStd": output_std}
+
+
 def stub_basicsr():
     registry = types.ModuleType("basicsr.utils.registry")
 
@@ -141,6 +171,8 @@ def main():
     converted.author = "TencentARC/GFPGAN"
     converted.license = "Apache-2.0"
     converted.short_description = "GFPGAN v1.4 aligned 512px face restoration, FP32 compute with 6-bit weights"
+    unquantized_model = ct.models.MLModel(converted, compute_units=ct.ComputeUnit.CPU_AND_GPU)
+    unquantized_metrics = validate_prediction(unquantized_model, example, reference, "UNQUANTIZED")
 
     import coremltools.optimize.coreml as optimize
 
@@ -157,28 +189,7 @@ def main():
     quantized.save(str(args.output))
 
     runtime_model = ct.models.MLModel(str(args.output), compute_units=ct.ComputeUnit.CPU_AND_GPU)
-    pixels = np.moveaxis(example[0].numpy(), 0, -1)
-    pixels = np.ascontiguousarray(np.rint(pixels * 255.0), dtype=np.uint8)
-    prediction = runtime_model.predict({"x_1": Image.fromarray(pixels)})["activation_out"]
-    prediction_array = np.asarray(prediction)
-    if prediction_array.shape == (1, 3, 512, 512):
-        prediction_array = prediction_array[0]
-    if prediction_array.shape == (3, 512, 512):
-        prediction_array = np.moveaxis(prediction_array, 0, -1)
-    if prediction_array.shape == (512, 512, 4):
-        prediction_array = prediction_array[..., :3]
-    if prediction_array.dtype != np.uint8:
-        if float(prediction_array.max()) <= 1.0:
-            prediction_array = prediction_array * 255.0
-        prediction_array = np.ascontiguousarray(np.rint(prediction_array), dtype=np.uint8)
-    reference_array = np.moveaxis(reference[0].numpy(), 0, -1)
-    mean_error = float(np.abs(prediction_array.astype(np.float32) / 255.0 - reference_array).mean())
-    output_std = float(prediction_array.astype(np.float32).std() / 255.0)
-    if prediction_array.shape != (512, 512, 3) or mean_error > 0.08 or output_std < 0.03:
-        raise RuntimeError(
-            f"Core ML output validation failed: shape={prediction_array.shape} "
-            f"mean_error={mean_error} std={output_std}"
-        )
+    quantized_metrics = validate_prediction(runtime_model, example, reference, "PAL6")
 
     spec = ct.models.utils.load_spec(str(args.output))
     manifest = {
@@ -197,8 +208,8 @@ def main():
         "inputs": [{"name": item.name, "kind": item.type.WhichOneof("Type")} for item in spec.description.input],
         "outputs": [{"name": item.name, "kind": item.type.WhichOneof("Type")} for item in spec.description.output],
         "patchMaxDelta": patch_delta,
-        "coreMLMeanAbsoluteError": mean_error,
-        "coreMLOutputStd": output_std,
+        "unquantizedValidation": unquantized_metrics,
+        "palettizedValidation": quantized_metrics,
     }
     args.manifest.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     print("GFPGAN-MLPROGRAM " + json.dumps(manifest, ensure_ascii=False))
