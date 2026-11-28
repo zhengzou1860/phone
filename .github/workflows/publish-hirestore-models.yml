@@ -60,9 +60,22 @@ jobs:
       - name: compile and verify GFPGAN
         run: |
           set -euo pipefail
-          rm -rf /tmp/gfpgan.mlmodelc
-          xcrun coremlcompiler compile /tmp/gfpgan-mlprogram.mlpackage /tmp \
+          rm -rf /tmp/gfpgan.mlmodelc /tmp/gfpgan-build
+          mkdir -p /tmp/gfpgan-build
+          xcrun coremlcompiler compile /tmp/gfpgan-mlprogram.mlpackage /tmp/gfpgan-build \
             --platform iOS --deployment-target 18.0
+          shopt -s nullglob
+          compiled=(/tmp/gfpgan-build/*.mlmodelc)
+          test "${#compiled[@]}" -eq 1
+          mv "${compiled[0]}" /tmp/gfpgan.mlmodelc
+          python - <<'PY'
+          from pathlib import Path
+          source = Path("/tmp/gfpgan.mlmodelc")
+          size = sum(path.stat().st_size for path in source.rglob("*") if path.is_file())
+          if size > 160 * 1024 * 1024:
+              raise SystemExit(f"compiled GFPGAN exceeds device budget: {size} bytes")
+          print(f"GFPGAN-COMPILED-BYTES {size}")
+          PY
           test -s /tmp/gfpgan.mlmodelc/coremldata.bin
           test -s /tmp/gfpgan.mlmodelc/model.mlmodel
           xcrun swiftc "$GITHUB_WORKSPACE/ci/verify_gfpgan.swift" -o /tmp/verify_gfpgan

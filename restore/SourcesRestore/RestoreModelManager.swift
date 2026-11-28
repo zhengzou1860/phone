@@ -274,6 +274,7 @@ final class RestoreModelManager: ObservableObject {
         if precompiled {
             RestoreJournal.line("AI 模型开始安装预编译包：\(spec.name)")
             try FileManager.default.copyItem(at: source, to: compiled)
+            _ = try RestoreInferenceCore.loadModel(compiled, spec: spec)
         } else {
             RestoreJournal.line("AI 模型开始编译：\(spec.name)")
             let result = try await MLModel.compileModel(at: source)

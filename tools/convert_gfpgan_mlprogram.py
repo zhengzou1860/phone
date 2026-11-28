@@ -161,8 +161,16 @@ def main():
     pixels = np.ascontiguousarray(np.rint(pixels * 255.0), dtype=np.uint8)
     prediction = runtime_model.predict({"x_1": Image.fromarray(pixels)})["activation_out"]
     prediction_array = np.asarray(prediction)
+    if prediction_array.shape == (1, 3, 512, 512):
+        prediction_array = prediction_array[0]
+    if prediction_array.shape == (3, 512, 512):
+        prediction_array = np.moveaxis(prediction_array, 0, -1)
+    if prediction_array.shape == (512, 512, 4):
+        prediction_array = prediction_array[..., :3]
     if prediction_array.dtype != np.uint8:
-        prediction_array = np.ascontiguousarray(np.rint(prediction_array * 255.0), dtype=np.uint8)
+        if float(prediction_array.max()) <= 1.0:
+            prediction_array = prediction_array * 255.0
+        prediction_array = np.ascontiguousarray(np.rint(prediction_array), dtype=np.uint8)
     reference_array = np.moveaxis(reference[0].numpy(), 0, -1)
     mean_error = float(np.abs(prediction_array.astype(np.float32) / 255.0 - reference_array).mean())
     output_std = float(prediction_array.astype(np.float32).std() / 255.0)
