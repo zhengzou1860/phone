@@ -51,6 +51,7 @@ jobs:
             restore/SourcesRestore/RestoreNativeSuperResolution.swift \
             restore/SourcesRestore/RestoreFaceMath.swift \
             restore/SourcesRestore/RestoreModelCatalog.swift \
+            restore/SourcesRestore/RestoreInferenceCore.swift \
             restore/SourcesRestore/RestorePCTransport.swift \
             restore/SourcesRestore/RestoreJournal.swift \
             ci/restoreselftest/main.swift \
