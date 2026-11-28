@@ -279,8 +279,8 @@ let pasteTransform = RestoreFaceMath.similarityTransform(
     to: pasteTemplate.map { CGPoint(x: $0.x * 0.5 + 20, y: $0.y * 0.5 + 20) }
 )!
 RestoreFaceMath.paste(patch: pastePatch, transform: pasteTransform, source: pasteSource, canvas: pasteCanvas)
-let pastedPixel = canvasPixel(pasteCanvas, x: 48, y: 144)
-let untouchedPixel = canvasPixel(pasteCanvas, x: 48, y: 200)
+let pastedPixel = canvasPixel(pasteCanvas, x: 48, y: 112)
+let untouchedPixel = canvasPixel(pasteCanvas, x: 48, y: 20)
 expect(pastedPixel.0 == 0 && pastedPixel.1 > 240 && pastedPixel.2 == 0, "face patch is drawn at the transformed image location without vertical mirroring")
 expect(untouchedPixel.0 > 240 && untouchedPixel.1 == 0 && untouchedPixel.2 == 0, "face patch leaves pixels outside its transformed bounds unchanged")
 expect(RestoreFaceMath.featherAlpha(pixelX: 256, pixelY: 281, size: 512) == 1, "face feather keeps the central facial area fully opaque")
