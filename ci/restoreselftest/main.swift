@@ -199,8 +199,8 @@ expect(realSpec.upscaleFactor == 2 && srSpec.upscaleFactor == 4, "super-resoluti
 expect(RestoreModelCatalog.all.count == 3, "model catalog includes RealESRGAN, LocalSR Fast, and GFPGAN")
 let faceSpec = RestoreModelCatalog.spec(for: .gfpgan)!
 expect(faceSpec.interface == .image && faceSpec.inputName == "x_1" && faceSpec.outputName == "activation_out", "GFPGAN uses its verified image feature names")
-expect(faceSpec.tileSize == 512 && faceSpec.totalByteCount == 337900799, "GFPGAN uses a verified 512px interface and pinned precompiled package size")
-expect(faceSpec.bundleRelativePath == "gfpgan.mlmodelc" && faceSpec.artifacts[0].isArchive, "GFPGAN installs an extracted precompiled model bundle")
+expect(faceSpec.tileSize == 512 && faceSpec.totalByteCount == 337392296, "GFPGAN uses a verified 512px interface and pinned source model size")
+expect(faceSpec.bundleRelativePath == "gfpgan.mlmodel" && !faceSpec.artifacts[0].isArchive, "GFPGAN compiles the source model with the device Core ML compiler")
 expect(RestoreModelCatalog.all.allSatisfy({ RestoreModelStorage.compiledURL(root: URL(fileURLWithPath: "/models"), spec: $0).pathExtension.lowercased() == "mlmodelc" }), "every installed model path preserves the Core ML bundle extension")
 let modelStorageRoot = FileManager.default.temporaryDirectory.appendingPathComponent("HiRestore-model-storage-\(UUID().uuidString)", isDirectory: true)
 defer { try? FileManager.default.removeItem(at: modelStorageRoot) }
@@ -212,11 +212,11 @@ expect(migratedFaceURL == RestoreModelStorage.compiledURL(root: modelStorageRoot
 let migratedContents = try Data(contentsOf: migratedFaceURL.appendingPathComponent("model.espresso.net"))
 expect(!FileManager.default.fileExists(atPath: legacyFaceURL.path) && migratedContents == Data("compiled-model".utf8), "legacy model migration preserves compiled files without copying or downloading")
 expect(try RestoreModelStorage.resolveCompiledModel(root: modelStorageRoot, spec: faceSpec) == migratedFaceURL, "model path resolution is stable after migration")
-expect(faceSpec.artifacts[0].sha256 == "36c1da280f6d4e680e3638f926cc166d09f54c44c5fdbad8fa5b967189de6688", "GFPGAN verifies the Xcode 26.6 archive with SHA-256")
+expect(faceSpec.artifacts[0].sha256 == "218a39c226adecb2ccbc1e358023b80a5cf2510be85dfc3ab0da698fad51391a", "GFPGAN verifies the source model with SHA-256")
 expect(faceSpec.artifacts[0].downloadURLs.allSatisfy { URL(string: $0)?.scheme == "https" }, "GFPGAN downloads only over HTTPS")
 let faceSources = faceSpec.artifacts[0].downloadURLs
 expect(faceSources.count == 3 && faceSources[0].contains("gh-proxy.com/") && faceSources[1].contains("ghfast.top/") && faceSources[2].contains("github.com/"), "GFPGAN prefers accelerated mirrors and keeps the official fallback")
-expect(faceSources.allSatisfy { $0.hasSuffix("/gfpgan-ios26.zip") }, "GFPGAN mirrors serve the same pinned precompiled archive")
+expect(faceSources.allSatisfy { $0.hasSuffix("/gfpgan.mlmodel") }, "GFPGAN mirrors serve the same pinned source model")
 let landmarkCenter = RestoreFaceMath.imagePoint(CGPoint(x: 0.5, y: 0.5), faceBox: CGRect(x: 0.25, y: 0.25, width: 0.5, height: 0.5), imageSize: CGSize(width: 1000, height: 800))
 expect(abs(landmarkCenter.x - 500) < 0.0001 && abs(landmarkCenter.y - 400) < 0.0001, "Vision landmarks map from the face box into upper-left image coordinates")
 let identityFace = RestoreFaceMath.similarityTransform(from: RestoreFaceMath.template)!
