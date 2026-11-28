@@ -1,4 +1,5 @@
 import Foundation
+import CoreGraphics
 
 func expect(_ condition: Bool, _ message: String) {
     guard condition else {
