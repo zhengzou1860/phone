@@ -279,7 +279,7 @@ let pasteTransform = RestoreFaceMath.similarityTransform(
     to: pasteTemplate.map { CGPoint(x: $0.x * 0.5 + 20, y: $0.y * 0.5 + 20) }
 )!
 RestoreFaceMath.paste(patch: pastePatch, transform: pasteTransform, source: pasteSource, canvas: pasteCanvas)
-let pastedPixel = canvasPixel(pasteCanvas, x: 48, y: 112)
+let pastedPixel = canvasPixel(pasteCanvas, x: 48, y: 144)
 expect(pastedPixel.0 == 0 && pastedPixel.1 > 240 && pastedPixel.2 == 0, "face patch is drawn at the transformed image location without vertical mirroring")
 let identityCanvas = try RestorePixelCanvas(width: 128, height: 128, source: pasteSource)
 RestoreFaceMath.paste(
@@ -288,8 +288,8 @@ RestoreFaceMath.paste(
     source: pasteSource,
     canvas: identityCanvas
 )
-let identityInside = canvasPixel(identityCanvas, x: 16, y: 100)
-let identityOutside = canvasPixel(identityCanvas, x: 16, y: 20)
+let identityInside = canvasPixel(identityCanvas, x: 16, y: 20)
+let identityOutside = canvasPixel(identityCanvas, x: 16, y: 100)
 expect(identityInside.0 == 0 && identityInside.1 > 240 && identityInside.2 == 0, "identity face patch covers the expected top-left crop")
 expect(identityOutside.0 > 240 && identityOutside.1 == 0 && identityOutside.2 == 0, "identity face patch leaves the lower image area unchanged")
 expect(RestoreFaceMath.featherAlpha(pixelX: 256, pixelY: 281, size: 512) == 1, "face feather keeps the central facial area fully opaque")
