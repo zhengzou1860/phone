@@ -157,7 +157,7 @@ enum RestoreModelStorage {
 
 enum RestoreModelCatalog {
     private static let localSRCommit = "bba30194995e2815364f111168fb15155a24920f"
-    private static let gfpganModelURL = "https://github.com/zhengzou1860/phone/releases/download/channel-hirestore-models/gfpgan.mlmodel"
+    private static let gfpganModelURL = "https://github.com/zhengzou1860/phone/releases/download/channel-hirestore-models/gfpgan-mlprogram.zip"
 
     static let all: [RestoreModelSpec] = [realESRGAN, localSRFast, gfpgan]
 
@@ -218,30 +218,31 @@ enum RestoreModelCatalog {
     private static let gfpgan = RestoreModelSpec(
         id: .gfpgan,
         name: "GFPGAN 人脸细节",
-        version: "1.2.0",
-        summary: "512px 对齐人脸细节补全；只贴回脸部区域，背景继续使用超分模型。首次需下载约 322 MiB，并在手机上编译。",
+        version: "1.3.0",
+        summary: "512px 对齐人脸细节还原；只贴回脸部区域，背景继续使用超分模型。首次需下载约 61 MiB，使用电脑预编译模型，无需在手机上编译。",
         licenseLabel: "Apache-2.0",
-        attribution: "TencentARC/GFPGAN · john-rocky/Core ML conversion",
-        sourceURL: "https://github.com/john-rocky/CoreML-Models",
-        bundleRelativePath: "gfpgan.mlmodel",
+        attribution: "TencentARC/GFPGAN · Core ML 转换",
+        sourceURL: "https://github.com/TencentARC/GFPGAN",
+        bundleRelativePath: "gfpgan.mlmodelc",
         artifacts: [RestoreModelArtifact(
-            relativePath: "gfpgan.mlmodel",
+            relativePath: "gfpgan-mlprogram.zip",
             downloadURL: gfpganModelURL,
-            byteCount: 337_392_296,
-            sha256: "218a39c226adecb2ccbc1e358023b80a5cf2510be85dfc3ab0da698fad51391a",
+            byteCount: 64_270_667,
+            sha256: "86be14dff1d5a9f24e4634c9fc8206641a332b289b200702e36e7a608dae25b8",
             alternateDownloadURLs: [
                 "https://gh-proxy.com/\(gfpganModelURL)",
                 "https://ghfast.top/\(gfpganModelURL)"
-            ]
+            ],
+            isArchive: true
         )],
-        catalogHash: "gfpgan-coreml-512-image-device-compiled-v1",
+        catalogHash: "gfpgan-v1.4-mlprogram-fp32-pal6-precompiled-v1",
         packagedByteCount: nil,
         compute: .gpu,
         inputName: "x_1",
         outputName: "activation_out",
         inputShape: [],
         outputShape: [],
-        dataType: .float16,
+        dataType: .float32,
         tileSize: 512,
         overlap: 0,
         interface: .image
