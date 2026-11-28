@@ -480,7 +480,7 @@ enum RestoreNativeVideoRunner {
             imageBuffer: output,
             formatDescription: formatDescription,
             sampleTiming: &timing,
-            sampleBuffer: &sampleBuffer
+            sampleBufferOut: &sampleBuffer
         )
         guard sampleStatus == noErr, let sampleBuffer else {
             throw RestoreError.exportFailed("无法创建输出视频帧（\(sampleStatus)）")
