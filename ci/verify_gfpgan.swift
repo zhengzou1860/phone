@@ -39,7 +39,7 @@ func verifyGFPGAN(at path: String) throws {
 }
 
 #if os(iOS)
-guard let modelURL = Bundle.main.url(forResource: "1.1.1-gfpgan", withExtension: "mlmodelc") else {
+guard let modelURL = Bundle.main.url(forResource: "1.3.0-gfpgan", withExtension: "mlmodelc") else {
     FileHandle.standardError.write(Data("GFPGAN-IOS-VERDICT FAIL compiled model missing\n".utf8))
     exit(1)
 }

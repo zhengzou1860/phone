@@ -8,7 +8,6 @@ on:
       - 'ci/restoreselftest/**'
       - 'ci/restoretiletest/**'
       - 'ci/restorearchivetest/**'
-      - 'ci/verify_gfpgan.swift'
       - 'ci/hirestorepctest.py'
       - 'tools/report_server_hirestore.py'
       - 'tools/start_hirestore.bat'

@@ -14,7 +14,7 @@ concurrency:
 jobs:
   gfpgan:
     runs-on: macos-latest
-    timeout-minutes: 30
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
 
@@ -30,24 +30,41 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: install model tools
-        run: python -m pip install --disable-pip-version-check 'gdown==5.2.0' 'coremltools==9.0'
+      - name: install conversion tools
+        run: python -m pip install --disable-pip-version-check 'torch==2.7.0' 'torchvision==0.22.0' 'coremltools==9.0' pillow numpy 'scikit-learn<1.6'
 
-      - name: download and inspect GFPGAN
+      - name: fetch pinned GFPGAN architecture
+        uses: actions/checkout@v4
+        with:
+          repository: TencentARC/GFPGAN
+          ref: 7552a7791caad982045a7bbe5634bbf1cd5c8679
+          path: upstream-gfpgan
+
+      - name: download GFPGAN v1.4 weights
         run: |
           set -euo pipefail
-          python tools/prepare_gfpgan.py \
-            --output /tmp/gfpgan.mlmodel \
+          curl -fL --retry 4 --retry-delay 3 \
+            https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.4.pth \
+            -o /tmp/GFPGANv1.4.pth
+          test "$(wc -c < /tmp/GFPGANv1.4.pth | tr -d ' ')" -gt 300000000
+
+      - name: convert and numerically validate GFPGAN
+        run: |
+          set -euo pipefail
+          python tools/convert_gfpgan_mlprogram.py \
+            --upstream "$GITHUB_WORKSPACE/upstream-gfpgan" \
+            --weights /tmp/GFPGANv1.4.pth \
+            --output /tmp/gfpgan-mlprogram.mlpackage \
             --manifest /tmp/gfpgan-manifest.json
 
       - name: compile and verify GFPGAN
         run: |
           set -euo pipefail
           rm -rf /tmp/gfpgan.mlmodelc
-          xcrun coremlcompiler compile /tmp/gfpgan.mlmodel /tmp \
+          xcrun coremlcompiler compile /tmp/gfpgan-mlprogram.mlpackage /tmp \
             --platform iOS --deployment-target 18.0
-          test -s /tmp/gfpgan.mlmodelc/model.espresso.net
           test -s /tmp/gfpgan.mlmodelc/coremldata.bin
+          test -s /tmp/gfpgan.mlmodelc/model.mlmodel
           xcrun swiftc "$GITHUB_WORKSPACE/ci/verify_gfpgan.swift" -o /tmp/verify_gfpgan
           /tmp/verify_gfpgan /tmp/gfpgan.mlmodelc
 
@@ -56,7 +73,7 @@ jobs:
           set -euo pipefail
           rm -rf /tmp/gfpgan-verify.app /tmp/gfpgan-verify-src
           mkdir -p /tmp/gfpgan-verify.app /tmp/gfpgan-verify-src
-          cp -R /tmp/gfpgan.mlmodelc /tmp/gfpgan-verify.app/1.1.1-gfpgan.mlmodelc
+          cp -R /tmp/gfpgan.mlmodelc /tmp/gfpgan-verify.app/1.3.0-gfpgan.mlmodelc
           cp "$GITHUB_WORKSPACE/ci/verify_gfpgan.swift" /tmp/gfpgan-verify-src/main.swift
           simulator=$(xcrun simctl list devices available -j | python3 -c '
           import json, sys
@@ -129,7 +146,7 @@ jobs:
           from pathlib import Path
 
           source = Path("/tmp/gfpgan.mlmodelc")
-          archive = Path("/tmp/gfpgan-ios26.zip")
+          archive = Path("/tmp/gfpgan-mlprogram.zip")
           with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_STORED, allowZip64=False) as handle:
               for path in sorted(source.rglob("*")):
                   handle.write(path, path.relative_to(source.parent).as_posix())
@@ -143,7 +160,7 @@ jobs:
               "file": archive.name,
               "bytes": archive.stat().st_size,
               "sha256": digest.hexdigest(),
-              "format": "mlmodelc",
+              "format": "mlmodelc-mlprogram",
               "archive": "zip-stored",
               "compiler": "Xcode 26.6",
               "minimumiOS": "18.0",
@@ -156,7 +173,7 @@ jobs:
         run: |
           set -euo pipefail
           curl -fsSL --retry 3 \
-            https://raw.githubusercontent.com/TencentARC/GFPGAN/master/LICENSE \
+            https://raw.githubusercontent.com/TencentARC/GFPGAN/7552a7791caad982045a7bbe5634bbf1cd5c8679/LICENSE \
             -o /tmp/GFPGAN_LICENSE.txt
           test -s /tmp/GFPGAN_LICENSE.txt
           grep -q 'Apache License' /tmp/GFPGAN_LICENSE.txt
@@ -164,10 +181,10 @@ jobs:
       - name: upload model artifact
         uses: actions/upload-artifact@v4
         with:
-          name: HiRestore-GFPGAN-model
+          name: HiRestore-GFPGAN-MLProgram-model
           path: |
-            /tmp/gfpgan.mlmodel
-            /tmp/gfpgan-ios26.zip
+            /tmp/gfpgan-mlprogram.mlpackage
+            /tmp/gfpgan-mlprogram.zip
             /tmp/gfpgan-manifest.json
             /tmp/GFPGAN_LICENSE.txt
           if-no-files-found: error
@@ -184,23 +201,16 @@ jobs:
               --notes 'Verified offline model assets for HiRestore.'
           fi
           gh release upload channel-hirestore-models \
-            /tmp/gfpgan.mlmodel /tmp/gfpgan-ios26.zip /tmp/gfpgan-manifest.json /tmp/GFPGAN_LICENSE.txt \
+            /tmp/gfpgan-mlprogram.zip /tmp/gfpgan-manifest.json /tmp/GFPGAN_LICENSE.txt \
             --clobber
           gh release edit channel-hirestore-models \
             --draft=false --prerelease \
-            --notes 'GFPGAN Core ML model converted by john-rocky/CoreML-Models; precompiled with Xcode 26.6 and verified on macOS plus the current iOS simulator; upstream TencentARC/GFPGAN, Apache-2.0.'
-          expected=$(python -c 'import json; print(json.load(open("/tmp/gfpgan-manifest.json"))["bytes"])')
+            --notes 'GFPGAN v1.4 ML Program with FP32 compute and 6-bit weight palettization, converted from TencentARC/GFPGAN and numerically validated against PyTorch; compiled with Xcode 26.6 and verified on macOS plus the current iOS simulator. Upstream Apache-2.0.'
+          expected=$(python -c 'import json; print(json.load(open("/tmp/gfpgan-manifest.json"))["compiled"]["bytes"])')
           actual=$(gh release view channel-hirestore-models --json assets \
-            --jq '.assets[] | select(.name=="gfpgan.mlmodel") | .size')
+            --jq '.assets[] | select(.name=="gfpgan-mlprogram.zip") | .size')
           test "$actual" = "$expected"
-          url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/channel-hirestore-models/gfpgan.mlmodel"
+          url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/channel-hirestore-models/gfpgan-mlprogram.zip"
           code=$(curl -fsSIL -o /dev/null -w '%{http_code}' --max-time 90 "$url")
           test "$code" = 200
-          compiled=$(python -c 'import json; print(json.load(open("/tmp/gfpgan-manifest.json"))["compiled"]["bytes"])')
-          compiled_actual=$(gh release view channel-hirestore-models --json assets \
-            --jq '.assets[] | select(.name=="gfpgan-ios26.zip") | .size')
-          test "$compiled_actual" = "$compiled"
-          compiled_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/channel-hirestore-models/gfpgan-ios26.zip"
-          compiled_code=$(curl -fsSIL -o /dev/null -w '%{http_code}' --max-time 90 "$compiled_url")
-          test "$compiled_code" = 200
-          echo "GFPGAN-RELEASE-VERDICT PASS bytes=$actual compiled_bytes=$compiled_actual url=$compiled_url"
+          echo "GFPGAN-RELEASE-VERDICT PASS bytes=$actual url=$url"
