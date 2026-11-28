@@ -171,7 +171,10 @@ def main():
     converted.author = "TencentARC/GFPGAN"
     converted.license = "Apache-2.0"
     converted.short_description = "GFPGAN v1.4 aligned 512px face restoration, FP32 compute with 6-bit weights"
-    unquantized_model = ct.models.MLModel(converted, compute_units=ct.ComputeUnit.CPU_AND_GPU)
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    unquantized_output = args.output.parent / "gfpgan-unquantized.mlpackage"
+    converted.save(str(unquantized_output))
+    unquantized_model = ct.models.MLModel(str(unquantized_output), compute_units=ct.ComputeUnit.CPU_AND_GPU)
     unquantized_metrics = validate_prediction(unquantized_model, example, reference, "UNQUANTIZED")
 
     import coremltools.optimize.coreml as optimize
@@ -185,7 +188,6 @@ def main():
     quantized.author = converted.author
     quantized.license = converted.license
     quantized.short_description = converted.short_description
-    args.output.parent.mkdir(parents=True, exist_ok=True)
     quantized.save(str(args.output))
 
     runtime_model = ct.models.MLModel(str(args.output), compute_units=ct.ComputeUnit.CPU_AND_GPU)
