@@ -74,6 +74,7 @@ jobs:
             restore/SourcesRestore/RestoreFaceMath.swift \
             restore/SourcesRestore/RestoreModelCatalog.swift \
             restore/SourcesRestore/RestoreInferenceCore.swift \
+            restore/SourcesRestore/RestoreJournal.swift \
             ci/restoretiletest/main.swift \
             -o /tmp/restoretiletest 2>&1 | tee -a /tmp/selftest.log
           status=${PIPESTATUS[0]}

@@ -296,9 +296,10 @@ enum RestoreInferenceCore {
     }
 
     static func predict(_ loaded: RestoreLoadedModel, input: MLMultiArray, spec: RestoreModelSpec) throws -> MLMultiArray {
-        guard var model = loaded.model else { throw RestoreError.modelLoadFailed("模型已卸载") }
+        var model = loaded.model
+        guard model != nil else { throw RestoreError.modelLoadFailed("模型已卸载") }
         do {
-            return try predict(model, input: input, spec: spec)
+            return try predict(model!, input: input, spec: spec)
         } catch {
             guard loaded.computeUnits != .cpuOnly else { throw error }
             let diagnostic = diagnostic(for: error)
@@ -329,9 +330,10 @@ enum RestoreInferenceCore {
     }
 
     static func predictImage(_ loaded: RestoreLoadedModel, image: CGImage, spec: RestoreModelSpec) throws -> CGImage {
-        guard var model = loaded.model else { throw RestoreError.modelLoadFailed("模型已卸载") }
+        var model = loaded.model
+        guard model != nil else { throw RestoreError.modelLoadFailed("模型已卸载") }
         do {
-            return try predictImage(model, image: image, spec: spec)
+            return try predictImage(model!, image: image, spec: spec)
         } catch {
             guard loaded.computeUnits != .cpuOnly else { throw error }
             let diagnostic = diagnostic(for: error)
