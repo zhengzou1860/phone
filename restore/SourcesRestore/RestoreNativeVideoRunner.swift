@@ -68,14 +68,16 @@ enum RestoreNativeVideoRunner {
             throw RestoreError.exportFailed("视频画面尺寸无效")
         }
         let videoTracks: [AVAssetTrack]
+        let videoTrack: AVAssetTrack
         let audioTracks: [AVAssetTrack]
         let preferredTransform: CGAffineTransform
         do {
             videoTracks = try await asset.loadTracks(withMediaType: .video)
             audioTracks = try await asset.loadTracks(withMediaType: .audio)
-            guard let videoTrack = videoTracks.first else {
+            guard let track = videoTracks.first else {
                 throw RestoreError.exportFailed("视频里没有可处理的画面")
             }
+            videoTrack = track
             preferredTransform = try await videoTrack.load(.preferredTransform)
         } catch {
             try state.checkCancellation()
@@ -135,7 +137,7 @@ enum RestoreNativeVideoRunner {
         reader.add(videoOutput)
 
         let audioOutput: AVAssetReaderTrackOutput?
-        let audioInput: AVAssetWriterAudioInput?
+        let audioInput: AVAssetWriterInput?
         if let audioTrack = audioTracks.first {
             let readerOutput = AVAssetReaderTrackOutput(track: audioTrack, outputSettings: nil)
             guard reader.canAdd(readerOutput) else {
@@ -143,13 +145,13 @@ enum RestoreNativeVideoRunner {
             }
             reader.add(readerOutput)
             audioOutput = readerOutput
-            audioInput = AVAssetWriterAudioInput(mediaType: .audio, outputSettings: nil)
+            audioInput = AVAssetWriterInput(mediaType: .audio, outputSettings: nil)
         } else {
             audioOutput = nil
             audioInput = nil
         }
 
-        let writer = AVAssetWriter(outputURL: outputURL, fileType: .mov)
+        let writer = try AVAssetWriter(outputURL: outputURL, fileType: .mov)
         let frameRate = geometry.frameDuration.value > 0
             ? Double(geometry.frameDuration.timescale) / Double(geometry.frameDuration.value)
             : 30
@@ -159,14 +161,14 @@ enum RestoreNativeVideoRunner {
                 kCVPixelBufferWidthKey as String: outputWidth,
                 kCVPixelBufferHeightKey as String: outputHeight,
                 kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
-                AVVideoCodecTypeKey: AVVideoCodecType.hevc,
+                "Codec": AVVideoCodecType.hevc,
                 AVVideoCompressionPropertiesKey: [
                     AVVideoAverageBitRateKey: estimatedBitRate(width: outputWidth, height: outputHeight, frameRate: frameRate),
                     AVVideoExpectedSourceFrameRateKey: frameRate
                 ]
             ]
         )
-        videoInput.transform = .identity
+        videoInput.transform = CGAffineTransform.identity
         guard writer.canAdd(videoInput) else {
             throw RestoreError.exportFailed("无法创建视频输出轨道")
         }
@@ -332,7 +334,7 @@ enum RestoreNativeVideoRunner {
                 try await Task.sleep(nanoseconds: 250_000_000)
             }
             do {
-                try await download.value
+                try await download
             } catch {
                 try Task.checkCancellation()
                 throw inferenceError("苹果视频超分模型下载失败", error)
@@ -462,7 +464,7 @@ enum RestoreNativeVideoRunner {
         let formatStatus = CMVideoFormatDescriptionCreateForImageBuffer(
             allocator: kCFAllocatorDefault,
             imageBuffer: output,
-            formatDescription: &formatDescription
+            formatDescriptionOut: &formatDescription
         )
         guard formatStatus == noErr, let formatDescription else {
             throw RestoreError.exportFailed("无法创建输出帧格式（\(formatStatus)）")
@@ -478,7 +480,6 @@ enum RestoreNativeVideoRunner {
             imageBuffer: output,
             formatDescription: formatDescription,
             sampleTiming: &timing,
-            sampleCount: 1,
             sampleBuffer: &sampleBuffer
         )
         guard sampleStatus == noErr, let sampleBuffer else {

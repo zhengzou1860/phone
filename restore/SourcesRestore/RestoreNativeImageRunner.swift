@@ -103,7 +103,7 @@ enum RestoreNativeImageRunner {
                 await progress(0.06 + Double(percentage) / 100 * 0.08, "下载苹果超分模型 \(percentage)%")
                 try await Task.sleep(nanoseconds: 250_000_000)
             }
-            try await download.value
+            try await download
         case .downloading:
             while configuration.configurationModelStatus == .downloading {
                 try Task.checkCancellation()
@@ -178,11 +178,11 @@ enum RestoreNativeImageRunner {
             throw RestoreError.inferenceFailed("无法裁切系统超分输入块")
         }
         let y = CGFloat(tile.height - tile.validHeight)
-        context.draw(cropped, in: CGRect(x: 0, y: y, width: tile.validWidth, height: tile.validHeight))
+        context.draw(cropped, in: CGRect(x: 0, y: y, width: CGFloat(tile.validWidth), height: CGFloat(tile.validHeight)))
         let paddingWidth = tile.width - tile.validWidth
         let paddingHeight = tile.height - tile.validHeight
         if paddingWidth > 0, let edge = cropped.cropping(to: CGRect(x: tile.validWidth - 1, y: 0, width: 1, height: tile.validHeight)) {
-            context.draw(edge, in: CGRect(x: tile.validWidth, y: y, width: paddingWidth, height: tile.validHeight))
+            context.draw(edge, in: CGRect(x: CGFloat(tile.validWidth), y: y, width: CGFloat(paddingWidth), height: CGFloat(tile.validHeight)))
         }
         if paddingHeight > 0, let edge = cropped.cropping(to: CGRect(x: 0, y: tile.validHeight - 1, width: tile.validWidth, height: 1)) {
             context.draw(edge, in: CGRect(x: 0, y: 0, width: tile.validWidth, height: paddingHeight))
@@ -227,7 +227,7 @@ enum RestoreNativeImageRunner {
         CVPixelBufferLockBaseAddress(buffer, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
         var result: CGImage?
-        let status = VTCreateCGImageFromCVPixelBuffer(buffer, nil, &result)
+        let status = VTCreateCGImageFromCVPixelBuffer(buffer, options: nil, imageOut: &result)
         guard status == noErr, let result else {
             throw RestoreError.inferenceFailed("无法读取系统超分结果（\(status)）")
         }
