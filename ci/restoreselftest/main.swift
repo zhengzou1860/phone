@@ -283,7 +283,7 @@ expect((0..<4032).allSatisfy { x in nativeTiles.contains { x >= $0.originX && x 
 expect((0..<3024).allSatisfy { y in nativeTiles.contains { y >= $0.originY && y < $0.originY + $0.validHeight } }, "native vertical tiles cover every source row")
 expect(RestoreNativeMath.tilePlan(width: 100, height: 100, maximumWidth: 0, maximumHeight: 1080, overlap: 64).isEmpty, "invalid native tile limits are rejected")
 var systemSettings = RestorationSettings(mode: .systemSuperResolution, restoreFaces: false)
-expect(systemSettings.model == nil && systemSettings.usesCoreMLFallback && !systemSettings.isAI, "system super-resolution keeps the bundled Core ML model as a fallback")
+expect(systemSettings.model == nil && systemSettings.mode.usesCoreMLFallback && !systemSettings.mode.isAI, "system super-resolution keeps the bundled Core ML model as a fallback")
 let systemData = try JSONEncoder().encode(systemSettings.mode)
 expect(try JSONDecoder().decode(RestoreProcessingMode.self, from: systemData) == .systemSuperResolution, "system super-resolution selection survives Codable round trips")
 expect(!RestorePreset.smart.settings(scale: 2).restoreFaces, "face restoration is opt-in instead of blocking the native path")
